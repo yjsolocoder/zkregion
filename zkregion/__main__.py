@@ -36,6 +36,14 @@ def main() -> int:
     print(f"  tampered response rejected: {verifier.verify(t, challenge, response + 1)}")
 
     print()
+    print("non-interactive Schnorr (Fiat-Shamir):")
+    proof = prover.prove(b"region/42", context=b"demo")
+    print(f"  commitment={proof.commitment}")
+    print(f"  proof accepted: {verifier.verify_proof(b'region/42', proof, context=b'demo')}")
+    print(f"  wrong message rejected: {verifier.verify_proof(b'region/43', proof, context=b'demo')}")
+    print(f"  wrong context rejected: {verifier.verify_proof(b'region/42', proof)}")
+
+    print()
     print("region membership:")
     region = Region(0, 100, 0, 100)
     print(f"  region size {region.width()}x{region.height()}")

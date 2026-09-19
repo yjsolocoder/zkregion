@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from . import (
     Region,
+    SchnorrBatchEntry,
+    SchnorrProof,
     SchnorrProver,
     SchnorrVerifier,
     commit,
@@ -54,6 +56,23 @@ def main() -> int:
     print(f"  valid proof accepted: {verifier.verify_proof(b'payload', proof, context=b'demo')}")
     print(f"  wrong message rejected: {verifier.verify_proof(b'other', proof, context=b'demo')}")
     print(f"  wrong context rejected: {verifier.verify_proof(b'payload', proof)}")
+
+    print()
+    print("batched Schnorr (Fiat-Shamir, random linear combination):")
+    batch_messages = [b"alpha", b"beta", b"gamma"]
+    entries = [
+        SchnorrBatchEntry(message, prover.prove(message, context=b"batch"), context=b"batch")
+        for message in batch_messages
+    ]
+    print(f"  batch of {len(entries)} accepted: {verifier.verify_batch(entries, randbelow=counter_randbelow())}")
+    last = entries[-1]
+    tampered = entries[:-1] + [
+        SchnorrBatchEntry(last.message, SchnorrProof(last.proof.commitment, last.proof.response + 1), context=b"batch")
+    ]
+    print(f"  tampered entry rejected: {not verifier.verify_batch(tampered, randbelow=counter_randbelow())}")
+    wrong_context = entries[:-1] + [SchnorrBatchEntry(last.message, last.proof)]
+    print(f"  wrong context rejected: {not verifier.verify_batch(wrong_context, randbelow=counter_randbelow())}")
+    print(f"  empty batch rejected: {not verifier.verify_batch([])}")
 
     print()
     print("merkle inclusion proofs:")

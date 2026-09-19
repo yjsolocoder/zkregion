@@ -25,6 +25,15 @@ assert verifier.verify(t, c, s)
 proof = prover.prove(b"payload", context=b"session-1")
 assert verifier.verify_proof(b"payload", proof, context=b"session-1")
 
+# 同一公钥的批量验证（随机线性组合，一次聚合检查）
+from zkregion import SchnorrBatchEntry
+
+batch = [
+    SchnorrBatchEntry(b"m1", prover.prove(b"m1", context=b"s"), context=b"s"),
+    SchnorrBatchEntry(b"m2", prover.prove(b"m2", context=b"s"), context=b"s"),
+]
+assert verifier.verify_batch(batch)
+
 # Merkle 包含证明
 from zkregion import merkle_root, prove_inclusion, verify_inclusion
 
@@ -63,7 +72,9 @@ python3 -m zkregion
 - `SchnorrVerifier(public_key, *, prime, generator)`
   - `verify(commitment, challenge, response)` — 交互式验证
   - `verify_proof(message, proof, *, context=b"") -> bool` — 非交互证明验证
+  - `verify_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 同一公钥的批量聚合验证
 - `SchnorrProof(commitment, response)` — 不可变证明对象（`t = g**k mod prime`，`s = k + c * secret`）
+- `SchnorrBatchEntry(message, proof, context=b"")` — 不可变批量验证条目，字段类型依次为 `bytes`、`SchnorrProof`、`bytes`
 - `merkle_root(leaves) -> bytes` — 非空 `bytes` 序列的 Merkle 根
 - `prove_inclusion(leaves, index) -> MerkleProof` — 按零基索引生成包含证明
 - `verify_inclusion(leaf, proof, root) -> bool` — 验证包含证明
@@ -87,9 +98,21 @@ python3 -m zkregion
 
 挑战 `c` 为 SHA-256 摘要的大端整数模 `prime`。转录依次写入固定域 `b"zkregion/schnorr-fs/v1"`、`prime`、`generator`、`public_key`、`t`、`context`、`message`；每项前置四字节无符号大端长度，整数取最短无符号大端编码。证明使用独立的临时随机数 `k`，与交互式 nonce 互不影响；应答 `s` 仍按普通整数计算、不针对群阶取模。
 
+### Schnorr 批量验证
+
+`verify_batch` 针对同一公钥的一批 `SchnorrBatchEntry` 做一次聚合检查，而不是逐项验证后取布尔汇总。`entries` 须为非字符串序列，空批返回 `False`。对每个结构合法的条目，按既有转录重算挑战 `c`，并恰好调用一次 `randbelow(prime - 1)` 得到 `r`，取非零系数 `a = r + 1`，最终检查：
+
+```
+g**Σ(a·s) == Π(t**a · public_key**(a·c))  (mod prime)
+```
+
+重复条目合法，各自独立取系数。系数源固定时结果可重复；缺省使用 `secrets.randbelow`。条目或其字段、`proof`、`randbelow` 的类型错误抛 `TypeError`（bool 不算整数）；系数非整数抛 `TypeError`，超出 `[0, prime - 1)` 抛 `ValueError`。commitment 越界、response 为负、消息或 context 不匹配、公钥错误或任何篡改均返回 `False`，无效证明允许短路。输入与交互式 nonce 均不被改写。
+
+**注意**：默认群（梅森素数 `2**127 - 1`）与这里的随机线性组合仅用于协议演示，不构成生产级安全保证。
+
 ## 限制
 
-`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。承诺只支持单点开合，没有范围证明、没有批量或聚合验证，区域判定也只是朴素的坐标比较，不检查坐标是否经过承诺绑定。
+`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。批量验证的随机线性组合同样仅供演示。承诺只支持单点开合，没有范围证明，区域判定也只是朴素的坐标比较，不检查坐标是否经过承诺绑定。
 
 ## 测试
 

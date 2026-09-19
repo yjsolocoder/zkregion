@@ -7,6 +7,7 @@ from zkregion import (
     MerkleMultiProof,
     MerkleProof,
     Region,
+    SchnorrBatchEntry,
     SchnorrProof,
     SchnorrProver,
     SchnorrVerifier,
@@ -227,6 +228,185 @@ class SchnorrFiatShamirTest(unittest.TestCase):
         verifier = SchnorrVerifier(prover.public_key)
         proof = prover.prove(b"offline", context=b"demo")
         self.assertTrue(verifier.verify_proof(b"offline", proof, context=b"demo"))
+
+
+class SchnorrBatchTest(unittest.TestCase):
+    def setUp(self):
+        self.prover = SchnorrProver(secret=4321, prime=SMALL_PRIME, generator=3, randbelow=counter_randbelow())
+        self.verifier = SchnorrVerifier(self.prover.public_key, prime=SMALL_PRIME, generator=3)
+        self.messages = [b"alpha", b"beta", b"gamma"]
+        self.entries = [
+            SchnorrBatchEntry(message, self.prover.prove(message, context=b"batch"), context=b"batch")
+            for message in self.messages
+        ]
+
+    def test_entry_defaults_to_empty_context(self):
+        entry = SchnorrBatchEntry(b"m", self.prover.prove(b"m"))
+        self.assertEqual(entry.context, b"")
+        self.assertTrue(self.verifier.verify_batch([entry], randbelow=counter_randbelow()))
+
+    def test_entry_is_immutable(self):
+        with self.assertRaises(AttributeError):
+            self.entries[0].message = b"other"
+
+    def test_honest_batch_verifies(self):
+        self.assertTrue(self.verifier.verify_batch(self.entries, randbelow=counter_randbelow()))
+
+    def test_default_randbelow_is_used(self):
+        self.assertTrue(self.verifier.verify_batch(self.entries))
+
+    def test_fixed_coefficient_source_is_reproducible(self):
+        first = self.verifier.verify_batch(self.entries, randbelow=counter_randbelow())
+        second = self.verifier.verify_batch(self.entries, randbelow=counter_randbelow())
+        self.assertEqual(first, second)
+
+    def test_single_entry_agrees_with_verify_proof(self):
+        entry = self.entries[0]
+        self.assertTrue(self.verifier.verify_batch([entry], randbelow=counter_randbelow()))
+        self.assertTrue(self.verifier.verify_proof(entry.message, entry.proof, context=entry.context))
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(self.verifier.verify_batch([], randbelow=counter_randbelow()))
+        self.assertFalse(self.verifier.verify_batch((), randbelow=counter_randbelow()))
+
+    def test_tuple_entries_accepted(self):
+        self.assertTrue(self.verifier.verify_batch(tuple(self.entries), randbelow=counter_randbelow()))
+
+    def test_duplicate_entries_each_draw_a_coefficient(self):
+        doubled = [self.entries[0], self.entries[0], self.entries[1]]
+        self.assertTrue(self.verifier.verify_batch(doubled, randbelow=counter_randbelow()))
+
+    def test_randbelow_called_exactly_once_per_entry(self):
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return counter_randbelow()(upper)
+
+        self.assertTrue(self.verifier.verify_batch(self.entries, randbelow=recording))
+        self.assertEqual(calls, [SMALL_PRIME - 1] * len(self.entries))
+
+    def test_tampered_response_fails(self):
+        entry = self.entries[1]
+        forged = SchnorrBatchEntry(
+            entry.message, SchnorrProof(entry.proof.commitment, entry.proof.response + 1), context=entry.context
+        )
+        batch = [self.entries[0], forged, self.entries[2]]
+        self.assertFalse(self.verifier.verify_batch(batch, randbelow=counter_randbelow()))
+
+    def test_tampered_commitment_fails(self):
+        entry = self.entries[0]
+        forged = SchnorrBatchEntry(
+            entry.message,
+            SchnorrProof(entry.proof.commitment % (SMALL_PRIME - 1) + 1, entry.proof.response),
+            context=entry.context,
+        )
+        if forged.proof.commitment == entry.proof.commitment:
+            forged = SchnorrBatchEntry(
+                entry.message, SchnorrProof(entry.proof.commitment + 1, entry.proof.response), context=entry.context
+            )
+        self.assertFalse(self.verifier.verify_batch([forged], randbelow=counter_randbelow()))
+
+    def test_wrong_message_or_context_fails(self):
+        entry = self.entries[0]
+        wrong_message = SchnorrBatchEntry(b"other", entry.proof, context=entry.context)
+        self.assertFalse(self.verifier.verify_batch([wrong_message], randbelow=counter_randbelow()))
+        wrong_context = SchnorrBatchEntry(entry.message, entry.proof, context=b"other")
+        self.assertFalse(self.verifier.verify_batch([wrong_context], randbelow=counter_randbelow()))
+        missing_context = SchnorrBatchEntry(entry.message, entry.proof)
+        self.assertFalse(self.verifier.verify_batch([missing_context], randbelow=counter_randbelow()))
+
+    def test_wrong_public_key_fails(self):
+        other = SchnorrVerifier(pow(3, 4322, SMALL_PRIME), prime=SMALL_PRIME, generator=3)
+        self.assertFalse(other.verify_batch(self.entries, randbelow=counter_randbelow()))
+
+    def test_out_of_range_commitment_returns_false(self):
+        entry = self.entries[0]
+        for bad in (0, SMALL_PRIME, SMALL_PRIME + 1, -1):
+            forged = SchnorrBatchEntry(entry.message, SchnorrProof(bad, entry.proof.response), context=entry.context)
+            self.assertFalse(self.verifier.verify_batch([forged], randbelow=counter_randbelow()))
+
+    def test_negative_response_returns_false(self):
+        entry = self.entries[0]
+        forged = SchnorrBatchEntry(entry.message, SchnorrProof(entry.proof.commitment, -1), context=entry.context)
+        self.assertFalse(self.verifier.verify_batch([forged], randbelow=counter_randbelow()))
+
+    def test_invalid_proof_may_short_circuit(self):
+        entry = self.entries[0]
+        forged = SchnorrBatchEntry(entry.message, SchnorrProof(0, entry.proof.response), context=entry.context)
+
+        def exploding(upper):
+            raise AssertionError("randbelow must not be called for an invalid entry")
+
+        self.assertFalse(self.verifier.verify_batch([forged], randbelow=exploding))
+
+    def test_entries_type_errors(self):
+        for bad in ("entries", b"entries", bytearray(b"x"), 42, None, (e for e in self.entries)):
+            with self.assertRaises(TypeError):
+                self.verifier.verify_batch(bad, randbelow=counter_randbelow())
+
+    def test_entry_and_field_type_errors(self):
+        entry = self.entries[0]
+        with self.assertRaises(TypeError):
+            self.verifier.verify_batch([(entry.message, entry.proof)], randbelow=counter_randbelow())
+        with self.assertRaises(TypeError):
+            self.verifier.verify_batch([SchnorrBatchEntry("m", entry.proof)], randbelow=counter_randbelow())
+        with self.assertRaises(TypeError):
+            self.verifier.verify_batch(
+                [SchnorrBatchEntry(entry.message, entry.proof, context="ctx")],
+                randbelow=counter_randbelow(),
+            )
+        with self.assertRaises(TypeError):
+            self.verifier.verify_batch(
+                [SchnorrBatchEntry(entry.message, (entry.proof.commitment, entry.proof.response))],
+                randbelow=counter_randbelow(),
+            )
+        with self.assertRaises(TypeError):
+            self.verifier.verify_batch(
+                [SchnorrBatchEntry(entry.message, SchnorrProof(1.5, entry.proof.response))],
+                randbelow=counter_randbelow(),
+            )
+        with self.assertRaises(TypeError):
+            self.verifier.verify_batch(
+                [SchnorrBatchEntry(entry.message, SchnorrProof(entry.proof.commitment, "s"))],
+                randbelow=counter_randbelow(),
+            )
+
+    def test_randbelow_type_errors(self):
+        with self.assertRaises(TypeError):
+            self.verifier.verify_batch(self.entries, randbelow=7)
+        for bad_value in ("1", 1.5, None, True):
+            with self.assertRaises(TypeError):
+                self.verifier.verify_batch(self.entries, randbelow=lambda upper: bad_value)
+
+    def test_coefficient_out_of_range_raises_value_error(self):
+        for bad_value in (-1, SMALL_PRIME - 1, SMALL_PRIME):
+            with self.assertRaises(ValueError):
+                self.verifier.verify_batch(self.entries, randbelow=lambda upper: bad_value)
+
+    def test_boundary_coefficients_accepted(self):
+        self.assertTrue(self.verifier.verify_batch(self.entries, randbelow=lambda upper: 0))
+        self.assertTrue(self.verifier.verify_batch(self.entries, randbelow=lambda upper: SMALL_PRIME - 2))
+
+    def test_inputs_are_not_mutated(self):
+        entries = list(self.entries)
+        snapshot = list(entries)
+        self.verifier.verify_batch(entries, randbelow=counter_randbelow())
+        self.assertEqual(entries, snapshot)
+
+    def test_does_not_touch_interactive_nonce(self):
+        commitment = self.prover.new_commitment()
+        self.verifier.verify_batch(self.entries, randbelow=counter_randbelow())
+        self.assertTrue(self.verifier.verify(commitment, 7, self.prover.respond(7)))
+
+    def test_default_group_parameters_are_usable(self):
+        prover = SchnorrProver(secret=123456789, randbelow=counter_randbelow())
+        verifier = SchnorrVerifier(prover.public_key)
+        entries = [
+            SchnorrBatchEntry(b"m1", prover.prove(b"m1", context=b"demo"), context=b"demo"),
+            SchnorrBatchEntry(b"m2", prover.prove(b"m2", context=b"demo"), context=b"demo"),
+        ]
+        self.assertTrue(verifier.verify_batch(entries, randbelow=counter_randbelow()))
 
 
 def leaf_digest(leaf: bytes) -> bytes:

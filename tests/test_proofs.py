@@ -1,3 +1,4 @@
+import dataclasses
 import hashlib
 import unittest
 
@@ -6,6 +7,7 @@ from zkregion import (
     DEFAULT_PRIME,
     MerkleMultiProof,
     MerkleProof,
+    PedersenCommitment,
     Region,
     SchnorrBatchEntry,
     SchnorrProof,
@@ -14,11 +16,13 @@ from zkregion import (
     commit,
     commit_coordinate,
     merkle_root,
+    pedersen_commit,
     prove_inclusion,
     prove_multi_inclusion,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
+    verify_pedersen_opening,
 )
 
 SMALL_PRIME = 104729  # a small prime keeps the group arithmetic readable in tests
@@ -66,6 +70,281 @@ class CommitmentTest(unittest.TestCase):
     def test_coordinate_requires_integers(self):
         with self.assertRaises(TypeError):
             commit_coordinate(1.5, 2)
+
+
+class PedersenCommitmentTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5  # independent-looking small base; log_3(5) mod 104729 is not obvious
+
+    def commit(self, value=50, lower=0, upper=100, blinding=1234, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    # ---- honest round trip -------------------------------------------------
+
+    def test_honest_opening_verifies(self):
+        commitment, blinding = self.commit()
+        self.assertIsInstance(commitment, PedersenCommitment)
+        self.assertTrue(verify_pedersen_opening(commitment, 50, blinding))
+
+    def test_commitment_is_frozen(self):
+        commitment, _ = self.commit()
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            commitment.element = commitment.element + 1
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            commitment.lower = 1
+
+    def test_element_is_g_to_the_offset_times_h_to_the_blinding(self):
+        lower, value, blinding = 10, 73, 4242
+        commitment, returned = self.commit(value=value, lower=lower, upper=100, blinding=blinding)
+        self.assertEqual(returned, blinding)
+        m = value - lower
+        self.assertEqual(commitment.element, (pow(self.G, m, self.PRIME) * pow(self.H, blinding, self.PRIME)) % self.PRIME)
+        self.assertEqual((commitment.lower, commitment.upper), (lower, 100))
+        self.assertEqual((commitment.prime, commitment.generator, commitment.h), (self.PRIME, self.G, self.H))
+
+    def test_inclusive_range_endpoints(self):
+        low, _ = self.commit(value=0, lower=0, upper=100, blinding=7)
+        high, high_r = self.commit(value=100, lower=0, upper=100, blinding=7)
+        self.assertTrue(verify_pedersen_opening(low, 0, 7))
+        self.assertTrue(verify_pedersen_opening(high, 100, high_r))
+        # m = 0 at the lower endpoint: element reduces to h**r
+        self.assertEqual(low.element, pow(self.H, 7, self.PRIME))
+
+    def test_negative_coordinates_supported(self):
+        commitment, blinding = self.commit(value=-250, lower=-500, upper=-100, blinding=99)
+        self.assertTrue(verify_pedersen_opening(commitment, -250, blinding))
+
+    def test_wrong_value_and_blinding_fail(self):
+        commitment, blinding = self.commit()
+        self.assertFalse(verify_pedersen_opening(commitment, 51, blinding))
+        self.assertFalse(verify_pedersen_opening(commitment, 50, blinding + 1))
+        self.assertFalse(verify_pedersen_opening(commitment, 49, blinding - 1))
+
+    def test_wrong_element_fails_but_other_fields_pass_through(self):
+        commitment, blinding = self.commit()
+        tampered = dataclasses.replace(commitment, element=(commitment.element + 1) % self.PRIME)
+        self.assertFalse(verify_pedersen_opening(tampered, 50, blinding))
+
+    # ---- blinding generation ----------------------------------------------
+
+    def test_random_blinding_is_drawn_from_randbelow(self):
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 555
+
+        commitment, blinding = pedersen_commit(
+            50, 0, 100, prime=self.PRIME, generator=self.G, h=self.H, randbelow=recording
+        )
+        self.assertEqual(calls, [self.PRIME - 2])
+        self.assertEqual(blinding, 556)  # r = randbelow(prime - 2) + 1
+        self.assertTrue(verify_pedersen_opening(commitment, 50, blinding))
+
+    def test_blinding_is_in_required_range(self):
+        seen = set()
+        for _ in range(20):
+            commitment, blinding = pedersen_commit(
+                50, 0, 100, prime=self.PRIME, generator=self.G, h=self.H
+            )
+            self.assertTrue(1 <= blinding < self.PRIME - 1)
+            seen.add(blinding)
+        self.assertGreater(len(seen), 1)
+
+    def test_explicit_blinding_endpoints(self):
+        for blinding in (1, self.PRIME - 2):
+            commitment, returned = self.commit(blinding=blinding)
+            self.assertEqual(returned, blinding)
+            self.assertTrue(verify_pedersen_opening(commitment, 50, blinding))
+
+    def test_randbelow_not_called_when_blinding_given(self):
+        def boom(upper):
+            raise AssertionError("randbelow must not be called")
+
+        self.commit(randbelow=boom)
+
+    # ---- defaults ----------------------------------------------------------
+
+    def test_default_group_parameters(self):
+        commitment, blinding = pedersen_commit(10, 0, 100, blinding=987654321)
+        self.assertEqual(commitment.prime, DEFAULT_PRIME)
+        self.assertEqual(commitment.generator, DEFAULT_GENERATOR)
+        self.assertEqual(commitment.h, pow(DEFAULT_GENERATOR, 2, DEFAULT_PRIME))
+        self.assertTrue(verify_pedersen_opening(commitment, 10, blinding))
+
+    def test_default_h_is_g_squared_and_breaks_binding(self):
+        # h = g**2 => C = g**m * g**(2r): (value + 2, r - 1) is a second opening
+        commitment, blinding = pedersen_commit(40, 0, 100, blinding=1000)
+        self.assertEqual(commitment.h, 9)
+        self.assertTrue(verify_pedersen_opening(commitment, 40, 1000))
+        self.assertTrue(verify_pedersen_opening(commitment, 42, 999))
+        self.assertTrue(verify_pedersen_opening(commitment, 38, 1001))
+
+    # ---- parameter validation at commit time ------------------------------
+
+    def test_commit_type_errors(self):
+        for bad in (1.5, "50", True, False, None):
+            with self.assertRaises(TypeError):
+                self.commit(value=bad)
+            with self.assertRaises(TypeError):
+                self.commit(lower=bad)
+            with self.assertRaises(TypeError):
+                self.commit(upper=bad)
+        for bad in (1.5, str(self.PRIME), True, None):
+            with self.assertRaises(TypeError):
+                self.commit(prime=bad)
+            with self.assertRaises(TypeError):
+                self.commit(generator=bad)
+        # None for h/blinding explicitly selects the default, like omission
+        for bad in (1.5, str(self.PRIME), True):
+            with self.assertRaises(TypeError):
+                self.commit(h=bad)
+            with self.assertRaises(TypeError):
+                self.commit(blinding=bad)
+        default_h, _ = self.commit(h=None)
+        self.assertEqual(default_h.h, pow(self.G, 2, self.PRIME))  # default h = g**2
+        self.assertTrue(1 <= self.commit(blinding=None)[1] < self.PRIME - 1)
+
+    def test_randbelow_must_be_callable(self):
+        for bad in (7, 1.5, None, "randbelow"):
+            with self.assertRaises(TypeError):
+                pedersen_commit(50, 0, 100, prime=self.PRIME, generator=self.G, h=self.H, randbelow=bad)
+
+    def test_randbelow_must_return_an_integer(self):
+        for bad in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                pedersen_commit(
+                    50, 0, 100, prime=self.PRIME, generator=self.G, h=self.H,
+                    randbelow=lambda upper, bad=bad: bad,
+                )
+
+    def test_randbelow_out_of_range_value_is_a_value_error(self):
+        for bad in (-1, self.PRIME - 2, self.PRIME):
+            with self.assertRaises(ValueError):
+                pedersen_commit(
+                    50, 0, 100, prime=self.PRIME, generator=self.G, h=self.H,
+                    randbelow=lambda upper, bad=bad: bad,
+                )
+
+    def test_commit_value_errors(self):
+        # inverted range
+        with self.assertRaises(ValueError):
+            self.commit(value=5, lower=100, upper=0)
+        # value outside the range
+        with self.assertRaises(ValueError):
+            self.commit(value=-1, lower=0, upper=100)
+        with self.assertRaises(ValueError):
+            self.commit(value=101, lower=0, upper=100)
+        # width >= prime - 1 (the offsets cannot all be represented distinctly)
+        with self.assertRaises(ValueError):
+            self.commit(value=0, lower=0, upper=self.PRIME - 1)
+        with self.assertRaises(ValueError):
+            self.commit(value=0, lower=0, upper=self.PRIME + 10)
+        # prime must exceed 3
+        with self.assertRaises(ValueError):
+            self.commit(prime=3)
+        with self.assertRaises(ValueError):
+            self.commit(prime=2)
+        # generator and h must lie strictly inside (1, prime)
+        with self.assertRaises(ValueError):
+            self.commit(generator=1)
+        with self.assertRaises(ValueError):
+            self.commit(generator=self.PRIME)
+        with self.assertRaises(ValueError):
+            self.commit(h=1)
+        with self.assertRaises(ValueError):
+            self.commit(h=self.PRIME)
+        # blinding outside [1, prime - 1)
+        with self.assertRaises(ValueError):
+            self.commit(blinding=0)
+        with self.assertRaises(ValueError):
+            self.commit(blinding=-1)
+        with self.assertRaises(ValueError):
+            self.commit(blinding=self.PRIME - 1)
+        with self.assertRaises(ValueError):
+            self.commit(blinding=self.PRIME)
+
+    def test_maximum_width_just_under_prime_minus_one_is_accepted(self):
+        commitment, blinding = self.commit(value=1, lower=0, upper=self.PRIME - 2, blinding=2)
+        self.assertTrue(verify_pedersen_opening(commitment, 1, blinding))
+
+    # ---- verification validation ------------------------------------------
+
+    def test_verify_type_errors(self):
+        commitment, blinding = self.commit()
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening((commitment.element, 0, 100), 50, blinding)
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening("commitment", 50, blinding)
+        for field in ("element", "lower", "upper", "prime", "generator", "h"):
+            bad = dataclasses.replace(commitment, **{field: 1.5})
+            with self.assertRaises(TypeError):
+                verify_pedersen_opening(bad, 50, blinding)
+            bad = dataclasses.replace(commitment, **{field: True})
+            with self.assertRaises(TypeError):
+                verify_pedersen_opening(bad, 50, blinding)
+        for bad in (1.5, "50", True, False, None):
+            with self.assertRaises(TypeError):
+                verify_pedersen_opening(commitment, bad, blinding)
+            with self.assertRaises(TypeError):
+                verify_pedersen_opening(commitment, 50, bad)
+
+    def test_verify_returns_false_for_bad_embedded_parameters(self):
+        commitment, blinding = self.commit()
+        # element outside the field
+        for bad_element in (0, self.PRIME, self.PRIME + 1, -1):
+            bad = dataclasses.replace(commitment, element=bad_element)
+            self.assertFalse(verify_pedersen_opening(bad, 50, blinding))
+        # bad group parameters embedded in the object
+        for field, bad_value in (
+            ("prime", 3),
+            ("prime", 2),
+            ("generator", 1),
+            ("generator", self.PRIME),
+            ("h", 1),
+            ("h", self.PRIME),
+        ):
+            bad = dataclasses.replace(commitment, **{field: bad_value})
+            self.assertFalse(verify_pedersen_opening(bad, 50, blinding), f"{field}={bad_value}")
+        # inverted or too-wide embedded range
+        self.assertFalse(
+            verify_pedersen_opening(dataclasses.replace(commitment, lower=101), 50, blinding)
+        )
+        wide = dataclasses.replace(commitment, upper=self.PRIME - 1)
+        self.assertFalse(verify_pedersen_opening(wide, 50, blinding))
+        # blinding outside [1, prime - 1)
+        for bad_blinding in (0, -1, self.PRIME - 1, self.PRIME):
+            self.assertFalse(verify_pedersen_opening(commitment, 50, bad_blinding))
+
+    def test_verify_value_outside_embedded_range_returns_false(self):
+        commitment, blinding = self.commit()
+        for bad_value in (-1, 101):
+            self.assertFalse(verify_pedersen_opening(commitment, bad_value, blinding))
+
+    def test_verify_uses_parameters_from_the_object(self):
+        # a commitment under a second group must not verify against mismatched fields
+        other_prime, other_g, other_h = 104723, 3, 7
+        other, other_r = pedersen_commit(
+            50, 0, 100, prime=other_prime, generator=other_g, h=other_h, blinding=1234
+        )
+        self.assertTrue(verify_pedersen_opening(other, 50, other_r))
+        self.assertFalse(verify_pedersen_opening(other, 51, other_r))
+        # swapping the element of the two groups invalidates the opening
+        crossed = dataclasses.replace(other, element=self.commit()[0].element)
+        self.assertFalse(verify_pedersen_opening(crossed, 50, other_r))
+
+    def test_inputs_are_not_mutated(self):
+        commitment, blinding = self.commit()
+        snapshot = dataclasses.replace(commitment)
+        value = 50
+        verify_pedersen_opening(commitment, value, blinding)
+        self.assertEqual(commitment, snapshot)
+        self.assertEqual(value, 50)
+        self.assertEqual(blinding, 1234)
 
 
 class SchnorrTest(unittest.TestCase):

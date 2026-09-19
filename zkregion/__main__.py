@@ -11,11 +11,13 @@ from . import (
     commit,
     commit_coordinate,
     merkle_root,
+    pedersen_commit,
     prove_inclusion,
     prove_multi_inclusion,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
+    verify_pedersen_opening,
 )
 
 
@@ -37,6 +39,24 @@ def main() -> int:
 
     coordinate, coordinate_nonce = commit_coordinate(-73, 40)
     print(f"  coordinate opens: {verify_opening(coordinate, b'-73:40', coordinate_nonce)}")
+
+    print()
+    print("Pedersen commitment (quantized range):")
+    lower, upper = 0, 100
+    commitment, blinding = pedersen_commit(40, lower, upper, blinding=1000)
+    print(f"  element={commitment.element}  blinding={blinding}  h={commitment.h}")
+    print(f"  honest opening accepted: {verify_pedersen_opening(commitment, 40, blinding)}")
+    print(f"  wrong value rejected: {not verify_pedersen_opening(commitment, 41, blinding)}")
+    print(f"  wrong blinding rejected: {not verify_pedersen_opening(commitment, 40, blinding + 1)}")
+    print(f"  out-of-range value rejected: {not verify_pedersen_opening(commitment, 101, blinding)}")
+    # default h = g**2 has a publicly known discrete log: the same commitment
+    # opens at (value + 2, blinding - 1), so it is not binding — demo only.
+    forged_value, forged_blinding = 42, blinding - 1
+    print(
+        f"  trapdoor: same element also opens at ({forged_value}, {forged_blinding}): "
+        f"{verify_pedersen_opening(commitment, forged_value, forged_blinding)}"
+    )
+    print("  (default h = g**2 breaks binding; demonstration only, not a range proof)")
 
     print()
     print("interactive Schnorr:")

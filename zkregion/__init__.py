@@ -1,6 +1,7 @@
 """zkregion - commitments and interactive proofs for region membership.
 
-Public API: commit / verify_opening / commit_coordinate / SchnorrProof /
+Public API: commit / verify_opening / commit_coordinate / PedersenCommitment /
+pedersen_commit / verify_pedersen_opening / SchnorrProof /
 SchnorrBatchEntry / SchnorrProver / SchnorrVerifier / Region / MerkleProof /
 merkle_root / prove_inclusion / verify_inclusion / MerkleMultiProof /
 prove_multi_inclusion / verify_multi_inclusion.
@@ -20,6 +21,7 @@ __all__ = [
     "DEFAULT_PRIME",
     "MerkleMultiProof",
     "MerkleProof",
+    "PedersenCommitment",
     "Region",
     "SchnorrBatchEntry",
     "SchnorrProof",
@@ -28,11 +30,13 @@ __all__ = [
     "commit",
     "commit_coordinate",
     "merkle_root",
+    "pedersen_commit",
     "prove_inclusion",
     "prove_multi_inclusion",
     "verify_inclusion",
     "verify_multi_inclusion",
     "verify_opening",
+    "verify_pedersen_opening",
 ]
 
 # Mersenne prime 2**127 - 1 and a small generator. This is a demonstration
@@ -118,6 +122,158 @@ def commit_coordinate(x: int, y: int, *, nonce: bytes | None = None) -> tuple[by
     if not isinstance(x, int) or not isinstance(y, int):
         raise TypeError("coordinates must be integers")
     return commit(f"{x}:{y}".encode("utf-8"), nonce=nonce)
+
+
+@dataclass(frozen=True)
+class PedersenCommitment:
+    """A Pedersen commitment over a multiplicative group modulo ``prime``.
+
+    Fields:
+
+    - ``element`` — the commitment ``C = g**m * h**r mod prime``, where the
+      message is the offset ``m = value - lower``;
+    - ``lower`` / ``upper`` — inclusive quantized range declared at commit;
+    - ``prime`` / ``generator`` — modulus and base ``g``;
+    - ``h`` — the blinding base.
+
+    .. warning::
+       With the default ``h = g**2 mod prime`` the discrete logarithm
+       ``log_g(h) = 2`` is publicly known, so the commitment is **not
+       binding**: anyone can open one commitment to several values. It is a
+       demonstration trapdoor commitment, not a range proof.
+    """
+
+    element: int
+    lower: int
+    upper: int
+    prime: int
+    generator: int
+    h: int
+
+
+def _check_int(value: object, name: str) -> None:
+    """Numbers are non-bool integers; bool is rejected everywhere."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer")
+
+
+def pedersen_commit(
+    value: int,
+    lower: int,
+    upper: int,
+    *,
+    prime: int = DEFAULT_PRIME,
+    generator: int = DEFAULT_GENERATOR,
+    h: int | None = None,
+    blinding: int | None = None,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> tuple[PedersenCommitment, int]:
+    """Commit to ``value`` inside the inclusive range ``[lower, upper]``.
+
+    Returns ``(commitment, blinding)``. The encoded message is the offset
+    ``m = value - lower`` and the commitment is ``g**m * h**r mod prime``.
+    ``lower <= value <= upper`` must hold and the range width
+    ``upper - lower`` must be strictly smaller than ``prime - 1``.
+
+    ``prime`` and ``generator`` (``g``) default to :data:`DEFAULT_PRIME` and
+    :data:`DEFAULT_GENERATOR`; ``h`` defaults to ``g**2 mod prime``, whose
+    discrete log is publicly known (see the trapdoor warning on
+    :class:`PedersenCommitment`). The blinding ``r`` defaults to
+    ``randbelow(prime - 2) + 1`` and must lie in ``[1, prime - 1)``; the
+    default source is :func:`secrets.randbelow`.
+
+    Type errors (including non-callable ``randbelow`` or a non-integer value
+    drawn from it) raise :class:`TypeError`; an invalid range, an out-of-range
+    value, bad group parameters or a bad blinding raise :class:`ValueError`.
+    """
+    _check_int(value, "value")
+    _check_int(lower, "lower")
+    _check_int(upper, "upper")
+    _check_int(prime, "prime")
+    _check_int(generator, "generator")
+    if prime <= 3:
+        raise ValueError("prime must be greater than 3")
+    if not 1 < generator < prime:
+        raise ValueError("generator must satisfy 1 < generator < prime")
+    if h is None:
+        h = pow(generator, 2, prime)
+    else:
+        _check_int(h, "h")
+        if not 1 < h < prime:
+            raise ValueError("h must satisfy 1 < h < prime")
+    if lower > upper:
+        raise ValueError("lower must not exceed upper")
+    if not lower <= value <= upper:
+        raise ValueError("value must satisfy lower <= value <= upper")
+    if upper - lower >= prime - 1:
+        raise ValueError("range width (upper - lower) must be smaller than prime - 1")
+    if blinding is None:
+        if not callable(randbelow):
+            raise TypeError("randbelow must be callable")
+        drawn = randbelow(prime - 2)
+        _check_int(drawn, "randbelow return value")
+        if not 0 <= drawn < prime - 2:
+            raise ValueError("randbelow must return a value in [0, prime - 2)")
+        blinding = drawn + 1
+    else:
+        _check_int(blinding, "blinding")
+        if not 1 <= blinding < prime - 1:
+            raise ValueError("blinding must satisfy 1 <= blinding < prime - 1")
+    message = value - lower
+    element = (pow(generator, message, prime) * pow(h, blinding, prime)) % prime
+    return (
+        PedersenCommitment(
+            element=element,
+            lower=lower,
+            upper=upper,
+            prime=prime,
+            generator=generator,
+            h=h,
+        ),
+        blinding,
+    )
+
+
+def verify_pedersen_opening(
+    commitment: PedersenCommitment,
+    value: int,
+    blinding: int,
+) -> bool:
+    """Verify that ``commitment`` opens at ``value`` with ``blinding``.
+
+    The group parameters and declared range come from ``commitment`` itself.
+    A wrong object or field type raises :class:`TypeError`; an out-of-range
+    element or value, or an incorrect opening, returns ``False``. Inputs are
+    never mutated.
+    """
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment")
+    for name in ("element", "lower", "upper", "prime", "generator", "h"):
+        _check_int(getattr(commitment, name), f"commitment {name}")
+    _check_int(value, "value")
+    _check_int(blinding, "blinding")
+    prime = commitment.prime
+    if prime <= 3:
+        return False
+    if not 1 < commitment.generator < prime or not 1 < commitment.h < prime:
+        return False
+    if not 0 < commitment.element < prime:
+        return False
+    if commitment.lower > commitment.upper:
+        return False
+    if commitment.upper - commitment.lower >= prime - 1:
+        return False
+    if not commitment.lower <= value <= commitment.upper:
+        return False
+    if not 1 <= blinding < prime - 1:
+        return False
+    message = value - commitment.lower
+    expected = (
+        pow(commitment.generator, message, prime)
+        * pow(commitment.h, blinding, prime)
+        % prime
+    )
+    return expected == commitment.element
 
 
 class SchnorrProver:

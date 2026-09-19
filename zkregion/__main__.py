@@ -5,6 +5,7 @@ from __future__ import annotations
 from . import (
     RangeProof,
     Region,
+    RegionProof,
     SchnorrBatchEntry,
     SchnorrProof,
     SchnorrProver,
@@ -16,11 +17,13 @@ from . import (
     prove_inclusion,
     prove_multi_inclusion,
     prove_range,
+    prove_region,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
     verify_pedersen_opening,
     verify_range,
+    verify_region,
 )
 
 
@@ -142,6 +145,21 @@ def main() -> int:
     print(f"  region size {region.width()}x{region.height()}")
     for x, y in ((50, 50), (0, 0), (100, 100), (101, 50), (-1, 50)):
         print(f"  contains({x:>4}, {y:>4}) = {region.contains(x, y)}")
+
+    print()
+    print("non-interactive 2D region membership proof:")
+    y_commitment, y_blinding = pedersen_commit(70, 0, 100, blinding=2000)
+    region_proof = prove_region(
+        commitment, y_commitment, 40, 70, blinding, y_blinding,
+        region, context=b"demo",
+    )
+    print(f"  x branches={len(region_proof.x_proof.t)}  y branches={len(region_proof.y_proof.t)}")
+    print(f"  valid proof accepted: {verify_region(commitment, y_commitment, region, region_proof, context=b'demo')}")
+    print(f"  wrong context rejected: {not verify_region(commitment, y_commitment, region, region_proof)}")
+    other_region = Region(0, 100, 0, 99)
+    print(f"  different region rejected: {not verify_region(commitment, y_commitment, other_region, region_proof, context=b'demo')}")
+    swapped = RegionProof(region_proof.y_proof, region_proof.x_proof)
+    print(f"  swapped axes rejected: {not verify_region(y_commitment, commitment, region, swapped, context=b'demo')}")
     return 0
 
 

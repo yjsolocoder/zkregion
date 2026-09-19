@@ -10,6 +10,7 @@ from zkregion import (
     PedersenCommitment,
     RangeProof,
     Region,
+    RegionProof,
     SchnorrBatchEntry,
     SchnorrProof,
     SchnorrProver,
@@ -21,14 +22,24 @@ from zkregion import (
     prove_inclusion,
     prove_multi_inclusion,
     prove_range,
+    prove_region,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
     verify_pedersen_opening,
     verify_range,
+    verify_region,
 )
 
 SMALL_PRIME = 104729  # a small prime keeps the group arithmetic readable in tests
+
+
+def forge_region(region=Region(0, 100, -50, 50), **overrides):
+    """Build a Region instance bypassing __post_init__ with tampered fields."""
+    forged = object.__new__(Region)
+    for name in ("min_x", "max_x", "min_y", "max_y"):
+        object.__setattr__(forged, name, overrides.get(name, getattr(region, name)))
+    return forged
 
 
 def counter_randbelow(start: int = 1):
@@ -602,6 +613,358 @@ class RangeProofTest(unittest.TestCase):
         verify_range(commitment, proof, b"ctx")
         self.assertEqual((commitment, proof), snapshot)
         self.assertEqual(blinding, 1234)
+
+
+class RegionProofTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+    REGION = Region(0, 100, -50, 50)
+
+    def commitments(self, x=40, y=-7, x_blinding=111, y_blinding=222, region=REGION):
+        x_commitment, returned_x = pedersen_commit(
+            x, region.min_x, region.max_x,
+            prime=self.PRIME, generator=self.G, h=self.H, blinding=x_blinding,
+        )
+        y_commitment, returned_y = pedersen_commit(
+            y, region.min_y, region.max_y,
+            prime=self.PRIME, generator=self.G, h=self.H, blinding=y_blinding,
+        )
+        return x_commitment, returned_x, y_commitment, returned_y
+
+    def prove(self, x=40, y=-7, region=REGION, context=b"ctx", **kwargs):
+        x_commitment, x_blinding, y_commitment, y_blinding = self.commitments(
+            x, y, region=region
+        )
+        proof = prove_region(
+            x_commitment, y_commitment, x, y, x_blinding, y_blinding,
+            region, context, randbelow=counter_randbelow(), **kwargs,
+        )
+        return x_commitment, y_commitment, x_blinding, y_blinding, proof
+
+    # ---- honest round trip -------------------------------------------------
+
+    def test_honest_proof_verifies(self):
+        x_commitment, y_commitment, _, _, proof = self.prove()
+        self.assertIsInstance(proof, RegionProof)
+        self.assertIsInstance(proof.x_proof, RangeProof)
+        self.assertIsInstance(proof.y_proof, RangeProof)
+        self.assertTrue(verify_region(x_commitment, y_commitment, self.REGION, proof, b"ctx"))
+        self.assertTrue(
+            verify_region(x_commitment, y_commitment, self.REGION, proof, context=b"ctx")
+        )
+
+    def test_proof_is_frozen(self):
+        _, _, _, _, proof = self.prove()
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            proof.x_proof = proof.y_proof
+
+    def test_default_context_accepted(self):
+        x_commitment, y_commitment, _, _, proof = self.prove(context=b"")
+        self.assertTrue(verify_region(x_commitment, y_commitment, self.REGION, proof))
+
+    def test_axis_proof_sizes_match_region_edges(self):
+        _, _, _, _, proof = self.prove()
+        self.assertEqual(len(proof.x_proof.t), self.REGION.max_x - self.REGION.min_x + 1)
+        self.assertEqual(len(proof.y_proof.t), self.REGION.max_y - self.REGION.min_y + 1)
+        self.assertEqual((len(proof.x_proof.t), len(proof.y_proof.t)), (101, 101))
+
+    def test_region_boundaries_and_negative_axis(self):
+        region = Region(-256, -1, -100, 100)
+        for x, y in ((-256, -100), (-1, 100), (-128, 0)):
+            xc, xb, yc, yb = self.commitments(x, y, region=region)
+            proof = prove_region(
+                xc, yc, x, y, xb, yb, region, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+            self.assertTrue(verify_region(xc, yc, region, proof, b"ctx"), f"({x}, {y})")
+
+    def test_axis_size_256_accepted(self):
+        region = Region(0, 255, 0, 255)
+        xc, xb, yc, yb = self.commitments(10, 20, region=region)
+        proof = prove_region(xc, yc, 10, 20, xb, yb, region, randbelow=counter_randbelow())
+        self.assertEqual((len(proof.x_proof.t), len(proof.y_proof.t)), (256, 256))
+        self.assertTrue(verify_region(xc, yc, region, proof))
+
+    def test_default_group_parameters_are_usable(self):
+        region = Region(0, 100, 0, 100)
+        x_commitment, x_blinding = pedersen_commit(40, 0, 100, blinding=987654321)
+        y_commitment, y_blinding = pedersen_commit(70, 0, 100, blinding=123456789)
+        proof = prove_region(
+            x_commitment, y_commitment, 40, 70, x_blinding, y_blinding,
+            region, context=b"demo",
+        )
+        self.assertTrue(verify_region(x_commitment, y_commitment, region, proof, b"demo"))
+
+    def test_verifier_never_receives_coordinates_or_blindings(self):
+        x_commitment, y_commitment, _, _, proof = self.prove()
+        # verify_region's signature exposes only commitments, region, proof
+        self.assertTrue(verify_region(x_commitment, y_commitment, self.REGION, proof, b"ctx"))
+
+    # ---- sub-proof transcript ----------------------------------------------
+
+    def test_subcontext_transcript(self):
+        x_commitment, y_commitment, _, _, proof = self.prove(context=b"ctx")
+
+        def expected(axis, commitment):
+            items = [b"zkregion/region/v1", axis, b"ctx"]
+            for value in (
+                self.REGION.min_x, self.REGION.max_x,
+                self.REGION.min_y, self.REGION.max_y,
+            ):
+                items.append(str(value).encode("ascii"))
+            for field in (
+                commitment.element, commitment.lower, commitment.upper,
+                commitment.prime, commitment.generator, commitment.h,
+            ):
+                items.append(str(field).encode("ascii"))
+            transcript = bytearray()
+            for item in items:
+                transcript.extend(len(item).to_bytes(4, "big"))
+                transcript.extend(item)
+            return bytes(transcript)
+
+        # the embedded RangeProofs verify exactly under those sub-contexts
+        self.assertTrue(verify_range(x_commitment, proof.x_proof, expected(b"x", x_commitment)))
+        self.assertTrue(verify_range(y_commitment, proof.y_proof, expected(b"y", y_commitment)))
+        # and under no other axis tag
+        self.assertFalse(verify_range(x_commitment, proof.x_proof, expected(b"y", x_commitment)))
+        self.assertFalse(verify_range(y_commitment, proof.y_proof, expected(b"x", y_commitment)))
+
+    def test_subproofs_do_not_verify_under_external_context_alone(self):
+        x_commitment, y_commitment, _, _, proof = self.prove(context=b"ctx")
+        self.assertFalse(verify_range(x_commitment, proof.x_proof, b"ctx"))
+        self.assertFalse(verify_range(y_commitment, proof.y_proof, b"ctx"))
+
+    # ---- prove-time validation ---------------------------------------------
+
+    def test_range_mismatch_raises_value_error(self):
+        x_commitment, x_blinding, y_commitment, y_blinding = self.commitments()
+        # commitment range shifted relative to the region edges
+        shifted_x, shifted_xb = pedersen_commit(
+            40, 1, 101, prime=self.PRIME, generator=self.G, h=self.H, blinding=111
+        )
+        with self.assertRaises(ValueError):
+            prove_region(
+                shifted_x, y_commitment, 40, -7, shifted_xb, y_blinding,
+                self.REGION, b"ctx", randbelow=counter_randbelow(),
+            )
+        shifted_y, shifted_yb = pedersen_commit(
+            -7, -49, 51, prime=self.PRIME, generator=self.G, h=self.H, blinding=222
+        )
+        with self.assertRaises(ValueError):
+            prove_region(
+                x_commitment, shifted_y, 40, -7, x_blinding, shifted_yb,
+                self.REGION, b"ctx", randbelow=counter_randbelow(),
+            )
+
+    def test_invalid_opening_raises_value_error(self):
+        x_commitment, _, y_commitment, y_blinding = self.commitments()
+        with self.assertRaises(ValueError):
+            prove_region(
+                x_commitment, y_commitment, 41, -7, 111, y_blinding,
+                self.REGION, b"ctx", randbelow=counter_randbelow(),
+            )
+        with self.assertRaises(ValueError):
+            prove_region(
+                x_commitment, y_commitment, 40, -7, 112, y_blinding,
+                self.REGION, b"ctx", randbelow=counter_randbelow(),
+            )
+        with self.assertRaises(ValueError):
+            prove_region(
+                x_commitment, y_commitment, 40, -6, 111, y_blinding,
+                self.REGION, b"ctx", randbelow=counter_randbelow(),
+            )
+
+    def test_range_over_256_raises_value_error(self):
+        region = Region(0, 256, 0, 100)
+        x_commitment, x_blinding = pedersen_commit(
+            0, 0, 256, prime=self.PRIME, generator=self.G, h=self.H, blinding=111
+        )
+        y_commitment, y_blinding = pedersen_commit(
+            0, 0, 100, prime=self.PRIME, generator=self.G, h=self.H, blinding=222
+        )
+        with self.assertRaises(ValueError):
+            prove_region(
+                x_commitment, y_commitment, 0, 0, x_blinding, y_blinding,
+                region, b"ctx", randbelow=counter_randbelow(),
+            )
+        region = Region(0, 100, 0, 256)
+        x_commitment, x_blinding = pedersen_commit(
+            0, 0, 100, prime=self.PRIME, generator=self.G, h=self.H, blinding=111
+        )
+        y_commitment, y_blinding = pedersen_commit(
+            0, 0, 256, prime=self.PRIME, generator=self.G, h=self.H, blinding=222
+        )
+        with self.assertRaises(ValueError):
+            prove_region(
+                x_commitment, y_commitment, 0, 0, x_blinding, y_blinding,
+                region, b"ctx", randbelow=counter_randbelow(),
+            )
+
+    def test_prove_type_errors(self):
+        x_commitment, _, y_commitment, _ = self.commitments()
+        good_args = (x_commitment, y_commitment, 40, -7, 111, 222, self.REGION)
+        with self.assertRaises(TypeError):
+            prove_region("x", y_commitment, 40, -7, 111, 222, self.REGION)
+        with self.assertRaises(TypeError):
+            prove_region(x_commitment, "y", 40, -7, 111, 222, self.REGION)
+        for bad in (1.5, "40", True, False, None):
+            for position in range(2, 6):
+                args = list(good_args)
+                args[position] = bad
+                with self.assertRaises(TypeError):
+                    prove_region(*args, b"ctx")
+        with self.assertRaises(TypeError):
+            prove_region(x_commitment, y_commitment, 40, -7, 111, 222, "region")
+        with self.assertRaises(TypeError):
+            prove_region(*good_args, "ctx")
+        bad_region = forge_region(self.REGION, min_x=1.5)
+        with self.assertRaises(TypeError):
+            prove_region(x_commitment, y_commitment, 40, -7, 111, 222, bad_region)
+        bad_commitment = dataclasses.replace(x_commitment, element=1.5)
+        with self.assertRaises(TypeError):
+            prove_region(bad_commitment, y_commitment, 40, -7, 111, 222, self.REGION)
+        with self.assertRaises(TypeError):
+            prove_region(*good_args, b"ctx", randbelow=7)
+
+    # ---- verify-time rejection ---------------------------------------------
+
+    def test_wrong_context_fails(self):
+        x_commitment, y_commitment, _, _, proof = self.prove(context=b"ctx")
+        self.assertFalse(verify_region(x_commitment, y_commitment, self.REGION, proof))
+        self.assertFalse(verify_region(x_commitment, y_commitment, self.REGION, proof, b"other"))
+
+    def test_different_region_fails(self):
+        x_commitment, y_commitment, _, _, proof = self.prove()
+        for region in (
+            Region(0, 100, -50, 51),
+            Region(0, 101, -50, 50),
+            Region(1, 100, -50, 50),
+            Region(-1, 100, -50, 50),
+            Region(0, 100, -49, 50),
+        ):
+            self.assertFalse(
+                verify_region(x_commitment, y_commitment, region, proof, b"ctx"),
+                region,
+            )
+
+    def test_swapped_axes_fail(self):
+        x_commitment, y_commitment, _, _, proof = self.prove()
+        # swap only the arguments: x proof checked against the y commitment
+        self.assertFalse(
+            verify_region(
+                y_commitment, x_commitment, self.REGION,
+                RegionProof(proof.x_proof, proof.y_proof), b"ctx",
+            )
+        )
+        # swap proof fields too: each sub-proof carries its own axis tag
+        swapped = RegionProof(proof.y_proof, proof.x_proof)
+        self.assertFalse(
+            verify_region(y_commitment, x_commitment, self.REGION, swapped, b"ctx")
+        )
+        # mixed: x commitment with the y sub-proof
+        self.assertFalse(
+            verify_region(
+                x_commitment, y_commitment, self.REGION,
+                RegionProof(proof.y_proof, proof.y_proof), b"ctx",
+            )
+        )
+
+    def test_foreign_commitment_fails(self):
+        x_commitment, y_commitment, _, _, proof = self.prove()
+        other_x, _ = pedersen_commit(
+            41, 0, 100, prime=self.PRIME, generator=self.G, h=self.H, blinding=333
+        )
+        other_y, _ = pedersen_commit(
+            -6, -50, 50, prime=self.PRIME, generator=self.G, h=self.H, blinding=444
+        )
+        self.assertFalse(verify_region(other_x, y_commitment, self.REGION, proof, b"ctx"))
+        self.assertFalse(verify_region(x_commitment, other_y, self.REGION, proof, b"ctx"))
+        shifted = dataclasses.replace(
+            x_commitment, element=(x_commitment.element + 1) % self.PRIME
+        )
+        self.assertFalse(verify_region(shifted, y_commitment, self.REGION, proof, b"ctx"))
+
+    def test_range_mismatch_returns_false(self):
+        x_commitment, y_commitment, _, _, proof = self.prove()
+        # a region with different edges but the same point inside can be
+        # passed at verification; commitments' declared ranges no longer match
+        self.assertFalse(
+            verify_region(x_commitment, y_commitment, Region(0, 99, -50, 50), proof, b"ctx")
+        )
+        # a commitment whose embedded range was rewritten fails too
+        rewritten = dataclasses.replace(x_commitment, lower=1, upper=101)
+        self.assertFalse(
+            verify_region(rewritten, y_commitment, self.REGION, proof, b"ctx")
+        )
+
+    def test_tampered_subproof_fails(self):
+        x_commitment, y_commitment, _, _, proof = self.prove()
+        tampered_x = RegionProof(
+            RangeProof(
+                proof.x_proof.t, proof.x_proof.e,
+                proof.x_proof.s[:-1] + (proof.x_proof.s[-1] + 1,),
+            ),
+            proof.y_proof,
+        )
+        self.assertFalse(verify_region(x_commitment, y_commitment, self.REGION, tampered_x, b"ctx"))
+        tampered_y = RegionProof(
+            proof.x_proof,
+            RangeProof((), (), ()),
+        )
+        self.assertFalse(verify_region(x_commitment, y_commitment, self.REGION, tampered_y, b"ctx"))
+
+    def test_proof_for_other_context_rejected(self):
+        x_commitment, y_commitment, _, _, proof = self.prove(context=b"alpha")
+        self.assertFalse(verify_region(x_commitment, y_commitment, self.REGION, proof, b"beta"))
+
+    def test_verify_type_errors(self):
+        x_commitment, y_commitment, _, _, proof = self.prove()
+        with self.assertRaises(TypeError):
+            verify_region("x", y_commitment, self.REGION, proof, b"ctx")
+        with self.assertRaises(TypeError):
+            verify_region(x_commitment, (1, 2), self.REGION, proof, b"ctx")
+        with self.assertRaises(TypeError):
+            verify_region(x_commitment, y_commitment, "region", proof, b"ctx")
+        with self.assertRaises(TypeError):
+            verify_region(x_commitment, y_commitment, self.REGION, (proof.x_proof, proof.y_proof), b"ctx")
+        with self.assertRaises(TypeError):
+            verify_region(x_commitment, y_commitment, self.REGION, proof, "ctx")
+        with self.assertRaises(TypeError):
+            verify_region(
+                x_commitment, y_commitment, self.REGION,
+                RegionProof((proof.x_proof.t, proof.x_proof.e, proof.x_proof.s), proof.y_proof),
+                b"ctx",
+            )
+        with self.assertRaises(TypeError):
+            verify_region(
+                x_commitment, y_commitment, self.REGION,
+                RegionProof(proof.x_proof, "y"), b"ctx",
+            )
+        for field in ("min_x", "max_x", "min_y", "max_y"):
+            bad_region = forge_region(self.REGION, **{field: True})
+            with self.assertRaises(TypeError):
+                verify_region(x_commitment, y_commitment, bad_region, proof, b"ctx")
+        bad_commitment = dataclasses.replace(x_commitment, h=True)
+        with self.assertRaises(TypeError):
+            verify_region(bad_commitment, y_commitment, self.REGION, proof, b"ctx")
+
+    def test_inputs_are_not_mutated(self):
+        x_commitment, y_commitment, x_blinding, y_blinding, proof = self.prove()
+        snapshot = (
+            dataclasses.replace(x_commitment),
+            dataclasses.replace(y_commitment),
+            dataclasses.replace(proof),
+        )
+        region = dataclasses.replace(self.REGION)
+        context = b"ctx"
+        verify_region(x_commitment, y_commitment, region, proof, context)
+        self.assertEqual(
+            (x_commitment, y_commitment, proof), snapshot
+        )
+        self.assertEqual((x_blinding, y_blinding), (111, 222))
+        self.assertEqual(context, b"ctx")
 
 
 class SchnorrTest(unittest.TestCase):

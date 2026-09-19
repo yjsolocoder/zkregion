@@ -1,6 +1,6 @@
 # zkregion
 
-面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含证明、量化区间的 Pedersen 陷门承诺及其上的 Schnorr OR 非交互区间证明，以及量化整数坐标下的矩形区域判定。
+面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含证明、量化区间的 Pedersen 陷门承诺及其上的 Schnorr OR 非交互区间证明与二维矩形区域成员证明，以及量化整数坐标下的矩形区域判定。
 
 ## 环境
 
@@ -63,6 +63,18 @@ proof = prove_range(commitment, 40, blinding, context=b"session-1")
 assert verify_range(commitment, proof, context=b"session-1")
 assert not verify_range(commitment, proof, context=b"other")
 
+# 二维矩形区域成员证明：分别对 x、y 做 Pedersen 承诺，证明承诺点落在 Region 内
+from zkregion import Region, prove_region, verify_region
+
+region = Region(0, 100, 0, 100)
+y_commitment, y_blinding = pedersen_commit(70, 0, 100)
+region_proof = prove_region(
+    commitment, y_commitment, 40, 70, blinding, y_blinding,
+    region, context=b"session-1",
+)
+assert verify_region(commitment, y_commitment, region, region_proof, context=b"session-1")
+assert not verify_region(commitment, y_commitment, region, region_proof, context=b"other")
+
 Region(0, 100, 0, 100).contains(50, 50)     # True
 ```
 
@@ -84,6 +96,9 @@ python3 -m zkregion
 - `prove_range(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> RangeProof` — 生成 Pedersen 承诺的非交互区间证明（Schnorr OR）
 - `verify_range(commitment, proof, context=b"") -> bool` — 验证区间证明
 - `RangeProof(t, e, s)` — 不可变区间证明对象，三个字段均为长度 `upper - lower + 1` 的 `tuple[int, ...]`
+- `prove_region(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionProof` — 生成二维矩形区域的非交互成员证明（复用 `prove_range`）
+- `verify_region(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证区域成员证明，无需坐标或盲因子
+- `RegionProof(x_proof, y_proof)` — 不可变区域证明对象，两字段均为 `RangeProof`
 - `SchnorrProver(secret, *, prime, generator, randbelow)`
   - `public_key` — `g**secret mod prime`
   - `new_commitment()` — 生成一次性随机数并返回 `g**k mod prime`
@@ -144,6 +159,14 @@ D_i = element * g**(-i) mod prime
 
 验证要求：每个 `t_i ∈ [1, prime)`、`e_i ∈ [0, prime)`、`s_i ≥ 0`，`sum(e) mod prime == c`，且每个分支满足 Schnorr 等式 `h**s_i == t_i * D_i**e_i (mod prime)`。生成前会先复用 `verify_pedersen_opening` 校验开合，开合不符抛 `ValueError`；类型错误（含 `bool` 整数、非元组证明字段、非 `bytes` 的 `context`、不可调用的 `randbelow`）抛 `TypeError`；其他非法结构、篡改或绑定不符（错误的承诺、`context` 或证明）一律返回 `False`。入口均不改写输入。
 
+### 二维矩形区域成员证明
+
+`prove_region(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"")` 在两个独立的 Pedersen 承诺之上生成非交互的二维矩形成员证明，`verify_region(x_commitment, y_commitment, region, proof, context=b"")` 验证，验证方只需两个承诺、区域与证明，**无需坐标或盲因子**。证明为冻结的 `RegionProof(x_proof, y_proof)`，两个字段都是 `RangeProof`，分别对应 x 轴与 y 轴。
+
+生成时要求 x 承诺声明区间恰好等于 `[region.min_x, region.max_x]`、y 承诺声明区间恰好等于 `[region.min_y, region.max_y]`，并先校验 `(x, x_blinding)` / `(y, y_blinding)` 是对应承诺的有效开合，随后复用 `prove_range` 逐轴生成子证明；两条轴的区间各自最多 256 个整数。每个子证明的 `context` 是按以下顺序逐项拼接的转录：域 `b"zkregion/region/v1"`、轴标签（`b"x"` 或 `b"y"`）、外部 `context`、Region 四边界（`min_x`、`max_x`、`min_y`、`max_y`，按数据类字段顺序）、该轴承诺六字段（`element`、`lower`、`upper`、`prime`、`generator`、`h`，按数据类字段顺序）；每项前置四字节无符号大端长度前缀，整数编码为十进制 ASCII。轴标签、区域边界与承诺字段都进入转录，因此更换区域、外部 `context`、任一承诺或交换两轴都会使验证失败。
+
+`context` 只接受 `bytes`；对象、证明字段或数值类型错误（`bool` 不算整数）抛 `TypeError`。生成时区间不匹配、开合无效或轴区间超过 256 个整数抛 `ValueError`（`randbelow` 错误同样按 `prove_range` 的规则抛 `TypeError` / `ValueError`）。验证时除类型错误外的任何情况——结构非法、证明篡改、更换区域、`context` 或承诺、交换两轴——均返回 `False`。入口不改写任何输入，安全限制与 `prove_range` 一致。
+
 ### Fiat-Shamir 转录
 
 挑战 `c` 为 SHA-256 摘要的大端整数模 `prime`。转录依次写入固定域 `b"zkregion/schnorr-fs/v1"`、`prime`、`generator`、`public_key`、`t`、`context`、`message`；每项前置四字节无符号大端长度，整数取最短无符号大端编码。证明使用独立的临时随机数 `k`，与交互式 nonce 互不影响；应答 `s` 仍按普通整数计算、不针对群阶取模。
@@ -156,7 +179,7 @@ D_i = element * g**(-i) mod prime
 
 ## 限制
 
-`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。区域判定只是朴素的坐标比较，不检查坐标是否经过承诺绑定；批量验证所用的随机线性组合与默认群一样仅供演示。Pedersen 承诺默认的 `h = g**2 mod prime` 带有公开陷门、破坏绑定性；其上的 Schnorr OR 区间证明同样是演示级构造——区间上限 256 个整数、挑战来自 SHA-256 Fiat-Shamir 转录、群参数与默认 `h` 均未做生产级安全分析，不能用于真实部署。
+`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。区域判定只是朴素的坐标比较，不检查坐标是否经过承诺绑定；批量验证所用的随机线性组合与默认群一样仅供演示。Pedersen 承诺默认的 `h = g**2 mod prime` 带有公开陷门、破坏绑定性；其上的 Schnorr OR 区间证明同样是演示级构造——区间上限 256 个整数、挑战来自 SHA-256 Fiat-Shamir 转录、群参数与默认 `h` 均未做生产级安全分析，不能用于真实部署。二维区域成员证明只是两个演示级区间证明的组合，继承同样的限制。
 
 ## 测试
 

@@ -1,8 +1,9 @@
 """zkregion - commitments and interactive proofs for region membership.
 
 Public API: commit / verify_opening / commit_coordinate / SchnorrProof /
-SchnorrProver / SchnorrVerifier / Region / MerkleProof / merkle_root /
-prove_inclusion / verify_inclusion.
+SchnorrProver / SchnorrVerifier / Region / MerkleProof / MerkleMultiProof /
+merkle_root / prove_inclusion / verify_inclusion / prove_multi_inclusion /
+verify_multi_inclusion.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from typing import Callable
 __all__ = [
     "DEFAULT_GENERATOR",
     "DEFAULT_PRIME",
+    "MerkleMultiProof",
     "MerkleProof",
     "Region",
     "SchnorrProof",
@@ -26,7 +28,9 @@ __all__ = [
     "commit_coordinate",
     "merkle_root",
     "prove_inclusion",
+    "prove_multi_inclusion",
     "verify_inclusion",
+    "verify_multi_inclusion",
     "verify_opening",
 ]
 
@@ -365,3 +369,179 @@ def verify_inclusion(leaf: bytes, proof: MerkleProof, root: bytes) -> bool:
     if position != 0:
         return False  # index deeper than the path allows
     return hmac.compare_digest(digest, root)
+
+
+# ---------------------------------------------------------------------------
+# Compact Merkle multi-inclusion proofs
+#
+# One proof covers several leaves at once: siblings shared between proven
+# nodes are collected only once, so the proof stays deterministic and
+# minimal. Layers are walked left to right; a proven node whose sibling is
+# itself proven merges without a sibling, a proven odd last node duplicates
+# itself, and any other proven node collects its sibling. Parent positions
+# are deduplicated per layer. Proving every leaf yields empty ``siblings``.
+
+
+@dataclass(frozen=True)
+class MerkleMultiProof:
+    """Multi-inclusion proof: ``indices`` into a tree of ``leaf_count`` leaves.
+
+    ``indices`` is a strictly increasing ``tuple[int, ...]``; ``siblings`` is
+    a ``tuple[bytes, ...]`` of the digests the verifier cannot recompute,
+    ordered by layer from leaves to root and left to right within a layer.
+    """
+
+    leaf_count: int
+    indices: tuple[int, ...]
+    siblings: tuple[bytes, ...]
+
+
+def _checked_multi_indices(indices: Sequence[int], size: int) -> list[int]:
+    if isinstance(indices, (bytes, bytearray, str)) or not isinstance(indices, Sequence):
+        raise TypeError("indices must be a sequence of integers")
+    items = list(indices)  # copy: inputs are never mutated
+    if not items:
+        raise ValueError("indices must not be empty")
+    for position, index in enumerate(items):
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError(f"indices[{position}] must be an integer")
+        if not 0 <= index < size:
+            raise IndexError(f"index {index} out of range for {size} leaves")
+    for previous, current in zip(items, items[1:]):
+        if current <= previous:
+            raise ValueError("indices must be strictly increasing without duplicates")
+    return items
+
+
+def prove_multi_inclusion(leaves: Sequence[bytes], indices: Sequence[int]) -> MerkleMultiProof:
+    """Build a compact :class:`MerkleMultiProof` for the leaves at ``indices``.
+
+    ``indices`` must be non-empty, strictly increasing and duplicate-free.
+    """
+    items = _checked_leaves(leaves)
+    positions = _checked_multi_indices(indices, len(items))
+    proven_indices = tuple(positions)
+    level = [_leaf_digest(leaf) for leaf in items]
+    siblings: list[bytes] = []
+    while len(level) > 1:
+        size = len(level)
+        if size % 2 == 1:
+            level = level + [level[-1]]
+        known = set(positions)
+        merged: set[int] = set()
+        for position in positions:
+            if position in merged:
+                continue
+            sibling = position ^ 1
+            if sibling in known:
+                merged.add(position)
+                merged.add(sibling)
+            elif position == size - 1 and size % 2 == 1:
+                merged.add(position)  # odd last node duplicates itself
+            else:
+                siblings.append(level[sibling])
+                merged.add(position)
+        level = [
+            _node_digest(level[offset], level[offset + 1])
+            for offset in range(0, len(level), 2)
+        ]
+        positions = sorted({position // 2 for position in positions})
+    return MerkleMultiProof(
+        leaf_count=len(items),
+        indices=proven_indices,
+        siblings=tuple(siblings),
+    )
+
+
+def verify_multi_inclusion(
+    entries: Sequence[tuple[int, bytes]],
+    proof: MerkleMultiProof,
+    root: bytes,
+) -> bool:
+    """Check ``entries`` against ``proof`` and Merkle ``root`` without the full leaf set.
+
+    ``entries`` holds one ``(index, leaf)`` pair per element of
+    ``proof.indices``, in the same order. Type errors raise
+    :class:`TypeError`; structural mismatches, wrong digest lengths and any
+    tampering return False.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of (index, leaf) pairs")
+    _check_bytes(root, "root")
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    items = list(entries)  # copy: inputs are never mutated
+    for entry in items:
+        if (
+            isinstance(entry, (bytes, bytearray, str))
+            or not isinstance(entry, Sequence)
+            or len(entry) != 2
+        ):
+            raise TypeError("entries must be a sequence of (index, leaf) pairs")
+        index, leaf = entry
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("entry index must be an integer")
+        _check_bytes(leaf, "entry leaf")
+    if not items:
+        return False
+    if proof.leaf_count < 1:
+        return False
+    if len(root) != _MERKLE_DIGEST_SIZE:
+        return False
+    if any(len(sibling) != _MERKLE_DIGEST_SIZE for sibling in proof.siblings):
+        return False
+    if tuple(index for index, _ in items) != proof.indices:
+        return False  # covers count mismatch, reordering and wrong indices
+    if not proof.indices:
+        return False
+    if any(index < 0 or index >= proof.leaf_count for index in proof.indices):
+        return False
+    if any(current <= previous for previous, current in zip(proof.indices, proof.indices[1:])):
+        return False
+    known = {index: _leaf_digest(leaf) for index, leaf in items}
+    positions = sorted(known)
+    pending = list(proof.siblings)
+    size = proof.leaf_count
+    while size > 1:
+        proven = set(positions)
+        merged: set[int] = set()
+        next_known: dict[int, bytes] = {}
+        for position in positions:
+            if position in merged:
+                continue
+            sibling = position ^ 1
+            if sibling in proven:
+                left, right = sorted((position, sibling))
+                digest = _node_digest(known[left], known[right])
+                merged.add(position)
+                merged.add(sibling)
+            elif position == size - 1 and size % 2 == 1:
+                digest = _node_digest(known[position], known[position])
+                merged.add(position)
+            else:
+                if not pending:
+                    return False  # proof ran out of siblings
+                sibling_digest = pending.pop(0)
+                if position % 2 == 0:
+                    digest = _node_digest(known[position], sibling_digest)
+                else:
+                    digest = _node_digest(sibling_digest, known[position])
+                merged.add(position)
+            next_known[position // 2] = digest
+        known = next_known
+        positions = sorted(known)
+        size = (size + 1) // 2
+    if pending:
+        return False  # siblings must be exhausted exactly
+    return hmac.compare_digest(known[0], root)

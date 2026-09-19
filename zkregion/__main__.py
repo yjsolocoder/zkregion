@@ -10,7 +10,9 @@ from . import (
     commit_coordinate,
     merkle_root,
     prove_inclusion,
+    prove_multi_inclusion,
     verify_inclusion,
+    verify_multi_inclusion,
     verify_opening,
 )
 
@@ -64,6 +66,19 @@ def main() -> int:
     shifted = prove_inclusion(leaves, 3)
     print(f"  wrong index rejected: {not verify_inclusion(b'gamma', shifted, root)}")
     print(f"  wrong root rejected: {not verify_inclusion(b'gamma', proof, merkle_root(leaves[:-1]))}")
+
+    print()
+    print("merkle multi-inclusion proofs:")
+    multi = prove_multi_inclusion(leaves, [1, 2, 4])
+    entries = [(1, b"beta"), (2, b"gamma"), (4, b"epsilon")]
+    print(f"  indices={multi.indices}  siblings={len(multi.siblings)} (single proofs would need 9)")
+    print(f"  valid proof accepted: {verify_multi_inclusion(entries, multi, root)}")
+    tampered = [(1, b"beta"), (2, b"other"), (4, b"epsilon")]
+    print(f"  tampered leaf rejected: {not verify_multi_inclusion(tampered, multi, root)}")
+    reordered = [entries[1], entries[0], entries[2]]
+    print(f"  reordered entries rejected: {not verify_multi_inclusion(reordered, multi, root)}")
+    everything = prove_multi_inclusion(leaves, list(range(len(leaves))))
+    print(f"  full-tree proof needs {len(everything.siblings)} siblings")
 
     print()
     print("region membership:")

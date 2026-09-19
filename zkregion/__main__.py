@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from . import Region, SchnorrProver, SchnorrVerifier, commit, commit_coordinate, verify_opening
+from . import (
+    Region,
+    SchnorrProver,
+    SchnorrVerifier,
+    commit,
+    commit_coordinate,
+    merkle_root,
+    prove_inclusion,
+    verify_inclusion,
+    verify_opening,
+)
 
 
 def counter_randbelow():
@@ -42,6 +52,18 @@ def main() -> int:
     print(f"  valid proof accepted: {verifier.verify_proof(b'payload', proof, context=b'demo')}")
     print(f"  wrong message rejected: {verifier.verify_proof(b'other', proof, context=b'demo')}")
     print(f"  wrong context rejected: {verifier.verify_proof(b'payload', proof)}")
+
+    print()
+    print("merkle inclusion proofs:")
+    leaves = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon"]
+    root = merkle_root(leaves)
+    proof = prove_inclusion(leaves, 2)
+    print(f"  root={root.hex()[:32]}…  leaves={len(leaves)}  path depth={len(proof.siblings)}")
+    print(f"  valid proof accepted: {verify_inclusion(b'gamma', proof, root)}")
+    print(f"  tampered leaf rejected: {not verify_inclusion(b'other', proof, root)}")
+    shifted = prove_inclusion(leaves, 3)
+    print(f"  wrong index rejected: {not verify_inclusion(b'gamma', shifted, root)}")
+    print(f"  wrong root rejected: {not verify_inclusion(b'gamma', proof, merkle_root(leaves[:-1]))}")
 
     print()
     print("region membership:")

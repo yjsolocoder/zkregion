@@ -1,7 +1,8 @@
 """zkregion - commitments and interactive proofs for region membership.
 
 Public API: commit / verify_opening / commit_coordinate / SchnorrProof /
-SchnorrProver / SchnorrVerifier / Region.
+SchnorrProver / SchnorrVerifier / Region / MerkleProof / merkle_root /
+prove_inclusion / verify_inclusion.
 """
 
 from __future__ import annotations
@@ -9,18 +10,23 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Callable
 
 __all__ = [
     "DEFAULT_GENERATOR",
     "DEFAULT_PRIME",
+    "MerkleProof",
     "Region",
     "SchnorrProof",
     "SchnorrProver",
     "SchnorrVerifier",
     "commit",
     "commit_coordinate",
+    "merkle_root",
+    "prove_inclusion",
+    "verify_inclusion",
     "verify_opening",
 ]
 
@@ -239,3 +245,123 @@ class Region:
 
     def height(self) -> int:
         return self.max_y - self.min_y + 1
+
+
+# ---------------------------------------------------------------------------
+# Deterministic SHA-256 Merkle inclusion proofs
+#
+# Leaf digest:     SHA-256(b"\x00" + len4 + leaf)   (len4 = 4-byte BE length)
+# Internal digest: SHA-256(b"\x01" + left + right)
+# Layers pair nodes in input order; an odd node is duplicated before merging.
+# A single-leaf tree's root is the leaf digest and its proof path is empty.
+
+_MERKLE_LEAF_PREFIX = b"\x00"
+_MERKLE_NODE_PREFIX = b"\x01"
+_MERKLE_DIGEST_SIZE = 32
+
+
+@dataclass(frozen=True)
+class MerkleProof:
+    """Inclusion proof: zero-based leaf ``index`` and ``siblings`` from leaf to root."""
+
+    index: int
+    siblings: tuple[bytes, ...]
+
+
+def _leaf_digest(leaf: bytes) -> bytes:
+    return hashlib.sha256(
+        _MERKLE_LEAF_PREFIX + len(leaf).to_bytes(4, "big") + leaf
+    ).digest()
+
+
+def _node_digest(left: bytes, right: bytes) -> bytes:
+    return hashlib.sha256(_MERKLE_NODE_PREFIX + left + right).digest()
+
+
+def _checked_leaves(leaves: Sequence[bytes]) -> list[bytes]:
+    if isinstance(leaves, (bytes, bytearray, str)) or not isinstance(leaves, Sequence):
+        raise TypeError("leaves must be a sequence of bytes")
+    items = list(leaves)  # copy: inputs are never mutated
+    if not items:
+        raise ValueError("leaves must not be empty")
+    for position, leaf in enumerate(items):
+        if not isinstance(leaf, bytes):
+            raise TypeError(f"leaves[{position}] must be bytes")
+    return items
+
+
+def _check_merkle_index(index: int, size: int) -> None:
+    if not isinstance(index, int) or isinstance(index, bool):
+        raise TypeError("index must be an integer")
+    if not 0 <= index < size:
+        raise IndexError(f"index {index} out of range for {size} leaves")
+
+
+def merkle_root(leaves: Sequence[bytes]) -> bytes:
+    """Return the Merkle root digest of a non-empty sequence of byte leaves."""
+    level = [_leaf_digest(leaf) for leaf in _checked_leaves(leaves)]
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level = level + [level[-1]]
+        level = [
+            _node_digest(level[offset], level[offset + 1])
+            for offset in range(0, len(level), 2)
+        ]
+    return level[0]
+
+
+def prove_inclusion(leaves: Sequence[bytes], index: int) -> MerkleProof:
+    """Build a :class:`MerkleProof` for the leaf at zero-based ``index``.
+
+    Duplicate leaves are located purely by position; content is never searched.
+    """
+    items = _checked_leaves(leaves)
+    _check_merkle_index(index, len(items))
+    level = [_leaf_digest(leaf) for leaf in items]
+    siblings: list[bytes] = []
+    position = index
+    while len(level) > 1:
+        if len(level) % 2 == 1:
+            level = level + [level[-1]]
+        siblings.append(level[position ^ 1])
+        level = [
+            _node_digest(level[offset], level[offset + 1])
+            for offset in range(0, len(level), 2)
+        ]
+        position //= 2
+    return MerkleProof(index=index, siblings=tuple(siblings))
+
+
+def verify_inclusion(leaf: bytes, proof: MerkleProof, root: bytes) -> bool:
+    """Check that ``leaf`` sits at ``proof.index`` under Merkle ``root``.
+
+    Type errors raise :class:`TypeError`; malformed digest lengths or an
+    index/path structure that cannot correspond to a real tree return False.
+    """
+    _check_bytes(leaf, "leaf")
+    _check_bytes(root, "root")
+    if not isinstance(proof, MerkleProof):
+        raise TypeError("proof must be a MerkleProof")
+    if not isinstance(proof.index, int) or isinstance(proof.index, bool):
+        raise TypeError("proof index must be an integer")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    if len(root) != _MERKLE_DIGEST_SIZE:
+        return False
+    if proof.index < 0:
+        return False
+    if any(len(sibling) != _MERKLE_DIGEST_SIZE for sibling in proof.siblings):
+        return False
+    digest = _leaf_digest(leaf)
+    position = proof.index
+    for sibling in proof.siblings:
+        if position % 2 == 0:
+            digest = _node_digest(digest, sibling)
+        else:
+            digest = _node_digest(sibling, digest)
+        position //= 2
+    if position != 0:
+        return False  # index deeper than the path allows
+    return hmac.compare_digest(digest, root)

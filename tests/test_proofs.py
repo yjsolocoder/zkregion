@@ -1,14 +1,19 @@
+import hashlib
 import unittest
 
 from zkregion import (
     DEFAULT_GENERATOR,
     DEFAULT_PRIME,
+    MerkleProof,
     Region,
     SchnorrProof,
     SchnorrProver,
     SchnorrVerifier,
     commit,
     commit_coordinate,
+    merkle_root,
+    prove_inclusion,
+    verify_inclusion,
     verify_opening,
 )
 
@@ -219,6 +224,138 @@ class SchnorrFiatShamirTest(unittest.TestCase):
         verifier = SchnorrVerifier(prover.public_key)
         proof = prover.prove(b"offline", context=b"demo")
         self.assertTrue(verifier.verify_proof(b"offline", proof, context=b"demo"))
+
+
+def leaf_digest(leaf: bytes) -> bytes:
+    return hashlib.sha256(b"\x00" + len(leaf).to_bytes(4, "big") + leaf).digest()
+
+
+def node_digest(left: bytes, right: bytes) -> bytes:
+    return hashlib.sha256(b"\x01" + left + right).digest()
+
+
+class MerkleTest(unittest.TestCase):
+    LEAVES = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon"]
+
+    def test_single_leaf_root_is_leaf_digest_with_empty_path(self):
+        self.assertEqual(merkle_root([b"only"]), leaf_digest(b"only"))
+        proof = prove_inclusion([b"only"], 0)
+        self.assertEqual(proof, MerkleProof(index=0, siblings=()))
+        self.assertTrue(verify_inclusion(b"only", proof, merkle_root([b"only"])))
+
+    def test_root_matches_manual_two_layer_construction(self):
+        h01 = node_digest(leaf_digest(b"alpha"), leaf_digest(b"beta"))
+        h23 = node_digest(leaf_digest(b"gamma"), leaf_digest(b"delta"))
+        self.assertEqual(merkle_root(self.LEAVES[:4]), node_digest(h01, h23))
+
+    def test_odd_layer_duplicates_last_node(self):
+        ha = leaf_digest(b"a")
+        hb = leaf_digest(b"b")
+        hc = leaf_digest(b"c")
+        expected = node_digest(node_digest(ha, hb), node_digest(hc, hc))
+        self.assertEqual(merkle_root([b"a", b"b", b"c"]), expected)
+
+    def test_leaf_length_prefix_is_four_byte_big_endian(self):
+        leaf = b"x" * 300
+        expected = hashlib.sha256(b"\x00" + (300).to_bytes(4, "big") + leaf).digest()
+        self.assertEqual(merkle_root([leaf]), expected)
+
+    def test_every_leaf_proves_against_the_root(self):
+        root = merkle_root(self.LEAVES)
+        for index, leaf in enumerate(self.LEAVES):
+            proof = prove_inclusion(self.LEAVES, index)
+            self.assertIsInstance(proof.siblings, tuple)
+            self.assertEqual(proof.index, index)
+            self.assertEqual(len(proof.siblings), 3)  # 5 leaves -> 3 levels
+            self.assertTrue(verify_inclusion(leaf, proof, root))
+
+    def test_duplicate_leaves_are_located_by_index(self):
+        leaves = [b"same", b"other", b"same"]
+        root = merkle_root(leaves)
+        first = prove_inclusion(leaves, 0)
+        second = prove_inclusion(leaves, 2)
+        self.assertNotEqual(first, second)
+        self.assertTrue(verify_inclusion(b"same", first, root))
+        self.assertTrue(verify_inclusion(b"same", second, root))
+        # each proof only works at its own index
+        self.assertFalse(verify_inclusion(b"same", MerkleProof(2, first.siblings), root))
+
+    def test_proof_is_immutable(self):
+        proof = prove_inclusion(self.LEAVES, 1)
+        with self.assertRaises(AttributeError):
+            proof.index = 3
+
+    def test_empty_tree_rejected(self):
+        with self.assertRaises(ValueError):
+            merkle_root([])
+        with self.assertRaises(ValueError):
+            prove_inclusion([], 0)
+
+    def test_leaf_type_errors(self):
+        for bad in (b"not-a-sequence-of-leaves", "text", 42, None):
+            with self.assertRaises(TypeError):
+                merkle_root(bad)
+        for bad_item in ("text", 7, None, bytearray(b"x")):
+            with self.assertRaises(TypeError):
+                merkle_root([b"ok", bad_item])
+        with self.assertRaises(TypeError):
+            prove_inclusion([b"ok", 7], 0)
+
+    def test_index_errors(self):
+        with self.assertRaises(IndexError):
+            prove_inclusion(self.LEAVES, len(self.LEAVES))
+        with self.assertRaises(IndexError):
+            prove_inclusion(self.LEAVES, -1)
+        for bad in (1.0, "0", None):
+            with self.assertRaises(TypeError):
+                prove_inclusion(self.LEAVES, bad)
+
+    def test_tampered_leaf_index_path_and_root_all_fail(self):
+        root = merkle_root(self.LEAVES)
+        proof = prove_inclusion(self.LEAVES, 2)
+        self.assertFalse(verify_inclusion(b"other", proof, root))
+        self.assertFalse(verify_inclusion(b"gamma", MerkleProof(3, proof.siblings), root))
+        swapped = MerkleProof(2, (proof.siblings[1], proof.siblings[0], proof.siblings[2]))
+        self.assertFalse(verify_inclusion(b"gamma", swapped, root))
+        flipped = MerkleProof(2, proof.siblings[:-1] + (proof.siblings[-1][::-1],))
+        self.assertFalse(verify_inclusion(b"gamma", flipped, root))
+        self.assertFalse(verify_inclusion(b"gamma", proof, merkle_root(self.LEAVES[:4])))
+
+    def test_verify_type_and_shape_checks(self):
+        root = merkle_root(self.LEAVES)
+        proof = prove_inclusion(self.LEAVES, 2)
+        with self.assertRaises(TypeError):
+            verify_inclusion("gamma", proof, root)
+        with self.assertRaises(TypeError):
+            verify_inclusion(b"gamma", proof, "root")
+        with self.assertRaises(TypeError):
+            verify_inclusion(b"gamma", (2, proof.siblings), root)
+        with self.assertRaises(TypeError):
+            verify_inclusion(b"gamma", MerkleProof(2.0, proof.siblings), root)
+        with self.assertRaises(TypeError):
+            verify_inclusion(b"gamma", MerkleProof(2, list(proof.siblings)), root)
+        with self.assertRaises(TypeError):
+            verify_inclusion(b"gamma", MerkleProof(2, (proof.siblings[0], "x", proof.siblings[2])), root)
+        # wrong digest lengths and negative index return False, not exceptions
+        self.assertFalse(verify_inclusion(b"gamma", proof, root[:-1]))
+        self.assertFalse(verify_inclusion(b"gamma", proof, root + b"\x00"))
+        self.assertFalse(verify_inclusion(b"gamma", MerkleProof(-1, proof.siblings), root))
+        short = MerkleProof(2, (proof.siblings[0][:16],) + proof.siblings[1:])
+        self.assertFalse(verify_inclusion(b"gamma", short, root))
+        # index deeper than the path allows
+        self.assertFalse(verify_inclusion(b"gamma", MerkleProof(8, proof.siblings), root))
+
+    def test_inputs_are_not_mutated(self):
+        leaves = list(self.LEAVES)
+        snapshot = list(leaves)
+        root = merkle_root(leaves)
+        proof = prove_inclusion(leaves, 1)
+        verify_inclusion(leaves[1], proof, root)
+        self.assertEqual(leaves, snapshot)
+        self.assertEqual(proof.siblings, prove_inclusion(snapshot, 1).siblings)
+
+    def test_tuple_leaves_accepted(self):
+        self.assertEqual(merkle_root(tuple(self.LEAVES)), merkle_root(self.LEAVES))
 
 
 class RegionTest(unittest.TestCase):

@@ -1,8 +1,8 @@
 """zkregion - commitments and interactive proofs for region membership.
 
 Public API: commit / verify_opening / commit_coordinate / SchnorrProof /
-SchnorrProver / SchnorrVerifier / Region / MerkleProof / merkle_root /
-prove_inclusion / verify_inclusion / MerkleMultiProof /
+SchnorrBatchEntry / SchnorrProver / SchnorrVerifier / Region / MerkleProof /
+merkle_root / prove_inclusion / verify_inclusion / MerkleMultiProof /
 prove_multi_inclusion / verify_multi_inclusion.
 """
 
@@ -21,6 +21,7 @@ __all__ = [
     "MerkleMultiProof",
     "MerkleProof",
     "Region",
+    "SchnorrBatchEntry",
     "SchnorrProof",
     "SchnorrProver",
     "SchnorrVerifier",
@@ -51,6 +52,15 @@ class SchnorrProof:
 
     commitment: int
     response: int
+
+
+@dataclass(frozen=True)
+class SchnorrBatchEntry:
+    """One item of a batch verification: ``message``, ``proof`` and ``context``."""
+
+    message: bytes
+    proof: SchnorrProof
+    context: bytes = b""
 
 
 def _encode_int(value: int) -> bytes:
@@ -219,6 +229,77 @@ class SchnorrVerifier:
         left = pow(self._generator, proof.response, self._prime)
         right = proof.commitment * pow(self._public_key, challenge, self._prime) % self._prime
         return left == right
+
+    def verify_batch(
+        self,
+        entries: Sequence[SchnorrBatchEntry],
+        *,
+        randbelow: Callable[[int], int] = secrets.randbelow,
+    ) -> bool:
+        """Verify a batch of Fiat-Shamir proofs made for this public key.
+
+        Every structurally valid entry recomputes its transcript challenge
+        ``c`` and draws exactly one coefficient ``a = r + 1`` from
+        ``r = randbelow(prime - 1)``; the batch is accepted iff the random
+        linear combination ``g**Σ(a*s) == Π(t**a * public_key**(a*c))``
+        holds modulo ``prime`` — never a per-entry boolean summary. An
+        empty batch returns False; out-of-range commitments, negative
+        responses, mismatched messages or contexts and any tampering
+        return False, and an invalid proof may short-circuit the batch.
+        Duplicate entries are legal and each draws its own coefficient.
+        A fixed ``randbelow`` makes the result reproducible; the default
+        is :func:`secrets.randbelow`.
+        """
+        if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+            raise TypeError("entries must be a sequence of SchnorrBatchEntry")
+        if not callable(randbelow):
+            raise TypeError("randbelow must be callable")
+        items = list(entries)  # copy: inputs are never mutated
+        if not items:
+            return False
+        exponent_sum = 0
+        product = 1
+        for position, entry in enumerate(items):
+            if not isinstance(entry, SchnorrBatchEntry):
+                raise TypeError(f"entries[{position}] must be a SchnorrBatchEntry")
+            _check_bytes(entry.message, f"entries[{position}] message")
+            _check_bytes(entry.context, f"entries[{position}] context")
+            proof = entry.proof
+            if not isinstance(proof, SchnorrProof):
+                raise TypeError(f"entries[{position}] proof must be a SchnorrProof")
+            if (
+                not isinstance(proof.commitment, int)
+                or isinstance(proof.commitment, bool)
+                or not isinstance(proof.response, int)
+                or isinstance(proof.response, bool)
+            ):
+                raise TypeError(
+                    f"entries[{position}] proof commitment and response must be integers"
+                )
+            if not 1 <= proof.commitment < self._prime or proof.response < 0:
+                return False  # structurally invalid proof: short-circuit
+            challenge = _fs_challenge(
+                self._prime,
+                self._generator,
+                self._public_key,
+                proof.commitment,
+                entry.context,
+                entry.message,
+            )
+            r = randbelow(self._prime - 1)
+            if not isinstance(r, int) or isinstance(r, bool):
+                raise TypeError("coefficient source randbelow must return an integer")
+            if not 0 <= r < self._prime - 1:
+                raise ValueError("coefficient source must satisfy 0 <= r < prime - 1")
+            coefficient = r + 1
+            exponent_sum += coefficient * proof.response
+            product = product * pow(proof.commitment, coefficient, self._prime) % self._prime
+            product = (
+                product
+                * pow(self._public_key, coefficient * challenge, self._prime)
+                % self._prime
+            )
+        return pow(self._generator, exponent_sum, self._prime) == product
 
 
 @dataclass(frozen=True)

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from . import (
     Region,
+    SchnorrBatchEntry,
+    SchnorrProof,
     SchnorrProver,
     SchnorrVerifier,
     commit,
@@ -54,6 +56,19 @@ def main() -> int:
     print(f"  valid proof accepted: {verifier.verify_proof(b'payload', proof, context=b'demo')}")
     print(f"  wrong message rejected: {verifier.verify_proof(b'other', proof, context=b'demo')}")
     print(f"  wrong context rejected: {verifier.verify_proof(b'payload', proof)}")
+
+    print()
+    print("batch Fiat-Shamir verification (same public key):")
+    batch = [
+        SchnorrBatchEntry(b"alpha", prover.prove(b"alpha", context=b"batch"), context=b"batch"),
+        SchnorrBatchEntry(b"beta", prover.prove(b"beta", context=b"batch"), context=b"batch"),
+    ]
+    print(f"  valid batch accepted: {verifier.verify_batch(batch, randbelow=counter_randbelow())}")
+    print(f"  duplicate entries accepted: {verifier.verify_batch(batch + batch[:1], randbelow=counter_randbelow())}")
+    print(f"  empty batch rejected: {not verifier.verify_batch(())}")
+    forged = SchnorrProof(batch[0].proof.commitment, batch[0].proof.response + 1)
+    tampered = [SchnorrBatchEntry(b"alpha", forged, context=b"batch"), batch[1]]
+    print(f"  tampered batch rejected: {not verifier.verify_batch(tampered, randbelow=counter_randbelow())}")
 
     print()
     print("merkle inclusion proofs:")

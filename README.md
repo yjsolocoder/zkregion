@@ -1,6 +1,6 @@
 # zkregion
 
-面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含证明、量化区间的 Pedersen 陷门承诺，以及量化整数坐标下的矩形区域判定。
+面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含证明、量化区间的 Pedersen 陷门承诺及其上的 Schnorr OR 非交互区间证明，以及量化整数坐标下的矩形区域判定。
 
 ## 环境
 
@@ -56,6 +56,13 @@ commitment, blinding = pedersen_commit(40, 0, 100)
 assert verify_pedersen_opening(commitment, 40, blinding)
 assert not verify_pedersen_opening(commitment, 41, blinding)
 
+# Pedersen 非交互区间证明（Schnorr OR）：证明承诺值落在声明区间内
+from zkregion import prove_range, verify_range
+
+proof = prove_range(commitment, 40, blinding, context=b"session-1")
+assert verify_range(commitment, proof, context=b"session-1")
+assert not verify_range(commitment, proof, context=b"other")
+
 Region(0, 100, 0, 100).contains(50, 50)     # True
 ```
 
@@ -74,6 +81,9 @@ python3 -m zkregion
 - `pedersen_commit(value, lower, upper, *, prime=DEFAULT_PRIME, generator=DEFAULT_GENERATOR, h=None, blinding=None, randbelow=secrets.randbelow) -> (PedersenCommitment, blinding)` — 区间量化值的 Pedersen 承诺
 - `verify_pedersen_opening(commitment, value, blinding) -> bool` — 复用承诺对象内参数验证开合
 - `PedersenCommitment(element, lower, upper, prime, generator, h)` — 不可变承诺对象；承诺值为 `element = g**(value-lower) * h**blinding mod prime`
+- `prove_range(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> RangeProof` — 生成 Pedersen 承诺的非交互区间证明（Schnorr OR）
+- `verify_range(commitment, proof, context=b"") -> bool` — 验证区间证明
+- `RangeProof(t, e, s)` — 不可变区间证明对象，三个字段均为长度 `upper - lower + 1` 的 `tuple[int, ...]`
 - `SchnorrProver(secret, *, prime, generator, randbelow)`
   - `public_key` — `g**secret mod prime`
   - `new_commitment()` — 生成一次性随机数并返回 `g**k mod prime`
@@ -114,11 +124,25 @@ element = g**m * h**r mod prime
 
 其中 `r` 为盲因子。`prime` 与 `g` 缺省取 `DEFAULT_PRIME` / `DEFAULT_GENERATOR`；`h` 缺省为 `g**2 mod prime`；盲因子缺省由 `randbelow(prime - 2) + 1` 生成（缺省源为 `secrets.randbelow`），也可用 `blinding=` 显式给出。函数返回 `(PedersenCommitment, blinding)`，承诺对象是冻结的 dataclass，携带 `element`、`lower`、`upper`、`prime`、`generator`、`h`，验证方无需其他带外参数。
 
-约束：必须有 `lower <= value <= upper`，且区间宽度 `upper - lower < prime - 1`；盲因子须在 `[1, prime - 1)`；`prime > 3`，`g` 与 `h` 均须位于 `(1, prime)`。所有数值只接受非 `bool` 整数（`True`/`False` 不算整数）：`value`、边界、`prime`、`g`、`h`、`blinding` 类型错误抛 `TypeError`；`randbelow` 不可调用或其返回值不是整数抛 `TypeError`。非法区间、越界 `value`、非法群参数或盲因子越界抛 `ValueError`；`randbelow` 返回值超出 `[0, prime - 2)` 也抛 `ValueError`。
+约束：必须有 `lower <= value <= upper`，且区间宽度 `upper - lower < prime - 1`；盲因子须在 `[1, prime - 1)`；`prime > 3`，`g` 与 `h` 均须位于 `(1, prime)`——无论 `h` 是显式传入还是按缺省 `g**2 mod prime` 计算，都会校验 `1 < h < prime`，不满足抛 `ValueError`。所有数值只接受非 `bool` 整数（`True`/`False` 不算整数）：`value`、边界、`prime`、`g`、`h`、`blinding` 类型错误抛 `TypeError`；`randbelow` 不可调用或其返回值不是整数抛 `TypeError`。非法区间、越界 `value`、非法群参数或盲因子越界抛 `ValueError`；`randbelow` 返回值超出 `[0, prime - 2)` 也抛 `ValueError`。
 
 `verify_pedersen_opening(commitment, value, blinding)` 只复用承诺对象内的群参数与区间，按同一公式重算并比对：`commitment` 不是 `PedersenCommitment` 或其字段、`value`、`blinding` 类型错误时抛 `TypeError`；对象内 `element` 或群参数越界、区间非法、`value` 越界、盲因子越界，或开合错误（错误的 `value`/`blinding`/`element`）一律返回 `False`。验证不改写任何输入。
 
-> **警告：默认 `h = g**2 mod prime` 的离散对数（`log_g(h) = 2`）是公开已知的，因此默认配置下的承诺不具备绑定性**——知道陷门即可对同一 `element` 给出多个开合（例如 `(value, r)` 与 `(value + 2, r - 1)`），演示程序会展示这一点。生产用途必须传入离散对数未知（无可信设置陷门）的 `h`。此外这只是一个带区间声明的承诺，**不是范围证明**：验证方只能确认开合值落在声明区间内，无法在不知道开合的情况下证明承诺值属于某区间。
+> **警告：默认 `h = g**2 mod prime` 的离散对数（`log_g(h) = 2`）是公开已知的，因此默认配置下的承诺不具备绑定性**——知道陷门即可对同一 `element` 给出多个开合（例如 `(value, r)` 与 `(value + 2, r - 1)`），演示程序会展示这一点。生产用途必须传入离散对数未知（无可信设置陷门）的 `h`。此外，单独的承诺对象只是带区间声明的承诺；"承诺值属于某区间" 的零知识论断由下文的 `prove_range` / `verify_range` 提供，且同样只是演示级安全强度。
+
+### Pedersen 非交互区间证明
+
+`prove_range(commitment, value, blinding, context=b"")` 在 Pedersen 承诺之上生成 Schnorr OR 风格的非交互区间证明，`verify_range(commitment, proof, context=b"")` 验证。对声明区间 `[lower, upper]` 内的每个偏移 `i`（共 `n = upper - lower + 1` 个，**最多 256 个整数**，超限生成抛 `ValueError`、验证返回 `False`）定义
+
+```
+D_i = element * g**(-i) mod prime
+```
+
+承诺以 `(value, r)` 开合当且仅当 `D_(value-lower) = h**r`，因此区间证明等价于"至少一个 `D_i` 以 `h` 为底的离散对数等于盲因子 `r`" 的 OR 证明。真实分支走诚实 Schnorr：取随机 `k`，`t = h**k mod prime`，挑战份额 `e = (c - Σ其他 e_i) mod prime`，响应 `s = k + e * r`（非负、不取模）；其余分支模拟：随机取 `e_i ∈ [0, prime)` 与非负 `s_i`，令 `t_i = h**s_i * D_i**(-e_i) mod prime`。证明为冻结的 `RangeProof(t, e, s)`，三个字段都是长度 `n` 的整数元组。
+
+挑战 `c` 为 SHA-256 摘要的大端整数模 `prime`。转录依次写入域 `b"zkregion/pedersen-range/v1"`、承诺六字段（`element`、`lower`、`upper`、`prime`、`generator`、`h`）、`context`、`n` 与全部 `t_i`；每项前置四字节无符号大端长度，整数编码为十进制 ASCII。
+
+验证要求：每个 `t_i ∈ [1, prime)`、`e_i ∈ [0, prime)`、`s_i ≥ 0`，`sum(e) mod prime == c`，且每个分支满足 Schnorr 等式 `h**s_i == t_i * D_i**e_i (mod prime)`。生成前会先复用 `verify_pedersen_opening` 校验开合，开合不符抛 `ValueError`；类型错误（含 `bool` 整数、非元组证明字段、非 `bytes` 的 `context`、不可调用的 `randbelow`）抛 `TypeError`；其他非法结构、篡改或绑定不符（错误的承诺、`context` 或证明）一律返回 `False`。入口均不改写输入。
 
 ### Fiat-Shamir 转录
 
@@ -132,7 +156,7 @@ element = g**m * h**r mod prime
 
 ## 限制
 
-`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。承诺只支持单点开合，没有范围证明，区域判定也只是朴素的坐标比较，不检查坐标是否经过承诺绑定；批量验证所用的随机线性组合与默认群一样仅供演示。Pedersen 承诺默认的 `h = g**2 mod prime` 带有公开陷门、破坏绑定性，且该承诺本身同样不是范围证明。
+`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。区域判定只是朴素的坐标比较，不检查坐标是否经过承诺绑定；批量验证所用的随机线性组合与默认群一样仅供演示。Pedersen 承诺默认的 `h = g**2 mod prime` 带有公开陷门、破坏绑定性；其上的 Schnorr OR 区间证明同样是演示级构造——区间上限 256 个整数、挑战来自 SHA-256 Fiat-Shamir 转录、群参数与默认 `h` 均未做生产级安全分析，不能用于真实部署。
 
 ## 测试
 

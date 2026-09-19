@@ -1,10 +1,11 @@
 """zkregion - commitments and interactive proofs for region membership.
 
 Public API: commit / verify_opening / commit_coordinate / PedersenCommitment /
-pedersen_commit / verify_pedersen_opening / SchnorrProof /
-SchnorrBatchEntry / SchnorrProver / SchnorrVerifier / Region / MerkleProof /
-merkle_root / prove_inclusion / verify_inclusion / MerkleMultiProof /
-prove_multi_inclusion / verify_multi_inclusion.
+pedersen_commit / verify_pedersen_opening / RangeProof / prove_range /
+verify_range / SchnorrProof / SchnorrBatchEntry / SchnorrProver /
+SchnorrVerifier / Region / MerkleProof / merkle_root / prove_inclusion /
+verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
+verify_multi_inclusion.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ __all__ = [
     "MerkleMultiProof",
     "MerkleProof",
     "PedersenCommitment",
+    "RangeProof",
     "Region",
     "SchnorrBatchEntry",
     "SchnorrProof",
@@ -33,10 +35,12 @@ __all__ = [
     "pedersen_commit",
     "prove_inclusion",
     "prove_multi_inclusion",
+    "prove_range",
     "verify_inclusion",
     "verify_multi_inclusion",
     "verify_opening",
     "verify_pedersen_opening",
+    "verify_range",
 ]
 
 # Mersenne prime 2**127 - 1 and a small generator. This is a demonstration
@@ -140,7 +144,9 @@ class PedersenCommitment:
        With the default ``h = g**2 mod prime`` the discrete logarithm
        ``log_g(h) = 2`` is publicly known, so the commitment is **not
        binding**: anyone can open one commitment to several values. It is a
-       demonstration trapdoor commitment, not a range proof.
+       demonstration trapdoor commitment; the accompanying
+       :func:`prove_range` / :func:`verify_range` range proof inherits the
+       same demonstration-only security level.
     """
 
     element: int
@@ -178,9 +184,10 @@ def pedersen_commit(
     ``prime`` and ``generator`` (``g``) default to :data:`DEFAULT_PRIME` and
     :data:`DEFAULT_GENERATOR`; ``h`` defaults to ``g**2 mod prime``, whose
     discrete log is publicly known (see the trapdoor warning on
-    :class:`PedersenCommitment`). The blinding ``r`` defaults to
-    ``randbelow(prime - 2) + 1`` and must lie in ``[1, prime - 1)``; the
-    default source is :func:`secrets.randbelow`.
+    :class:`PedersenCommitment`). Whether given explicitly or computed from
+    the default, ``h`` must satisfy ``1 < h < prime``. The blinding ``r``
+    defaults to ``randbelow(prime - 2) + 1`` and must lie in
+    ``[1, prime - 1)``; the default source is :func:`secrets.randbelow`.
 
     Type errors (including non-callable ``randbelow`` or a non-integer value
     drawn from it) raise :class:`TypeError`; an invalid range, an out-of-range
@@ -199,8 +206,8 @@ def pedersen_commit(
         h = pow(generator, 2, prime)
     else:
         _check_int(h, "h")
-        if not 1 < h < prime:
-            raise ValueError("h must satisfy 1 < h < prime")
+    if not 1 < h < prime:
+        raise ValueError("h must satisfy 1 < h < prime")
     if lower > upper:
         raise ValueError("lower must not exceed upper")
     if not lower <= value <= upper:
@@ -274,6 +281,204 @@ def verify_pedersen_opening(
         % prime
     )
     return expected == commitment.element
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive Pedersen range proofs (Schnorr OR over the offsets)
+#
+# For each offset i in [0, n) define D_i = element * generator**(-i) mod prime.
+# The commitment opens at value = lower + j with blinding r exactly when
+# D_j = h**r, so a range proof is an OR proof: "I know the base-h discrete
+# logarithm of at least one D_i". The real branch runs an honest Schnorr
+# round; every other branch is simulated, and the Fiat-Shamir challenge
+# shares are chosen so they sum to the transcript challenge modulo prime.
+
+_RANGE_DOMAIN = b"zkregion/pedersen-range/v1"
+_MAX_RANGE_VALUES = 256
+
+
+@dataclass(frozen=True)
+class RangeProof:
+    """A non-interactive range proof over a :class:`PedersenCommitment`.
+
+    ``t`` holds the per-branch announcements, ``e`` the challenge shares and
+    ``s`` the responses; all three are tuples of ``upper - lower + 1``
+    integers, one per integer in the declared range.
+    """
+
+    t: tuple[int, ...]
+    e: tuple[int, ...]
+    s: tuple[int, ...]
+
+
+def _range_challenge(
+    commitment: PedersenCommitment,
+    context: bytes,
+    size: int,
+    announcements: tuple[int, ...],
+) -> int:
+    """SHA-256 transcript challenge as a big-endian integer mod ``prime``.
+
+    The transcript is the domain separator, the six commitment fields, the
+    context, the range size ``n`` and every announcement ``t_i``; each item
+    is prefixed with its four-byte big-endian length and integers are
+    encoded as decimal ASCII.
+    """
+    fields = (
+        commitment.element,
+        commitment.lower,
+        commitment.upper,
+        commitment.prime,
+        commitment.generator,
+        commitment.h,
+    )
+    items = [_RANGE_DOMAIN]
+    items.extend(str(field).encode("ascii") for field in fields)
+    items.append(context)
+    items.append(str(size).encode("ascii"))
+    items.extend(str(t).encode("ascii") for t in announcements)
+    transcript = hashlib.sha256()
+    for item in items:
+        transcript.update(len(item).to_bytes(4, "big"))
+        transcript.update(item)
+    return int.from_bytes(transcript.digest(), "big") % commitment.prime
+
+
+def _check_commitment_fields(commitment: PedersenCommitment) -> None:
+    for name in ("element", "lower", "upper", "prime", "generator", "h"):
+        _check_int(getattr(commitment, name), f"commitment {name}")
+
+
+def prove_range(
+    commitment: PedersenCommitment,
+    value: int,
+    blinding: int,
+    context: bytes = b"",
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> RangeProof:
+    """Prove that ``commitment`` opens at some value inside its declared range.
+
+    ``value`` and ``blinding`` must be a valid opening of ``commitment``;
+    the opening is verified before any proving work happens and a mismatch
+    raises :class:`ValueError`. The declared range may contain at most 256
+    integers; wider ranges raise :class:`ValueError`. Randomness is drawn
+    from ``randbelow`` (default :func:`secrets.randbelow`); a draw that is
+    not a non-bool integer raises :class:`TypeError`, an out-of-range draw
+    raises :class:`ValueError`.
+    """
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment")
+    _check_commitment_fields(commitment)
+    _check_int(value, "value")
+    _check_int(blinding, "blinding")
+    _check_bytes(context, "context")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    size = commitment.upper - commitment.lower + 1
+    if size > _MAX_RANGE_VALUES:
+        raise ValueError(
+            f"range must contain at most {_MAX_RANGE_VALUES} integers"
+        )
+    if not verify_pedersen_opening(commitment, value, blinding):
+        raise ValueError("commitment does not open at (value, blinding)")
+    prime = commitment.prime
+    generator = commitment.generator
+    h = commitment.h
+
+    def draw(upper: int) -> int:
+        drawn = randbelow(upper)
+        _check_int(drawn, "randbelow return value")
+        if not 0 <= drawn < upper:
+            raise ValueError(f"randbelow must return a value in [0, {upper})")
+        return drawn
+
+    index = value - commitment.lower
+    offsets = [commitment.element * pow(generator, -i, prime) % prime for i in range(size)]
+    t: list[int] = [0] * size
+    e: list[int] = [0] * size
+    s: list[int] = [0] * size
+    for i in range(size):
+        if i == index:
+            continue
+        e[i] = draw(prime)  # challenge share in [0, prime)
+        s[i] = draw(prime - 1) + 1  # non-negative response
+        t[i] = pow(h, s[i], prime) * pow(offsets[i], -e[i], prime) % prime
+    k = draw(prime - 1) + 1
+    t[index] = pow(h, k, prime)
+    challenge = _range_challenge(commitment, context, size, tuple(t))
+    e[index] = (challenge - sum(e)) % prime
+    s[index] = k + e[index] * blinding
+    return RangeProof(t=tuple(t), e=tuple(e), s=tuple(s))
+
+
+def verify_range(
+    commitment: PedersenCommitment,
+    proof: RangeProof,
+    context: bytes = b"",
+) -> bool:
+    """Verify a :class:`RangeProof` against ``commitment`` and ``context``.
+
+    Every branch must satisfy the Schnorr equation
+    ``h**s_i == t_i * D_i**e_i (mod prime)`` with
+    ``D_i = element * generator**(-i) mod prime``, the challenge shares must
+    lie in ``[0, prime)`` and sum to the transcript challenge modulo
+    ``prime``, and the responses must be non-negative. Type errors (wrong
+    object, non-tuple or non-integer proof fields, non-bytes context) raise
+    :class:`TypeError`; any other invalid structure, tampering or binding
+    mismatch — including ranges wider than 256 integers — returns ``False``.
+    Inputs are never mutated.
+    """
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment")
+    _check_commitment_fields(commitment)
+    if not isinstance(proof, RangeProof):
+        raise TypeError("proof must be a RangeProof")
+    for field_name in ("t", "e", "s"):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(f"proof {field_name} must be a tuple of integers")
+        for item in field:
+            _check_int(item, f"proof {field_name} entry")
+    _check_bytes(context, "context")
+    prime = commitment.prime
+    if prime <= 3:
+        return False
+    if not 1 < commitment.generator < prime or not 1 < commitment.h < prime:
+        return False
+    if not 0 < commitment.element < prime:
+        return False
+    if commitment.lower > commitment.upper:
+        return False
+    if commitment.upper - commitment.lower >= prime - 1:
+        return False
+    size = commitment.upper - commitment.lower + 1
+    if size > _MAX_RANGE_VALUES:
+        return False
+    if not (len(proof.t) == len(proof.e) == len(proof.s) == size):
+        return False
+    if any(not 1 <= t_i < prime for t_i in proof.t):
+        return False
+    if any(not 0 <= e_i < prime for e_i in proof.e):
+        return False
+    if any(s_i < 0 for s_i in proof.s):
+        return False
+    challenge = _range_challenge(commitment, context, size, proof.t)
+    if sum(proof.e) % prime != challenge:
+        return False
+    generator = commitment.generator
+    h = commitment.h
+    try:
+        inverses = [pow(generator, -i, prime) for i in range(size)]
+    except ValueError:
+        return False  # generator not invertible modulo prime
+    for i in range(size):
+        offset = commitment.element * inverses[i] % prime
+        left = pow(h, proof.s[i], prime)
+        right = proof.t[i] * pow(offset, proof.e[i], prime) % prime
+        if left != right:
+            return False
+    return True
 
 
 class SchnorrProver:

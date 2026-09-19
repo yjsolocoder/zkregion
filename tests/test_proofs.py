@@ -4,6 +4,7 @@ import unittest
 from zkregion import (
     DEFAULT_GENERATOR,
     DEFAULT_PRIME,
+    MerkleMultiProof,
     MerkleProof,
     Region,
     SchnorrProof,
@@ -13,7 +14,9 @@ from zkregion import (
     commit_coordinate,
     merkle_root,
     prove_inclusion,
+    prove_multi_inclusion,
     verify_inclusion,
+    verify_multi_inclusion,
     verify_opening,
 )
 
@@ -385,6 +388,201 @@ class RegionTest(unittest.TestCase):
     def test_non_integer_coordinates_rejected(self):
         with self.assertRaises(TypeError):
             Region(0, 10, 0, 10).contains(1.5, 2)
+
+
+class MerkleMultiProofTest(unittest.TestCase):
+    LEAVES = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon"]
+
+    def entries(self, leaves, indices):
+        return [(index, leaves[index]) for index in indices]
+
+    def test_roundtrip_for_every_subset(self):
+        # exhaustive over all non-empty subsets of a 5-leaf (odd) tree
+        root = merkle_root(self.LEAVES)
+        for mask in range(1, 1 << len(self.LEAVES)):
+            indices = tuple(i for i in range(len(self.LEAVES)) if mask & (1 << i))
+            proof = prove_multi_inclusion(self.LEAVES, indices)
+            self.assertIsInstance(proof, MerkleMultiProof)
+            self.assertEqual(proof.leaf_count, len(self.LEAVES))
+            self.assertEqual(proof.indices, indices)
+            self.assertIsInstance(proof.siblings, tuple)
+            self.assertTrue(
+                verify_multi_inclusion(self.entries(self.LEAVES, indices), proof, root),
+                f"subset {indices} failed",
+            )
+
+    def test_roundtrip_across_tree_sizes(self):
+        for size in range(1, 10):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            root = merkle_root(leaves)
+            for indices in ((0,), (size - 1,), tuple(sorted({0, size - 1})), tuple(range(size))):
+                proof = prove_multi_inclusion(leaves, indices)
+                self.assertTrue(
+                    verify_multi_inclusion(self.entries(leaves, indices), proof, root),
+                    f"size={size} indices={indices}",
+                )
+
+    def test_single_leaf_tree(self):
+        proof = prove_multi_inclusion([b"only"], (0,))
+        self.assertEqual(proof, MerkleMultiProof(leaf_count=1, indices=(0,), siblings=()))
+        self.assertTrue(verify_multi_inclusion([(0, b"only")], proof, merkle_root([b"only"])))
+
+    def test_full_leaf_proof_has_empty_siblings(self):
+        for size in range(1, 9):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            proof = prove_multi_inclusion(leaves, range(size))
+            self.assertEqual(proof.siblings, ())
+            self.assertTrue(
+                verify_multi_inclusion(list(enumerate(leaves)), proof, merkle_root(leaves))
+            )
+
+    def test_proof_is_deterministic(self):
+        first = prove_multi_inclusion(self.LEAVES, (0, 2, 4))
+        second = prove_multi_inclusion(self.LEAVES, (0, 2, 4))
+        self.assertEqual(first, second)
+
+    def test_proof_is_minimal_and_matches_manual_layout(self):
+        # three leaves: prove indices 0 and 2; only H(beta) is needed,
+        # index 2 duplicates itself at the first level
+        leaves = [b"a", b"b", b"c"]
+        proof = prove_multi_inclusion(leaves, (0, 2))
+        self.assertEqual(proof.siblings, (leaf_digest(b"b"),))
+        self.assertTrue(
+            verify_multi_inclusion([(0, b"a"), (2, b"c")], proof, merkle_root(leaves))
+        )
+
+    def test_shared_sibling_is_collected_once(self):
+        # adjacent pair shares its parent: only the other subtree root is needed
+        leaves = [b"a", b"b", b"c", b"d"]
+        proof = prove_multi_inclusion(leaves, (0, 1))
+        self.assertEqual(
+            proof.siblings,
+            (node_digest(leaf_digest(b"c"), leaf_digest(b"d")),),
+        )
+
+    def test_multi_proof_agrees_with_single_proofs(self):
+        root = merkle_root(self.LEAVES)
+        proof = prove_multi_inclusion(self.LEAVES, (1, 3))
+        self.assertTrue(verify_multi_inclusion(self.entries(self.LEAVES, (1, 3)), proof, root))
+        for index in (1, 3):
+            single = prove_inclusion(self.LEAVES, index)
+            self.assertTrue(verify_inclusion(self.LEAVES[index], single, root))
+
+    def test_proof_is_immutable(self):
+        proof = prove_multi_inclusion(self.LEAVES, (1, 3))
+        with self.assertRaises(AttributeError):
+            proof.indices = (0,)
+
+    def test_prove_type_errors(self):
+        with self.assertRaises(TypeError):
+            prove_multi_inclusion(b"not-a-sequence", (0,))
+        with self.assertRaises(TypeError):
+            prove_multi_inclusion([b"ok", 7], (0,))
+        for bad in (b"\x00", "0", 1, None):
+            with self.assertRaises(TypeError):
+                prove_multi_inclusion(self.LEAVES, bad)
+        for bad_index in (1.0, "0", None, True):
+            with self.assertRaises(TypeError):
+                prove_multi_inclusion(self.LEAVES, (0, bad_index))
+
+    def test_prove_value_errors(self):
+        with self.assertRaises(ValueError):
+            prove_multi_inclusion(self.LEAVES, ())
+        with self.assertRaises(ValueError):
+            prove_multi_inclusion(self.LEAVES, [])
+        with self.assertRaises(ValueError):
+            prove_multi_inclusion(self.LEAVES, (1, 1))
+        with self.assertRaises(ValueError):
+            prove_multi_inclusion(self.LEAVES, (2, 0))
+        with self.assertRaises(ValueError):
+            prove_multi_inclusion([], (0,))
+
+    def test_prove_index_errors(self):
+        with self.assertRaises(IndexError):
+            prove_multi_inclusion(self.LEAVES, (len(self.LEAVES),))
+        with self.assertRaises(IndexError):
+            prove_multi_inclusion(self.LEAVES, (-1,))
+        with self.assertRaises(IndexError):
+            prove_multi_inclusion(self.LEAVES, (0, len(self.LEAVES)))
+
+    def test_verify_type_errors(self):
+        root = merkle_root(self.LEAVES)
+        proof = prove_multi_inclusion(self.LEAVES, (1, 3))
+        entries = self.entries(self.LEAVES, (1, 3))
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion("entries", proof, root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion([(1, "beta"), (3, "delta")], proof, root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion([(1.0, b"beta"), (3, b"delta")], proof, root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion([(True, b"beta"), (3, b"delta")], proof, root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion([(1, b"beta", b"extra"), (3, b"delta")], proof, root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion(entries, proof, "root")
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion(entries, (1, 3), root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion(entries, MerkleMultiProof(True, (1, 3), proof.siblings), root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion(entries, MerkleMultiProof(5, [1, 3], proof.siblings), root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion(entries, MerkleMultiProof(5, (1, 3.0), proof.siblings), root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion(entries, MerkleMultiProof(5, (1, 3), list(proof.siblings)), root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion(
+                entries, MerkleMultiProof(5, (1, 3), proof.siblings + ("x",)), root
+            )
+
+    def test_verify_shape_errors_return_false(self):
+        root = merkle_root(self.LEAVES)
+        proof = prove_multi_inclusion(self.LEAVES, (1, 3))
+        entries = self.entries(self.LEAVES, (1, 3))
+        # empty or mismatched entries
+        self.assertFalse(verify_multi_inclusion([], proof, root))
+        self.assertFalse(verify_multi_inclusion(entries[:1], proof, root))
+        self.assertFalse(verify_multi_inclusion(entries + [(4, b"epsilon")], proof, root))
+        self.assertFalse(verify_multi_inclusion([(1, b"beta"), (2, b"gamma")], proof, root))
+        self.assertFalse(verify_multi_inclusion([entries[1], entries[0]], proof, root))
+        # malformed proof fields
+        self.assertFalse(verify_multi_inclusion(entries, MerkleMultiProof(0, (1, 3), proof.siblings), root))
+        self.assertFalse(verify_multi_inclusion(entries, MerkleMultiProof(-2, (1, 3), proof.siblings), root))
+        self.assertFalse(verify_multi_inclusion(entries, MerkleMultiProof(5, (), proof.siblings), root))
+        self.assertFalse(verify_multi_inclusion(entries, MerkleMultiProof(5, (3, 1), proof.siblings), root))
+        self.assertFalse(verify_multi_inclusion(entries, MerkleMultiProof(5, (1, 1), proof.siblings), root))
+        self.assertFalse(verify_multi_inclusion(entries, MerkleMultiProof(5, (1, 5), proof.siblings), root))
+        self.assertFalse(verify_multi_inclusion(entries, MerkleMultiProof(5, (-1, 3), proof.siblings), root))
+        # digest length errors
+        self.assertFalse(verify_multi_inclusion(entries, proof, root[:-1]))
+        self.assertFalse(verify_multi_inclusion(entries, proof, root + b"\x00"))
+        short = MerkleMultiProof(5, (1, 3), (proof.siblings[0][:16],) + proof.siblings[1:])
+        self.assertFalse(verify_multi_inclusion(entries, short, root))
+        # sibling count mismatch in either direction
+        self.assertFalse(verify_multi_inclusion(entries, MerkleMultiProof(5, (1, 3), proof.siblings[:-1]), root))
+        self.assertFalse(verify_multi_inclusion(entries, MerkleMultiProof(5, (1, 3), proof.siblings + (root,)), root))
+
+    def test_verify_tampering_fails(self):
+        root = merkle_root(self.LEAVES)
+        proof = prove_multi_inclusion(self.LEAVES, (1, 3))
+        entries = self.entries(self.LEAVES, (1, 3))
+        self.assertFalse(verify_multi_inclusion([(1, b"beta"), (3, b"other")], proof, root))
+        flipped = MerkleMultiProof(5, (1, 3), proof.siblings[:-1] + (proof.siblings[-1][::-1],))
+        self.assertFalse(verify_multi_inclusion(entries, flipped, root))
+        self.assertFalse(verify_multi_inclusion(entries, proof, merkle_root(self.LEAVES[:4])))
+        # a proof for a different subset must not validate these entries
+        other = prove_multi_inclusion(self.LEAVES, (1, 2))
+        self.assertFalse(verify_multi_inclusion(entries, other, root))
+
+    def test_inputs_are_not_mutated(self):
+        leaves = list(self.LEAVES)
+        indices = [1, 3]
+        entries = self.entries(leaves, indices)
+        snapshot = (list(leaves), list(indices), list(entries))
+        proof = prove_multi_inclusion(leaves, indices)
+        verify_multi_inclusion(entries, proof, merkle_root(leaves))
+        self.assertEqual((leaves, indices, entries), snapshot)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,9 @@ from . import (
     commit_coordinate,
     merkle_root,
     prove_inclusion,
+    prove_multi_inclusion,
     verify_inclusion,
+    verify_multi_inclusion,
     verify_opening,
 )
 
@@ -64,6 +66,21 @@ def main() -> int:
     shifted = prove_inclusion(leaves, 3)
     print(f"  wrong index rejected: {not verify_inclusion(b'gamma', shifted, root)}")
     print(f"  wrong root rejected: {not verify_inclusion(b'gamma', proof, merkle_root(leaves[:-1]))}")
+
+    print()
+    print("merkle multi-inclusion proofs:")
+    indices = (0, 2, 4)
+    multi = prove_multi_inclusion(leaves, indices)
+    entries = [(index, leaves[index]) for index in indices]
+    print(f"  indices={indices}  siblings={len(multi.siblings)}  leaf_count={multi.leaf_count}")
+    print(f"  valid proof accepted: {verify_multi_inclusion(entries, multi, root)}")
+    tampered = [(0, b"other"), (2, b"gamma"), (4, b"epsilon")]
+    print(f"  tampered leaf rejected: {not verify_multi_inclusion(tampered, multi, root)}")
+    reordered = [entries[1], entries[0], entries[2]]
+    print(f"  misordered entries rejected: {not verify_multi_inclusion(reordered, multi, root)}")
+    full = prove_multi_inclusion(leaves, range(len(leaves)))
+    print(f"  full-leaf proof needs no siblings: {full.siblings == ()}")
+    print(f"  full-leaf proof accepted: {verify_multi_inclusion(list(enumerate(leaves)), full, root)}")
 
     print()
     print("region membership:")

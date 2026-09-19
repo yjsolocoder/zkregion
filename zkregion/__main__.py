@@ -11,11 +11,13 @@ from . import (
     commit,
     commit_coordinate,
     merkle_root,
+    pedersen_commit,
     prove_inclusion,
     prove_multi_inclusion,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
+    verify_pedersen_opening,
 )
 
 
@@ -37,6 +39,27 @@ def main() -> int:
 
     coordinate, coordinate_nonce = commit_coordinate(-73, 40)
     print(f"  coordinate opens: {verify_opening(coordinate, b'-73:40', coordinate_nonce)}")
+
+    print()
+    print("Pedersen trapdoor commitment (quantized coordinate):")
+    lower, upper = 0, 1000
+    # explicit blinding keeps the demo deterministic; normally it is drawn at random
+    pc, blinding = pedersen_commit(
+        500, lower, upper, prime=104729, generator=3, blinding=12345
+    )
+    print(f"  C={pc.commitment}  element={pc.element}  bounds=[{pc.lower}, {pc.upper}]")
+    print(f"  honest opening accepted: {verify_pedersen_opening(pc, 500, blinding)}")
+    print(f"  wrong value rejected: {not verify_pedersen_opening(pc, 501, blinding)}")
+    print(f"  wrong blinding rejected: {not verify_pedersen_opening(pc, 500, blinding + 1)}")
+    print(f"  out-of-range value rejected: {not verify_pedersen_opening(pc, 1001, blinding)}")
+    # default h = g**2 mod prime has the KNOWN trapdoor log 2: an opening at
+    # value-2 with blinding+1 gives the identical C, so binding does not hold
+    alt_value, alt_blinding = 498, blinding + 1
+    print(
+        f"  trapdoor re-opening at {alt_value} accepted: "
+        f"{verify_pedersen_opening(pc, alt_value, alt_blinding)}  "
+        f"(binding broken; demo only, not a range proof)"
+    )
 
     print()
     print("interactive Schnorr:")

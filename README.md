@@ -1,6 +1,6 @@
 # zkregion
 
-面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含证明，以及量化整数坐标下的矩形区域判定。
+面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、量化坐标的 Pedersen 陷门承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含证明，以及量化整数坐标下的矩形区域判定。
 
 ## 环境
 
@@ -13,6 +13,13 @@ from zkregion import Region, SchnorrProof, SchnorrProver, SchnorrVerifier, commi
 
 commitment, nonce = commit(b"coordinate")
 assert verify_opening(commitment, b"coordinate", nonce)
+
+# 量化坐标的 Pedersen 陷门承诺：C = g**m * h**r mod prime，m = value - lower
+from zkregion import pedersen_commit, verify_pedersen_opening
+
+pc, blinding = pedersen_commit(500, 0, 1000)
+assert verify_pedersen_opening(pc, 500, blinding)
+assert not verify_pedersen_opening(pc, 501, blinding)
 
 prover = SchnorrProver(secret=12345)
 verifier = SchnorrVerifier(prover.public_key)
@@ -64,6 +71,9 @@ python3 -m zkregion
 - `commit(value, *, nonce=None) -> (commitment, nonce)` — 哈希承诺，`nonce` 缺省随机 16 字节
 - `verify_opening(commitment, value, nonce) -> bool` — 常量时间比对
 - `commit_coordinate(x, y, *, nonce=None)` — 对整数坐标对做承诺
+- `pedersen_commit(value, lower, upper, prime=DEFAULT_PRIME, generator=DEFAULT_GENERATOR, h=None, *, blinding=None, randbelow=secrets.randbelow) -> (PedersenCommitment, blinding)` — 量化坐标的 Pedersen 承诺
+- `verify_pedersen_opening(commitment_obj, value, blinding) -> bool` — 复用对象参数验证开合
+- `PedersenCommitment(commitment, element, lower, upper, prime, generator, h)` — 不可变承诺对象，不存储盲因子
 - `SchnorrProver(secret, *, prime, generator, randbelow)`
   - `public_key` — `g**secret mod prime`
   - `new_commitment()` — 生成一次性随机数并返回 `g**k mod prime`
@@ -104,9 +114,23 @@ python3 -m zkregion
 
 `entries`、条目字段、`proof` 或 `randbelow` 的类型错误抛 `TypeError`（`bool` 不算整数）；系数来源返回非整数抛 `TypeError`，超出 `[0, prime - 1)` 抛 `ValueError`。commitment 越界、response 为负、消息或 context 不匹配、错误公钥或任一篡改均返回 `False`，无效证明允许短路。验证不改写输入，也不触碰证明方的交互式 nonce。注意：默认群与这里的随机线性组合仅供演示，未做生产级安全分析。
 
+### Pedersen 陷门承诺
+
+对量化坐标 `value`（编码为相对下界的偏移 `m = value - lower`）做 Pedersen 承诺：`C = g**m * h**r mod prime`。`pedersen_commit(value, lower, upper, ...)` 返回冻结的 `PedersenCommitment` 对象与盲因子 `r`；对象保存 `commitment`、`element`、`lower`、`upper`、`prime`、`generator`、`h`，**不保存盲因子**。
+
+- 必须满足 `lower <= value <= upper` 且区间宽 `upper - lower < prime - 1`，否则抛 `ValueError`；
+- `prime`、`generator` 缺省取 `DEFAULT_PRIME` / `DEFAULT_GENERATOR`；`h` 缺省为 `g**2 mod prime`；
+- 盲因子缺省为 `randbelow(prime - 2) + 1`（即 `secrets.randbelow`），也可用 `blinding=` 显式给出；`r` 必须位于 `[1, prime - 1)`，否则抛 `ValueError`；
+- 所有数值参数只接受非 `bool` 整数：`value`、`lower`、`upper`、`prime`、`generator`、`h`、`blinding` 类型错误抛 `TypeError`；`prime > 3`，`generator`、`h` 必须位于 `(1, prime)`，否则抛 `ValueError`；
+- `randbelow` 不可调用或返回非整数抛 `TypeError`；
+
+`verify_pedersen_opening(commitment_obj, value, blinding)` 直接复用对象上的群参数与边界，验证方无需另行传入。对象或其任一字段、`value`、`blinding` 类型错误抛 `TypeError`；`element` 或 `value` 越界、盲因子非法、以及任何错误开合（错误 value 或错误 blinding）均返回 `False` 而非异常。验证不改写输入。
+
+**陷门警告（重要）**：默认 `h = g**2 mod prime` 相对 `g` 的离散对数是公开已知的（`log_g(h) = 2`），知道陷门即可对同一承诺给出不同开合（`(m, r)` 与 `(m - 2, r + 1)` 等价），因此默认设置下承诺**不具备绑定性**，仅供演示协议流程；它也**不是范围证明**——承诺本身既不证明也不强制 `value` 落在区间内，范围检查只是开合验证的一部分。需要绑定时应传入离散对数未知的 `h`（由可信设置生成）。
+
 ## 限制
 
-`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。承诺只支持单点开合，没有范围证明，区域判定也只是朴素的坐标比较，不检查坐标是否经过承诺绑定；批量验证所用的随机线性组合与默认群一样仅供演示。
+`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。承诺只支持单点开合，没有范围证明，区域判定也只是朴素的坐标比较，不检查坐标是否经过承诺绑定；批量验证所用的随机线性组合与默认群一样仅供演示。Pedersen 承诺默认 `h = g**2` 的陷门已知、绑定性被破坏，同样仅供演示，且不是范围证明。
 
 ## 测试
 

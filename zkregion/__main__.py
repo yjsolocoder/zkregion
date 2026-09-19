@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from . import (
+    RangeProof,
     Region,
     SchnorrBatchEntry,
     SchnorrProof,
@@ -14,10 +15,12 @@ from . import (
     pedersen_commit,
     prove_inclusion,
     prove_multi_inclusion,
+    prove_range,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
     verify_pedersen_opening,
+    verify_range,
 )
 
 
@@ -57,6 +60,18 @@ def main() -> int:
         f"{verify_pedersen_opening(commitment, forged_value, forged_blinding)}"
     )
     print("  (default h = g**2 breaks binding; demonstration only, not a range proof)")
+
+    print()
+    print("Pedersen range proof (non-interactive Schnorr OR):")
+    range_proof = prove_range(commitment, 40, blinding, context=b"demo")
+    print(f"  branches={len(range_proof.t)}  (one per integer in [{lower}, {upper}])")
+    print(f"  valid proof accepted: {verify_range(commitment, range_proof, context=b'demo')}")
+    print(f"  wrong context rejected: {not verify_range(commitment, range_proof)}")
+    forged = RangeProof(range_proof.t, range_proof.e, (range_proof.s[0] + 1,) + range_proof.s[1:])
+    print(f"  tampered response rejected: {not verify_range(commitment, forged, context=b'demo')}")
+    other, _ = pedersen_commit(41, lower, upper, blinding=1001)
+    print(f"  foreign commitment rejected: {not verify_range(other, range_proof, context=b'demo')}")
+    print("  (demonstration group and transcript only; not production-grade)")
 
     print()
     print("interactive Schnorr:")

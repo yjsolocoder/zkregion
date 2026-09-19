@@ -8,6 +8,7 @@ from zkregion import (
     MerkleMultiProof,
     MerkleProof,
     PedersenCommitment,
+    RangeProof,
     Region,
     SchnorrBatchEntry,
     SchnorrProof,
@@ -19,10 +20,12 @@ from zkregion import (
     pedersen_commit,
     prove_inclusion,
     prove_multi_inclusion,
+    prove_range,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
     verify_pedersen_opening,
+    verify_range,
 )
 
 SMALL_PRIME = 104729  # a small prime keeps the group arithmetic readable in tests
@@ -271,6 +274,18 @@ class PedersenCommitmentTest(unittest.TestCase):
     def test_maximum_width_just_under_prime_minus_one_is_accepted(self):
         commitment, blinding = self.commit(value=1, lower=0, upper=self.PRIME - 2, blinding=2)
         self.assertTrue(verify_pedersen_opening(commitment, 1, blinding))
+
+    def test_default_h_is_also_validated(self):
+        # 6**2 % 7 == 1: the derived default h falls outside (1, prime)
+        with self.assertRaises(ValueError):
+            pedersen_commit(0, 0, 4, prime=7, generator=6, blinding=1)
+        # 3**2 % 9 == 0: composite modulus can drive the default h to zero
+        with self.assertRaises(ValueError):
+            pedersen_commit(0, 0, 4, prime=9, generator=3, blinding=1)
+        # a usable default h still works
+        commitment, blinding = pedersen_commit(0, 0, 4, prime=7, generator=3, blinding=1)
+        self.assertEqual(commitment.h, 2)
+        self.assertTrue(verify_pedersen_opening(commitment, 0, blinding))
 
     # ---- verification validation ------------------------------------------
 
@@ -1032,6 +1047,243 @@ class MerkleMultiProofTest(unittest.TestCase):
         proof = prove_multi_inclusion(leaves, indices)
         verify_multi_inclusion(entries, proof, merkle_root(leaves))
         self.assertEqual((leaves, indices, entries), snapshot)
+
+
+def range_transcript_challenge(commitment, size, t, context):
+    """Independent recomputation of the range-proof Fiat-Shamir challenge."""
+    items = [b"zkregion/pedersen-range/v1"]
+    items += [
+        str(field).encode("ascii")
+        for field in (
+            commitment.element,
+            commitment.lower,
+            commitment.upper,
+            commitment.prime,
+            commitment.generator,
+            commitment.h,
+        )
+    ]
+    items.append(context)
+    items.append(str(size).encode("ascii"))
+    items += [str(item).encode("ascii") for item in t]
+    transcript = hashlib.sha256()
+    for item in items:
+        transcript.update(len(item).to_bytes(4, "big"))
+        transcript.update(item)
+    return int.from_bytes(transcript.digest(), "big") % commitment.prime
+
+
+class RangeProofTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def commit(self, value=50, lower=0, upper=100, blinding=1234, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    def prove(self, value=50, lower=0, upper=100, blinding=1234, context=b"", **kwargs):
+        commitment, returned = self.commit(value, lower, upper, blinding, **kwargs)
+        proof = prove_range(
+            commitment, value, returned, context, randbelow=counter_randbelow()
+        )
+        return commitment, returned, proof
+
+    # ---- honest round trip -------------------------------------------------
+
+    def test_honest_proof_verifies(self):
+        commitment, _, proof = self.prove()
+        self.assertIsInstance(proof, RangeProof)
+        self.assertTrue(verify_range(commitment, proof))
+
+    def test_every_value_in_range_proves(self):
+        for value in (0, 1, 50, 99, 100):
+            commitment, blinding = self.commit(value=value)
+            proof = prove_range(commitment, value, blinding, randbelow=counter_randbelow())
+            self.assertTrue(verify_range(commitment, proof), f"value={value}")
+
+    def test_single_integer_range(self):
+        commitment, _, proof = self.prove(value=7, lower=7, upper=7)
+        self.assertEqual(len(proof.t), 1)
+        self.assertTrue(verify_range(commitment, proof))
+
+    def test_maximum_256_integers_accepted(self):
+        commitment, _, proof = self.prove(value=100, lower=0, upper=255)
+        self.assertEqual(len(proof.t), 256)
+        self.assertTrue(verify_range(commitment, proof))
+
+    def test_257_integers_rejected(self):
+        commitment, blinding = self.commit(value=0, lower=0, upper=256)
+        with self.assertRaises(ValueError):
+            prove_range(commitment, 0, blinding, randbelow=counter_randbelow())
+        # verification of an oversized range returns False, never raises
+        self.assertFalse(verify_range(commitment, RangeProof((), (), ())))
+
+    def test_proof_shape_and_field_types(self):
+        commitment, _, proof = self.prove()
+        self.assertEqual(len(proof.t), len(proof.e), 101)
+        self.assertEqual(len(proof.s), 101)
+        for field in (proof.t, proof.e, proof.s):
+            self.assertIsInstance(field, tuple)
+            self.assertTrue(all(isinstance(item, int) for item in field))
+        self.assertTrue(all(1 <= item < self.PRIME for item in proof.t))
+        self.assertTrue(all(0 <= item < self.PRIME for item in proof.e))
+        self.assertTrue(all(item >= 0 for item in proof.s))
+
+    def test_proof_is_immutable(self):
+        _, _, proof = self.prove()
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            proof.s = proof.s
+
+    def test_challenge_shares_sum_to_transcript_challenge(self):
+        commitment, _, proof = self.prove(context=b"ctx")
+        c = range_transcript_challenge(commitment, 101, proof.t, b"ctx")
+        self.assertEqual(sum(proof.e) % self.PRIME, c)
+
+    def test_fixed_randbelow_is_reproducible(self):
+        commitment, blinding = self.commit()
+        first = prove_range(commitment, 50, blinding, randbelow=counter_randbelow())
+        second = prove_range(commitment, 50, blinding, randbelow=counter_randbelow())
+        self.assertEqual(first, second)
+
+    def test_default_group_parameters_are_usable(self):
+        commitment, blinding = pedersen_commit(10, 0, 20, blinding=987654321)
+        proof = prove_range(commitment, 10, blinding, randbelow=counter_randbelow())
+        self.assertTrue(verify_range(commitment, proof))
+
+    # ---- prover validation -------------------------------------------------
+
+    def test_prove_requires_a_valid_opening(self):
+        commitment, blinding = self.commit()
+        with self.assertRaises(ValueError):
+            prove_range(commitment, 51, blinding)  # wrong value
+        with self.assertRaises(ValueError):
+            prove_range(commitment, 50, blinding + 1)  # wrong blinding
+
+    def test_prove_type_errors(self):
+        commitment, blinding = self.commit()
+        with self.assertRaises(TypeError):
+            prove_range((commitment.element, 0, 100), 50, blinding)
+        for bad in (1.5, "50", True, None):
+            with self.assertRaises(TypeError):
+                prove_range(commitment, bad, blinding)
+            with self.assertRaises(TypeError):
+                prove_range(commitment, 50, bad)
+        with self.assertRaises(TypeError):
+            prove_range(commitment, 50, blinding, context="ctx")
+        with self.assertRaises(TypeError):
+            prove_range(commitment, 50, blinding, randbelow=7)
+        for bad in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                prove_range(
+                    commitment, 50, blinding, randbelow=lambda upper, bad=bad: bad
+                )
+        for bad in (-1, self.PRIME):
+            with self.assertRaises(ValueError):
+                prove_range(
+                    commitment, 50, blinding, randbelow=lambda upper, bad=bad: bad
+                )
+
+    # ---- verification failures ---------------------------------------------
+
+    def test_tampering_fails(self):
+        commitment, _, proof = self.prove(context=b"ctx")
+        cases = [
+            RangeProof((proof.t[0] % (self.PRIME - 1) + 1,) + proof.t[1:], proof.e, proof.s),
+            RangeProof(proof.t, (proof.e[0] + 1,) + proof.e[1:], proof.s),
+            RangeProof(proof.t, proof.e, (proof.s[0] + 1,) + proof.s[1:]),
+            RangeProof(proof.t[::-1], proof.e, proof.s),
+        ]
+        for tampered in cases:
+            self.assertFalse(verify_range(commitment, tampered, context=b"ctx"))
+
+    def test_context_binds_proof(self):
+        commitment, _, proof = self.prove(context=b"ctx")
+        self.assertTrue(verify_range(commitment, proof, context=b"ctx"))
+        self.assertFalse(verify_range(commitment, proof))
+        self.assertFalse(verify_range(commitment, proof, context=b"other"))
+
+    def test_proof_does_not_transfer_to_other_commitments(self):
+        _, _, proof = self.prove()
+        other, _ = self.commit(value=50, blinding=4321)
+        self.assertFalse(verify_range(other, proof))
+        shifted, _ = self.commit(value=51)
+        self.assertFalse(verify_range(shifted, proof))
+
+    def test_structural_failures_return_false(self):
+        commitment, _, proof = self.prove()
+        # wrong branch counts
+        self.assertFalse(verify_range(commitment, RangeProof((), (), ())))
+        self.assertFalse(
+            verify_range(commitment, RangeProof(proof.t[:-1], proof.e, proof.s))
+        )
+        self.assertFalse(
+            verify_range(commitment, RangeProof(proof.t, proof.e, proof.s + (0,)))
+        )
+        # t outside [1, prime)
+        for bad in (0, self.PRIME, -1):
+            tampered = RangeProof((bad,) + proof.t[1:], proof.e, proof.s)
+            self.assertFalse(verify_range(commitment, tampered))
+        # e outside [0, prime)
+        for bad in (-1, self.PRIME):
+            tampered = RangeProof(proof.t, (bad,) + proof.e[1:], proof.s)
+            self.assertFalse(verify_range(commitment, tampered))
+        # negative response
+        tampered = RangeProof(proof.t, proof.e, (-1,) + proof.s[1:])
+        self.assertFalse(verify_range(commitment, tampered))
+        # bad embedded commitment fields
+        for field, bad_value in (
+            ("element", 0),
+            ("element", self.PRIME),
+            ("prime", 3),
+            ("generator", 1),
+            ("h", self.PRIME),
+            ("lower", 101),
+        ):
+            bad = dataclasses.replace(commitment, **{field: bad_value})
+            self.assertFalse(verify_range(bad, proof), f"{field}={bad_value}")
+
+    def test_verify_type_errors(self):
+        commitment, _, proof = self.prove()
+        with self.assertRaises(TypeError):
+            verify_range("commitment", proof)
+        with self.assertRaises(TypeError):
+            verify_range(commitment, (proof.t, proof.e, proof.s))
+        with self.assertRaises(TypeError):
+            verify_range(commitment, proof, context="ctx")
+        for field in ("element", "lower", "upper", "prime", "generator", "h"):
+            bad = dataclasses.replace(commitment, **{field: True})
+            with self.assertRaises(TypeError):
+                verify_range(bad, proof)
+        with self.assertRaises(TypeError):
+            verify_range(commitment, RangeProof(list(proof.t), proof.e, proof.s))
+        with self.assertRaises(TypeError):
+            verify_range(commitment, RangeProof(proof.t, proof.e, list(proof.s)))
+        for bad_item in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                verify_range(
+                    commitment, RangeProof((bad_item,) + proof.t[1:], proof.e, proof.s)
+                )
+            with self.assertRaises(TypeError):
+                verify_range(
+                    commitment, RangeProof(proof.t, (bad_item,) + proof.e[1:], proof.s)
+                )
+            with self.assertRaises(TypeError):
+                verify_range(
+                    commitment, RangeProof(proof.t, proof.e, (bad_item,) + proof.s[1:])
+                )
+
+    def test_inputs_are_not_mutated(self):
+        commitment, blinding = self.commit()
+        snapshot = dataclasses.replace(commitment)
+        proof = prove_range(commitment, 50, blinding, randbelow=counter_randbelow())
+        proof_snapshot = RangeProof(proof.t, proof.e, proof.s)
+        verify_range(commitment, proof)
+        self.assertEqual(commitment, snapshot)
+        self.assertEqual(proof, proof_snapshot)
+        self.assertEqual(blinding, 1234)
 
 
 if __name__ == "__main__":

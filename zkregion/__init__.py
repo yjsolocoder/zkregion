@@ -1,10 +1,11 @@
 """zkregion - commitments and interactive proofs for region membership.
 
 Public API: commit / verify_opening / commit_coordinate / PedersenCommitment /
-pedersen_commit / verify_pedersen_opening / SchnorrProof /
-SchnorrBatchEntry / SchnorrProver / SchnorrVerifier / Region / MerkleProof /
-merkle_root / prove_inclusion / verify_inclusion / MerkleMultiProof /
-prove_multi_inclusion / verify_multi_inclusion.
+pedersen_commit / verify_pedersen_opening / RangeProof / prove_range /
+verify_range / SchnorrProof / SchnorrBatchEntry / SchnorrProver /
+SchnorrVerifier / Region / MerkleProof / merkle_root / prove_inclusion /
+verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
+verify_multi_inclusion.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ __all__ = [
     "MerkleMultiProof",
     "MerkleProof",
     "PedersenCommitment",
+    "RangeProof",
     "Region",
     "SchnorrBatchEntry",
     "SchnorrProof",
@@ -33,10 +35,12 @@ __all__ = [
     "pedersen_commit",
     "prove_inclusion",
     "prove_multi_inclusion",
+    "prove_range",
     "verify_inclusion",
     "verify_multi_inclusion",
     "verify_opening",
     "verify_pedersen_opening",
+    "verify_range",
 ]
 
 # Mersenne prime 2**127 - 1 and a small generator. This is a demonstration
@@ -178,7 +182,9 @@ def pedersen_commit(
     ``prime`` and ``generator`` (``g``) default to :data:`DEFAULT_PRIME` and
     :data:`DEFAULT_GENERATOR`; ``h`` defaults to ``g**2 mod prime``, whose
     discrete log is publicly known (see the trapdoor warning on
-    :class:`PedersenCommitment`). The blinding ``r`` defaults to
+    :class:`PedersenCommitment`). The default ``h`` is validated like an
+    explicit one: if ``g**2 mod prime`` falls outside ``(1, prime)`` a
+    :class:`ValueError` is raised. The blinding ``r`` defaults to
     ``randbelow(prime - 2) + 1`` and must lie in ``[1, prime - 1)``; the
     default source is :func:`secrets.randbelow`.
 
@@ -199,8 +205,8 @@ def pedersen_commit(
         h = pow(generator, 2, prime)
     else:
         _check_int(h, "h")
-        if not 1 < h < prime:
-            raise ValueError("h must satisfy 1 < h < prime")
+    if not 1 < h < prime:
+        raise ValueError("h must satisfy 1 < h < prime")
     if lower > upper:
         raise ValueError("lower must not exceed upper")
     if not lower <= value <= upper:
@@ -274,6 +280,210 @@ def verify_pedersen_opening(
         % prime
     )
     return expected == commitment.element
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive Pedersen range proofs (Schnorr OR over quantized integers)
+#
+# For C = g**m * h**r with m = value - lower, each offset i in [0, n) defines
+# D_i = C * g**(-i) mod prime, so D_m = h**r: knowing the opening is knowing
+# the base-h discrete log of D_m. The proof is a Cramer-Damgard-Schoenmakers
+# OR over all n branches: every branch satisfies the Schnorr equation
+# h**s_i == t_i * D_i**e_i (mod prime) and the shares sum to the Fiat-Shamir
+# challenge, sum(e) % prime == c. Only the real branch is answered honestly;
+# the others are simulated, so the verifier learns nothing about m.
+
+_RANGE_DOMAIN = b"zkregion/pedersen-range/v1"
+_MAX_RANGE_SIZE = 256
+
+
+@dataclass(frozen=True)
+class RangeProof:
+    """A non-interactive Pedersen range proof.
+
+    ``t``, ``e`` and ``s`` are integer tuples of length
+    ``n = upper - lower + 1``: the per-branch commitments, challenge shares
+    and responses of the Schnorr OR proof.
+    """
+
+    t: tuple[int, ...]
+    e: tuple[int, ...]
+    s: tuple[int, ...]
+
+
+def _encode_ascii_int(value: int) -> bytes:
+    """Decimal ASCII encoding of an integer (``-`` sign for negatives)."""
+    return str(value).encode("ascii")
+
+
+def _range_challenge(
+    commitment: PedersenCommitment,
+    context: bytes,
+    size: int,
+    t: tuple[int, ...],
+) -> int:
+    """SHA-256 transcript challenge as a big-endian integer mod ``prime``.
+
+    The transcript is the domain, the six commitment fields, ``context``,
+    the branch count ``n`` and every ``t``; each item is length-prefixed
+    with four big-endian bytes and integers are decimal ASCII.
+    """
+    transcript = hashlib.sha256()
+    items = [_RANGE_DOMAIN]
+    items.extend(
+        _encode_ascii_int(field)
+        for field in (
+            commitment.element,
+            commitment.lower,
+            commitment.upper,
+            commitment.prime,
+            commitment.generator,
+            commitment.h,
+        )
+    )
+    items.append(context)
+    items.append(_encode_ascii_int(size))
+    items.extend(_encode_ascii_int(item) for item in t)
+    for item in items:
+        transcript.update(len(item).to_bytes(4, "big"))
+        transcript.update(item)
+    return int.from_bytes(transcript.digest(), "big") % commitment.prime
+
+
+def _draw_below(randbelow: Callable[[int], int], upper: int) -> int:
+    drawn = randbelow(upper)
+    _check_int(drawn, "randbelow return value")
+    if not 0 <= drawn < upper:
+        raise ValueError(f"randbelow must return a value in [0, {upper})")
+    return drawn
+
+
+def prove_range(
+    commitment: PedersenCommitment,
+    value: int,
+    blinding: int,
+    context: bytes = b"",
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> RangeProof:
+    """Prove in zero knowledge that ``commitment`` opens inside its range.
+
+    ``commitment`` must actually open at ``value`` with ``blinding`` — the
+    opening is verified before anything is drawn — and the declared range
+    must contain at most 256 integers. Returns a :class:`RangeProof` whose
+    per-branch challenge shares lie in ``[0, prime)`` and whose responses
+    are non-negative plain integers (not reduced modulo any group order).
+    ``context`` is bound into the Fiat-Shamir transcript.
+
+    Type errors (including a non-callable ``randbelow`` or a non-integer
+    drawn from it) raise :class:`TypeError`; a failed opening, an oversized
+    range or unusable group parameters raise :class:`ValueError`. Inputs
+    are never mutated.
+    """
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment")
+    _check_bytes(context, "context")
+    if not verify_pedersen_opening(commitment, value, blinding):
+        raise ValueError("commitment does not open at value with blinding")
+    size = commitment.upper - commitment.lower + 1
+    if size > _MAX_RANGE_SIZE:
+        raise ValueError("range must contain at most 256 integers")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    prime = commitment.prime
+    h = commitment.h
+    try:
+        generator_inverse = pow(commitment.generator, -1, prime)
+    except ValueError:
+        raise ValueError("generator must be invertible modulo prime") from None
+    bases = [
+        commitment.element * pow(generator_inverse, offset, prime) % prime
+        for offset in range(size)
+    ]
+    target = value - commitment.lower
+    t: list[int] = [0] * size
+    e: list[int] = [0] * size
+    s: list[int] = [0] * size
+    nonce = 0
+    for offset in range(size):
+        if offset == target:
+            nonce = _draw_below(randbelow, prime - 1) + 1
+            t[offset] = pow(h, nonce, prime)
+        else:
+            share = _draw_below(randbelow, prime)
+            response = _draw_below(randbelow, prime)
+            e[offset] = share
+            s[offset] = response
+            t[offset] = (
+                pow(h, response, prime) * pow(bases[offset], -share, prime)
+            ) % prime
+    challenge = _range_challenge(commitment, context, size, tuple(t))
+    e[target] = (challenge - sum(e)) % prime
+    s[target] = nonce + e[target] * blinding
+    return RangeProof(t=tuple(t), e=tuple(e), s=tuple(s))
+
+
+def verify_range(
+    commitment: PedersenCommitment,
+    proof: RangeProof,
+    context: bytes = b"",
+) -> bool:
+    """Verify a :class:`RangeProof` against ``commitment`` and ``context``.
+
+    The group parameters and declared range come from ``commitment`` itself.
+    A wrong object or field type raises :class:`TypeError`; out-of-range
+    fields, an oversized range, malformed branch counts, tampering or a
+    context/binding mismatch return ``False``. Inputs are never mutated.
+    """
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment")
+    if not isinstance(proof, RangeProof):
+        raise TypeError("proof must be a RangeProof")
+    _check_bytes(context, "context")
+    for name in ("element", "lower", "upper", "prime", "generator", "h"):
+        _check_int(getattr(commitment, name), f"commitment {name}")
+    for name in ("t", "e", "s"):
+        items = getattr(proof, name)
+        if not isinstance(items, tuple):
+            raise TypeError(f"proof {name} must be a tuple of integers")
+        for item in items:
+            _check_int(item, f"proof {name} item")
+    prime = commitment.prime
+    if prime <= 3:
+        return False
+    if not 1 < commitment.generator < prime or not 1 < commitment.h < prime:
+        return False
+    if not 0 < commitment.element < prime:
+        return False
+    if commitment.lower > commitment.upper:
+        return False
+    if commitment.upper - commitment.lower >= prime - 1:
+        return False
+    size = commitment.upper - commitment.lower + 1
+    if size > _MAX_RANGE_SIZE:
+        return False
+    if not (len(proof.t) == len(proof.e) == len(proof.s) == size):
+        return False
+    if any(not 1 <= item < prime for item in proof.t):
+        return False
+    if any(not 0 <= item < prime for item in proof.e):
+        return False
+    if any(item < 0 for item in proof.s):
+        return False
+    challenge = _range_challenge(commitment, context, size, proof.t)
+    if sum(proof.e) % prime != challenge:
+        return False
+    try:
+        generator_inverse = pow(commitment.generator, -1, prime)
+    except ValueError:
+        return False
+    for offset in range(size):
+        base = commitment.element * pow(generator_inverse, offset, prime) % prime
+        left = pow(commitment.h, proof.s[offset], prime)
+        right = proof.t[offset] * pow(base, proof.e[offset], prime) % prime
+        if left != right:
+            return False
+    return True
 
 
 class SchnorrProver:

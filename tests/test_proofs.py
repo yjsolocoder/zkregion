@@ -4,6 +4,7 @@ from zkregion import (
     DEFAULT_GENERATOR,
     DEFAULT_PRIME,
     Region,
+    SchnorrProof,
     SchnorrProver,
     SchnorrVerifier,
     commit,
@@ -110,6 +111,114 @@ class SchnorrTest(unittest.TestCase):
         self.assertTrue(verifier.verify(commitment, 42, prover.respond(42)))
         self.assertEqual(DEFAULT_GENERATOR, 3)
         self.assertGreater(DEFAULT_PRIME, 123456789)
+
+
+class SchnorrFiatShamirTest(unittest.TestCase):
+    def setUp(self):
+        self.prover = SchnorrProver(secret=4321, prime=SMALL_PRIME, generator=3, randbelow=counter_randbelow())
+        self.verifier = SchnorrVerifier(self.prover.public_key, prime=SMALL_PRIME, generator=3)
+
+    def test_honest_proof_verifies(self):
+        proof = self.prover.prove(b"message")
+        self.assertIsInstance(proof, SchnorrProof)
+        self.assertTrue(self.verifier.verify_proof(b"message", proof))
+
+    def test_proof_is_immutable(self):
+        proof = self.prover.prove(b"message")
+        with self.assertRaises(AttributeError):
+            proof.response = proof.response + 1
+
+    def test_wrong_message_fails(self):
+        proof = self.prover.prove(b"message")
+        self.assertFalse(self.verifier.verify_proof(b"other", proof))
+
+    def test_context_binds_proof(self):
+        proof = self.prover.prove(b"message", context=b"ctx")
+        self.assertTrue(self.verifier.verify_proof(b"message", proof, context=b"ctx"))
+        self.assertFalse(self.verifier.verify_proof(b"message", proof))
+        self.assertFalse(self.verifier.verify_proof(b"message", proof, context=b"other"))
+
+    def test_tampered_response_fails(self):
+        proof = self.prover.prove(b"message")
+        tampered = SchnorrProof(commitment=proof.commitment, response=proof.response + 1)
+        self.assertFalse(self.verifier.verify_proof(b"message", tampered))
+
+    def test_wrong_public_key_fails(self):
+        proof = self.prover.prove(b"message")
+        other = SchnorrVerifier(pow(3, 4322, SMALL_PRIME), prime=SMALL_PRIME, generator=3)
+        self.assertFalse(other.verify_proof(b"message", proof))
+
+    def test_prove_does_not_touch_interactive_nonce(self):
+        commitment = self.prover.new_commitment()
+        self.prover.prove(b"message")
+        self.assertTrue(self.verifier.verify(commitment, 7, self.prover.respond(7)))
+
+    def test_response_matches_transcript_challenge(self):
+        # recompute c from the transcript and confirm s == k + c * secret
+        import hashlib
+
+        draws = []
+        base = counter_randbelow()
+
+        def recording(upper):
+            value = base(upper)
+            draws.append(value)
+            return value
+
+        secret = 4321
+        prover = SchnorrProver(secret=secret, prime=SMALL_PRIME, generator=3, randbelow=recording)
+        proof = prover.prove(b"m", context=b"c")
+        k = draws[0] + 1
+
+        def encode(value):
+            return value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+
+        transcript = hashlib.sha256()
+        for item in (
+            b"zkregion/schnorr-fs/v1",
+            encode(SMALL_PRIME),
+            encode(3),
+            encode(prover.public_key),
+            encode(proof.commitment),
+            b"c",
+            b"m",
+        ):
+            transcript.update(len(item).to_bytes(4, "big"))
+            transcript.update(item)
+        c = int.from_bytes(transcript.digest(), "big") % SMALL_PRIME
+        self.assertEqual(proof.response, k + c * secret)
+
+    def test_out_of_range_commitment_returns_false(self):
+        proof = self.prover.prove(b"message")
+        for bad in (0, SMALL_PRIME, SMALL_PRIME + 1, -1):
+            self.assertFalse(self.verifier.verify_proof(b"message", SchnorrProof(bad, proof.response)))
+
+    def test_negative_response_returns_false(self):
+        proof = self.prover.prove(b"message")
+        self.assertFalse(self.verifier.verify_proof(b"message", SchnorrProof(proof.commitment, -1)))
+
+    def test_type_checks(self):
+        proof = self.prover.prove(b"message")
+        with self.assertRaises(TypeError):
+            self.prover.prove("message")
+        with self.assertRaises(TypeError):
+            self.prover.prove(b"message", context="ctx")
+        with self.assertRaises(TypeError):
+            self.verifier.verify_proof("message", proof)
+        with self.assertRaises(TypeError):
+            self.verifier.verify_proof(b"message", proof, context="ctx")
+        with self.assertRaises(TypeError):
+            self.verifier.verify_proof(b"message", (proof.commitment, proof.response))
+        with self.assertRaises(TypeError):
+            self.verifier.verify_proof(b"message", SchnorrProof(1.5, proof.response))
+        with self.assertRaises(TypeError):
+            self.verifier.verify_proof(b"message", SchnorrProof(proof.commitment, "s"))
+
+    def test_default_group_parameters_are_usable(self):
+        prover = SchnorrProver(secret=123456789, randbelow=counter_randbelow())
+        verifier = SchnorrVerifier(prover.public_key)
+        proof = prover.prove(b"offline", context=b"demo")
+        self.assertTrue(verifier.verify_proof(b"offline", proof, context=b"demo"))
 
 
 class RegionTest(unittest.TestCase):

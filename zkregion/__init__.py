@@ -1,7 +1,7 @@
 """zkregion - commitments and interactive proofs for region membership.
 
-Public API: commit / verify_opening / commit_coordinate / SchnorrProver /
-SchnorrVerifier / Region.
+Public API: commit / verify_opening / commit_coordinate / SchnorrProof /
+SchnorrProver / SchnorrVerifier / Region.
 """
 
 from __future__ import annotations
@@ -16,6 +16,7 @@ __all__ = [
     "DEFAULT_GENERATOR",
     "DEFAULT_PRIME",
     "Region",
+    "SchnorrProof",
     "SchnorrProver",
     "SchnorrVerifier",
     "commit",
@@ -31,6 +32,49 @@ DEFAULT_GENERATOR = 3
 
 NONCE_BYTES = 16
 _DOMAIN = b"zkregion/commit/v1"
+_FS_DOMAIN = b"zkregion/schnorr-fs/v1"
+
+
+@dataclass(frozen=True)
+class SchnorrProof:
+    """A Fiat-Shamir Schnorr proof: commitment ``t`` and response ``s``."""
+
+    commitment: int
+    response: int
+
+
+def _encode_int(value: int) -> bytes:
+    """Shortest unsigned big-endian encoding of a non-negative integer."""
+    return value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+
+
+def _fs_challenge(
+    prime: int,
+    generator: int,
+    public_key: int,
+    commitment: int,
+    context: bytes,
+    message: bytes,
+) -> int:
+    """SHA-256 transcript challenge as a big-endian integer mod ``prime``."""
+    transcript = hashlib.sha256()
+    for item in (
+        _FS_DOMAIN,
+        _encode_int(prime),
+        _encode_int(generator),
+        _encode_int(public_key),
+        _encode_int(commitment),
+        context,
+        message,
+    ):
+        transcript.update(len(item).to_bytes(4, "big"))
+        transcript.update(item)
+    return int.from_bytes(transcript.digest(), "big") % prime
+
+
+def _check_bytes(value: bytes, name: str) -> None:
+    if not isinstance(value, bytes):
+        raise TypeError(f"{name} must be bytes")
 
 
 def commit(value: bytes, *, nonce: bytes | None = None) -> tuple[bytes, bytes]:
@@ -105,6 +149,22 @@ class SchnorrProver:
         bounded = challenge % self._prime
         return self._nonce + bounded * self._secret
 
+    def prove(self, message: bytes, *, context: bytes = b"") -> SchnorrProof:
+        """Non-interactive Fiat-Shamir proof of knowledge of the secret.
+
+        Draws a fresh ephemeral ``k`` independently of the interactive nonce
+        and returns ``SchnorrProof(t, s)`` with ``s = k + c * secret`` (not
+        reduced modulo the group order).
+        """
+        _check_bytes(message, "message")
+        _check_bytes(context, "context")
+        k = self._randbelow(self._prime - 1) + 1
+        commitment = pow(self._generator, k, self._prime)
+        challenge = _fs_challenge(
+            self._prime, self._generator, self.public_key, commitment, context, message
+        )
+        return SchnorrProof(commitment=commitment, response=k + challenge * self._secret)
+
 
 class SchnorrVerifier:
     """Checks the Schnorr response against a published commitment."""
@@ -131,6 +191,23 @@ class SchnorrVerifier:
         bounded = challenge % self._prime
         left = pow(self._generator, response, self._prime)
         right = commitment * pow(self._public_key, bounded, self._prime) % self._prime
+        return left == right
+
+    def verify_proof(self, message: bytes, proof: SchnorrProof, *, context: bytes = b"") -> bool:
+        """Check a Fiat-Shamir proof produced by :meth:`SchnorrProver.prove`."""
+        _check_bytes(message, "message")
+        _check_bytes(context, "context")
+        if not isinstance(proof, SchnorrProof):
+            raise TypeError("proof must be a SchnorrProof")
+        if not isinstance(proof.commitment, int) or not isinstance(proof.response, int):
+            raise TypeError("proof commitment and response must be integers")
+        if not 1 <= proof.commitment < self._prime or proof.response < 0:
+            return False
+        challenge = _fs_challenge(
+            self._prime, self._generator, self._public_key, proof.commitment, context, message
+        )
+        left = pow(self._generator, proof.response, self._prime)
+        right = proof.commitment * pow(self._public_key, challenge, self._prime) % self._prime
         return left == right
 
 

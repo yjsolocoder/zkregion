@@ -2,10 +2,10 @@
 
 Public API: commit / verify_opening / commit_coordinate / PedersenCommitment /
 pedersen_commit / verify_pedersen_opening / RangeProof / prove_range /
-verify_range / SchnorrProof / SchnorrBatchEntry / SchnorrProver /
-SchnorrVerifier / Region / MerkleProof / merkle_root / prove_inclusion /
-verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
-verify_multi_inclusion.
+verify_range / RegionProof / prove_region / verify_region / SchnorrProof /
+SchnorrBatchEntry / SchnorrProver / SchnorrVerifier / Region / MerkleProof /
+merkle_root / prove_inclusion / verify_inclusion / MerkleMultiProof /
+prove_multi_inclusion / verify_multi_inclusion.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ __all__ = [
     "PedersenCommitment",
     "RangeProof",
     "Region",
+    "RegionProof",
     "SchnorrBatchEntry",
     "SchnorrProof",
     "SchnorrProver",
@@ -36,11 +37,13 @@ __all__ = [
     "prove_inclusion",
     "prove_multi_inclusion",
     "prove_range",
+    "prove_region",
     "verify_inclusion",
     "verify_multi_inclusion",
     "verify_opening",
     "verify_pedersen_opening",
     "verify_range",
+    "verify_region",
 ]
 
 # Mersenne prime 2**127 - 1 and a small generator. This is a demonstration
@@ -691,6 +694,177 @@ class Region:
 
     def height(self) -> int:
         return self.max_y - self.min_y + 1
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive 2-D region membership proofs
+#
+# A region proof is a pair of Pedersen range proofs, one per axis: the x
+# commitment must be declared over exactly [region.min_x, region.max_x] and
+# the y commitment over exactly [region.min_y, region.max_y]. Each sub-proof
+# is produced by prove_range under a derived context that binds the region
+# domain separator, the axis label, the external context, the four region
+# bounds and both commitments, so a proof cannot be replayed against another
+# region, context, commitment pair or axis assignment.
+
+_REGION_DOMAIN = b"zkregion/region/v1"
+
+
+@dataclass(frozen=True)
+class RegionProof:
+    """A non-interactive 2-D region membership proof.
+
+    ``x_proof`` and ``y_proof`` are :class:`RangeProof` objects over the x
+    and y :class:`PedersenCommitment` respectively; the verifier learns
+    nothing about the coordinates or blinding factors.
+    """
+
+    x_proof: RangeProof
+    y_proof: RangeProof
+
+
+def _check_region_fields(region: Region) -> None:
+    for name in ("min_x", "max_x", "min_y", "max_y"):
+        _check_int(getattr(region, name), f"region {name}")
+
+
+def _region_sub_context(
+    axis: bytes,
+    context: bytes,
+    region: Region,
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+) -> bytes:
+    """Length-prefixed transcript context for one axis sub-proof.
+
+    Items, in order: the region domain separator, the axis label, the
+    external context, the four region bounds and the six fields of the x
+    then the y commitment (dataclass field order). Every item is prefixed
+    with its four-byte unsigned big-endian length; integers are encoded as
+    decimal ASCII.
+    """
+    items = [_REGION_DOMAIN, axis, context]
+    items.extend(
+        str(bound).encode("ascii")
+        for bound in (region.min_x, region.max_x, region.min_y, region.max_y)
+    )
+    for commitment in (x_commitment, y_commitment):
+        items.extend(
+            str(getattr(commitment, name)).encode("ascii")
+            for name in ("element", "lower", "upper", "prime", "generator", "h")
+        )
+    transcript = bytearray()
+    for item in items:
+        transcript += len(item).to_bytes(4, "big")
+        transcript += item
+    return bytes(transcript)
+
+
+def prove_region(
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    x: int,
+    y: int,
+    x_blinding: int,
+    y_blinding: int,
+    region: Region,
+    context: bytes = b"",
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> RegionProof:
+    """Prove that the committed ``(x, y)`` lies inside ``region``.
+
+    ``x_commitment`` must be declared over exactly
+    ``[region.min_x, region.max_x]`` and ``y_commitment`` over exactly
+    ``[region.min_y, region.max_y]``; a mismatch raises :class:`ValueError`.
+    Each opening is verified (via :func:`prove_range`) before its sub-proof
+    is produced, and each axis range may contain at most 256 integers —
+    violations raise :class:`ValueError`. Type errors (wrong objects,
+    non-integer or ``bool`` numbers, non-``bytes`` context, non-callable
+    ``randbelow``) raise :class:`TypeError`. Inputs are never mutated.
+    """
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError("x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError("y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    _check_int(x, "x")
+    _check_int(y, "y")
+    _check_int(x_blinding, "x_blinding")
+    _check_int(y_blinding, "y_blinding")
+    if not isinstance(region, Region):
+        raise TypeError("region must be a Region")
+    _check_region_fields(region)
+    _check_bytes(context, "context")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if (x_commitment.lower, x_commitment.upper) != (region.min_x, region.max_x):
+        raise ValueError("x commitment range must equal (region.min_x, region.max_x)")
+    if (y_commitment.lower, y_commitment.upper) != (region.min_y, region.max_y):
+        raise ValueError("y commitment range must equal (region.min_y, region.max_y)")
+    x_proof = prove_range(
+        x_commitment,
+        x,
+        x_blinding,
+        _region_sub_context(b"x", context, region, x_commitment, y_commitment),
+        randbelow=randbelow,
+    )
+    y_proof = prove_range(
+        y_commitment,
+        y,
+        y_blinding,
+        _region_sub_context(b"y", context, region, x_commitment, y_commitment),
+        randbelow=randbelow,
+    )
+    return RegionProof(x_proof=x_proof, y_proof=y_proof)
+
+
+def verify_region(
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    region: Region,
+    proof: RegionProof,
+    context: bytes = b"",
+) -> bool:
+    """Verify a :class:`RegionProof` against both commitments and ``region``.
+
+    The verifier needs only the two commitments, the region and the proof —
+    never the coordinates or blinding factors. Type errors (wrong objects,
+    non-integer or ``bool`` fields, non-``bytes`` context) raise
+    :class:`TypeError`; a commitment range that does not equal the region
+    bounds, any invalid structure, tampering, a swapped region, context or
+    commitment, or swapped axes returns ``False``. Inputs are never mutated.
+    """
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError("x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError("y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    if not isinstance(region, Region):
+        raise TypeError("region must be a Region")
+    _check_region_fields(region)
+    if not isinstance(proof, RegionProof):
+        raise TypeError("proof must be a RegionProof")
+    if not isinstance(proof.x_proof, RangeProof):
+        raise TypeError("proof x_proof must be a RangeProof")
+    if not isinstance(proof.y_proof, RangeProof):
+        raise TypeError("proof y_proof must be a RangeProof")
+    _check_bytes(context, "context")
+    if (x_commitment.lower, x_commitment.upper) != (region.min_x, region.max_x):
+        return False
+    if (y_commitment.lower, y_commitment.upper) != (region.min_y, region.max_y):
+        return False
+    return verify_range(
+        x_commitment,
+        proof.x_proof,
+        _region_sub_context(b"x", context, region, x_commitment, y_commitment),
+    ) and verify_range(
+        y_commitment,
+        proof.y_proof,
+        _region_sub_context(b"y", context, region, x_commitment, y_commitment),
+    )
 
 
 # ---------------------------------------------------------------------------

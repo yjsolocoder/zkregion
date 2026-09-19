@@ -5,6 +5,7 @@ from __future__ import annotations
 from . import (
     RangeProof,
     Region,
+    RegionProof,
     SchnorrBatchEntry,
     SchnorrProof,
     SchnorrProver,
@@ -16,11 +17,13 @@ from . import (
     prove_inclusion,
     prove_multi_inclusion,
     prove_range,
+    prove_region,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
     verify_pedersen_opening,
     verify_range,
+    verify_region,
 )
 
 
@@ -76,6 +79,23 @@ def main() -> int:
     other, other_r = pedersen_commit(41, lower, upper, blinding=1001)
     print(f"  foreign commitment rejected: {not verify_range(other, range_proof, context=b'demo')}")
     print("  (Schnorr OR over the demo group; demonstration-level security only)")
+
+    print()
+    print("2-D region membership proof (two range proofs, one per axis):")
+    region = Region(0, 100, 0, 100)
+    x_commitment, x_blinding = pedersen_commit(40, region.min_x, region.max_x, blinding=1000)
+    y_commitment, y_blinding = pedersen_commit(60, region.min_y, region.max_y, blinding=2000)
+    region_proof = prove_region(
+        x_commitment, y_commitment, 40, 60, x_blinding, y_blinding, region, context=b"demo"
+    )
+    print(f"  x branches={len(region_proof.x_proof.t)}  y branches={len(region_proof.y_proof.t)}")
+    print(f"  valid proof accepted: {verify_region(x_commitment, y_commitment, region, region_proof, context=b'demo')}")
+    print(f"  wrong context rejected: {not verify_region(x_commitment, y_commitment, region, region_proof)}")
+    other_region = Region(0, 100, 0, 99)
+    print(f"  wrong region rejected: {not verify_region(x_commitment, y_commitment, other_region, region_proof, context=b'demo')}")
+    swapped = RegionProof(x_proof=region_proof.y_proof, y_proof=region_proof.x_proof)
+    print(f"  swapped axes rejected: {not verify_region(x_commitment, y_commitment, region, swapped, context=b'demo')}")
+    print("  (verifier needs only the commitments, the region and the proof)")
 
     print()
     print("interactive Schnorr:")

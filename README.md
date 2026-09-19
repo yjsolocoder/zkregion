@@ -75,6 +75,15 @@ region_proof = prove_region(
 assert verify_region(x_commitment, y_commitment, region, region_proof, context=b"session-1")
 assert not verify_region(x_commitment, y_commitment, region, region_proof, context=b"other")
 
+# 二维区域证明的批量验证（按 (prime, generator, h) 分组做随机线性组合）
+from zkregion import RegionBatchEntry, verify_region_batch
+
+batch = [
+    RegionBatchEntry(x_commitment, y_commitment, region, region_proof, b"session-1"),
+    RegionBatchEntry(x_commitment, y_commitment, region, region_proof, b"session-1"),
+]
+assert verify_region_batch(batch)
+
 Region(0, 100, 0, 100).contains(50, 50)     # True
 ```
 
@@ -99,6 +108,8 @@ python3 -m zkregion
 - `prove_region(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionProof` — 生成二维矩形区域成员非交互证明
 - `verify_region(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证区域成员证明，无需坐标或盲因子
 - `RegionProof(x_proof, y_proof)` — 不可变区域证明对象，两字段均为 `RangeProof`
+- `verify_region_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 区域证明的批量验证，按 `(prime, generator, h)` 分组做一次随机线性组合
+- `RegionBatchEntry(x_commitment, y_commitment, region, proof, context=b"")` — 不可变批量验证条目，字段次序与 `verify_region` 入参一致
 - `SchnorrProver(secret, *, prime, generator, randbelow)`
   - `public_key` — `g**secret mod prime`
   - `new_commitment()` — 生成一次性随机数并返回 `g**k mod prime`
@@ -166,6 +177,22 @@ D_i = element * g**(-i) mod prime
 每条轴的子证明在派生 context 下进行，派生 context 按以下项目逐项前置四字节无符号大端长度拼接：域 `b"zkregion/region/v1"`、轴标签 `b"x"` 或 `b"y"`、外部 `context`、Region 四边界（`min_x`、`max_x`、`min_y`、`max_y`）、x 承诺六字段、y 承诺六字段（均按数据类字段顺序）；整数编码为十进制 ASCII。因此证明同时绑定区域、外部 context、两个承诺与轴分配——更换区域、context、承诺或交换两轴（含交换子证明、交换承诺）都验证失败。
 
 `context` 只接受 `bytes`，所有整数拒绝 `bool`；承诺、区域、证明对象或其字段、数值类型错误抛 `TypeError`。生成时区间不匹配、开合无效或轴区间超过 256 个整数抛 `ValueError`；验证时上述非类型错误、结构非法、篡改或绑定不符一律返回 `False`。入口均不改写输入。
+
+### 二维区域证明批量验证
+
+`verify_region_batch(entries, *, randbelow=secrets.randbelow)` 一次验证一批 `RegionBatchEntry`，每个条目就是 `verify_region` 的五个入参（`x_commitment`、`y_commitment`、`region`、`proof`、`context`，后者缺省 `b""`）冻结成的不可变数据类。`entries` 须为非字符串、非空序列：空批返回 `False`，重复条目合法并各自独立取系数。漏项无法被发现，批次完整性由调用方保证。
+
+每个条目逐字节复用既定的 Region 派生 context 与 RangeProof 转录：x/y 承诺的声明区间必须分别等于区域的 `(min_x, max_x)` / `(min_y, max_y)`，两个子证明必须都是 `RangeProof` 且 `t`/`e`/`s` 元组长度恰为各自轴区间的整数数，逐个校验 `t_i ∈ [1, prime)`、`e_i ∈ [0, prime)`、`s_i ≥ 0`，以及 `sum(e) mod prime` 等于转录挑战。上述结构、区间、挑战和或任何绑定（区域、承诺、外部 `context`、轴分配，含跨条目重组）不符都返回 `False`，允许短路。
+
+通过结构校验后，**每条 RangeProof 分支**（每个条目的每个轴偏移 `i`）恰调用一次 `randbelow(prime - 1)` 得 `r`，取非零系数 `a = r + 1`；`D_i = element * generator**(-i) mod prime` 的定义与单点验证完全一致。所有分支按 `(prime, generator, h)` 分组，每组只检查一次聚合等式
+
+```
+h**Σ(a*s) == Π(t**a * D_i**(a*e))   (mod prime)
+```
+
+即把该组内所有条目的两条轴、全部分支纳入同一个随机线性组合，而**不是**逐条分支或逐条目验证后做布尔汇总——因此同组内响应误差可以在系数为 1 时相消，而不同 `(prime, generator, h)`（不同群或不同 `h`）之间不能跨组相消。传入固定的 `randbelow` 结果可重复，缺省为 `secrets.randbelow`。
+
+类型错误（含 `bool` 整数、非元组证明字段、非 `bytes` 的 `context`、`randbelow` 不可调用或返回非整数）抛 `TypeError`；系数来源返回值超出 `[0, prime - 1)` 抛 `ValueError`。其余非法结构、篡改、区域/承诺/context 绑定错误、跨项重组、子证明数量错误均返回 `False`；入口不改写任何输入。与 Schnorr 批量验证一样，这里的随机线性组合只供演示。
 
 ### Fiat-Shamir 转录
 

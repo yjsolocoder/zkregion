@@ -5,6 +5,7 @@ from __future__ import annotations
 from . import (
     RangeProof,
     Region,
+    RegionBatchEntry,
     RegionProof,
     SchnorrBatchEntry,
     SchnorrProof,
@@ -24,6 +25,7 @@ from . import (
     verify_pedersen_opening,
     verify_range,
     verify_region,
+    verify_region_batch,
 )
 
 
@@ -96,6 +98,39 @@ def main() -> int:
     swapped = RegionProof(x_proof=region_proof.y_proof, y_proof=region_proof.x_proof)
     print(f"  swapped axes rejected: {not verify_region(x_commitment, y_commitment, region, swapped, context=b'demo')}")
     print("  (verifier needs only the commitments, the region and the proof)")
+
+    print()
+    print("batch region verification (random linear combination per (prime, generator, h)):")
+    batch_region = Region(0, 100, 0, 100)
+    batch_entries = []
+    for x, y in ((40, 60), (10, 90), (100, 0)):
+        bx, bx_r = pedersen_commit(x, 0, 100, blinding=1000 + x)
+        by, by_r = pedersen_commit(y, 0, 100, blinding=2000 + y)
+        bp = prove_region(bx, by, x, y, bx_r, by_r, batch_region, context=b"batch")
+        batch_entries.append(RegionBatchEntry(bx, by, batch_region, bp, b"batch"))
+    print(f"  valid batch of {len(batch_entries)} accepted: "
+          f"{verify_region_batch(batch_entries, randbelow=counter_randbelow())}")
+    print(f"  duplicate entries accepted: "
+          f"{verify_region_batch(batch_entries + batch_entries[:1], randbelow=counter_randbelow())}")
+    print(f"  empty batch rejected: {not verify_region_batch(())}")
+    forged = RegionProof(
+        RangeProof(
+            batch_entries[0].proof.x_proof.t,
+            batch_entries[0].proof.x_proof.e,
+            batch_entries[0].proof.x_proof.s[:-1]
+            + (batch_entries[0].proof.x_proof.s[-1] + 1,),
+        ),
+        batch_entries[0].proof.y_proof,
+    )
+    tampered = [RegionBatchEntry(
+        batch_entries[0].x_commitment, batch_entries[0].y_commitment,
+        batch_region, forged, b"batch",
+    )] + batch_entries[1:]
+    print(f"  tampered batch rejected: {not verify_region_batch(tampered, randbelow=counter_randbelow())}")
+    wrong_context = [RegionBatchEntry(
+        e.x_commitment, e.y_commitment, e.region, e.proof, b"other"
+    ) for e in batch_entries[:1]]
+    print(f"  wrong context rejected: {not verify_region_batch(wrong_context, randbelow=counter_randbelow())}")
 
     print()
     print("interactive Schnorr:")

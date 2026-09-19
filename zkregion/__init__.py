@@ -2,10 +2,11 @@
 
 Public API: commit / verify_opening / commit_coordinate / PedersenCommitment /
 pedersen_commit / verify_pedersen_opening / RangeProof / prove_range /
-verify_range / RegionProof / prove_region / verify_region / SchnorrProof /
-SchnorrBatchEntry / SchnorrProver / SchnorrVerifier / Region / MerkleProof /
-merkle_root / prove_inclusion / verify_inclusion / MerkleMultiProof /
-prove_multi_inclusion / verify_multi_inclusion.
+verify_range / RegionProof / prove_region / verify_region / RegionBatchEntry /
+verify_region_batch / SchnorrProof / SchnorrBatchEntry / SchnorrProver /
+SchnorrVerifier / Region / MerkleProof / merkle_root / prove_inclusion /
+verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
+verify_multi_inclusion.
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ __all__ = [
     "PedersenCommitment",
     "RangeProof",
     "Region",
+    "RegionBatchEntry",
     "RegionProof",
     "SchnorrBatchEntry",
     "SchnorrProof",
@@ -44,6 +46,7 @@ __all__ = [
     "verify_pedersen_opening",
     "verify_range",
     "verify_region",
+    "verify_region_batch",
 ]
 
 # Mersenne prime 2**127 - 1 and a small generator. This is a demonstration
@@ -865,6 +868,214 @@ def verify_region(
         proof.y_proof,
         _region_sub_context(b"y", context, region, x_commitment, y_commitment),
     )
+
+
+@dataclass(frozen=True)
+class RegionBatchEntry:
+    """One item of a region batch verification.
+
+    Fields are the two :class:`PedersenCommitment` objects, the claimed
+    :class:`Region`, the :class:`RegionProof` and the external ``context``
+    (empty by default) — exactly the arguments of :func:`verify_region`, in
+    the same order.
+    """
+
+    x_commitment: PedersenCommitment
+    y_commitment: PedersenCommitment
+    region: Region
+    proof: RegionProof
+    context: bytes = b""
+
+
+def _range_proof_check_material(
+    commitment: PedersenCommitment,
+    proof: RangeProof,
+    context: bytes,
+) -> tuple[int, int, int, int, tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Validate one range proof structurally and return its batch material.
+
+    This mirrors :func:`verify_range` up to (but excluding) the per-branch
+    Schnorr equations: group parameters, ranges, tuple lengths, the
+    ``t`` / ``e`` / ``s`` bounds and the challenge sum are all checked
+    against the byte-for-byte transcript. The returned tuple is
+    ``(prime, generator, h, size, t, e, s)``; ``D_i`` is recomputed by the
+    caller as ``element * generator**(-i) mod prime``.
+    """
+    prime = commitment.prime
+    generator = commitment.generator
+    h = commitment.h
+    if prime <= 3 or not 1 < generator < prime or not 1 < h < prime:
+        raise ValueError("invalid commitment group parameters")
+    if not 0 < commitment.element < prime:
+        raise ValueError("commitment element out of range")
+    if commitment.lower > commitment.upper:
+        raise ValueError("commitment lower must not exceed upper")
+    if commitment.upper - commitment.lower >= prime - 1:
+        raise ValueError("commitment range width must be smaller than prime - 1")
+    size = commitment.upper - commitment.lower + 1
+    if size > _MAX_RANGE_VALUES:
+        raise ValueError(f"range must contain at most {_MAX_RANGE_VALUES} integers")
+    if not (len(proof.t) == len(proof.e) == len(proof.s) == size):
+        raise ValueError("proof fields must have one entry per integer in the range")
+    if any(not 1 <= t_i < prime for t_i in proof.t):
+        raise ValueError("proof announcement out of range")
+    if any(not 0 <= e_i < prime for e_i in proof.e):
+        raise ValueError("proof challenge share out of range")
+    if any(s_i < 0 for s_i in proof.s):
+        raise ValueError("proof response must be non-negative")
+    challenge = _range_challenge(commitment, context, size, proof.t)
+    if sum(proof.e) % prime != challenge:
+        raise ValueError("proof challenge shares do not sum to the transcript challenge")
+    return prime, generator, h, size, proof.t, proof.e, proof.s
+
+
+def verify_region_batch(
+    entries: Sequence[RegionBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a batch of :class:`RegionProof` objects with random linear checks.
+
+    ``entries`` must be a non-empty, non-string sequence of
+    :class:`RegionBatchEntry`; an empty batch returns ``False`` and
+    duplicate entries are legal (each draws its own coefficients). Every
+    entry is validated exactly as :func:`verify_region` would, reusing the
+    established :class:`Region` and :class:`RangeProof` transcripts
+    byte for byte: the commitment ranges must equal the region bounds, the
+    sub-proof structure and tuple sizes must match, the ``t`` / ``e`` /
+    ``s`` values must be in range, and the challenge shares must sum to
+    the transcript challenge.
+
+    Each range-proof branch then draws exactly one random coefficient
+    ``a = r + 1`` with ``r = randbelow(prime - 1)``. Branches sharing the
+    same ``(prime, generator, h)`` group are checked together with a
+    single aggregate equation
+
+    ``h**Σ(a*s) == Π(t**a * D_i**(a*e)) (mod prime)``
+
+    where ``D_i = element * generator**(-i) mod prime`` is unchanged from
+    :func:`verify_range`; per-branch results are never AND-ed together.
+    Type errors — including ``bool`` integers and a non-callable
+    ``randbelow`` or one that returns a non-integer — raise
+    :class:`TypeError`; a coefficient outside ``[0, prime - 1)`` raises
+    :class:`ValueError`. Every other invalid structure, tampering, region,
+    commitment or context binding mismatch, cross-item recombination or
+    sub-proof count error returns ``False``; short-circuiting is allowed.
+    Missing entries cannot be detected: the caller guarantees the batch
+    is complete. Inputs are never mutated.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of RegionBatchEntry")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    items = list(entries)  # copy: inputs are never mutated
+    if not items:
+        return False
+
+    # group -> {"sum": Σ(a*s), "product": Π(t**a * D_i**(a*e))}
+    groups: dict[tuple[int, int, int], dict[str, int]] = {}
+
+    def add_branch(
+        group_key: tuple[int, int, int],
+        t_i: int,
+        e_i: int,
+        s_i: int,
+        offset_i: int,
+    ) -> None:
+        prime, _generator, _h = group_key
+        r = randbelow(prime - 1)
+        if not isinstance(r, int) or isinstance(r, bool):
+            raise TypeError("coefficient source randbelow must return an integer")
+        if not 0 <= r < prime - 1:
+            raise ValueError("coefficient source must satisfy 0 <= r < prime - 1")
+        coefficient = r + 1
+        state = groups.setdefault(group_key, {"sum": 0, "product": 1})
+        state["sum"] += coefficient * s_i
+        state["product"] = (
+            state["product"]
+            * pow(t_i, coefficient, prime)
+            % prime
+            * pow(offset_i, coefficient * e_i, prime)
+            % prime
+        )
+
+    for position, entry in enumerate(items):
+        if not isinstance(entry, RegionBatchEntry):
+            raise TypeError(f"entries[{position}] must be a RegionBatchEntry")
+        x_commitment = entry.x_commitment
+        y_commitment = entry.y_commitment
+        region = entry.region
+        proof = entry.proof
+        if not isinstance(x_commitment, PedersenCommitment):
+            raise TypeError(f"entries[{position}] x_commitment must be a PedersenCommitment")
+        if not isinstance(y_commitment, PedersenCommitment):
+            raise TypeError(f"entries[{position}] y_commitment must be a PedersenCommitment")
+        _check_commitment_fields(x_commitment)
+        _check_commitment_fields(y_commitment)
+        if not isinstance(region, Region):
+            raise TypeError(f"entries[{position}] region must be a Region")
+        _check_region_fields(region)
+        if not isinstance(proof, RegionProof):
+            raise TypeError(f"entries[{position}] proof must be a RegionProof")
+        if not isinstance(proof.x_proof, RangeProof):
+            raise TypeError(f"entries[{position}] proof x_proof must be a RangeProof")
+        if not isinstance(proof.y_proof, RangeProof):
+            raise TypeError(f"entries[{position}] proof y_proof must be a RangeProof")
+        for axis_name, sub_proof in (("x", proof.x_proof), ("y", proof.y_proof)):
+            for field_name in ("t", "e", "s"):
+                field = getattr(sub_proof, field_name)
+                if not isinstance(field, tuple):
+                    raise TypeError(
+                        f"entries[{position}] {axis_name}_proof {field_name} "
+                        "must be a tuple of integers"
+                    )
+                for item in field:
+                    _check_int(
+                        item,
+                        f"entries[{position}] {axis_name}_proof {field_name} entry",
+                    )
+        _check_bytes(entry.context, f"entries[{position}] context")
+        if (x_commitment.lower, x_commitment.upper) != (region.min_x, region.max_x):
+            return False
+        if (y_commitment.lower, y_commitment.upper) != (region.min_y, region.max_y):
+            return False
+        axes = (
+            (
+                b"x",
+                x_commitment,
+                proof.x_proof,
+                _region_sub_context(b"x", entry.context, region, x_commitment, y_commitment),
+            ),
+            (
+                b"y",
+                y_commitment,
+                proof.y_proof,
+                _region_sub_context(b"y", entry.context, region, x_commitment, y_commitment),
+            ),
+        )
+        for _axis, commitment, sub_proof, sub_context in axes:
+            try:
+                prime, generator, h, size, announcements, shares, responses = (
+                    _range_proof_check_material(commitment, sub_proof, sub_context)
+                )
+                inverses = [pow(generator, -i, prime) for i in range(size)]
+            except (TypeError, ValueError):
+                return False  # structural/transcript mismatch: short-circuit
+            group_key = (prime, generator, h)
+            for i in range(size):
+                offset_i = commitment.element * inverses[i] % prime
+                add_branch(
+                    group_key,
+                    announcements[i],
+                    shares[i],
+                    responses[i],
+                    offset_i,
+                )
+
+    for (prime, generator, h), state in groups.items():
+        if pow(h, state["sum"], prime) != state["product"]:
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------

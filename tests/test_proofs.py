@@ -10,6 +10,7 @@ from zkregion import (
     PedersenCommitment,
     RangeProof,
     Region,
+    RegionBatchEntry,
     RegionProof,
     SchnorrBatchEntry,
     SchnorrProof,
@@ -29,6 +30,7 @@ from zkregion import (
     verify_pedersen_opening,
     verify_range,
     verify_region,
+    verify_region_batch,
 )
 
 SMALL_PRIME = 104729  # a small prime keeps the group arithmetic readable in tests
@@ -888,6 +890,363 @@ class RegionProofTest(unittest.TestCase):
         )
         verify_region(x_commitment, y_commitment, region, proof, b"ctx")
         self.assertEqual((x_commitment, y_commitment, proof), snapshot)
+
+
+class RegionBatchTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def commit(self, value, lower, upper, blinding, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    def entry(self, x=5, y=25, region=None, context=b"ctx", x_blinding=1234, y_blinding=4321):
+        region = Region(0, 10, 20, 30) if region is None else region
+        x_commitment, x_r = self.commit(x, region.min_x, region.max_x, x_blinding)
+        y_commitment, y_r = self.commit(y, region.min_y, region.max_y, y_blinding)
+        proof = prove_region(
+            x_commitment, y_commitment, x, y, x_r, y_r, region, context,
+            randbelow=counter_randbelow(),
+        )
+        return RegionBatchEntry(x_commitment, y_commitment, region, proof, context)
+
+    # ---- entry object -------------------------------------------------------
+
+    def test_entry_defaults_equality_and_immutability(self):
+        entry = self.entry(context=b"")
+        self.assertEqual(entry.context, b"")
+        self.assertEqual(
+            RegionBatchEntry(entry.x_commitment, entry.y_commitment, entry.region, entry.proof),
+            entry,
+        )
+        other = self.entry(context=b"other")
+        self.assertNotEqual(entry, other)
+        self.assertEqual(
+            tuple(getattr(entry, name) for name in (
+                "x_commitment", "y_commitment", "region", "proof", "context")),
+            (entry.x_commitment, entry.y_commitment, entry.region, entry.proof, b""),
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            entry.context = b"other"
+
+    # ---- honest round trip --------------------------------------------------
+
+    def test_honest_batch_verifies(self):
+        entries = [self.entry(context=b"a"), self.entry(context=b"b"), self.entry(context=b"c")]
+        self.assertTrue(verify_region_batch(entries, randbelow=counter_randbelow()))
+        self.assertTrue(verify_region_batch(tuple(entries)))  # default secrets.randbelow
+
+    def test_single_entry_agrees_with_verify_region(self):
+        entry = self.entry()
+        self.assertTrue(verify_region_batch([entry], randbelow=counter_randbelow()))
+        self.assertTrue(
+            verify_region(
+                entry.x_commitment, entry.y_commitment, entry.region, entry.proof, entry.context
+            )
+        )
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(verify_region_batch([], randbelow=counter_randbelow()))
+        self.assertFalse(verify_region_batch(()))
+
+    def test_duplicate_entries_are_legal(self):
+        entry = self.entry()
+        self.assertTrue(verify_region_batch([entry, entry, entry], randbelow=counter_randbelow()))
+
+    def test_distinct_ranges_share_one_group(self):
+        entries = [
+            self.entry(region=Region(0, 10, 20, 30)),
+            self.entry(x=25, y=25, region=Region(20, 30, 20, 30)),
+        ]
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(verify_region_batch(entries, randbelow=recording))
+        # 11 + 11 branches per entry, two entries
+        self.assertEqual(calls, [self.PRIME - 1] * 44)
+
+    def test_mixed_groups_each_checked_under_its_own_parameters(self):
+        small = self.entry()
+        region = Region(0, 10, 20, 30)
+        x_commitment, x_r = pedersen_commit(5, 0, 10, blinding=987654321)
+        y_commitment, y_r = pedersen_commit(25, 20, 30, blinding=123456789)
+        proof = prove_region(x_commitment, y_commitment, 5, 25, x_r, y_r, region, b"ctx")
+        default_entry = RegionBatchEntry(x_commitment, y_commitment, region, proof, b"ctx")
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(verify_region_batch([small, default_entry], randbelow=recording))
+        self.assertEqual(sorted(set(calls)), sorted({self.PRIME - 1, DEFAULT_PRIME - 1}))
+        self.assertEqual(len(calls), 44)  # 22 branches per entry
+
+    # ---- randomness ----------------------------------------------------------
+
+    def test_randbelow_called_once_per_branch_with_prime_minus_one(self):
+        entries = [self.entry(), self.entry()]
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(verify_region_batch(entries, randbelow=recording))
+        self.assertEqual(calls, [self.PRIME - 1] * 44)
+
+    def test_fixed_coefficient_source_is_reproducible(self):
+        entries = [self.entry(), self.entry()]
+        first = verify_region_batch(entries, randbelow=counter_randbelow(9))
+        second = verify_region_batch(entries, randbelow=counter_randbelow(9))
+        self.assertEqual(first, second)
+
+    def test_random_linear_combination_not_per_branch_summary(self):
+        # coefficients all 1: +1 and -1 response deltas cancel in the single
+        # aggregate exponent sum, even though neither sub-proof verifies alone
+        entry = self.entry()
+        x_proof, y_proof = entry.proof.x_proof, entry.proof.y_proof
+        x_tampered = RangeProof(
+            x_proof.t, x_proof.e, x_proof.s[:-1] + (x_proof.s[-1] + 1,)
+        )
+        y_tampered = RangeProof(
+            y_proof.t, y_proof.e, y_proof.s[:-1] + (y_proof.s[-1] - 1,)
+        )
+        forged = RegionProof(x_tampered, y_tampered)
+        self.assertFalse(
+            verify_range(
+                entry.x_commitment,
+                x_tampered,
+                RegionProofTest.sub_context(
+                    b"x", entry.context, entry.region, entry.x_commitment, entry.y_commitment
+                ),
+            )
+        )
+        forged_entry = RegionBatchEntry(
+            entry.x_commitment, entry.y_commitment, entry.region, forged, entry.context
+        )
+        self.assertTrue(verify_region_batch([forged_entry], randbelow=lambda upper: 0))
+
+    # ---- rejection -----------------------------------------------------------
+
+    def test_tampering_fails(self):
+        entry = self.entry()
+        x_proof, y_proof = entry.proof.x_proof, entry.proof.y_proof
+        tampered_x = RangeProof(
+            x_proof.t, x_proof.e, x_proof.s[:-1] + (x_proof.s[-1] + 1,)
+        )
+        tampered_y = RangeProof(
+            y_proof.t, y_proof.e, y_proof.s[:-1] + (y_proof.s[-1] + 1,)
+        )
+        cases = [
+            RegionBatchEntry(entry.x_commitment, entry.y_commitment, entry.region,
+                             RegionProof(tampered_x, y_proof), entry.context),
+            RegionBatchEntry(entry.x_commitment, entry.y_commitment, entry.region,
+                             RegionProof(x_proof, tampered_y), entry.context),
+            RegionBatchEntry(entry.x_commitment, entry.y_commitment, entry.region,
+                             entry.proof, b"other"),
+            RegionBatchEntry(entry.x_commitment, entry.y_commitment, entry.region, entry.proof),
+            RegionBatchEntry(entry.x_commitment, entry.y_commitment,
+                             Region(0, 9, 20, 30), entry.proof, entry.context),
+            RegionBatchEntry(entry.x_commitment, entry.y_commitment,
+                             Region(0, 10, 21, 30), entry.proof, entry.context),
+        ]
+        for batch in cases:
+            self.assertFalse(
+                verify_region_batch([batch], randbelow=counter_randbelow()),
+                f"batch accepted: {batch!r}",
+            )
+
+    def test_foreign_commitment_and_swapped_axes_fail(self):
+        entry = self.entry()
+        other, _ = self.commit(6, 0, 10, 777)
+        cases = [
+            RegionBatchEntry(other, entry.y_commitment, entry.region, entry.proof, entry.context),
+            RegionBatchEntry(entry.x_commitment, other, entry.region, entry.proof, entry.context),
+            RegionBatchEntry(entry.x_commitment, entry.y_commitment, entry.region,
+                             RegionProof(entry.proof.y_proof, entry.proof.x_proof), entry.context),
+            RegionBatchEntry(entry.y_commitment, entry.x_commitment, entry.region,
+                             entry.proof, entry.context),
+        ]
+        for batch in cases:
+            self.assertFalse(
+                verify_region_batch([batch], randbelow=counter_randbelow()),
+                f"batch accepted: {batch!r}",
+            )
+
+    def test_cross_item_recombination_fails(self):
+        first = self.entry(context=b"a")
+        second = self.entry(context=b"b", x_blinding=5555, y_blinding=6666)
+        assert first.x_commitment != second.x_commitment  # distinct blinding factors
+        # second's commitments paired with first's region proof
+        recombined = RegionBatchEntry(
+            second.x_commitment, second.y_commitment, second.region, first.proof, first.context
+        )
+        self.assertFalse(verify_region_batch([recombined], randbelow=counter_randbelow()))
+        # proof from one item replayed with another item's context entry
+        replayed = RegionBatchEntry(
+            first.x_commitment, first.y_commitment, first.region, first.proof, second.context
+        )
+        self.assertFalse(verify_region_batch([replayed], randbelow=counter_randbelow()))
+
+    def test_cancellation_does_not_cross_group_boundaries(self):
+        # same prime/generator, different h: an x delta of +1 in one group and
+        # a y delta of -1 in the other cannot cancel
+        first = self.entry()
+        xc, xr = self.commit(5, 0, 10, 333, h=7)
+        yc, yr = self.commit(25, 20, 30, 444, h=7)
+        proof = prove_region(xc, yc, 5, 25, xr, yr, first.region, b"ctx")
+        second = RegionBatchEntry(xc, yc, first.region, proof, b"ctx")
+        x_delta = RangeProof(
+            first.proof.x_proof.t, first.proof.x_proof.e,
+            first.proof.x_proof.s[:-1] + (first.proof.x_proof.s[-1] + 1,),
+        )
+        y_delta = RangeProof(
+            proof.y_proof.t, proof.y_proof.e,
+            proof.y_proof.s[:-1] + (proof.y_proof.s[-1] - 1,),
+        )
+        forged_first = RegionBatchEntry(
+            first.x_commitment, first.y_commitment, first.region,
+            RegionProof(x_delta, first.proof.y_proof), first.context,
+        )
+        forged_second = RegionBatchEntry(
+            xc, yc, first.region, RegionProof(proof.x_proof, y_delta), b"ctx"
+        )
+        self.assertFalse(
+            verify_region_batch([forged_first, forged_second], randbelow=lambda upper: 0)
+        )
+
+    def test_sub_proof_count_errors_return_false(self):
+        entry = self.entry()
+        short_x = RangeProof(entry.proof.x_proof.t[:-1], entry.proof.x_proof.e, entry.proof.x_proof.s)
+        cases = [
+            RegionProof(short_x, entry.proof.y_proof),
+            RegionProof(entry.proof.x_proof, RangeProof((), (), ())),
+        ]
+        for forged in cases:
+            bad = RegionBatchEntry(
+                entry.x_commitment, entry.y_commitment, entry.region, forged, entry.context
+            )
+            self.assertFalse(verify_region_batch([bad], randbelow=counter_randbelow()))
+
+    def test_oversized_axis_range_returns_false(self):
+        entry = self.entry()
+        wide_region = Region(0, 256, 20, 30)
+        wide_x, _ = self.commit(5, 0, 256, 1234)
+        bad = RegionBatchEntry(wide_x, entry.y_commitment, wide_region, entry.proof, entry.context)
+        self.assertFalse(verify_region_batch([bad], randbelow=counter_randbelow()))
+
+    def test_bad_embedded_commitment_parameters_return_false(self):
+        entry = self.entry()
+        for name, value in (("element", 0), ("prime", 7), ("generator", 1), ("h", self.PRIME)):
+            broken_x = dataclasses.replace(entry.x_commitment, **{name: value})
+            bad = RegionBatchEntry(
+                broken_x, entry.y_commitment, entry.region, entry.proof, entry.context
+            )
+            self.assertFalse(
+                verify_region_batch([bad], randbelow=counter_randbelow()), name
+            )
+
+    def test_invalid_entry_short_circuits_before_drawing(self):
+        entry = self.entry()
+        short_x = RangeProof(entry.proof.x_proof.t[:-1], entry.proof.x_proof.e, entry.proof.x_proof.s)
+        invalid = RegionBatchEntry(
+            entry.x_commitment, entry.y_commitment, entry.region,
+            RegionProof(short_x, entry.proof.y_proof), entry.context,
+        )
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertFalse(verify_region_batch([invalid, entry], randbelow=recording))
+        self.assertEqual(calls, [])  # the invalid entry is rejected before any draw
+        self.assertFalse(verify_region_batch([entry, invalid], randbelow=recording))
+        self.assertEqual(calls, [self.PRIME - 1] * 22)  # one draw per branch of entry 1
+
+    # ---- type errors ---------------------------------------------------------
+
+    def test_type_errors(self):
+        entry = self.entry()
+        for bad in ("entries", b"entries", bytearray(b"x"), 42, None):
+            with self.assertRaises(TypeError):
+                verify_region_batch(bad)
+        with self.assertRaises(TypeError):
+            verify_region_batch([(entry.x_commitment, entry.y_commitment)])
+        with self.assertRaises(TypeError):
+            verify_region_batch([
+                RegionBatchEntry(entry.x_commitment, entry.y_commitment, entry.region, entry.proof, "ctx")
+            ])
+        with self.assertRaises(TypeError):
+            verify_region_batch([
+                RegionBatchEntry(entry.x_commitment, entry.y_commitment, entry.region,
+                                 (entry.proof.x_proof, entry.proof.y_proof), b"ctx")
+            ])
+        with self.assertRaises(TypeError):
+            verify_region_batch([
+                RegionBatchEntry(entry.x_commitment, entry.y_commitment, entry.region,
+                                 RegionProof("proof", entry.proof.y_proof), b"ctx")
+            ])
+        with self.assertRaises(TypeError):
+            verify_region_batch([
+                RegionBatchEntry(entry.x_commitment, entry.y_commitment,
+                                 (0, 10, 20, 30), entry.proof, b"ctx")
+            ])
+        with self.assertRaises(TypeError):
+            verify_region_batch([
+                RegionBatchEntry((entry.x_commitment.element, 0, 10, self.PRIME, self.G, self.H),
+                                 entry.y_commitment, entry.region, entry.proof, b"ctx")
+            ])
+        bool_proof = RegionProof(
+            RangeProof((True,) * len(entry.proof.x_proof.t), entry.proof.x_proof.e, entry.proof.x_proof.s),
+            entry.proof.y_proof,
+        )
+        with self.assertRaises(TypeError):
+            verify_region_batch([
+                RegionBatchEntry(entry.x_commitment, entry.y_commitment, entry.region, bool_proof, b"ctx")
+            ])
+        list_proof = RegionProof(
+            RangeProof(list(entry.proof.x_proof.t), entry.proof.x_proof.e, entry.proof.x_proof.s),
+            entry.proof.y_proof,
+        )
+        with self.assertRaises(TypeError):
+            verify_region_batch([
+                RegionBatchEntry(entry.x_commitment, entry.y_commitment, entry.region, list_proof, b"ctx")
+            ])
+        with self.assertRaises(TypeError):
+            verify_region_batch([entry], randbelow=7)
+
+    def test_coefficient_source_errors(self):
+        entry = self.entry()
+        for bad in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                verify_region_batch([entry], randbelow=lambda upper, bad=bad: bad)
+        for bad in (-1, self.PRIME - 1, self.PRIME):
+            with self.assertRaises(ValueError):
+                verify_region_batch([entry], randbelow=lambda upper, bad=bad: bad)
+
+    # ---- hygiene -------------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        entries = [self.entry(), self.entry()]
+        snapshot = [dataclasses.replace(entry) for entry in entries]
+        verify_region_batch(entries, randbelow=counter_randbelow())
+        self.assertEqual(entries, snapshot)
+
+    def test_default_group_parameters_are_usable(self):
+        region = Region(0, 10, 20, 30)
+        x_commitment, x_r = pedersen_commit(5, 0, 10, blinding=987654321)
+        y_commitment, y_r = pedersen_commit(25, 20, 30, blinding=123456789)
+        proof = prove_region(x_commitment, y_commitment, 5, 25, x_r, y_r, region, b"demo")
+        entry = RegionBatchEntry(x_commitment, y_commitment, region, proof, b"demo")
+        self.assertTrue(verify_region_batch([entry], randbelow=counter_randbelow()))
 
 
 class SchnorrTest(unittest.TestCase):

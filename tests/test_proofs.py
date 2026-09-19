@@ -3,12 +3,16 @@ import unittest
 from zkregion import (
     DEFAULT_GENERATOR,
     DEFAULT_PRIME,
+    MerkleProof,
     Region,
     SchnorrProof,
     SchnorrProver,
     SchnorrVerifier,
     commit,
     commit_coordinate,
+    merkle_root,
+    prove_inclusion,
+    verify_inclusion,
     verify_opening,
 )
 
@@ -248,6 +252,214 @@ class RegionTest(unittest.TestCase):
     def test_non_integer_coordinates_rejected(self):
         with self.assertRaises(TypeError):
             Region(0, 10, 0, 10).contains(1.5, 2)
+
+
+def _leaf_digest(leaf: bytes) -> bytes:
+    import hashlib
+
+    return hashlib.sha256(b"\x00" + len(leaf).to_bytes(4, "big") + leaf).digest()
+
+
+def _node_digest(left: bytes, right: bytes) -> bytes:
+    import hashlib
+
+    return hashlib.sha256(b"\x01" + left + right).digest()
+
+
+class MerkleRootTest(unittest.TestCase):
+    def test_single_leaf_root_is_leaf_digest(self):
+        self.assertEqual(merkle_root([b"only"]), _leaf_digest(b"only"))
+
+    def test_two_leaves_pair_directly(self):
+        h0, h1 = _leaf_digest(b"a"), _leaf_digest(b"b")
+        self.assertEqual(merkle_root([b"a", b"b"]), _node_digest(h0, h1))
+
+    def test_odd_level_duplicates_last_node(self):
+        h0, h1, h2 = map(_leaf_digest, (b"a", b"b", b"c"))
+        n01 = _node_digest(h0, h1)
+        n22 = _node_digest(h2, h2)
+        self.assertEqual(merkle_root([b"a", b"b", b"c"]), _node_digest(n01, n22))
+
+    def test_root_is_deterministic_and_order_sensitive(self):
+        leaves = [b"a", b"b", b"c", b"d"]
+        self.assertEqual(merkle_root(leaves), merkle_root(list(leaves)))
+        self.assertNotEqual(merkle_root(leaves), merkle_root([b"a", b"c", b"b", b"d"]))
+
+    def test_accepts_tuples(self):
+        self.assertEqual(merkle_root((b"a", b"b")), merkle_root([b"a", b"b"]))
+
+    def test_empty_tree_rejected(self):
+        with self.assertRaises(ValueError):
+            merkle_root([])
+        with self.assertRaises(ValueError):
+            merkle_root(())
+
+    def test_non_bytes_leaves_rejected(self):
+        with self.assertRaises(TypeError):
+            merkle_root([b"a", "b"])
+        with self.assertRaises(TypeError):
+            merkle_root([1])
+
+    def test_non_sequence_rejected(self):
+        with self.assertRaises(TypeError):
+            merkle_root(123)
+        with self.assertRaises(TypeError):
+            merkle_root(iter([b"a", b"b"]))
+
+    def test_inputs_are_not_mutated(self):
+        leaves = [b"a", b"b", b"c", b"d", b"e"]
+        snapshot = list(leaves)
+        merkle_root(leaves)
+        self.assertEqual(leaves, snapshot)
+
+
+class MerkleProofTest(unittest.TestCase):
+    def test_proof_is_frozen_tuple_path(self):
+        proof = prove_inclusion([b"a", b"b"], 0)
+        self.assertIsInstance(proof, MerkleProof)
+        self.assertIsInstance(proof.siblings, tuple)
+        with self.assertRaises(AttributeError):
+            proof.index = 1
+
+    def test_single_leaf_has_empty_path(self):
+        proof = prove_inclusion([b"only"], 0)
+        self.assertEqual((proof.index, proof.siblings), (0, ()))
+        self.assertTrue(verify_inclusion(b"only", proof, merkle_root([b"only"])))
+
+    def test_every_index_verifies_for_each_tree_size(self):
+        for size in range(1, 9):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            root = merkle_root(leaves)
+            for index in range(size):
+                with self.subTest(size=size, index=index):
+                    proof = prove_inclusion(leaves, index)
+                    self.assertEqual(len(proof.siblings), (size - 1).bit_length())
+                    self.assertTrue(verify_inclusion(leaves[index], proof, root))
+
+    def test_three_leaf_path_matches_manual_vector(self):
+        h0, h1, h2 = map(_leaf_digest, (b"a", b"b", b"c"))
+        n01 = _node_digest(h0, h1)
+        n22 = _node_digest(h2, h2)
+        self.assertEqual(prove_inclusion([b"a", b"b", b"c"], 0).siblings, (h1, n22))
+        self.assertEqual(prove_inclusion([b"a", b"b", b"c"], 1).siblings, (h0, n22))
+        self.assertEqual(prove_inclusion([b"a", b"b", b"c"], 2).siblings, (h2, n01))
+
+    def test_duplicate_leaves_are_located_by_index(self):
+        leaves = [b"same", b"same", b"other", b"same"]
+        root = merkle_root(leaves)
+        paths = {prove_inclusion(leaves, i).siblings for i in range(4)}
+        # duplicate content still yields position-specific sibling paths
+        self.assertEqual(len(paths), 3)
+        for i in range(4):
+            self.assertTrue(verify_inclusion(leaves[i], prove_inclusion(leaves, i), root))
+        # a proof for one occurrence does not verify at the wrong index
+        first = prove_inclusion(leaves, 0)
+        third = MerkleProof(3, first.siblings)
+        self.assertFalse(verify_inclusion(b"same", third, root))
+
+    def test_index_out_of_range(self):
+        with self.assertRaises(IndexError):
+            prove_inclusion([b"a", b"b"], 2)
+        with self.assertRaises(IndexError):
+            prove_inclusion([b"a"], -1)
+
+    def test_non_integer_index_rejected(self):
+        with self.assertRaises(TypeError):
+            prove_inclusion([b"a", b"b"], 1.0)
+        with self.assertRaises(TypeError):
+            prove_inclusion([b"a", b"b"], "0")
+
+    def test_propagates_leaf_validation(self):
+        with self.assertRaises(ValueError):
+            prove_inclusion([], 0)
+        with self.assertRaises(TypeError):
+            prove_inclusion([b"a", 1], 0)
+
+    def test_inputs_are_not_mutated(self):
+        leaves = [b"a", b"b", b"c"]
+        snapshot = list(leaves)
+        prove_inclusion(leaves, 2)
+        self.assertEqual(leaves, snapshot)
+
+
+class MerkleVerificationTest(unittest.TestCase):
+    def setUp(self):
+        self.leaves = [f"leaf-{i}".encode() for i in range(5)]
+        self.root = merkle_root(self.leaves)
+
+    def test_tampered_leaf_rejected(self):
+        proof = prove_inclusion(self.leaves, 2)
+        self.assertFalse(verify_inclusion(b"leaf-X", proof, self.root))
+
+    def test_tampered_index_rejected(self):
+        proof = prove_inclusion(self.leaves, 0)
+        relocated = MerkleProof(1, proof.siblings)
+        self.assertFalse(verify_inclusion(self.leaves[0], relocated, self.root))
+
+    def test_tampered_sibling_rejected(self):
+        proof = prove_inclusion(self.leaves, 2)
+        broken = (b"\x00" * 32,) + proof.siblings[1:]
+        self.assertFalse(verify_inclusion(self.leaves[2], MerkleProof(2, broken), self.root))
+
+    def test_tampered_root_rejected(self):
+        proof = prove_inclusion(self.leaves, 2)
+        self.assertFalse(verify_inclusion(self.leaves[2], proof, b"\x00" * 32))
+
+    def test_wrong_tree_root_rejected(self):
+        proof = prove_inclusion(self.leaves, 2)
+        self.assertFalse(verify_inclusion(self.leaves[2], proof, merkle_root([b"other"])))
+
+    def test_truncated_and_extended_paths_rejected(self):
+        proof = prove_inclusion(self.leaves, 2)
+        leaf = self.leaves[2]
+        self.assertFalse(verify_inclusion(leaf, MerkleProof(2, proof.siblings[:-1]), self.root))
+        self.assertFalse(
+            verify_inclusion(leaf, MerkleProof(2, proof.siblings + (b"\x00" * 32,)), self.root)
+        )
+
+    def test_root_must_be_32_bytes(self):
+        proof = prove_inclusion(self.leaves, 2)
+        for bad_root in (b"", b"\x00" * 31, b"\x00" * 33):
+            self.assertFalse(verify_inclusion(self.leaves[2], proof, bad_root))
+
+    def test_siblings_must_be_32_byte_bytes(self):
+        proof = prove_inclusion(self.leaves, 2)
+        self.assertFalse(
+            verify_inclusion(self.leaves[2], MerkleProof(2, ("not-bytes",)), self.root)
+        )
+        self.assertFalse(
+            verify_inclusion(self.leaves[2], MerkleProof(2, (b"\x00" * 31,)), self.root)
+        )
+        self.assertFalse(
+            verify_inclusion(self.leaves[2], MerkleProof(2, [b"\x00" * 32]), self.root)
+        )
+
+    def test_negative_index_returns_false(self):
+        proof = prove_inclusion(self.leaves, 2)
+        self.assertFalse(
+            verify_inclusion(self.leaves[2], MerkleProof(-1, proof.siblings), self.root)
+        )
+
+    def test_non_integer_index_returns_false(self):
+        proof = prove_inclusion(self.leaves, 2)
+        self.assertFalse(
+            verify_inclusion(self.leaves[2], MerkleProof(2.0, proof.siblings), self.root)
+        )
+
+    def test_type_errors(self):
+        proof = prove_inclusion(self.leaves, 2)
+        with self.assertRaises(TypeError):
+            verify_inclusion("leaf-2", proof, self.root)
+        with self.assertRaises(TypeError):
+            verify_inclusion(self.leaves[2], proof, "root")
+        with self.assertRaises(TypeError):
+            verify_inclusion(self.leaves[2], (2, proof.siblings), self.root)
+
+    def test_does_not_mutate_proof(self):
+        proof = prove_inclusion(self.leaves, 2)
+        siblings = proof.siblings
+        verify_inclusion(self.leaves[2], proof, self.root)
+        self.assertEqual(proof.siblings, siblings)
 
 
 if __name__ == "__main__":

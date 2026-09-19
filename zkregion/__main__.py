@@ -2,7 +2,17 @@
 
 from __future__ import annotations
 
-from . import Region, SchnorrProver, SchnorrVerifier, commit, commit_coordinate, verify_opening
+from . import (
+    Region,
+    SchnorrProver,
+    SchnorrVerifier,
+    commit,
+    commit_coordinate,
+    merkle_root,
+    prove_inclusion,
+    verify_inclusion,
+    verify_opening,
+)
 
 
 def counter_randbelow():
@@ -49,6 +59,30 @@ def main() -> int:
     print(f"  region size {region.width()}x{region.height()}")
     for x, y in ((50, 50), (0, 0), (100, 100), (101, 50), (-1, 50)):
         print(f"  contains({x:>4}, {y:>4}) = {region.contains(x, y)}")
+
+    print()
+    print("Merkle inclusion proofs:")
+    leaves = [f"leaf-{i}".encode() for i in range(5)]
+    root = merkle_root(leaves)
+    print(f"  root={root.hex()[:32]}…")
+    for index in (0, 2, 4):
+        proof = prove_inclusion(leaves, index)
+        accepted = verify_inclusion(leaves[index], proof, root)
+        print(f"  leaf {index} proof has {len(proof.siblings)} siblings, accepted: {accepted}")
+    single = [b"only"]
+    single_root = merkle_root(single)
+    single_proof = prove_inclusion(single, 0)
+    print(
+        "  single-leaf root is the leaf digest, empty path: "
+        f"{single_proof.siblings == () and verify_inclusion(b'only', single_proof, single_root)}"
+    )
+    duplicate = [b"same", b"same", b"same"]
+    duplicate_root = merkle_root(duplicate)
+    middle = prove_inclusion(duplicate, 1)
+    print(f"  duplicate leaves located by index: {verify_inclusion(b'same', middle, duplicate_root)}")
+    tampered = prove_inclusion(leaves, 2)
+    print(f"  tampered leaf rejected: {not verify_inclusion(b'forged', tampered, root)}")
+    print(f"  tampered root rejected: {not verify_inclusion(leaves[2], tampered, b'\\x00' * 32)}")
     return 0
 
 

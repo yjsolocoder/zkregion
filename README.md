@@ -1,6 +1,6 @@
 # zkregion
 
-面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明，以及量化整数坐标下的矩形区域判定。
+面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、量化整数坐标下的矩形区域判定，以及确定性 SHA-256 Merkle 包含证明。
 
 ## 环境
 
@@ -9,7 +9,11 @@ Python 3.10+，只依赖标准库（`hashlib`、`hmac`、`secrets`）。
 ## 使用
 
 ```python
-from zkregion import Region, SchnorrProof, SchnorrProver, SchnorrVerifier, commit, verify_opening
+from zkregion import (
+    Region, SchnorrProof, SchnorrProver, SchnorrVerifier,
+    commit, verify_opening,
+    MerkleProof, merkle_root, prove_inclusion, verify_inclusion,
+)
 
 commitment, nonce = commit(b"coordinate")
 assert verify_opening(commitment, b"coordinate", nonce)
@@ -24,6 +28,12 @@ assert verifier.verify(t, c, s)
 # 非交互 Fiat-Shamir 证明
 proof = prover.prove(b"payload", context=b"session-1")
 assert verifier.verify_proof(b"payload", proof, context=b"session-1")
+
+# Merkle 包含证明
+leaves = [b"alice", b"bob", b"carol"]
+root = merkle_root(leaves)
+inclusion = prove_inclusion(leaves, 1)          # 按零基索引定位
+assert verify_inclusion(b"bob", inclusion, root)
 
 Region(0, 100, 0, 100).contains(50, 50)     # True
 ```
@@ -50,6 +60,21 @@ python3 -m zkregion
   - `verify_proof(message, proof, *, context=b"") -> bool` — 非交互证明验证
 - `SchnorrProof(commitment, response)` — 不可变证明对象（`t = g**k mod prime`，`s = k + c * secret`）
 - `Region(min_x, max_x, min_y, max_y)` — 闭区间矩形；`contains(x, y)`
+- `MerkleProof(index, siblings)` — 冻结数据类；`index` 为零基叶位置，`siblings` 为按叶到根排列的 `tuple[bytes, ...]`
+- `merkle_root(leaves) -> bytes` — 计算 32 字节 Merkle 根
+- `prove_inclusion(leaves, index) -> MerkleProof` — 为 `leaves[index]` 生成包含证明；重复叶按调用方给出的索引定位，不按内容搜索
+- `verify_inclusion(leaf, proof, root) -> bool` — 验证包含证明，篡改叶、索引、路径或根均返回 `False`
+
+### Merkle 构造
+
+摘要全部使用 SHA-256 并以一字节域前缀区分叶节点与内部节点：
+
+- 叶摘要：`SHA-256(b"\x00" + len4 + leaf)`，`len4` 为叶长的四字节无符号大端编码；
+- 内部摘要：`SHA-256(b"\x01" + left + right)`。
+
+每层按输入顺序两两合并；一层为奇数个节点时，复制末项后与自身合并。单叶树的根就是该叶摘要，证明路径为空元组。验证时依据 `index` 的奇偶决定当前节点在左侧还是右侧，每上升一层将索引整除二；单叶树要求路径为空。
+
+`leaves` 必须是非空序列且各项为 `bytes`：空树抛 `ValueError`，类型错误抛 `TypeError`，索引越界抛 `IndexError`。验证时 `leaf`、`root` 及各兄弟摘要须为 `bytes`，后两者恰为 32 字节，`proof` 须为 `MerkleProof` 且 `index` 为非负整数；类型错误抛 `TypeError`，长度或索引结构非法返回 `False`。所有入口均不改写输入。
 
 ### Fiat-Shamir 转录
 
@@ -57,7 +82,7 @@ python3 -m zkregion
 
 ## 限制
 
-`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。承诺只支持单点开合，没有范围证明、没有 Merkle 包含证明、没有批量或聚合验证，区域判定也只是朴素的坐标比较，不检查坐标是否经过承诺绑定。
+`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。承诺只支持单点开合，没有范围证明、没有批量或聚合验证，区域判定也只是朴素的坐标比较，不检查坐标是否经过承诺绑定。Merkle 树只提供单点包含证明，不排除第二原像以外的多证明批量验证，也不证明叶集合之外的性质。
 
 ## 测试
 

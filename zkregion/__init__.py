@@ -1,7 +1,8 @@
 """zkregion - commitments and interactive proofs for region membership.
 
 Public API: commit / verify_opening / commit_coordinate / SchnorrProof /
-SchnorrProver / SchnorrVerifier / Region.
+SchnorrProver / SchnorrVerifier / Region / MerkleProof / merkle_root /
+prove_inclusion / verify_inclusion.
 """
 
 from __future__ import annotations
@@ -15,12 +16,16 @@ from typing import Callable
 __all__ = [
     "DEFAULT_GENERATOR",
     "DEFAULT_PRIME",
+    "MerkleProof",
     "Region",
     "SchnorrProof",
     "SchnorrProver",
     "SchnorrVerifier",
     "commit",
     "commit_coordinate",
+    "merkle_root",
+    "prove_inclusion",
+    "verify_inclusion",
     "verify_opening",
 ]
 
@@ -239,3 +244,103 @@ class Region:
 
     def height(self) -> int:
         return self.max_y - self.min_y + 1
+
+
+@dataclass(frozen=True)
+class MerkleProof:
+    """An inclusion proof for one leaf.
+
+    ``index`` is the zero-based leaf position and ``siblings`` are the
+    co-nodes ordered from leaf level up to the root.
+    """
+
+    index: int
+    siblings: tuple[bytes, ...]
+
+
+def _leaf_digest(leaf: bytes) -> bytes:
+    return hashlib.sha256(b"\x00" + len(leaf).to_bytes(4, "big") + leaf).digest()
+
+
+def _node_digest(left: bytes, right: bytes) -> bytes:
+    return hashlib.sha256(b"\x01" + left + right).digest()
+
+
+def _validate_leaves(leaves: object) -> int:
+    try:
+        length = len(leaves)
+    except TypeError:
+        raise TypeError("leaves must be a non-empty sequence of bytes")
+    if length == 0:
+        raise ValueError("leaves must be non-empty")
+    for leaf in leaves:
+        if not isinstance(leaf, bytes):
+            raise TypeError("all leaves must be bytes")
+    return length
+
+
+def _merkle_levels(leaves: object) -> list[list[bytes]]:
+    """Return the tree levels bottom-up; inputs are never mutated."""
+    _validate_leaves(leaves)
+    level = [_leaf_digest(leaf) for leaf in leaves]
+    levels = [level]
+    while len(level) > 1:
+        if len(level) % 2:
+            level = level + [level[-1]]
+        level = [_node_digest(level[i], level[i + 1]) for i in range(0, len(level), 2)]
+        levels.append(level)
+    return levels
+
+
+def merkle_root(leaves: object) -> bytes:
+    """Return the deterministic SHA-256 Merkle root of ``leaves``."""
+    return _merkle_levels(leaves)[-1][0]
+
+
+def prove_inclusion(leaves: object, index: int) -> MerkleProof:
+    """Build a :class:`MerkleProof` for ``leaves[index]``.
+
+    The index is positional: duplicate leaves are distinguished by the
+    caller-supplied zero-based index, never searched by content.
+    """
+    if not isinstance(index, int):
+        raise TypeError("index must be an integer")
+    levels = _merkle_levels(leaves)
+    if not 0 <= index < len(levels[0]):
+        raise IndexError("leaf index out of range")
+    siblings = []
+    position = index
+    for level in levels[:-1]:
+        if position % 2:
+            siblings.append(level[position - 1])
+        else:
+            paired = level[position + 1] if position + 1 < len(level) else level[position]
+            siblings.append(paired)
+        position //= 2
+    return MerkleProof(index=index, siblings=tuple(siblings))
+
+
+def verify_inclusion(leaf: object, proof: object, root: object) -> bool:
+    """Check a :class:`MerkleProof` against ``root``; never raises on bad data."""
+    if not isinstance(leaf, bytes):
+        raise TypeError("leaf must be bytes")
+    if not isinstance(root, bytes):
+        raise TypeError("root must be bytes")
+    if len(root) != 32:
+        return False
+    if not isinstance(proof, MerkleProof):
+        raise TypeError("proof must be a MerkleProof")
+    if not isinstance(proof.index, int) or proof.index < 0:
+        return False
+    if not isinstance(proof.siblings, tuple):
+        return False
+    node = _leaf_digest(leaf)
+    position = proof.index
+    for sibling in proof.siblings:
+        if not isinstance(sibling, bytes) or len(sibling) != 32:
+            return False
+        node = (
+            _node_digest(sibling, node) if position % 2 else _node_digest(node, sibling)
+        )
+        position //= 2
+    return position == 0 and hmac.compare_digest(node, root)

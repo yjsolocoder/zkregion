@@ -18,6 +18,7 @@ from zkregion import (
     Region,
     RegionBatchEntry,
     RegionProof,
+    RegionReplayGuard,
     ReplayBinding,
     ReplayGuard,
     SchnorrBatchEntry,
@@ -4587,6 +4588,386 @@ class RangeReplayGuardTest(unittest.TestCase):
 
     def test_inputs_are_not_mutated(self):
         guard = RangeReplayGuard()
+        snapshot = dataclasses.replace(self.entry)
+        binding = guard.bind_once(self.entry, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        guard.check(self.entry, binding, now=1)
+        self.assertEqual(self.entry, snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+
+class RegionReplayGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.region = Region(0, 10, 20, 30)
+        self.x_commitment, self.x_blinding = pedersen_commit(
+            5, 0, 10, prime=SMALL_PRIME, generator=3, h=5, blinding=111,
+        )
+        self.y_commitment, self.y_blinding = pedersen_commit(
+            25, 20, 30, prime=SMALL_PRIME, generator=3, h=5, blinding=222,
+        )
+        self.proof = prove_region(
+            self.x_commitment, self.y_commitment, 5, 25,
+            self.x_blinding, self.y_blinding, self.region, b"ctx",
+        )
+        self.entry = RegionBatchEntry(
+            self.x_commitment, self.y_commitment, self.region, self.proof, b"ctx"
+        )
+
+    def entry_with(self, **changes):
+        return dataclasses.replace(self.entry, **changes)
+
+    def bound_leaf(self, entry):
+        items = [b"zkregion/region-bound/v1"]
+        for c in (entry.x_commitment, entry.y_commitment):
+            items += [str(v).encode("ascii")
+                      for v in (c.element, c.lower, c.upper, c.prime, c.generator, c.h)]
+        r = entry.region
+        items += [str(v).encode("ascii") for v in (r.min_x, r.max_x, r.min_y, r.max_y)]
+        items.append(entry.context)
+        for sub in (entry.proof.x_proof, entry.proof.y_proof):
+            for seq in (sub.t, sub.e, sub.s):
+                items.append(str(len(seq)).encode("ascii"))
+                items += [str(v).encode("ascii") for v in seq]
+        return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+    def expected_digest(self, entry, session_id, expires_at=None):
+        def frame(item):
+            return len(item).to_bytes(4, "big") + item
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = frame(b"zr/rg/v1") + frame(session_id) + self.bound_leaf(entry) + frame(expiry)
+        return hashlib.sha256(material).digest()
+
+    # ---- binding ------------------------------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(binding.digest, self.expected_digest(self.entry, b"s1"))
+        self.assertEqual(len(binding.digest), 32)
+        binding = guard.bind_once(self.entry, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(binding.digest, self.expected_digest(self.entry, b"s2", 1000))
+
+    def test_digest_domain_is_distinct(self):
+        # the region replay domain separates the digest from an identical
+        # transcript framed under the range replay domain
+        def frame(item):
+            return len(item).to_bytes(4, "big") + item
+
+        material = frame(b"zr/rr/v1") + frame(b"s1") + self.bound_leaf(self.entry) + frame(b"\x00")
+        self.assertNotEqual(
+            RegionReplayGuard().bind_once(self.entry, b"s1").digest,
+            hashlib.sha256(material).digest(),
+        )
+
+    def test_digest_binds_every_component(self):
+        guard = RegionReplayGuard()
+        base = guard.bind_once(self.entry, b"s")
+        self.assertNotEqual(base.digest, self.expected_digest(self.entry, b"other"))
+        self.assertNotEqual(base.digest, self.expected_digest(self.entry, b"s", 1))
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(self.entry_with(context=b"other"), b"s"),
+        )
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(
+                self.entry_with(region=Region(0, 10, 20, 29)), b"s"
+            ),
+        )
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(
+                self.entry_with(
+                    x_commitment=dataclasses.replace(self.x_commitment, upper=11)
+                ),
+                b"s",
+            ),
+        )
+        tampered = RegionProof(
+            RangeProof(
+                self.proof.x_proof.t, self.proof.x_proof.e,
+                self.proof.x_proof.s[:-1] + (self.proof.x_proof.s[-1] + 1,),
+            ),
+            self.proof.y_proof,
+        )
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(self.entry_with(proof=tampered), b"s"),
+        )
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        no_expiry = RegionReplayGuard().bind_once(self.entry, b"s")
+        with_expiry = RegionReplayGuard().bind_once(self.entry, b"s", expires_at=0)
+        later = RegionReplayGuard().bind_once(self.entry, b"s", expires_at=1)
+        self.assertNotEqual(no_expiry.digest, with_expiry.digest)
+        self.assertNotEqual(with_expiry.digest, later.digest)
+
+    def test_pending_id_cannot_be_rebound(self):
+        guard = RegionReplayGuard()
+        guard.bind_once(self.entry, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        guard = RegionReplayGuard()
+        first = guard.bind_once(self.entry, b"s1")
+        second = guard.bind_once(self.entry, b"s2")
+        self.assertNotEqual(first, second)
+        self.assertTrue(guard.check(self.entry, first, now=1))
+        self.assertTrue(guard.check(self.entry, second, now=1))
+
+    def test_bind_once_type_errors(self):
+        guard = RegionReplayGuard()
+        for bad in ("entry", 7, None, self.proof, self.region, self.x_commitment):
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(self.entry, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(self.entry, b"s", expires_at=bad)
+
+    def test_bind_once_nested_type_errors(self):
+        guard = RegionReplayGuard()
+        with self.assertRaises(TypeError):
+            guard.bind_once(self.entry_with(x_commitment="c"), b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                self.entry_with(x_commitment=dataclasses.replace(self.x_commitment, h=True)),
+                b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(self.entry_with(region="r"), b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(self.entry_with(proof="p"), b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                self.entry_with(proof=RegionProof("x", self.proof.y_proof)), b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                self.entry_with(
+                    proof=RegionProof(
+                        RangeProof(
+                            list(self.proof.x_proof.t),
+                            self.proof.x_proof.e,
+                            self.proof.x_proof.s,
+                        ),
+                        self.proof.y_proof,
+                    )
+                ),
+                b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(self.entry_with(context="ctx"), b"s")
+        # bool region bounds are rejected even though Region itself allows them
+        bool_region_entry = self.entry_with(region=Region(True, 10, 20, 30))
+        with self.assertRaises(TypeError):
+            guard.bind_once(bool_region_entry, b"s")
+
+    def test_bind_once_value_errors(self):
+        guard = RegionReplayGuard()
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"")
+        for bad in (-1, 2**64):
+            with self.assertRaises(ValueError):
+                guard.bind_once(self.entry, b"s", expires_at=bad)
+
+    # ---- honest check and single use ----------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s", expires_at=1000)
+        self.assertTrue(guard.check(self.entry, binding, now=999))
+        # the consumed id is rejected and cannot be replayed
+        self.assertFalse(guard.check(self.entry, binding, now=999))
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"s")
+
+    def test_check_calls_verify_region_in_field_order(self):
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(
+            guard.check(
+                self.entry, binding, now=1,
+            )
+        )
+
+    def test_check_without_expiry_ignores_now(self):
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding, now=0))
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding, now=2**64 - 1))
+
+    def test_check_with_default_now(self):
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding))
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s", expires_at=10**12)
+        self.assertTrue(guard.check(self.entry, binding))
+
+    def test_expiry_boundary_is_inclusive(self):
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s1", expires_at=1000)
+        self.assertTrue(guard.check(self.entry, binding, now=999))
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s2", expires_at=1000)
+        self.assertFalse(guard.check(self.entry, binding, now=1000))
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s3", expires_at=1000)
+        self.assertFalse(guard.check(self.entry, binding, now=1001))
+
+    # ---- rejection never consumes -------------------------------------------
+
+    def test_expired_rejection_does_not_consume(self):
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s", expires_at=1000)
+        self.assertFalse(guard.check(self.entry, binding, now=2000))
+        # still pending: an earlier clock succeeds and consumes it
+        self.assertTrue(guard.check(self.entry, binding, now=999))
+        self.assertFalse(guard.check(self.entry, binding, now=999))
+
+    def test_bad_proof_rejection_does_not_consume(self):
+        forged = self.entry_with(
+            proof=RegionProof(
+                RangeProof(
+                    self.proof.x_proof.t, self.proof.x_proof.e,
+                    self.proof.x_proof.s[:-1] + (self.proof.x_proof.s[-1] + 1,),
+                ),
+                self.proof.y_proof,
+            )
+        )
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(forged, b"s")
+        self.assertFalse(guard.check(forged, binding, now=1))
+        # id still pending — rebinding is still refused while it waits
+        with self.assertRaises(ValueError):
+            guard.bind_once(forged, b"s")
+
+    def test_entry_field_substitution_rejected_without_consuming(self):
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        tampered_x = RangeProof(
+            self.proof.x_proof.t, self.proof.x_proof.e,
+            self.proof.x_proof.s[:-1] + (self.proof.x_proof.s[-1] + 1,),
+        )
+        for changed in (
+            self.entry_with(context=b"other"),
+            self.entry_with(region=Region(0, 10, 20, 29)),
+            self.entry_with(
+                x_commitment=dataclasses.replace(self.x_commitment, upper=11)
+            ),
+            self.entry_with(proof=RegionProof(tampered_x, self.proof.y_proof)),
+            self.entry_with(
+                proof=RegionProof(self.proof.y_proof, self.proof.x_proof)
+            ),
+            RegionBatchEntry(
+                self.y_commitment, self.x_commitment, self.region, self.proof, b"ctx"
+            ),
+        ):
+            self.assertFalse(guard.check(changed, binding, now=1))
+        # the originally bound entry still verifies once
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+
+    def test_verify_region_failure_does_not_consume(self):
+        # a structurally valid entry whose commitment ranges do not match the
+        # region is accepted by bind_once but rejected by check
+        mismatched = self.entry_with(region=Region(0, 9, 20, 30))
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(mismatched, b"s")
+        self.assertFalse(guard.check(mismatched, binding, now=1))
+        # the id stays pending; rebinding still raises
+        with self.assertRaises(ValueError):
+            guard.bind_once(mismatched, b"s")
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        guard = RegionReplayGuard()
+        guard.bind_once(self.entry, b"local")
+        # an equal binding built elsewhere verifies (bindings compare by
+        # value), but an id never registered in this guard does not
+        foreign = RegionReplayGuard().bind_once(self.entry, b"elsewhere")
+        self.assertFalse(guard.check(self.entry, foreign, now=1))
+        equal = RegionReplayGuard().bind_once(self.entry, b"local")
+        self.assertTrue(guard.check(self.entry, equal, now=1))
+        unknown = ReplayBinding(b"never-bound", b"\x00" * 32)
+        self.assertFalse(guard.check(self.entry, unknown, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        guard = RegionReplayGuard()
+        guard.bind_once(self.entry, b"s")
+        forged_digest = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(guard.check(self.entry, forged_digest, now=1))
+        forged_expiry = ReplayBinding(
+            b"s", self.expected_digest(self.entry, b"s", 1), 1
+        )
+        self.assertFalse(guard.check(self.entry, forged_expiry, now=0))
+
+    def test_cross_guard_binding_rejected(self):
+        # a range-guard binding for the same id is not a region-guard binding
+        commitment, blinding = pedersen_commit(
+            4, 0, 10, prime=SMALL_PRIME, generator=3, blinding=1000,
+        )
+        proof = prove_range(
+            commitment, 4, blinding, b"ctx", randbelow=counter_randbelow()
+        )
+        range_binding = RangeReplayGuard().bind_once(
+            RangeBatchEntry(commitment, proof, b"ctx"), b"s"
+        )
+        guard = RegionReplayGuard()
+        guard.bind_once(self.entry, b"s")
+        self.assertFalse(guard.check(self.entry, range_binding, now=1))
+        # and the region digests differ from the range ones for equal framing
+        region_binding = RegionReplayGuard().bind_once(self.entry, b"s")
+        self.assertNotEqual(range_binding.digest, region_binding.digest)
+
+    # ---- argument validation ------------------------------------------------
+
+    def test_check_type_errors(self):
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        for bad in ("entry", 7, None, self.proof, self.region):
+            with self.assertRaises(TypeError):
+                guard.check(bad, binding, now=1)
+        for bad in ("binding", 7, None, (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(self.entry, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(self.entry, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        guard = RegionReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(self.entry, binding, now=bad)
+
+    def test_instances_are_independent(self):
+        first = RegionReplayGuard()
+        second = RegionReplayGuard()
+        binding = first.bind_once(self.entry, b"s")
+        self.assertFalse(second.check(self.entry, binding, now=1))
+        # the rejected foreign check did not touch the first guard
+        self.assertTrue(first.check(self.entry, binding, now=1))
+
+    def test_inputs_are_not_mutated(self):
+        guard = RegionReplayGuard()
         snapshot = dataclasses.replace(self.entry)
         binding = guard.bind_once(self.entry, b"s")
         binding_snapshot = dataclasses.replace(binding)

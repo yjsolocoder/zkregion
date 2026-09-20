@@ -15,6 +15,7 @@ from . import (
     Region,
     RegionBatchEntry,
     RegionProof,
+    RegionReplayGuard,
     ReplayBinding,
     ReplayGuard,
     SchnorrBatchEntry,
@@ -432,6 +433,46 @@ def main() -> int:
           f"{not other_range.check(forged_range_entry, other_range_binding)}")
     print(f"  binding from another guard instance rejected: "
           f"{not other_range.check(range_replay_entry, fresh_binding)}")
+
+    print()
+    print("per-instance replay protection for region proofs (bind once, check once):")
+    region_guard = RegionReplayGuard()
+    region_replay_entry = batch_entries[0]
+    region_binding = region_guard.bind_once(
+        region_replay_entry, b"region-session-1", expires_at=10**12
+    )
+    print(f"  digest={region_binding.digest.hex()[:32]}…  expires_at={region_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{region_guard.check(region_replay_entry, region_binding, now=100)}")
+    print(f"  replay rejected: "
+          f"{not region_guard.check(region_replay_entry, region_binding, now=101)}")
+    tampered_region = RegionProof(
+        RangeProof(
+            region_replay_entry.proof.x_proof.t,
+            region_replay_entry.proof.x_proof.e,
+            region_replay_entry.proof.x_proof.s[:-1]
+            + (region_replay_entry.proof.x_proof.s[-1] + 1,),
+        ),
+        region_replay_entry.proof.y_proof,
+    )
+    forged_region_entry = dataclasses.replace(region_replay_entry, proof=tampered_region)
+    other_region_guard = RegionReplayGuard()
+    other_region_binding = other_region_guard.bind_once(forged_region_entry, b"region-session-2")
+    print(f"  bad region proof rejected without consuming the id: "
+          f"{not other_region_guard.check(forged_region_entry, other_region_binding)}")
+    substituted = dataclasses.replace(
+        region_replay_entry,
+        region=Region(
+            region_replay_entry.region.min_x,
+            region_replay_entry.region.max_x,
+            region_replay_entry.region.min_y,
+            region_replay_entry.region.max_y - 1,
+        ),
+    )
+    print(f"  substituted region field rejected without consuming the id: "
+          f"{not other_region_guard.check(substituted, other_region_binding)}")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_region_guard.check(region_replay_entry, fresh_binding)}")
 
     print()
     print("region membership:")

@@ -63,6 +63,15 @@ proof = prove_range(commitment, 40, blinding, context=b"session-1")
 assert verify_range(commitment, proof, context=b"session-1")
 assert not verify_range(commitment, proof, context=b"other")
 
+# 区间证明的批量验证（按 (prime, generator, h) 分组做随机线性组合）
+from zkregion import RangeBatchEntry, verify_range_batch
+
+batch = [
+    RangeBatchEntry(commitment, proof, b"session-1"),
+    RangeBatchEntry(commitment, proof, b"session-1"),
+]
+assert verify_range_batch(batch)
+
 # 二维区域成员非交互证明：证明承诺的 (x, y) 落在矩形区域内
 from zkregion import RegionProof, prove_region, verify_region
 
@@ -105,6 +114,8 @@ python3 -m zkregion
 - `prove_range(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> RangeProof` — 生成 Pedersen 承诺的非交互区间证明（Schnorr OR）
 - `verify_range(commitment, proof, context=b"") -> bool` — 验证区间证明
 - `RangeProof(t, e, s)` — 不可变区间证明对象，三个字段均为长度 `upper - lower + 1` 的 `tuple[int, ...]`
+- `verify_range_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 区间证明的批量验证，按 `(prime, generator, h)` 分组做一次随机线性组合
+- `RangeBatchEntry(commitment, proof, context=b"")` — 不可变批量验证条目，字段次序与 `verify_range` 入参一致
 - `prove_region(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionProof` — 生成二维矩形区域成员非交互证明
 - `verify_region(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证区域成员证明，无需坐标或盲因子
 - `RegionProof(x_proof, y_proof)` — 不可变区域证明对象，两字段均为 `RangeProof`
@@ -169,6 +180,22 @@ D_i = element * g**(-i) mod prime
 挑战 `c` 为 SHA-256 摘要的大端整数模 `prime`。转录依次写入域 `b"zkregion/pedersen-range/v1"`、承诺六字段（`element`、`lower`、`upper`、`prime`、`generator`、`h`）、`context`、`n` 与全部 `t_i`；每项前置四字节无符号大端长度，整数编码为十进制 ASCII。
 
 验证要求：每个 `t_i ∈ [1, prime)`、`e_i ∈ [0, prime)`、`s_i ≥ 0`，`sum(e) mod prime == c`，且每个分支满足 Schnorr 等式 `h**s_i == t_i * D_i**e_i (mod prime)`。生成前会先复用 `verify_pedersen_opening` 校验开合，开合不符抛 `ValueError`；类型错误（含 `bool` 整数、非元组证明字段、非 `bytes` 的 `context`、不可调用的 `randbelow`）抛 `TypeError`；其他非法结构、篡改或绑定不符（错误的承诺、`context` 或证明）一律返回 `False`。入口均不改写输入。
+
+### Pedersen 区间证明批量验证
+
+`verify_range_batch(entries, *, randbelow=secrets.randbelow)` 一次验证一批 `RangeBatchEntry`，每个条目就是 `verify_range` 的三个入参（`commitment`、`proof`、`context`，后者缺省 `b""`）冻结成的不可变数据类。`entries` 须为非字符串、非空序列：空批返回 `False`，重复条目合法并各自独立取系数。漏项无法被发现，批次完整性由调用方保证。
+
+每个条目逐字节复用既定的 RangeProof 转录与结构校验：承诺六字段、声明区间与 `context` 全部绑定进挑战，`t`/`e`/`s` 元组长度恰为区间整数数，逐个校验 `t_i ∈ [1, prime)`、`e_i ∈ [0, prime)`、`s_i ≥ 0`，以及 `sum(e) mod prime` 等于转录挑战。上述结构、挑战和或任何绑定（承诺、`context`，含跨条目重组）不符都返回 `False`，允许短路。
+
+通过结构校验后，**每条 RangeProof 分支**（每个条目的每个偏移 `i`）恰调用一次 `randbelow(prime - 1)` 得 `r`，取非零系数 `a = r + 1`；`D_i = element * generator**(-i) mod prime` 的定义与单点验证完全一致。所有分支按 `(prime, generator, h)` 分组，每组只检查一次聚合等式
+
+```
+h**Σ(a*s) == Π(t**a * D_i**(a*e))   (mod prime)
+```
+
+即把该组内所有条目的全部分支纳入同一个随机线性组合，而**不是**逐证明验证后做布尔汇总——因此同组内响应误差可以在系数为 1 时相消，而不同 `(prime, generator, h)`（不同群或不同 `h`）之间不能跨组相消。传入固定的 `randbelow` 结果可重复，缺省为 `secrets.randbelow`。
+
+类型错误（含 `bool` 整数、非元组证明字段、非 `bytes` 的 `context`、`randbelow` 不可调用或返回非整数）抛 `TypeError`；系数来源返回值超出 `[0, prime - 1)` 抛 `ValueError`。其余非法结构、篡改或承诺/context 绑定错误均返回 `False`；入口不改写任何输入。与 Schnorr 批量验证一样，这里的随机线性组合只供演示。
 
 ### 二维区域成员非交互证明
 

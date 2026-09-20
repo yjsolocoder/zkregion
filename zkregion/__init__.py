@@ -2,7 +2,8 @@
 
 Public API: commit / verify_opening / commit_coordinate / PedersenCommitment /
 pedersen_commit / verify_pedersen_opening / RangeProof / prove_range /
-verify_range / RegionProof / prove_region / verify_region / RegionBatchEntry /
+verify_range / RangeBatchEntry / verify_range_batch / RegionProof /
+prove_region / verify_region / RegionBatchEntry /
 verify_region_batch / SchnorrProof / SchnorrBatchEntry / SchnorrProver /
 SchnorrVerifier / Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
@@ -24,6 +25,7 @@ __all__ = [
     "MerkleMultiProof",
     "MerkleProof",
     "PedersenCommitment",
+    "RangeBatchEntry",
     "RangeProof",
     "Region",
     "RegionBatchEntry",
@@ -45,6 +47,7 @@ __all__ = [
     "verify_opening",
     "verify_pedersen_opening",
     "verify_range",
+    "verify_range_batch",
     "verify_region",
     "verify_region_batch",
 ]
@@ -315,6 +318,20 @@ class RangeProof:
     t: tuple[int, ...]
     e: tuple[int, ...]
     s: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class RangeBatchEntry:
+    """One item of a range batch verification.
+
+    Fields are the :class:`PedersenCommitment`, the :class:`RangeProof` and
+    the external ``context`` (empty by default) — exactly the arguments of
+    :func:`verify_range`, in the same order.
+    """
+
+    commitment: PedersenCommitment
+    proof: RangeProof
+    context: bytes = b""
 
 
 def _range_challenge(
@@ -1071,6 +1088,101 @@ def verify_region_batch(
                     responses[i],
                     offset_i,
                 )
+
+    for (prime, generator, h), state in groups.items():
+        if pow(h, state["sum"], prime) != state["product"]:
+            return False
+    return True
+
+
+def verify_range_batch(
+    entries: Sequence[RangeBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a batch of :class:`RangeProof` objects with random linear checks.
+
+    ``entries`` must be a non-empty, non-string sequence of
+    :class:`RangeBatchEntry`; an empty batch returns ``False`` and
+    duplicate entries are legal (each draws its own coefficients). Every
+    entry is validated exactly as :func:`verify_range` would, reusing the
+    established :class:`RangeProof` transcript byte for byte: the six
+    commitment fields, the declared range and the ``context`` are all
+    bound into the challenge, the tuple sizes must match the range, the
+    ``t`` / ``e`` / ``s`` values must be in range, and the challenge
+    shares must sum to the transcript challenge.
+
+    Each range-proof branch then draws exactly one random coefficient
+    ``a = r + 1`` with ``r = randbelow(prime - 1)``. Branches sharing the
+    same ``(prime, generator, h)`` group are checked together with a
+    single aggregate equation
+
+    ``h**Σ(a*s) == Π(t**a * D_i**(a*e)) (mod prime)``
+
+    where ``D_i = element * generator**(-i) mod prime`` is unchanged from
+    :func:`verify_range`; per-proof results are never AND-ed together.
+    Type errors — including ``bool`` integers and a non-callable
+    ``randbelow`` or one that returns a non-integer — raise
+    :class:`TypeError`; a coefficient outside ``[0, prime - 1)`` raises
+    :class:`ValueError`. Every other invalid structure, tampering or
+    commitment/context binding mismatch returns ``False``;
+    short-circuiting is allowed. Missing entries cannot be detected: the
+    caller guarantees the batch is complete. Inputs are never mutated.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of RangeBatchEntry")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    items = list(entries)  # copy: inputs are never mutated
+    if not items:
+        return False
+
+    # group -> {"sum": Σ(a*s), "product": Π(t**a * D_i**(a*e))}
+    groups: dict[tuple[int, int, int], dict[str, int]] = {}
+    for position, entry in enumerate(items):
+        if not isinstance(entry, RangeBatchEntry):
+            raise TypeError(f"entries[{position}] must be a RangeBatchEntry")
+        commitment = entry.commitment
+        proof = entry.proof
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(f"entries[{position}] commitment must be a PedersenCommitment")
+        _check_commitment_fields(commitment)
+        if not isinstance(proof, RangeProof):
+            raise TypeError(f"entries[{position}] proof must be a RangeProof")
+        for field_name in ("t", "e", "s"):
+            field = getattr(proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"entries[{position}] proof {field_name} must be a tuple of integers"
+                )
+            for item in field:
+                _check_int(item, f"entries[{position}] proof {field_name} entry")
+        _check_bytes(entry.context, f"entries[{position}] context")
+        try:
+            prime, generator, h, size, announcements, shares, responses = (
+                _range_proof_check_material(commitment, proof, entry.context)
+            )
+            inverses = [pow(generator, -i, prime) for i in range(size)]
+        except (TypeError, ValueError):
+            return False  # structural/transcript mismatch: short-circuit
+        group_key = (prime, generator, h)
+        state = groups.setdefault(group_key, {"sum": 0, "product": 1})
+        for i in range(size):
+            r = randbelow(prime - 1)
+            if not isinstance(r, int) or isinstance(r, bool):
+                raise TypeError("coefficient source randbelow must return an integer")
+            if not 0 <= r < prime - 1:
+                raise ValueError("coefficient source must satisfy 0 <= r < prime - 1")
+            coefficient = r + 1
+            offset_i = commitment.element * inverses[i] % prime
+            state["sum"] += coefficient * responses[i]
+            state["product"] = (
+                state["product"]
+                * pow(announcements[i], coefficient, prime)
+                % prime
+                * pow(offset_i, coefficient * shares[i], prime)
+                % prime
+            )
 
     for (prime, generator, h), state in groups.items():
         if pow(h, state["sum"], prime) != state["product"]:

@@ -17,6 +17,8 @@ from zkregion import (
     Region,
     RegionBatchEntry,
     RegionProof,
+    ReplayBinding,
+    ReplayGuard,
     SchnorrBatchEntry,
     SchnorrProof,
     SchnorrProver,
@@ -3958,6 +3960,362 @@ class MerkleMultiProofTest(unittest.TestCase):
         proof = prove_multi_inclusion(leaves, indices)
         verify_multi_inclusion(entries, proof, merkle_root(leaves))
         self.assertEqual((leaves, indices, entries), snapshot)
+
+
+def _replay_digest_manual(session_id, entry, expires_at):
+    marker = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+
+    def frame(item):
+        return len(item).to_bytes(4, "big") + item
+
+    return hashlib.sha256(
+        frame(b"zr/r/v1") + frame(session_id) + bound_schnorr_leaf(entry) + frame(marker)
+    ).digest()
+
+
+class ReplayBindingTest(unittest.TestCase):
+    def test_positional_construction_defaults_and_equality(self):
+        binding = ReplayBinding(b"session", b"\x01" * 32)
+        self.assertEqual(binding.session_id, b"session")
+        self.assertEqual(binding.digest, b"\x01" * 32)
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(ReplayBinding(b"session", b"\x01" * 32, None), binding)
+        self.assertEqual(
+            tuple(getattr(binding, name) for name in ("session_id", "digest", "expires_at")),
+            (b"session", b"\x01" * 32, None),
+        )
+
+    def test_expiry_is_part_of_value_equality(self):
+        no_expiry = ReplayBinding(b"s", b"\x02" * 32)
+        with_expiry = ReplayBinding(b"s", b"\x02" * 32, 100)
+        self.assertNotEqual(no_expiry, with_expiry)
+        self.assertEqual(ReplayBinding(b"s", b"\x02" * 32, 100), with_expiry)
+        self.assertNotEqual(ReplayBinding(b"s", b"\x02" * 32, 101), with_expiry)
+        self.assertNotEqual(ReplayBinding(b"s", b"\x03" * 32, 100), with_expiry)
+        self.assertNotEqual(ReplayBinding(b"t", b"\x02" * 32, 100), with_expiry)
+
+    def test_frozen(self):
+        binding = ReplayBinding(b"s", b"d")
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            binding.session_id = b"t"
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            binding.digest = b"e"
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            binding.expires_at = 1
+
+
+class ReplayGuardTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+
+    def setUp(self):
+        self.prover = SchnorrProver(secret=12345, prime=self.PRIME, generator=self.G)
+        self.proof = self.prover.prove(b"payload", context=b"ctx")
+        self.entry = MultiSchnorrEntry(
+            self.prover.public_key, b"payload", self.proof, b"ctx", self.PRIME, self.G
+        )
+
+    # ---- binding/digest -----------------------------------------------------
+
+    def test_bind_returns_matching_binding(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"session-1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"session-1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(
+            binding.digest, _replay_digest_manual(b"session-1", self.entry, None)
+        )
+
+    def test_digest_vector_with_expiry(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"session-2", expires_at=0x0102030405060708)
+        self.assertEqual(binding.expires_at, 0x0102030405060708)
+        self.assertEqual(
+            binding.digest,
+            _replay_digest_manual(b"session-2", self.entry, 0x0102030405060708),
+        )
+
+    def test_digest_distinguishes_every_component(self):
+        guard = ReplayGuard()
+        base = guard.bind_once(self.entry, b"s")
+        self.assertNotEqual(
+            base.digest,
+            ReplayGuard().bind_once(self.entry, b"other").digest,
+        )
+        self.assertNotEqual(
+            base.digest,
+            ReplayGuard().bind_once(self.entry, b"s", expires_at=1).digest,
+        )
+        other_message = MultiSchnorrEntry(
+            self.prover.public_key, b"other", self.proof, b"ctx", self.PRIME, self.G
+        )
+        self.assertNotEqual(
+            base.digest,
+            ReplayGuard().bind_once(other_message, b"s").digest,
+        )
+        other_context = MultiSchnorrEntry(
+            self.prover.public_key, b"payload", self.proof, b"other", self.PRIME, self.G
+        )
+        self.assertNotEqual(
+            base.digest,
+            ReplayGuard().bind_once(other_context, b"s").digest,
+        )
+
+    # ---- honest check / consumption -----------------------------------------
+
+    def test_check_verifies_and_consumes(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"session-1")
+        self.assertTrue(guard.check(self.entry, binding, now=1_000))
+        self.assertFalse(guard.check(self.entry, binding, now=1_000))  # consumed
+
+    def test_check_accepts_value_equal_distinct_binding_object(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"session-1")
+        copy = ReplayBinding(binding.session_id, bytes(binding.digest), binding.expires_at)
+        self.assertIsNot(copy, binding)
+        self.assertEqual(copy, binding)
+        self.assertTrue(guard.check(self.entry, copy, now=1_000))
+
+    def test_check_default_now_with_no_expiry(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"session-1")
+        self.assertTrue(guard.check(self.entry, binding))
+
+    def test_successful_check_calls_schnorr_verifier_with_entry_fields(self):
+        # a proof made under a second group verifies through that group
+        other = SchnorrProver(secret=987, prime=104723, generator=5)
+        other_proof = other.prove(b"payload", context=b"ctx")
+        other_entry = MultiSchnorrEntry(
+            other.public_key, b"payload", other_proof, b"ctx", 104723, 5
+        )
+        guard = ReplayGuard()
+        binding = guard.bind_once(other_entry, b"g2")
+        self.assertTrue(guard.check(other_entry, binding, now=1))
+
+    # ---- rejection does not consume -----------------------------------------
+
+    def test_wrong_entry_is_rejected_and_not_consumed(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"session-1")
+        forged = dataclasses.replace(
+            self.entry,
+            proof=SchnorrProof(self.proof.commitment, self.proof.response + 1),
+        )
+        self.assertFalse(guard.check(forged, binding, now=1_000))
+        self.assertTrue(guard.check(self.entry, binding, now=1_000))  # still pending
+
+    def test_wrong_message_is_rejected_and_not_consumed(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"session-1")
+        other = MultiSchnorrEntry(
+            self.prover.public_key, b"other", self.proof, b"ctx", self.PRIME, self.G
+        )
+        self.assertFalse(guard.check(other, binding, now=1_000))
+        self.assertTrue(guard.check(self.entry, binding, now=1_000))
+
+    def test_forged_digest_is_rejected_and_not_consumed(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"session-1", expires_at=1_000)
+        # stripping the expiry changes the digest the check recomputes
+        forged = ReplayBinding(binding.session_id, binding.digest, None)
+        self.assertFalse(guard.check(self.entry, forged, now=1))
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+
+    def test_unknown_binding_is_rejected(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"session-1")
+        # a binding for a session never registered on this guard
+        foreign = ReplayBinding(
+            b"session-x", _replay_digest_manual(b"session-x", self.entry, None)
+        )
+        self.assertFalse(guard.check(self.entry, foreign, now=1))
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+
+    def test_instance_isolation(self):
+        first = ReplayGuard()
+        second = ReplayGuard()
+        binding = first.bind_once(self.entry, b"session-1")
+        self.assertFalse(second.check(self.entry, binding, now=1))
+        self.assertTrue(first.check(self.entry, binding, now=1))
+
+    # ---- expiry --------------------------------------------------------------
+
+    def test_check_just_before_expiry_succeeds(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"s", expires_at=100)
+        self.assertTrue(guard.check(self.entry, binding, now=99))
+
+    def test_check_at_expiry_moment_fails(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"s", expires_at=100)
+        self.assertFalse(guard.check(self.entry, binding, now=100))  # now >= expires_at
+        self.assertFalse(guard.check(self.entry, binding, now=1_000))
+
+    def test_expired_rejection_does_not_consume(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"s", expires_at=100)
+        self.assertFalse(guard.check(self.entry, binding, now=100))
+        # still pending: cannot rebind, but an earlier (valid) time succeeds
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding, now=50))
+        self.assertFalse(guard.check(self.entry, binding, now=50))  # now consumed
+
+    # ---- bind_once registration ---------------------------------------------
+
+    def test_rebind_pending_session_raises(self):
+        guard = ReplayGuard()
+        guard.bind_once(self.entry, b"session-1")
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"session-1")
+
+    def test_rebind_consumed_session_raises(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"session-1")
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"session-1")
+
+    def test_distinct_sessions_coexist(self):
+        guard = ReplayGuard()
+        first = guard.bind_once(self.entry, b"a")
+        second = guard.bind_once(self.entry, b"b")
+        self.assertTrue(guard.check(self.entry, first, now=1))
+        self.assertTrue(guard.check(self.entry, second, now=1))
+        self.assertFalse(guard.check(self.entry, first, now=1))
+        self.assertFalse(guard.check(self.entry, second, now=1))
+
+    # ---- type/value errors ---------------------------------------------------
+
+    def test_bind_entry_type_error(self):
+        guard = ReplayGuard()
+        for bad in (None, 7, "entry", (self.prover.public_key, b"payload", self.proof)):
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, b"s")
+
+    def test_bind_session_type_error(self):
+        guard = ReplayGuard()
+        for bad in ("session", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(self.entry, bad)
+
+    def test_bind_empty_session_value_error(self):
+        with self.assertRaises(ValueError):
+            ReplayGuard().bind_once(self.entry, b"")
+
+    def test_bind_expiry_type_errors(self):
+        for bad in ("100", 1.5, True, False):
+            with self.assertRaises(TypeError):
+                ReplayGuard().bind_once(self.entry, b"s", expires_at=bad)
+
+    def test_bind_expiry_out_of_range_value_error(self):
+        for bad in (-1, 1 << 64, (1 << 64) + 1):
+            with self.assertRaises(ValueError):
+                ReplayGuard().bind_once(self.entry, b"s", expires_at=bad)
+
+    def test_bind_uint64_endpoints_accepted(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"s", expires_at=(1 << 64) - 1)
+        self.assertEqual(binding.expires_at, (1 << 64) - 1)
+        self.assertTrue(guard.check(self.entry, binding, now=(1 << 64) - 2))
+
+    def test_bind_malformed_entry_field_type_error(self):
+        guard = ReplayGuard()
+        cases = (
+            dataclasses.replace(self.entry, public_key=True),
+            dataclasses.replace(self.entry, message="payload"),
+            dataclasses.replace(self.entry, context="ctx"),
+            dataclasses.replace(self.entry, prime=1.5),
+            dataclasses.replace(self.entry, proof="proof"),
+            dataclasses.replace(
+                self.entry,
+                proof=SchnorrProof(True, self.proof.response),
+            ),
+        )
+        for bad in cases:
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, b"s")
+
+    def test_bind_negative_entry_field_value_error(self):
+        for name, value in (
+            ("public_key", -1),
+            ("prime", -1),
+            ("generator", -1),
+        ):
+            bad = dataclasses.replace(self.entry, **{name: value})
+            with self.assertRaises(ValueError):
+                ReplayGuard().bind_once(bad, b"s")
+        bad_proof = SchnorrProof(self.proof.commitment, -1)
+        with self.assertRaises(ValueError):
+            ReplayGuard().bind_once(
+                dataclasses.replace(self.entry, proof=bad_proof), b"s"
+            )
+
+    def test_check_type_errors(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        with self.assertRaises(TypeError):
+            guard.check("entry", binding, now=1)
+        with self.assertRaises(TypeError):
+            guard.check(self.entry, "binding", now=1)
+        with self.assertRaises(TypeError):
+            guard.check(self.entry, binding, now="1")
+        with self.assertRaises(TypeError):
+            guard.check(self.entry, binding, now=True)
+        with self.assertRaises(TypeError):
+            guard.check(self.entry, binding, now=1.5)
+
+    def test_check_now_out_of_range_value_error(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        for bad in (-1, 1 << 64):
+            with self.assertRaises(ValueError):
+                guard.check(self.entry, binding, now=bad)
+
+    def test_check_bad_binding_field_type_error(self):
+        guard = ReplayGuard()
+        guard.bind_once(self.entry, b"s")
+        # value-equal lookups aside, malformed binding fields are type errors
+        with self.assertRaises(TypeError):
+            guard.check(self.entry, ReplayBinding("s", b"d"), now=1)
+        with self.assertRaises(TypeError):
+            guard.check(self.entry, ReplayBinding(b"s", "d"), now=1)
+        with self.assertRaises(TypeError):
+            guard.check(self.entry, ReplayBinding(b"s", b"d", "1"), now=1)
+        with self.assertRaises(TypeError):
+            guard.check(self.entry, ReplayBinding(b"s", b"d", True), now=1)
+
+    def test_check_structurally_invalid_entry_returns_false(self):
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        negative = dataclasses.replace(self.entry, public_key=-1)
+        self.assertFalse(guard.check(negative, binding, now=1))
+        # nothing was consumed
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+
+    def test_check_invalid_group_parameters_return_false(self):
+        # bind_once only enforces types/non-negativity; group range checks
+        # surface as False at check time, through SchnorrVerifier.
+        for name, value in (("prime", 3), ("generator", 1)):
+            bad = dataclasses.replace(self.entry, **{name: value})
+            guard = ReplayGuard()
+            binding = guard.bind_once(bad, f"s-{name}".encode())
+            self.assertFalse(guard.check(bad, binding, now=1), f"{name}={value}")
+        # a valid entry still verifies after the rejected checks above
+        guard = ReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+
+    def test_inputs_are_not_mutated(self):
+        guard = ReplayGuard()
+        entry_snapshot = dataclasses.replace(self.entry)
+        binding = guard.bind_once(self.entry, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        guard.check(self.entry, binding, now=1)
+        self.assertEqual(self.entry, entry_snapshot)
+        self.assertEqual(binding, binding_snapshot)
 
 
 if __name__ == "__main__":

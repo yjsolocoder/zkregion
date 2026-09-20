@@ -65,6 +65,18 @@ proof = prove_multi_inclusion(leaves, tuple(range(len(leaves))))
 batch = BoundSchnorrBatch(tuple(multi), len(multi), proof)
 assert verify_bound(batch, root)
 
+# 实例内防重放：把会话 id 与条目一次性绑定，验签成功即消费会话
+from zkregion import ReplayGuard
+
+guard = ReplayGuard()
+binding = guard.bind_once(multi[0], b"session-1")
+assert guard.check(multi[0], binding, now=1_700_000_000)   # True，会话已消费
+assert not guard.check(multi[0], binding, now=1_700_000_000)  # 重放被拒
+try:
+    guard.bind_once(multi[0], b"session-1")                 # 待用或已消费都不可重绑
+except ValueError:
+    pass
+
 # Merkle 包含证明
 from zkregion import prove_inclusion, verify_inclusion
 
@@ -212,6 +224,8 @@ python3 -m zkregion
 - `MultiSchnorrEntry(public_key, message, proof, context=b"", prime=DEFAULT_PRIME, generator=DEFAULT_GENERATOR)` — 不可变多公钥批量验证条目；前三字段依次为 `int`、`bytes`、`SchnorrProof`，均为必填且可位置构造，值相等即相等
 - `verify_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的 Schnorr 完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_schnorr_batch` 验签
 - `BoundSchnorrBatch(entries, leaf_count, proof)` — 冻结的完整批对象；字段依次为 `tuple[MultiSchnorrEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变
+- `ReplayBinding(session_id:bytes, digest:bytes, expires_at:int|None=None)` — 冻结的防重放绑定；三字段均可位置构造、按值相等且不可变，类型错误抛 `TypeError`
+- `ReplayGuard()` 及其方法 `bind_once(entry:MultiSchnorrEntry, session_id, *, expires_at=None) -> ReplayBinding` / `check(entry, binding, *, now=None) -> bool` — 实例内一次性防重放（详见下文“实例内防重放”）
 - `verify_region_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的区域证明完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_region_batch` 验子证明
 - `BoundRegionBatch(entries, leaf_count, proof)` — 冻结的完整批对象；字段依次为 `tuple[RegionBatchEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变
 - `merkle_root(leaves) -> bytes` — 非空 `bytes` 序列的 Merkle 根
@@ -364,6 +378,23 @@ g**Σ(a*s) == Π(t**a * public_key**(a*c))   (mod prime)
 2. 根通过后，以**同一个 `randbelow`** 调用 `verify_schnorr_batch(entries, randbelow=randbelow)` 验签，随机源契约（每结构合法条目恰调用一次 `randbelow(prime - 1)`、非整数返回 `TypeError`、越界返回 `ValueError`）与输入完全沿用后者，不做包装或改动。
 
 类型错误——`batch` 不是 `BoundSchnorrBatch`、`entries` 不是元组或含非 `MultiSchnorrEntry`、条目嵌套字段类型错误（含 `bool` 整数、非 `bytes` 的 `message`/`context`、非 `SchnorrProof`）、`leaf_count` 不是非 `bool` 整数、`proof`/`root` 类型错误、`randbelow` 不可调用——抛 `TypeError`；其余一切无效情形（空批、缺项、数量不符、索引缺口/重复/乱序、错误根、叶字节篡改、签名或转录不符、非随机随机源导致的 `False` 等）均返回 `False`。入口不改写任何输入。与其它批量验证一样，这里的随机线性组合只供演示。
+
+### 实例内防重放
+
+`ReplayGuard()` 在**单个实例内**提供一次性防重放：登记与待消费状态只存在于该实例上，不同 guard 之间互不相认，因此防重放不跨实例。
+
+- `bind_once(entry: MultiSchnorrEntry, session_id, *, expires_at=None) -> ReplayBinding` 登记"本会话绑定到该条目"并返回冻结的 `ReplayBinding(session_id, digest, expires_at)`；
+- `check(entry, binding, *, now=None) -> bool` 验证**本实例**上一条**待用**（已登记、尚未成功消费）且与 `binding` **按值相等**的绑定，并以条目的公钥与群参数构造 `SchnorrVerifier`，再以条目的 `message`、`proof`、`context` 调用 `verify_proof`（旧接口与输入完全不变）。校验**成功才消费** `session_id`；任何拒绝（摘要不符、非本实例绑定、已消费、过期、验签失败等）都**不消费**。会话处于待用或已消费状态时再次 `bind_once` 同一 `session_id` 抛 `ValueError`。
+
+绑定摘要为：
+
+```
+digest = SHA-256(F(D) || F(session_id) || L(entry) || F(E))
+```
+
+其中域分隔符 `D = b"zr/r/v1"`；`F(x) = len4(x) || x` 为四字节无符号大端长度前缀；`L(entry)` 是该条目的 BoundSchnorr 叶原字节（与“Merkle 承诺的 Schnorr 完整批验”一节的叶字节完全一致），**不再套 `F`**；`E` 是过期标记：无期（`expires_at=None`）为 `b"\x00"`，有期为 `b"\x01" + uint64be(expires_at)`（`expires_at` 为 8 字节无符号大端）。
+
+`now` 缺省取当前 Unix 秒（`int(time.time())`）。`expires_at` 与 `now` 只接受 `None`（仅 `expires_at`）或非 `bool` 的 `uint64` 整数：类型错误（含 `bool`、非整数）抛 `TypeError`；`session_id` 为空或整数超出 `[0, 2**64-1]` 抛 `ValueError`；当 `now >= expires_at` 时校验返回 `False`（不消费）。条目字段类型错误抛 `TypeError`；`check` 遇到无法按无符号编码的结构非法条目（如负整数）返回 `False`，而 `bind_once` 对此抛 `ValueError`。入口不改写任何输入。
 
 ### Merkle 承诺的区域证明完整批验
 

@@ -14,6 +14,7 @@ from . import (
     Region,
     RegionBatchEntry,
     RegionProof,
+    ReplayGuard,
     SchnorrBatchEntry,
     SchnorrProof,
     SchnorrProver,
@@ -337,6 +338,33 @@ def main() -> int:
         "  committed-but-forged response rejected: "
         f"{not verify_bound(forged_batch, merkle_root(forged_leaves), randbelow=counter_randbelow())}"
     )
+
+    print()
+    print("instance-local replay protection (bind once, check once):")
+    replay_entry = multi_batch[0]
+    guard = ReplayGuard()
+    binding = guard.bind_once(replay_entry, b"session-1")
+    print(f"  binding digest={binding.digest.hex()[:32]}…  expires_at={binding.expires_at}")
+    print(f"  first check accepted: {guard.check(replay_entry, binding, now=1_700_000_000)}")
+    print(f"  replayed check rejected: {not guard.check(replay_entry, binding, now=1_700_000_000)}")
+    try:
+        guard.bind_once(replay_entry, b"session-1")
+        rebound = True
+    except ValueError:
+        rebound = False
+    print(f"  re-binding a consumed session rejected: {not rebound}")
+    timed = ReplayGuard()
+    timed_binding = timed.bind_once(replay_entry, b"session-2", expires_at=1_700_000_000)
+    print(f"  check before expiry accepted: {timed.check(replay_entry, timed_binding, now=1_699_999_999)}")
+    expiring = ReplayGuard()
+    expiring_binding = expiring.bind_once(replay_entry, b"session-3", expires_at=1_700_000_000)
+    print(f"  expired check rejected without consuming: "
+          f"{not expiring.check(replay_entry, expiring_binding, now=1_700_000_000)}")
+    print(f"  still usable at an earlier time: "
+          f"{expiring.check(replay_entry, expiring_binding, now=1_699_999_999)}")
+    other_guard = ReplayGuard()
+    print(f"  binding unknown to another guard instance rejected: "
+          f"{not other_guard.check(replay_entry, binding, now=1_700_000_001)}")
 
     print()
     print("merkle inclusion proofs:")

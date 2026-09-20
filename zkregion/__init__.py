@@ -9,6 +9,7 @@ SchnorrVerifier / MultiSchnorrEntry / verify_schnorr_batch /
 BoundSchnorrBatch / verify_bound /
 BoundRegionBatch / verify_region_bound /
 BoundRangeBatch / verify_range_bound /
+ReplayBinding / ReplayGuard /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion.
@@ -19,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Callable
@@ -38,6 +40,8 @@ __all__ = [
     "Region",
     "RegionBatchEntry",
     "RegionProof",
+    "ReplayBinding",
+    "ReplayGuard",
     "SchnorrBatchEntry",
     "SchnorrProof",
     "SchnorrProver",
@@ -2104,3 +2108,219 @@ def verify_range_bound(
     if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
         return False
     return verify_range_batch(entries, randbelow=randbelow)
+
+
+# ---------------------------------------------------------------------------
+# Instance-local replay protection
+#
+# A ReplayBinding pins one MultiSchnorrEntry (its BoundSchnorr leaf bytes) to
+# a session id, optionally with a uint64 expiry. The digest is
+# SHA-256(F(D) || F(session_id) || L(entry) || F(E)), where D is the replay
+# domain separator, F frames an item with its four-byte unsigned big-endian
+# length, L is the raw BoundSchnorr leaf bytes (no framing) and E is the
+# empty/expiry marker. A ReplayGuard keeps per-instance pending/consumed
+# registries: a bound session may be checked exactly once, and only against a
+# value-equal binding; the Schnorr proof itself is re-verified through a
+# SchnorrVerifier built from the entry's own public key and group parameters.
+
+_REPLAY_DOMAIN = b"zr/r/v1"
+_UINT64_MAX = (1 << 64) - 1
+
+
+@dataclass(frozen=True)
+class ReplayBinding:
+    """A replay-protected binding of a session id to one :class:`MultiSchnorrEntry`.
+
+    Fields, in order: ``session_id`` (``bytes``), ``digest`` (``bytes``) and
+    ``expires_at`` (``int`` or ``None`` — ``None`` means the binding never
+    expires). All three are positional construction arguments; bindings
+    compare by value and are immutable.
+    """
+
+    session_id: bytes
+    digest: bytes
+    expires_at: int | None = None
+
+
+def _replay_expiry_bytes(expires_at: int | None) -> bytes:
+    """Encode the empty/expiry marker: ``b"\\x00"`` or ``b"\\x01" + uint64be``."""
+    if expires_at is None:
+        return b"\x00"
+    return b"\x01" + expires_at.to_bytes(8, "big")
+
+
+def _replay_digest(
+    session_id: bytes,
+    entry: MultiSchnorrEntry,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the replay binding digest.
+
+    ``SHA-256(F(D) || F(session_id) || L(entry) || F(E))`` where
+    ``D = b"zr/r/v1"``, ``F`` is a four-byte unsigned big-endian length
+    prefix, ``L`` is the raw BoundSchnorr leaf bytes (not framed) and ``E``
+    is the empty/expiry marker.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(len(_REPLAY_DOMAIN).to_bytes(4, "big"))
+    transcript.update(_REPLAY_DOMAIN)
+    transcript.update(len(session_id).to_bytes(4, "big"))
+    transcript.update(session_id)
+    transcript.update(_bound_schnorr_leaf(entry))
+    marker = _replay_expiry_bytes(expires_at)
+    transcript.update(len(marker).to_bytes(4, "big"))
+    transcript.update(marker)
+    return transcript.digest()
+
+
+def _check_replay_entry(entry: MultiSchnorrEntry) -> None:
+    """Validate the entry fields a replay binding encodes.
+
+    Mirrors the strictness of the bound-batch verifiers: malformed field
+    types (including ``bool``) raise :class:`TypeError`, and negative
+    integers, which the unsigned leaf encoding cannot represent, raise
+    :class:`ValueError`.
+    """
+    proof = entry.proof
+    if not isinstance(proof, SchnorrProof):
+        raise TypeError("entry proof must be a SchnorrProof")
+    _check_int(entry.public_key, "entry public_key")
+    _check_bytes(entry.message, "entry message")
+    _check_int(proof.commitment, "entry proof commitment")
+    _check_int(proof.response, "entry proof response")
+    _check_bytes(entry.context, "entry context")
+    _check_int(entry.prime, "entry prime")
+    _check_int(entry.generator, "entry generator")
+    if min(
+        entry.public_key,
+        proof.commitment,
+        proof.response,
+        entry.prime,
+        entry.generator,
+    ) < 0:
+        raise ValueError("entry integer fields must be non-negative")
+
+
+class ReplayGuard:
+    """Per-instance, single-use replay protection for :class:`MultiSchnorrEntry`.
+
+    Registries are local to this instance: a binding created by one guard is
+    not known by another guard, so anti-replay never crosses instances.
+    """
+
+    def __init__(self) -> None:
+        # session_id -> ReplayBinding for bindings still awaiting a check;
+        # consumed session ids are remembered so a session can never be
+        # rebound within this instance.
+        self._pending: dict[bytes, ReplayBinding] = {}
+        self._consumed: set[bytes] = set()
+
+    def bind_once(
+        self,
+        entry: MultiSchnorrEntry,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register a one-time binding of ``session_id`` to ``entry``.
+
+        Returns the frozen :class:`ReplayBinding`. A session id that is
+        pending (already bound, not yet checked) or already consumed cannot
+        be rebound on this instance and raises :class:`ValueError`.
+        """
+        if not isinstance(entry, MultiSchnorrEntry):
+            raise TypeError("entry must be a MultiSchnorrEntry")
+        _check_replay_entry(entry)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+                raise TypeError("expires_at must be an integer or None")
+            if not 0 <= expires_at <= _UINT64_MAX:
+                raise ValueError("expires_at must fit in uint64")
+        if session_id in self._pending or session_id in self._consumed:
+            raise ValueError("session_id is already bound on this guard")
+        binding = ReplayBinding(
+            session_id=session_id,
+            digest=_replay_digest(session_id, entry, expires_at),
+            expires_at=expires_at,
+        )
+        self._pending[session_id] = binding
+        return binding
+
+    def check(
+        self,
+        entry: MultiSchnorrEntry,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for ``entry``.
+
+        The check succeeds only when ``binding`` is a value-equal binding
+        registered on this instance, its digest matches the presented
+        ``entry``, it is not expired at ``now`` and the entry's Schnorr
+        proof verifies (via a :class:`SchnorrVerifier` built from the
+        entry's public key and group parameters) for the entry's
+        ``message`` and ``context``. Only success consumes ``session_id``;
+        every rejection — including an expired binding — leaves it pending.
+        """
+        if not isinstance(entry, MultiSchnorrEntry):
+            raise TypeError("entry must be a MultiSchnorrEntry")
+        try:
+            _check_replay_entry(entry)
+        except ValueError:
+            return False  # structurally un-encodable entry
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        _check_bytes(binding.session_id, "binding session_id")
+        _check_bytes(binding.digest, "binding digest")
+        expires_at = binding.expires_at
+        if expires_at is not None:
+            if not isinstance(expires_at, int) or isinstance(expires_at, bool):
+                raise TypeError("binding expires_at must be an integer or None")
+            if not 0 <= expires_at <= _UINT64_MAX:
+                raise ValueError("binding expires_at must fit in uint64")
+        if now is None:
+            now = int(time.time())
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("now must be an integer or None")
+        if not 0 <= now <= _UINT64_MAX:
+            raise ValueError("now must fit in uint64")
+        if not binding.session_id:
+            raise ValueError("binding session_id must not be empty")
+
+        # The digest pins the presented entry's BoundSchnorr leaf; a binding
+        # presented with any other entry fails before the registry is touched.
+        expected_digest = _replay_digest(binding.session_id, entry, expires_at)
+        if not hmac.compare_digest(binding.digest, expected_digest):
+            return False
+
+        registered = self._pending.get(binding.session_id)
+        if registered is None or registered != binding:
+            return False  # unknown/consumed session or non-equal binding: do not consume
+
+        # Expired bindings are rejected without consuming, per the contract;
+        # the session stays pending, so it cannot be rebound either.
+        if expires_at is not None and now >= expires_at:
+            return False
+
+        # Invalid embedded group parameters reject like any other bad entry.
+        try:
+            verifier = SchnorrVerifier(
+                entry.public_key,
+                prime=entry.prime,
+                generator=entry.generator,
+            )
+            valid = verifier.verify_proof(
+                entry.message, entry.proof, context=entry.context
+            )
+        except ValueError:
+            return False
+        if not valid:
+            return False  # proof rejected: the binding stays pending
+
+        self._pending.pop(binding.session_id, None)
+        self._consumed.add(binding.session_id)
+        return True

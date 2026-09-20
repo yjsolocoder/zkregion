@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -2190,6 +2191,90 @@ def _replay_expiry_bytes(expires_at: int | None) -> bytes:
     return b"\x01" + expires_at.to_bytes(8, "big")
 
 
+class _ReplayRegistry:
+    """Thread-safe per-instance pending/claimed/consumed session state.
+
+    A session id passes through the states ``pending`` (registered by
+    ``bind_once`` but no ``check`` is working on it), ``claimed`` (exactly
+    one ``check`` has atomically taken the id and is running its potentially
+    long verification) and ``consumed`` (a verification succeeded). Both
+    pending and claimed ids reject a rebind or a second concurrent claim, so
+    at most one concurrent ``check`` of the same id can win.
+
+    Every method holds the registry lock only for its short dictionary
+    mutation; callers release it (via :meth:`claim`) *before* delegating to
+    proof verification, so a slow verification of one id never serializes
+    checks or binds of a different id.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._pending: dict[bytes, ReplayBinding] = {}
+        self._claims: dict[bytes, ReplayBinding] = {}
+        self._consumed: set[bytes] = set()
+
+    def register(self, session_id: bytes, binding: ReplayBinding) -> None:
+        """Register ``binding`` as pending; the id must not be in use.
+
+        Caller has already validated the arguments, so the duplicate case
+        (pending, claimed or consumed) is the only failure and raises
+        :class:`ValueError`.
+        """
+        with self._lock:
+            if session_id in self._pending or session_id in self._claims or session_id in self._consumed:
+                raise ValueError("session_id is already bound or has been consumed")
+            self._pending[session_id] = binding
+
+    def claim(self, session_id: bytes, binding: ReplayBinding) -> bool:
+        """Atomically take a pending id iff its stored binding equals ``binding``.
+
+        Returns ``True`` exactly once among concurrent claims of the same id
+        and moves the id from pending to claimed. An unknown, consumed,
+        already-claimed id or an unequal binding returns ``False`` without
+        changing state.
+        """
+        with self._lock:
+            stored = self._pending.get(session_id)
+            if stored is None or stored != binding:
+                return False
+            del self._pending[session_id]
+            self._claims[session_id] = stored
+            return True
+
+    def commit(self, session_id: bytes) -> None:
+        """Move a claimed id to consumed.
+
+        The id is known to be claimed by this caller, so it is discarded
+        directly; a missing id is tolerated rather than raising
+        :class:`KeyError`.
+        """
+        with self._lock:
+            self._claims.pop(session_id, None)
+            self._consumed.add(session_id)
+
+    def release(self, session_id: bytes) -> None:
+        """Undo a claim after a rejection or an escaped verification error.
+
+        The id becomes pending again with its original binding. A missing
+        claim is tolerated, so an unexpected state never surfaces as
+        :class:`KeyError`.
+        """
+        with self._lock:
+            binding = self._claims.pop(session_id, None)
+            if binding is not None:
+                self._pending[session_id] = binding
+
+    def pending_snapshot(self) -> dict[bytes, ReplayBinding]:
+        """A point-in-time copy of the pending bindings (compat/tests)."""
+        with self._lock:
+            return dict(self._pending)
+
+    def consumed_snapshot(self) -> set[bytes]:
+        """A point-in-time copy of the consumed ids (compat/tests)."""
+        with self._lock:
+            return set(self._consumed)
+
+
 def _replay_digest(
     entry: MultiSchnorrEntry,
     session_id: bytes,
@@ -2249,11 +2334,25 @@ class ReplayGuard:
     pending binding exactly once and then marks the id consumed. Both the
     pending and the consumed state live on this guard instance and are never
     shared between instances.
+
+    Concurrent ``check`` calls for the same session id are resolved by an
+    atomic in-instance claim: at most one call claims the pending id and
+    proceeds to the (potentially slow) signature verification; every other
+    call sees the id as in-flight or consumed and returns ``False``. The
+    claim is held only as per-id registry state, never as a global lock, so
+    verifying one id does not block checks or binds of other ids.
     """
 
     def __init__(self) -> None:
-        self._pending: dict[bytes, ReplayBinding] = {}
-        self._consumed: set[bytes] = set()
+        self._registry = _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        return self._registry.consumed_snapshot()
 
     def bind_once(
         self,
@@ -2267,10 +2366,10 @@ class ReplayGuard:
         Returns the frozen :class:`ReplayBinding`. ``session_id`` must be
         non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
         non-``bool`` unsigned 64-bit Unix-second timestamp. A session id that
-        is already pending or has been consumed raises :class:`ValueError`;
-        wrong argument types raise :class:`TypeError` (an empty id or an
-        out-of-range expiry raise :class:`ValueError`). Inputs are never
-        mutated.
+        is already pending, being checked or has been consumed raises
+        :class:`ValueError`; wrong argument types raise :class:`TypeError`
+        (an empty id or an out-of-range expiry raise :class:`ValueError`).
+        Inputs are never mutated.
         """
         _check_multi_schnorr_entry(entry)
         _check_bytes(session_id, "session_id")
@@ -2280,14 +2379,12 @@ class ReplayGuard:
             _check_uint64(expires_at, "expires_at")
         if not _multi_schnorr_entry_is_encodable(entry):
             raise ValueError("entry integer fields must be non-negative")
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _replay_digest(entry, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        self._registry.register(session_id, binding)
         return binding
 
     def check(
@@ -2301,8 +2398,10 @@ class ReplayGuard:
 
         ``binding`` must be the equal, still-pending :class:`ReplayBinding`
         previously registered on this guard for ``binding.session_id``. The
-        entry's proof is checked with a :class:`SchnorrVerifier` built from
-        the entry's own public key and group parameters, via
+        id is claimed atomically before any verification runs, so among
+        concurrent calls for the same id at most one can return ``True``.
+        The entry's proof is then checked with a :class:`SchnorrVerifier`
+        built from the entry's own public key and group parameters, via
         :meth:`SchnorrVerifier.verify_proof` with ``entry.message``,
         ``entry.proof`` and ``entry.context`` unchanged. For a binding with
         an expiry, ``now >= expires_at`` makes the check fail; ``now``
@@ -2310,11 +2409,13 @@ class ReplayGuard:
         non-``bool`` unsigned 64-bit integer.
 
         Only a fully successful check consumes the session id; every
-        rejection (unknown or consumed id, unequal binding, expiry, bad
-        group parameters or a failing proof) returns ``False`` and leaves
-        the registration untouched. Type errors raise :class:`TypeError`;
-        an out-of-range ``now`` raises :class:`ValueError`. Inputs are never
-        mutated.
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, expiry, bad group parameters or a failing
+        proof) returns ``False``, releases any claim and leaves the
+        registration pending and untouched. Verification runs without any
+        lock held, so different ids are never serialized by it. Type errors
+        raise :class:`TypeError`; an out-of-range ``now`` raises
+        :class:`ValueError`. Inputs are never mutated.
         """
         _check_multi_schnorr_entry(entry)
         if not isinstance(binding, ReplayBinding):
@@ -2326,30 +2427,38 @@ class ReplayGuard:
             current = now
         if not _multi_schnorr_entry_is_encodable(entry):
             return False  # negative integers cannot be encoded into the bound leaf
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _replay_digest(entry, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented entry is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
+        session_id = binding.session_id
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
         try:
-            verifier = SchnorrVerifier(
-                entry.public_key, prime=entry.prime, generator=entry.generator
-            )
-            accepted = verifier.verify_proof(
-                entry.message, entry.proof, context=entry.context
-            )
-        except ValueError:
-            return False  # invalid embedded public key or group parameters
-        if not accepted:
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+            if not hmac.compare_digest(
+                binding.digest,
+                _replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            try:
+                verifier = SchnorrVerifier(
+                    entry.public_key, prime=entry.prime, generator=entry.generator
+                )
+                accepted = verifier.verify_proof(
+                    entry.message, entry.proof, context=entry.context
+                )
+            except ValueError:
+                return False  # invalid embedded public key or group parameters
+            if not accepted:
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to the pending state; after commit() the claim is gone and this
+            # is a no-op, leaving the id consumed.
+            if not committed:
+                self._registry.release(session_id)
 
 
 def _range_replay_digest(
@@ -2399,11 +2508,23 @@ class RangeReplayGuard:
     pending binding exactly once and then marks the id consumed. Both the
     pending and the consumed state live on this guard instance and are never
     shared between instances.
+
+    As with :class:`ReplayGuard`, concurrent checks of the same id are
+    decided by an atomic claim taken before the range proof is verified; the
+    verification runs without any lock held, so different ids are never
+    serialized.
     """
 
     def __init__(self) -> None:
-        self._pending: dict[bytes, ReplayBinding] = {}
-        self._consumed: set[bytes] = set()
+        self._registry = _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        return self._registry.consumed_snapshot()
 
     def bind_once(
         self,
@@ -2417,10 +2538,10 @@ class RangeReplayGuard:
         Returns the frozen :class:`ReplayBinding`. ``session_id`` must be
         non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
         non-``bool`` unsigned 64-bit Unix-second timestamp. A session id that
-        is already pending or has been consumed raises :class:`ValueError`;
-        wrong argument types raise :class:`TypeError` (an empty id or an
-        out-of-range expiry raise :class:`ValueError`). Inputs are never
-        mutated.
+        is already pending, being checked or has been consumed raises
+        :class:`ValueError`; wrong argument types raise :class:`TypeError`
+        (an empty id or an out-of-range expiry raise :class:`ValueError`).
+        Inputs are never mutated.
         """
         _check_range_batch_entry(entry)
         _check_bytes(session_id, "session_id")
@@ -2428,14 +2549,12 @@ class RangeReplayGuard:
             raise ValueError("session_id must not be empty")
         if expires_at is not None:
             _check_uint64(expires_at, "expires_at")
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _range_replay_digest(entry, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        self._registry.register(session_id, binding)
         return binding
 
     def check(
@@ -2449,7 +2568,9 @@ class RangeReplayGuard:
 
         ``binding`` must be the equal, still-pending :class:`ReplayBinding`
         previously registered on this guard for ``binding.session_id``. The
-        entry's range proof is checked with :func:`verify_range` called with
+        id is claimed atomically before verification, so among concurrent
+        calls for the same id at most one can return ``True``. The entry's
+        range proof is then checked with :func:`verify_range` called with
         ``entry.commitment``, ``entry.proof`` and ``entry.context`` in field
         order, unchanged. For a binding with an expiry,
         ``now >= expires_at`` makes the check fail; ``now`` defaults to the
@@ -2457,9 +2578,11 @@ class RangeReplayGuard:
         64-bit integer.
 
         Only a fully successful check consumes the session id; every
-        rejection (unknown or consumed id, unequal binding, digest mismatch,
-        expiry or a failing range proof) returns ``False`` and leaves the
-        registration untouched. Type errors raise :class:`TypeError`; an
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry or a failing range
+        proof) returns ``False``, releases any claim and leaves the
+        registration pending. Verification runs without a lock, so other
+        ids are never blocked. Type errors raise :class:`TypeError`; an
         out-of-range ``now`` raises :class:`ValueError`. Inputs are never
         mutated.
         """
@@ -2471,21 +2594,26 @@ class RangeReplayGuard:
         else:
             _check_uint64(now, "now")
             current = now
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _range_replay_digest(entry, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented entry is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
-        if not verify_range(entry.commitment, entry.proof, entry.context):
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+        session_id = binding.session_id
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _range_replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_range(entry.commitment, entry.proof, entry.context):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
 
 
 def _region_replay_digest(
@@ -2550,11 +2678,23 @@ class RegionReplayGuard:
     pending binding exactly once and then marks the id consumed. Both the
     pending and the consumed state live on this guard instance and are never
     shared between instances.
+
+    As with the other single-entry guards, concurrent checks of the same id
+    are decided by an atomic claim taken before the region proof is
+    verified; the verification runs without any lock held, so different ids
+    are never serialized.
     """
 
     def __init__(self) -> None:
-        self._pending: dict[bytes, ReplayBinding] = {}
-        self._consumed: set[bytes] = set()
+        self._registry = _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        return self._registry.consumed_snapshot()
 
     def bind_once(
         self,
@@ -2568,10 +2708,10 @@ class RegionReplayGuard:
         Returns the frozen :class:`ReplayBinding`. ``session_id`` must be
         non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
         non-``bool`` unsigned 64-bit Unix-second timestamp. A session id that
-        is already pending or has been consumed raises :class:`ValueError`;
-        wrong argument types raise :class:`TypeError` (an empty id or an
-        out-of-range expiry raise :class:`ValueError`). Inputs are never
-        mutated.
+        is already pending, being checked or has been consumed raises
+        :class:`ValueError`; wrong argument types raise :class:`TypeError`
+        (an empty id or an out-of-range expiry raise :class:`ValueError`).
+        Inputs are never mutated.
         """
         _check_region_batch_entry(entry)
         _check_bytes(session_id, "session_id")
@@ -2579,14 +2719,12 @@ class RegionReplayGuard:
             raise ValueError("session_id must not be empty")
         if expires_at is not None:
             _check_uint64(expires_at, "expires_at")
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _region_replay_digest(entry, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        self._registry.register(session_id, binding)
         return binding
 
     def check(
@@ -2600,7 +2738,9 @@ class RegionReplayGuard:
 
         ``binding`` must be the equal, still-pending :class:`ReplayBinding`
         previously registered on this guard for ``binding.session_id``. The
-        entry's region proof is checked with :func:`verify_region` called in
+        id is claimed atomically before verification, so among concurrent
+        calls for the same id at most one can return ``True``. The entry's
+        region proof is then checked with :func:`verify_region` called in
         field order with ``entry.x_commitment``, ``entry.y_commitment``,
         ``entry.region``, ``entry.proof`` and ``entry.context``, unchanged.
         For a binding with an expiry, ``now >= expires_at`` makes the check
@@ -2608,9 +2748,11 @@ class RegionReplayGuard:
         be a non-``bool`` unsigned 64-bit integer.
 
         Only a fully successful check consumes the session id; every
-        rejection (unknown or consumed id, unequal binding, digest mismatch,
-        a substituted entry field, expiry or a failing region proof) returns
-        ``False`` and leaves the registration untouched. Type errors raise
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, a substituted entry field,
+        expiry or a failing region proof) returns ``False``, releases any
+        claim and leaves the registration pending. Verification runs without
+        a lock, so other ids are never blocked. Type errors raise
         :class:`TypeError`; an out-of-range ``now`` raises
         :class:`ValueError`. Inputs are never mutated.
         """
@@ -2622,27 +2764,32 @@ class RegionReplayGuard:
         else:
             _check_uint64(now, "now")
             current = now
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _region_replay_digest(entry, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented entry is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
-        if not verify_region(
-            entry.x_commitment,
-            entry.y_commitment,
-            entry.region,
-            entry.proof,
-            entry.context,
-        ):
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+        session_id = binding.session_id
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _region_replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_region(
+                entry.x_commitment,
+                entry.y_commitment,
+                entry.region,
+                entry.proof,
+                entry.context,
+            ):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2814,11 +2961,23 @@ class BoundRegionReplayGuard:
     delegating to :func:`verify_region_bound` with the random source passed
     through — and then marks the id consumed. Both the pending and the
     consumed state live on this guard instance and are never shared.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the (potentially slow) delegated batch verification; the claim is
+    per-id registry state rather than a global lock, so a batch being
+    verified under one id never serializes checks or binds of other ids.
     """
 
     def __init__(self) -> None:
-        self._pending: dict[bytes, ReplayBinding] = {}
-        self._consumed: set[bytes] = set()
+        self._registry = _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        return self._registry.consumed_snapshot()
 
     def bind_once(
         self,
@@ -2834,11 +2993,11 @@ class BoundRegionReplayGuard:
         non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
         non-``bool`` unsigned 64-bit Unix-second timestamp; the U-framed
         integers (``leaf_count`` and the proof indices) must likewise fit in
-        uint64. A session id that is already pending or consumed raises
-        :class:`ValueError`. Wrong argument or nested field types raise
-        :class:`TypeError`; an empty id, an out-of-uint64 expiry or framed
-        integer, or a rebind raise :class:`ValueError`. Inputs are never
-        mutated.
+        uint64. A session id that is already pending, being checked or
+        consumed raises :class:`ValueError`. Wrong argument or nested field
+        types raise :class:`TypeError`; an empty id, an out-of-uint64 expiry
+        or framed integer, or a rebind raise :class:`ValueError`. Inputs are
+        never mutated.
         """
         _check_bound_region_batch_types(batch, root)
         _check_bytes(session_id, "session_id")
@@ -2848,14 +3007,12 @@ class BoundRegionReplayGuard:
             _check_uint64(expires_at, "expires_at")
         if not _bound_region_replay_encodable(batch):
             raise ValueError("leaf_count and proof indices must be unsigned 64-bit integers")
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _bound_region_replay_digest(batch, root, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        self._registry.register(session_id, binding)
         return binding
 
     def check(
@@ -2871,22 +3028,29 @@ class BoundRegionReplayGuard:
 
         ``binding`` must be the equal, still-pending :class:`ReplayBinding`
         previously registered on this guard for ``binding.session_id``. The
-        digest is recomputed over the presented ``batch`` / ``root``; for a
-        binding with an expiry, ``now >= expires_at`` makes the check fail
-        (``now`` defaults to the current Unix seconds and must otherwise be
-        a non-``bool`` uint64). Only then is the batch/root handed to
-        :func:`verify_region_bound` with ``randbelow`` passed through
-        unchanged, under that function's root, structure and randomness
-        contract.
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id at
+        most one can return ``True``. The digest is recomputed over the
+        presented ``batch`` / ``root``; for a binding with an expiry,
+        ``now >= expires_at`` makes the check fail (``now`` defaults to the
+        current Unix seconds and must otherwise be a non-``bool`` uint64).
+        Only then is the batch/root handed to :func:`verify_region_bound`
+        with ``randbelow`` passed through unchanged, under that function's
+        root, structure and randomness contract.
 
         Only a fully successful check consumes the session id; every
-        rejection (unknown or consumed id, unequal binding, digest
-        mismatch, expiry, a non-32-byte root or sibling, or
-        :func:`verify_region_bound` returning ``False``) returns ``False``
-        and leaves the registration untouched. Type errors raise
-        :class:`TypeError`; an out-of-range ``now`` raises
-        :class:`ValueError`, and errors surfaced by the delegated
-        verification propagate unchanged. Inputs are never mutated.
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, a non-32-byte root
+        or sibling, or :func:`verify_region_bound` returning ``False``)
+        returns ``False``, releases the claim and leaves the registration
+        pending. An exception escaping the delegated verification (such as
+        the :class:`TypeError` / :class:`ValueError` raised by a bad
+        ``randbelow``) likewise releases the claim and then propagates
+        unchanged, leaving the id usable. Verification runs without any lock
+        held, so other ids are never serialized. Argument type errors
+        (including a non-callable ``randbelow``) raise :class:`TypeError`;
+        an out-of-range ``now`` raises :class:`ValueError`. Inputs are never
+        mutated.
         """
         _check_bound_region_batch_types(batch, root)
         if not isinstance(binding, ReplayBinding):
@@ -2900,21 +3064,26 @@ class BoundRegionReplayGuard:
             current = now
         if not _bound_region_replay_encodable(batch):
             return False  # negative or oversized U-framed integers
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _bound_region_replay_digest(batch, root, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented batch/root is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
-        if not verify_region_bound(batch, root, randbelow=randbelow):
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+        session_id = binding.session_id
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_region_replay_digest(batch, root, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_region_bound(batch, root, randbelow=randbelow):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -3070,11 +3239,23 @@ class BoundRangeReplayGuard:
     domain separator (``b"zr/brr/v1"``) and the per-entry leaves changed
     to the BoundRange leaves. Both the pending and the consumed state live
     on this guard instance and are never shared.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the (potentially slow) delegated batch verification; the claim is
+    per-id registry state rather than a global lock, so a batch being
+    verified under one id never serializes checks or binds of other ids.
     """
 
     def __init__(self) -> None:
-        self._pending: dict[bytes, ReplayBinding] = {}
-        self._consumed: set[bytes] = set()
+        self._registry = _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        return self._registry.consumed_snapshot()
 
     def bind_once(
         self,
@@ -3090,11 +3271,11 @@ class BoundRangeReplayGuard:
         non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
         non-``bool`` unsigned 64-bit Unix-second timestamp; the U-framed
         integers (``leaf_count`` and the proof indices) must likewise fit in
-        uint64. A session id that is already pending or consumed raises
-        :class:`ValueError`. Wrong argument or nested field types raise
-        :class:`TypeError`; an empty id, an out-of-uint64 expiry or framed
-        integer, or a rebind raise :class:`ValueError`. Inputs are never
-        mutated.
+        uint64. A session id that is already pending, being checked or
+        consumed raises :class:`ValueError`. Wrong argument or nested field
+        types raise :class:`TypeError`; an empty id, an out-of-uint64 expiry
+        or framed integer, or a rebind raise :class:`ValueError`. Inputs are
+        never mutated.
         """
         _check_bound_range_batch_types(batch, root)
         _check_bytes(session_id, "session_id")
@@ -3104,14 +3285,12 @@ class BoundRangeReplayGuard:
             _check_uint64(expires_at, "expires_at")
         if not _bound_range_replay_encodable(batch):
             raise ValueError("leaf_count and proof indices must be unsigned 64-bit integers")
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _bound_range_replay_digest(batch, root, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        self._registry.register(session_id, binding)
         return binding
 
     def check(
@@ -3127,22 +3306,29 @@ class BoundRangeReplayGuard:
 
         ``binding`` must be the equal, still-pending :class:`ReplayBinding`
         previously registered on this guard for ``binding.session_id``. The
-        digest is recomputed over the presented ``batch`` / ``root``; for a
-        binding with an expiry, ``now >= expires_at`` makes the check fail
-        (``now`` defaults to the current Unix seconds and must otherwise be
-        a non-``bool`` uint64). Only then is the batch/root handed to
-        :func:`verify_range_bound` with ``randbelow`` passed through
-        unchanged, under that function's root, structure and randomness
-        contract.
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id at
+        most one can return ``True``. The digest is recomputed over the
+        presented ``batch`` / ``root``; for a binding with an expiry,
+        ``now >= expires_at`` makes the check fail (``now`` defaults to the
+        current Unix seconds and must otherwise be a non-``bool`` uint64).
+        Only then is the batch/root handed to :func:`verify_range_bound`
+        with ``randbelow`` passed through unchanged, under that function's
+        root, structure and randomness contract.
 
         Only a fully successful check consumes the session id; every
-        rejection (unknown or consumed id, unequal binding, digest
-        mismatch, expiry, a non-32-byte root or sibling, or
-        :func:`verify_range_bound` returning ``False``) returns ``False``
-        and leaves the registration untouched. Type errors raise
-        :class:`TypeError`; an out-of-range ``now`` raises
-        :class:`ValueError`, and errors surfaced by the delegated
-        verification propagate unchanged. Inputs are never mutated.
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, a non-32-byte root
+        or sibling, or :func:`verify_range_bound` returning ``False``)
+        returns ``False``, releases the claim and leaves the registration
+        pending. An exception escaping the delegated verification (such as
+        the :class:`TypeError` / :class:`ValueError` raised by a bad
+        ``randbelow``) likewise releases the claim and then propagates
+        unchanged, leaving the id usable. Verification runs without any lock
+        held, so other ids are never serialized. Argument type errors
+        (including a non-callable ``randbelow``) raise :class:`TypeError`;
+        an out-of-range ``now`` raises :class:`ValueError`. Inputs are never
+        mutated.
         """
         _check_bound_range_batch_types(batch, root)
         if not isinstance(binding, ReplayBinding):
@@ -3156,21 +3342,26 @@ class BoundRangeReplayGuard:
             current = now
         if not _bound_range_replay_encodable(batch):
             return False  # negative or oversized U-framed integers
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _bound_range_replay_digest(batch, root, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented batch/root is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
-        if not verify_range_bound(batch, root, randbelow=randbelow):
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+        session_id = binding.session_id
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_range_replay_digest(batch, root, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_range_bound(batch, root, randbelow=randbelow):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -3336,11 +3527,23 @@ class BoundSchnorrReplayGuard:
     domain separator (``b"zr/bsr/v1"``) and the per-entry leaves changed
     to the BoundSchnorr leaves. Both the pending and the consumed state
     live on this guard instance and are never shared.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the (potentially slow) delegated batch verification; the claim is
+    per-id registry state rather than a global lock, so a batch being
+    verified under one id never serializes checks or binds of other ids.
     """
 
     def __init__(self) -> None:
-        self._pending: dict[bytes, ReplayBinding] = {}
-        self._consumed: set[bytes] = set()
+        self._registry = _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        return self._registry.consumed_snapshot()
 
     def bind_once(
         self,
@@ -3358,11 +3561,11 @@ class BoundSchnorrReplayGuard:
         integers (``leaf_count`` and the proof indices) must fit in uint64
         and every BoundSchnorr leaf integer (``prime``, ``generator``,
         ``public_key`` and the proof commitment / response) must be
-        non-negative. A session id that is already pending or consumed
-        raises :class:`ValueError`. Wrong argument or nested field types
-        raise :class:`TypeError`; an empty id, an out-of-uint64 expiry or
-        framed integer, a negative leaf integer or a rebind raise
-        :class:`ValueError`. Inputs are never mutated.
+        non-negative. A session id that is already pending, being checked
+        or consumed raises :class:`ValueError`. Wrong argument or nested
+        field types raise :class:`TypeError`; an empty id, an
+        out-of-uint64 expiry or framed integer, a negative leaf integer or
+        a rebind raise :class:`ValueError`. Inputs are never mutated.
         """
         _check_bound_schnorr_batch_types(batch, root)
         _check_bytes(session_id, "session_id")
@@ -3375,14 +3578,12 @@ class BoundSchnorrReplayGuard:
                 "leaf_count, proof indices and leaf integers must be non-negative "
                 "unsigned integers"
             )
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _bound_schnorr_replay_digest(batch, root, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        self._registry.register(session_id, binding)
         return binding
 
     def check(
@@ -3398,21 +3599,29 @@ class BoundSchnorrReplayGuard:
 
         ``binding`` must be the equal, still-pending :class:`ReplayBinding`
         previously registered on this guard for ``binding.session_id``. The
-        digest is recomputed over the presented ``batch`` / ``root``; for a
-        binding with an expiry, ``now >= expires_at`` makes the check fail
-        (``now`` defaults to the current Unix seconds and must otherwise be
-        a non-``bool`` uint64). Only then is the batch/root handed to
-        :func:`verify_bound` with ``randbelow`` passed through unchanged,
-        under that function's root, structure and randomness contract.
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id at
+        most one can return ``True``. The digest is recomputed over the
+        presented ``batch`` / ``root``; for a binding with an expiry,
+        ``now >= expires_at`` makes the check fail (``now`` defaults to the
+        current Unix seconds and must otherwise be a non-``bool`` uint64).
+        Only then is the batch/root handed to :func:`verify_bound` with
+        ``randbelow`` passed through unchanged, under that function's root,
+        structure and randomness contract.
 
         Only a fully successful check consumes the session id; every
-        rejection (unknown or consumed id, unequal binding, digest
-        mismatch, a negative leaf integer, a non-32-byte root or sibling,
-        or :func:`verify_bound` returning ``False``) returns ``False`` and
-        leaves the registration untouched. Type errors raise
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, a negative leaf integer, a
+        non-32-byte root or sibling, or :func:`verify_bound` returning
+        ``False``) returns ``False``, releases the claim and leaves the
+        registration pending. An exception escaping the delegated
+        verification (such as the :class:`TypeError` / :class:`ValueError`
+        raised by a bad ``randbelow``) likewise releases the claim and then
+        propagates unchanged, leaving the id usable. Verification runs
+        without any lock held, so other ids are never serialized. Argument
+        type errors (including a non-callable ``randbelow``) raise
         :class:`TypeError`; an out-of-range ``now`` raises
-        :class:`ValueError`, and errors surfaced by the delegated
-        verification propagate unchanged. Inputs are never mutated.
+        :class:`ValueError`. Inputs are never mutated.
         """
         _check_bound_schnorr_batch_types(batch, root)
         if not isinstance(binding, ReplayBinding):
@@ -3426,18 +3635,23 @@ class BoundSchnorrReplayGuard:
             current = now
         if not _bound_schnorr_replay_encodable(batch):
             return False  # negative or oversized framed/leaf integers
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _bound_schnorr_replay_digest(batch, root, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented batch/root is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
-        if not verify_bound(batch, root, randbelow=randbelow):
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+        session_id = binding.session_id
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_schnorr_replay_digest(batch, root, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_bound(batch, root, randbelow=randbelow):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)

@@ -4,10 +4,10 @@ Public API: commit / verify_opening / commit_coordinate / PedersenCommitment /
 pedersen_commit / verify_pedersen_opening / RangeProof / prove_range /
 verify_range / RangeBatchEntry / verify_range_batch / RegionProof /
 prove_region / verify_region / RegionBatchEntry / verify_region_batch /
-SchnorrProof / SchnorrBatchEntry / SchnorrProver /
-SchnorrVerifier / Region / MerkleProof / merkle_root / prove_inclusion /
-verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
-verify_multi_inclusion.
+SchnorrProof / SchnorrBatchEntry / SchnorrProver / SchnorrVerifier /
+MultiSchnorrEntry / verify_schnorr_batch / Region / MerkleProof /
+merkle_root / prove_inclusion / verify_inclusion / MerkleMultiProof /
+prove_multi_inclusion / verify_multi_inclusion.
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ __all__ = [
     "DEFAULT_PRIME",
     "MerkleMultiProof",
     "MerkleProof",
+    "MultiSchnorrEntry",
     "PedersenCommitment",
     "RangeBatchEntry",
     "RangeProof",
@@ -50,6 +51,7 @@ __all__ = [
     "verify_range_batch",
     "verify_region",
     "verify_region_batch",
+    "verify_schnorr_batch",
 ]
 
 # Mersenne prime 2**127 - 1 and a small generator. This is a demonstration
@@ -795,6 +797,116 @@ class SchnorrVerifier:
                 % self._prime
             )
         return pow(self._generator, exponent_sum, self._prime) == product
+
+
+@dataclass(frozen=True)
+class MultiSchnorrEntry:
+    """One item of a multi-key Schnorr batch verification.
+
+    Fields are the ``public_key``, the ``message`` and the
+    :class:`SchnorrProof`, then the optional ``context`` (empty by
+    default) and the group parameters ``prime`` / ``generator`` (the
+    defaults) — everything :func:`verify_schnorr_batch` needs to recompute
+    one proof's Fiat-Shamir transcript, in construction order.
+    """
+
+    public_key: int
+    message: bytes
+    proof: SchnorrProof
+    context: bytes = b""
+    prime: int = DEFAULT_PRIME
+    generator: int = DEFAULT_GENERATOR
+
+
+def verify_schnorr_batch(
+    entries: Sequence[MultiSchnorrEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a batch of Fiat-Shamir Schnorr proofs across public keys.
+
+    ``entries`` must be a non-empty, non-string sequence of
+    :class:`MultiSchnorrEntry`; an empty batch returns ``False`` and
+    duplicate entries are legal (each draws its own coefficient). Every
+    entry reuses the established Fiat-Shamir transcript byte for byte,
+    rebinding the six fields ``prime``, ``generator``, ``public_key``,
+    commitment, ``context`` and ``message`` to recompute its challenge.
+
+    Each entry draws exactly one random coefficient ``a = r + 1`` with
+    ``r = randbelow(prime - 1)``. Entries sharing the same
+    ``(prime, generator)`` group are checked together with a single
+    aggregate equation
+
+    ``generator**Σ(a*s) == Π(t**a * public_key**(a*c)) (mod prime)``
+
+    where every entry uses its own ``public_key``; per-entry results are
+    never AND-ed together and errors cannot cancel across groups. Type
+    errors — including ``bool`` integers and a non-callable ``randbelow``
+    or one that returns a non-integer — raise :class:`TypeError`; a
+    coefficient outside ``[0, prime - 1)`` raises :class:`ValueError`.
+    Every other invalid structure, tampering or binding mismatch returns
+    ``False``; short-circuiting is allowed. Missing entries cannot be
+    detected: the caller guarantees the batch is complete. Inputs are
+    never mutated.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of MultiSchnorrEntry")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    items = list(entries)  # copy: inputs are never mutated
+    if not items:
+        return False
+
+    # group -> {"sum": Σ(a*s), "product": Π(t**a * public_key**(a*c))}
+    groups: dict[tuple[int, int], dict[str, int]] = {}
+
+    for position, entry in enumerate(items):
+        if not isinstance(entry, MultiSchnorrEntry):
+            raise TypeError(f"entries[{position}] must be a MultiSchnorrEntry")
+        _check_int(entry.public_key, f"entries[{position}] public_key")
+        _check_bytes(entry.message, f"entries[{position}] message")
+        proof = entry.proof
+        if not isinstance(proof, SchnorrProof):
+            raise TypeError(f"entries[{position}] proof must be a SchnorrProof")
+        _check_int(proof.commitment, f"entries[{position}] proof commitment")
+        _check_int(proof.response, f"entries[{position}] proof response")
+        _check_bytes(entry.context, f"entries[{position}] context")
+        _check_int(entry.prime, f"entries[{position}] prime")
+        _check_int(entry.generator, f"entries[{position}] generator")
+        prime = entry.prime
+        generator = entry.generator
+        if not 1 < generator < prime:
+            return False
+        if not 0 < entry.public_key < prime:
+            return False
+        if not 1 <= proof.commitment < prime or proof.response < 0:
+            return False  # structurally invalid proof: short-circuit
+        challenge = _fs_challenge(
+            prime,
+            generator,
+            entry.public_key,
+            proof.commitment,
+            entry.context,
+            entry.message,
+        )
+        r = randbelow(prime - 1)
+        if not isinstance(r, int) or isinstance(r, bool):
+            raise TypeError("coefficient source randbelow must return an integer")
+        if not 0 <= r < prime - 1:
+            raise ValueError("coefficient source must satisfy 0 <= r < prime - 1")
+        coefficient = r + 1
+        state = groups.setdefault((prime, generator), {"sum": 0, "product": 1})
+        state["sum"] += coefficient * proof.response
+        state["product"] = (
+            state["product"]
+            * pow(proof.commitment, coefficient, prime) % prime
+            * pow(entry.public_key, coefficient * challenge, prime) % prime
+        )
+
+    for (prime, generator), state in groups.items():
+        if pow(generator, state["sum"], prime) != state["product"]:
+            return False
+    return True
 
 
 @dataclass(frozen=True)

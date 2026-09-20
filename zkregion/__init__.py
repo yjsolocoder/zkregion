@@ -23,6 +23,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -2254,6 +2255,11 @@ class ReplayGuard:
     def __init__(self) -> None:
         self._pending: dict[bytes, ReplayBinding] = {}
         self._consumed: set[bytes] = set()
+        # Guards only the three tables below; it is never held while a proof
+        # is being verified, so a slow check on one session id cannot block
+        # other ids. The set records ids temporarily claimed by a check.
+        self._lock = threading.Lock()
+        self._inflight: set[bytes] = set()
 
     def bind_once(
         self,
@@ -2280,14 +2286,19 @@ class ReplayGuard:
             _check_uint64(expires_at, "expires_at")
         if not _multi_schnorr_entry_is_encodable(entry):
             raise ValueError("entry integer fields must be non-negative")
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _replay_digest(entry, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        with self._lock:
+            if (
+                session_id in self._pending
+                or session_id in self._consumed
+                or session_id in self._inflight
+            ):
+                raise ValueError("session_id is already bound or has been consumed")
+            self._pending[session_id] = binding
         return binding
 
     def check(
@@ -2326,30 +2337,44 @@ class ReplayGuard:
             current = now
         if not _multi_schnorr_entry_is_encodable(entry):
             return False  # negative integers cannot be encoded into the bound leaf
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _replay_digest(entry, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented entry is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
+        session_id = binding.session_id
+        with self._lock:
+            # Atomic claim: one pending id can be held by at most one check.
+            stored = self._pending.get(session_id)
+            if stored is None or stored != binding or session_id in self._inflight:
+                # unknown id, already consumed, claimed by a concurrent check,
+                # or unequal binding
+                return False
+            self._inflight.add(session_id)
+        accepted = False
         try:
-            verifier = SchnorrVerifier(
-                entry.public_key, prime=entry.prime, generator=entry.generator
-            )
-            accepted = verifier.verify_proof(
-                entry.message, entry.proof, context=entry.context
-            )
-        except ValueError:
-            return False  # invalid embedded public key or group parameters
-        if not accepted:
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+            if not hmac.compare_digest(
+                binding.digest,
+                _replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            # The lock is not held during verification, so this cannot block
+            # checks of any other session id.
+            try:
+                verifier = SchnorrVerifier(
+                    entry.public_key, prime=entry.prime, generator=entry.generator
+                )
+                accepted = verifier.verify_proof(
+                    entry.message, entry.proof, context=entry.context
+                )
+            except ValueError:
+                return False  # invalid embedded public key or group parameters
+            return accepted
+        finally:
+            with self._lock:
+                # Release the claim on every outcome; only a verified check
+                # atomically consumes the id. pop(..., None) never raises.
+                self._inflight.discard(session_id)
+                if accepted:
+                    self._pending.pop(session_id, None)
+                    self._consumed.add(session_id)
 
 
 def _range_replay_digest(
@@ -2404,6 +2429,11 @@ class RangeReplayGuard:
     def __init__(self) -> None:
         self._pending: dict[bytes, ReplayBinding] = {}
         self._consumed: set[bytes] = set()
+        # Guards only the three tables below; it is never held while a proof
+        # is being verified, so a slow check on one session id cannot block
+        # other ids. The set records ids temporarily claimed by a check.
+        self._lock = threading.Lock()
+        self._inflight: set[bytes] = set()
 
     def bind_once(
         self,
@@ -2428,14 +2458,19 @@ class RangeReplayGuard:
             raise ValueError("session_id must not be empty")
         if expires_at is not None:
             _check_uint64(expires_at, "expires_at")
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _range_replay_digest(entry, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        with self._lock:
+            if (
+                session_id in self._pending
+                or session_id in self._consumed
+                or session_id in self._inflight
+            ):
+                raise ValueError("session_id is already bound or has been consumed")
+            self._pending[session_id] = binding
         return binding
 
     def check(
@@ -2471,21 +2506,36 @@ class RangeReplayGuard:
         else:
             _check_uint64(now, "now")
             current = now
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _range_replay_digest(entry, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented entry is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
-        if not verify_range(entry.commitment, entry.proof, entry.context):
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+        session_id = binding.session_id
+        with self._lock:
+            # Atomic claim: one pending id can be held by at most one check.
+            stored = self._pending.get(session_id)
+            if stored is None or stored != binding or session_id in self._inflight:
+                # unknown id, already consumed, claimed by a concurrent check,
+                # or unequal binding
+                return False
+            self._inflight.add(session_id)
+        accepted = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _range_replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            # The lock is not held during verification, so this cannot block
+            # checks of any other session id.
+            accepted = verify_range(entry.commitment, entry.proof, entry.context)
+            return accepted
+        finally:
+            with self._lock:
+                # Release the claim on every outcome; only a verified check
+                # atomically consumes the id. pop(..., None) never raises.
+                self._inflight.discard(session_id)
+                if accepted:
+                    self._pending.pop(session_id, None)
+                    self._consumed.add(session_id)
 
 
 def _region_replay_digest(
@@ -2555,6 +2605,11 @@ class RegionReplayGuard:
     def __init__(self) -> None:
         self._pending: dict[bytes, ReplayBinding] = {}
         self._consumed: set[bytes] = set()
+        # Guards only the three tables below; it is never held while a proof
+        # is being verified, so a slow check on one session id cannot block
+        # other ids. The set records ids temporarily claimed by a check.
+        self._lock = threading.Lock()
+        self._inflight: set[bytes] = set()
 
     def bind_once(
         self,
@@ -2579,14 +2634,19 @@ class RegionReplayGuard:
             raise ValueError("session_id must not be empty")
         if expires_at is not None:
             _check_uint64(expires_at, "expires_at")
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _region_replay_digest(entry, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        with self._lock:
+            if (
+                session_id in self._pending
+                or session_id in self._consumed
+                or session_id in self._inflight
+            ):
+                raise ValueError("session_id is already bound or has been consumed")
+            self._pending[session_id] = binding
         return binding
 
     def check(
@@ -2622,27 +2682,42 @@ class RegionReplayGuard:
         else:
             _check_uint64(now, "now")
             current = now
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _region_replay_digest(entry, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented entry is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
-        if not verify_region(
-            entry.x_commitment,
-            entry.y_commitment,
-            entry.region,
-            entry.proof,
-            entry.context,
-        ):
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+        session_id = binding.session_id
+        with self._lock:
+            # Atomic claim: one pending id can be held by at most one check.
+            stored = self._pending.get(session_id)
+            if stored is None or stored != binding or session_id in self._inflight:
+                # unknown id, already consumed, claimed by a concurrent check,
+                # or unequal binding
+                return False
+            self._inflight.add(session_id)
+        accepted = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _region_replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            # The lock is not held during verification, so this cannot block
+            # checks of any other session id.
+            accepted = verify_region(
+                entry.x_commitment,
+                entry.y_commitment,
+                entry.region,
+                entry.proof,
+                entry.context,
+            )
+            return accepted
+        finally:
+            with self._lock:
+                # Release the claim on every outcome; only a verified check
+                # atomically consumes the id. pop(..., None) never raises.
+                self._inflight.discard(session_id)
+                if accepted:
+                    self._pending.pop(session_id, None)
+                    self._consumed.add(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -2819,6 +2894,11 @@ class BoundRegionReplayGuard:
     def __init__(self) -> None:
         self._pending: dict[bytes, ReplayBinding] = {}
         self._consumed: set[bytes] = set()
+        # Guards only the three tables below; it is never held while a proof
+        # is being verified, so a slow check on one session id cannot block
+        # other ids. The set records ids temporarily claimed by a check.
+        self._lock = threading.Lock()
+        self._inflight: set[bytes] = set()
 
     def bind_once(
         self,
@@ -2848,14 +2928,19 @@ class BoundRegionReplayGuard:
             _check_uint64(expires_at, "expires_at")
         if not _bound_region_replay_encodable(batch):
             raise ValueError("leaf_count and proof indices must be unsigned 64-bit integers")
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _bound_region_replay_digest(batch, root, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        with self._lock:
+            if (
+                session_id in self._pending
+                or session_id in self._consumed
+                or session_id in self._inflight
+            ):
+                raise ValueError("session_id is already bound or has been consumed")
+            self._pending[session_id] = binding
         return binding
 
     def check(
@@ -2900,21 +2985,38 @@ class BoundRegionReplayGuard:
             current = now
         if not _bound_region_replay_encodable(batch):
             return False  # negative or oversized U-framed integers
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _bound_region_replay_digest(batch, root, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented batch/root is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
-        if not verify_region_bound(batch, root, randbelow=randbelow):
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+        session_id = binding.session_id
+        with self._lock:
+            # Atomic claim: one pending id can be held by at most one check.
+            stored = self._pending.get(session_id)
+            if stored is None or stored != binding or session_id in self._inflight:
+                # unknown id, already consumed, claimed by a concurrent check,
+                # or unequal binding
+                return False
+            self._inflight.add(session_id)
+        accepted = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_region_replay_digest(batch, root, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            # The lock is not held during delegation, so a slow verification
+            # cannot block checks of any other session id.
+            accepted = verify_region_bound(batch, root, randbelow=randbelow)
+            return accepted
+        finally:
+            with self._lock:
+                # Release the claim on every outcome — including a False
+                # result, expiry or an exception (e.g. from randbelow) raised
+                # by the delegated verification; only a verified check
+                # atomically consumes the id. pop(..., None) never raises.
+                self._inflight.discard(session_id)
+                if accepted:
+                    self._pending.pop(session_id, None)
+                    self._consumed.add(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -3075,6 +3177,11 @@ class BoundRangeReplayGuard:
     def __init__(self) -> None:
         self._pending: dict[bytes, ReplayBinding] = {}
         self._consumed: set[bytes] = set()
+        # Guards only the three tables below; it is never held while a proof
+        # is being verified, so a slow check on one session id cannot block
+        # other ids. The set records ids temporarily claimed by a check.
+        self._lock = threading.Lock()
+        self._inflight: set[bytes] = set()
 
     def bind_once(
         self,
@@ -3104,14 +3211,19 @@ class BoundRangeReplayGuard:
             _check_uint64(expires_at, "expires_at")
         if not _bound_range_replay_encodable(batch):
             raise ValueError("leaf_count and proof indices must be unsigned 64-bit integers")
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _bound_range_replay_digest(batch, root, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        with self._lock:
+            if (
+                session_id in self._pending
+                or session_id in self._consumed
+                or session_id in self._inflight
+            ):
+                raise ValueError("session_id is already bound or has been consumed")
+            self._pending[session_id] = binding
         return binding
 
     def check(
@@ -3156,21 +3268,38 @@ class BoundRangeReplayGuard:
             current = now
         if not _bound_range_replay_encodable(batch):
             return False  # negative or oversized U-framed integers
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _bound_range_replay_digest(batch, root, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented batch/root is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
-        if not verify_range_bound(batch, root, randbelow=randbelow):
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+        session_id = binding.session_id
+        with self._lock:
+            # Atomic claim: one pending id can be held by at most one check.
+            stored = self._pending.get(session_id)
+            if stored is None or stored != binding or session_id in self._inflight:
+                # unknown id, already consumed, claimed by a concurrent check,
+                # or unequal binding
+                return False
+            self._inflight.add(session_id)
+        accepted = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_range_replay_digest(batch, root, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            # The lock is not held during delegation, so a slow verification
+            # cannot block checks of any other session id.
+            accepted = verify_range_bound(batch, root, randbelow=randbelow)
+            return accepted
+        finally:
+            with self._lock:
+                # Release the claim on every outcome — including a False
+                # result, expiry or an exception (e.g. from randbelow) raised
+                # by the delegated verification; only a verified check
+                # atomically consumes the id. pop(..., None) never raises.
+                self._inflight.discard(session_id)
+                if accepted:
+                    self._pending.pop(session_id, None)
+                    self._consumed.add(session_id)
 
 
 # ---------------------------------------------------------------------------
@@ -3341,6 +3470,11 @@ class BoundSchnorrReplayGuard:
     def __init__(self) -> None:
         self._pending: dict[bytes, ReplayBinding] = {}
         self._consumed: set[bytes] = set()
+        # Guards only the three tables below; it is never held while a proof
+        # is being verified, so a slow check on one session id cannot block
+        # other ids. The set records ids temporarily claimed by a check.
+        self._lock = threading.Lock()
+        self._inflight: set[bytes] = set()
 
     def bind_once(
         self,
@@ -3375,14 +3509,19 @@ class BoundSchnorrReplayGuard:
                 "leaf_count, proof indices and leaf integers must be non-negative "
                 "unsigned integers"
             )
-        if session_id in self._pending or session_id in self._consumed:
-            raise ValueError("session_id is already bound or has been consumed")
         binding = ReplayBinding(
             session_id,
             _bound_schnorr_replay_digest(batch, root, session_id, expires_at),
             expires_at,
         )
-        self._pending[session_id] = binding
+        with self._lock:
+            if (
+                session_id in self._pending
+                or session_id in self._consumed
+                or session_id in self._inflight
+            ):
+                raise ValueError("session_id is already bound or has been consumed")
+            self._pending[session_id] = binding
         return binding
 
     def check(
@@ -3426,18 +3565,35 @@ class BoundSchnorrReplayGuard:
             current = now
         if not _bound_schnorr_replay_encodable(batch):
             return False  # negative or oversized framed/leaf integers
-        stored = self._pending.get(binding.session_id)
-        if stored is None or stored != binding:
-            return False  # unknown id, already consumed, or unequal binding
-        if not hmac.compare_digest(
-            binding.digest,
-            _bound_schnorr_replay_digest(batch, root, binding.session_id, binding.expires_at),
-        ):
-            return False  # the presented batch/root is not the one originally bound
-        if binding.expires_at is not None and current >= binding.expires_at:
-            return False  # expired: rejection does not consume the id
-        if not verify_bound(batch, root, randbelow=randbelow):
-            return False
-        del self._pending[binding.session_id]
-        self._consumed.add(binding.session_id)
-        return True
+        session_id = binding.session_id
+        with self._lock:
+            # Atomic claim: one pending id can be held by at most one check.
+            stored = self._pending.get(session_id)
+            if stored is None or stored != binding or session_id in self._inflight:
+                # unknown id, already consumed, claimed by a concurrent check,
+                # or unequal binding
+                return False
+            self._inflight.add(session_id)
+        accepted = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_schnorr_replay_digest(batch, root, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            # The lock is not held during delegation, so a slow verification
+            # cannot block checks of any other session id.
+            accepted = verify_bound(batch, root, randbelow=randbelow)
+            return accepted
+        finally:
+            with self._lock:
+                # Release the claim on every outcome — including a False
+                # result, expiry or an exception (e.g. from randbelow) raised
+                # by the delegated verification; only a verified check
+                # atomically consumes the id. pop(..., None) never raises.
+                self._inflight.discard(session_id)
+                if accepted:
+                    self._pending.pop(session_id, None)
+                    self._consumed.add(session_id)

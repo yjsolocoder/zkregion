@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 from . import (
+    BoundSchnorrBatch,
     MultiSchnorrEntry,
     RangeBatchEntry,
     RangeProof,
@@ -21,6 +24,7 @@ from . import (
     prove_multi_inclusion,
     prove_range,
     prove_region,
+    verify_bound,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
@@ -210,6 +214,44 @@ def main() -> int:
     tampered = [MultiSchnorrEntry(multi_batch[0].public_key, b"alpha", forged, b"multi"),
                 multi_batch[1]]
     print(f"  tampered batch rejected: {not verify_schnorr_batch(tampered, randbelow=counter_randbelow())}")
+
+    print()
+    print("Merkle-committed Schnorr batch (root check, then batch signatures):")
+
+    def enc(value: int) -> bytes:
+        return value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+
+    def bound_leaf(entry: MultiSchnorrEntry) -> bytes:
+        items = (
+            b"zkregion/schnorr-fs/v1",
+            enc(entry.prime),
+            enc(entry.generator),
+            enc(entry.public_key),
+            enc(entry.proof.commitment),
+            entry.context,
+            entry.message,
+            enc(entry.proof.response),
+        )
+        return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+    bound_leaves = [bound_leaf(entry) for entry in multi_batch]
+    bound_root = merkle_root(bound_leaves)
+    bound_proof = prove_multi_inclusion(bound_leaves, tuple(range(len(multi_batch))))
+    bound_batch = BoundSchnorrBatch(tuple(multi_batch), len(multi_batch), bound_proof)
+    print(f"  entries={len(multi_batch)}  complete index coverage 0..{len(multi_batch) - 1}")
+    print(f"  valid bound batch accepted: {verify_bound(bound_batch, bound_root, randbelow=counter_randbelow())}")
+    print(f"  wrong root rejected: {not verify_bound(bound_batch, merkle_root(bound_leaves[:1]))}")
+    committed = dataclasses.replace(
+        multi_batch[0],
+        proof=SchnorrProof(multi_batch[0].proof.commitment, multi_batch[0].proof.response + 1),
+    )
+    forged_leaves = [bound_leaf(committed)] + bound_leaves[1:]
+    forged_proof = prove_multi_inclusion(forged_leaves, tuple(range(len(multi_batch))))
+    forged_batch = BoundSchnorrBatch((committed, *multi_batch[1:]), len(multi_batch), forged_proof)
+    print(
+        "  committed-but-forged response rejected: "
+        f"{not verify_bound(forged_batch, merkle_root(forged_leaves), randbelow=counter_randbelow())}"
+    )
 
     print()
     print("merkle inclusion proofs:")

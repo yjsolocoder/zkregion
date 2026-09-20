@@ -5,6 +5,7 @@ import unittest
 from zkregion import (
     DEFAULT_GENERATOR,
     DEFAULT_PRIME,
+    BoundSchnorrBatch,
     MerkleMultiProof,
     MerkleProof,
     MultiSchnorrEntry,
@@ -26,6 +27,7 @@ from zkregion import (
     prove_multi_inclusion,
     prove_range,
     prove_region,
+    verify_bound,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
@@ -2251,6 +2253,475 @@ def leaf_digest(leaf: bytes) -> bytes:
 
 def node_digest(left: bytes, right: bytes) -> bytes:
     return hashlib.sha256(b"\x01" + left + right).digest()
+
+
+def encode_uint(value: int) -> bytes:
+    return value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+
+
+def bound_schnorr_leaf(entry: MultiSchnorrEntry) -> bytes:
+    items = (
+        b"zkregion/schnorr-fs/v1",
+        encode_uint(entry.prime),
+        encode_uint(entry.generator),
+        encode_uint(entry.public_key),
+        encode_uint(entry.proof.commitment),
+        entry.context,
+        entry.message,
+        encode_uint(entry.proof.response),
+    )
+    return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+
+class BoundSchnorrBatchTest(unittest.TestCase):
+    G_PRIME = SMALL_PRIME
+    G2_PRIME = 104723
+
+    def prover(self, secret, prime, generator):
+        return SchnorrProver(
+            secret=secret, prime=prime, generator=generator, randbelow=counter_randbelow()
+        )
+
+    def setUp(self):
+        self.alice = self.prover(4321, self.G_PRIME, 3)
+        self.bob = self.prover(7777, self.G_PRIME, 3)
+        self.carol = self.prover(5566, self.G2_PRIME, 3)
+
+    def entry(self, prover, message, *, prime, generator, context=b"ctx"):
+        return MultiSchnorrEntry(
+            public_key=prover.public_key,
+            message=message,
+            proof=prover.prove(message, context=context),
+            context=context,
+            prime=prime,
+            generator=generator,
+        )
+
+    def build(self, entries):
+        leaves = [bound_schnorr_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        batch = BoundSchnorrBatch(tuple(entries), len(entries), proof)
+        return batch, root
+
+    def honest(self):
+        entries = [
+            self.entry(self.alice, b"alpha", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"beta", prime=self.G_PRIME, generator=3),
+            self.entry(self.carol, b"gamma", prime=self.G2_PRIME, generator=3),
+        ]
+        return self.build(entries)
+
+    # ---- batch object -------------------------------------------------------
+
+    def test_batch_positional_equality_and_immutability(self):
+        batch, root = self.honest()
+        proof = batch.proof
+        rebuilt = BoundSchnorrBatch(batch.entries, 3, proof)
+        self.assertEqual(rebuilt, batch)
+        self.assertEqual(hash(rebuilt), hash(batch))
+        self.assertEqual(
+            tuple(getattr(batch, name) for name in ("entries", "leaf_count", "proof")),
+            (batch.entries, 3, proof),
+        )
+        self.assertIsInstance(batch.entries, tuple)
+        self.assertNotEqual(
+            BoundSchnorrBatch(batch.entries, 4, proof), batch
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.leaf_count = 4
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.entries = ()
+
+    def test_field_types(self):
+        batch, _ = self.honest()
+        self.assertIsInstance(batch.entries, tuple)
+        for entry in batch.entries:
+            self.assertIsInstance(entry, MultiSchnorrEntry)
+        self.assertIsInstance(batch.leaf_count, int)
+        self.assertNotIsInstance(batch.leaf_count, bool)
+        self.assertIsInstance(batch.proof, MerkleMultiProof)
+
+    # ---- honest round trip --------------------------------------------------
+
+    def test_honest_batch_verifies(self):
+        batch, root = self.honest()
+        self.assertTrue(verify_bound(batch, root, randbelow=counter_randbelow()))
+        self.assertTrue(verify_bound(batch, root))  # default secrets.randbelow
+
+    def test_single_entry_batch_verifies(self):
+        entries = [self.entry(self.alice, b"only", prime=self.G_PRIME, generator=3)]
+        batch, root = self.build(entries)
+        self.assertTrue(verify_bound(batch, root, randbelow=counter_randbelow()))
+        self.assertTrue(
+            verify_schnorr_batch(entries, randbelow=counter_randbelow())
+        )
+
+    def test_full_leaf_proof_has_empty_siblings(self):
+        batch, root = self.honest()
+        self.assertEqual(batch.proof.siblings, ())
+
+    def test_leaf_is_the_seven_transcript_items_plus_response(self):
+        from zkregion import _fs_challenge
+
+        batch, _ = self.honest()
+        entry = batch.entries[0]
+        leaf = bound_schnorr_leaf(entry)
+        offset = 0
+        items = []
+        for _ in range(8):
+            length = int.from_bytes(leaf[offset:offset + 4], "big")
+            offset += 4
+            items.append(leaf[offset:offset + length])
+            offset += length
+        self.assertEqual(offset, len(leaf))  # exactly eight framed items, nothing trailing
+        self.assertEqual(items[0], b"zkregion/schnorr-fs/v1")
+        self.assertEqual(items[1], encode_uint(entry.prime))
+        self.assertEqual(items[2], encode_uint(entry.generator))
+        self.assertEqual(items[3], encode_uint(entry.public_key))
+        self.assertEqual(items[4], encode_uint(entry.proof.commitment))
+        self.assertEqual(items[5], entry.context)
+        self.assertEqual(items[6], entry.message)
+        self.assertEqual(items[7], encode_uint(entry.proof.response))
+        # shortest unsigned big-endian: no leading zero bytes
+        self.assertFalse(items[1].startswith(b"\x00"))
+        self.assertFalse(items[7].startswith(b"\x00"))
+        # the same seven items drive the Fiat-Shamir challenge, in order
+        fs = hashlib.sha256()
+        for item in items[:7]:
+            fs.update(len(item).to_bytes(4, "big"))
+            fs.update(item)
+        self.assertEqual(
+            int.from_bytes(fs.digest(), "big") % entry.prime,
+            _fs_challenge(
+                entry.prime, entry.generator, entry.public_key,
+                entry.proof.commitment, entry.context, entry.message,
+            ),
+        )
+
+    def test_leaf_uses_merkle_leaf_domain(self):
+        batch, root = self.honest()
+        # root recomputed with the library's leaf framing must match
+        self.assertEqual(
+            merkle_root([bound_schnorr_leaf(entry) for entry in batch.entries]), root
+        )
+
+    def test_empty_context_and_message_are_framed_as_zero_length(self):
+        entry = self.entry(self.alice, b"", prime=self.G_PRIME, generator=3, context=b"")
+        leaf = bound_schnorr_leaf(entry)
+        # offset of the context item (index 5): five prior 4-byte prefixes + bodies
+        offset = 0
+        for _ in range(5):
+            length = int.from_bytes(leaf[offset:offset + 4], "big")
+            offset += 4 + length
+        self.assertEqual(leaf[offset:offset + 4], b"\x00\x00\x00\x00")  # empty context
+        offset += 4
+        self.assertEqual(leaf[offset:offset + 4], b"\x00\x00\x00\x00")  # empty message
+
+    # ---- completeness / count checks ---------------------------------------
+
+    def test_empty_batch_returns_false(self):
+        proof = MerkleMultiProof(1, (), ())
+        batch = BoundSchnorrBatch((), 0, proof)
+        self.assertFalse(verify_bound(batch, bytes(32), randbelow=counter_randbelow()))
+
+    def test_leaf_count_must_equal_entry_count(self):
+        entries = [
+            self.entry(self.alice, b"a", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"b", prime=self.G_PRIME, generator=3),
+        ]
+        leaves = [bound_schnorr_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, (0, 1))
+        for count in (1, 3, 0):
+            batch = BoundSchnorrBatch(tuple(entries), count, proof)
+            self.assertFalse(
+                verify_bound(batch, root, randbelow=counter_randbelow()), count
+            )
+
+    def test_leaf_count_must_equal_proof_leaf_count(self):
+        entries = [
+            self.entry(self.alice, b"a", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"b", prime=self.G_PRIME, generator=3),
+        ]
+        leaves = [bound_schnorr_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, (0, 1))
+        for claimed in (1, 3):
+            bad_proof = dataclasses.replace(proof, leaf_count=claimed)
+            batch = BoundSchnorrBatch(tuple(entries), 2, bad_proof)
+            self.assertFalse(
+                verify_bound(batch, root, randbelow=counter_randbelow()), claimed
+            )
+
+    def test_indices_must_cover_zero_to_n_without_gaps(self):
+        batch, root = self.honest()
+        good_indices = batch.proof.indices
+        for bad_indices in (
+            (0, 1),          # missing one
+            (0, 1, 1),       # duplicate
+            (0, 0, 2),       # duplicate with gap
+            (2, 1, 0),       # reversed
+            (0, 2, 1),       # reordered
+            (1, 2, 3),       # starts at 1
+            (-1, 1, 2),      # negative
+            (0, 1, 3),       # gap at the end
+            (),              # empty
+        ):
+            bad_proof = MerkleMultiProof(3, bad_indices, batch.proof.siblings)
+            bad_batch = BoundSchnorrBatch(batch.entries, 3, bad_proof)
+            self.assertFalse(
+                verify_bound(bad_batch, root, randbelow=counter_randbelow()),
+                bad_indices,
+            )
+        self.assertEqual(good_indices, (0, 1, 2))
+
+    def test_missing_entry_returns_false(self):
+        entries = [
+            self.entry(self.alice, b"a", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"b", prime=self.G_PRIME, generator=3),
+        ]
+        leaves = [bound_schnorr_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        # proof claims three leaves covering 0..2 but only two entries exist
+        proof = MerkleMultiProof(3, (0, 1, 2), ())
+        batch = BoundSchnorrBatch(tuple(entries), 3, proof)
+        self.assertFalse(verify_bound(batch, root, randbelow=counter_randbelow()))
+
+    # ---- Merkle binding rejection -------------------------------------------
+
+    def test_wrong_root_returns_false(self):
+        batch, _ = self.honest()
+        self.assertFalse(verify_bound(batch, bytes(32), randbelow=counter_randbelow()))
+        other = merkle_root([b"alpha", b"beta", b"gamma"])
+        self.assertFalse(verify_bound(batch, other, randbelow=counter_randbelow()))
+
+    def test_tampered_leaf_returns_false_even_with_matching_proof(self):
+        entries = [
+            self.entry(self.alice, b"alpha", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"beta", prime=self.G_PRIME, generator=3),
+        ]
+        batch, root = self.build(entries)
+        # tamper the message but keep a structurally valid proof for the old leaves
+        tampered = dataclasses.replace(entries[0], message=b"other")
+        bad_batch = BoundSchnorrBatch((tampered, entries[1]), 2, batch.proof)
+        self.assertFalse(verify_bound(bad_batch, root, randbelow=counter_randbelow()))
+        # wrong public key / context / group likewise change the leaf
+        for tampered in (
+            dataclasses.replace(entries[0], public_key=self.bob.public_key),
+            dataclasses.replace(entries[0], context=b"other"),
+            dataclasses.replace(entries[0], prime=self.G2_PRIME),
+            dataclasses.replace(entries[0], generator=5),
+        ):
+            bad_batch = BoundSchnorrBatch((tampered, entries[1]), 2, batch.proof)
+            self.assertFalse(
+                verify_bound(bad_batch, root, randbelow=counter_randbelow()),
+                tampered,
+            )
+
+    def test_response_is_committed_by_the_leaf(self):
+        entries = [
+            self.entry(self.alice, b"alpha", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"beta", prime=self.G_PRIME, generator=3),
+        ]
+        batch, root = self.build(entries)
+        tampered = dataclasses.replace(
+            entries[0],
+            proof=SchnorrProof(entries[0].proof.commitment, entries[0].proof.response + 1),
+        )
+        bad_batch = BoundSchnorrBatch((tampered, entries[1]), 2, batch.proof)
+        self.assertFalse(verify_bound(bad_batch, root, randbelow=counter_randbelow()))
+
+    def test_committed_but_forged_signature_fails_at_signature_step(self):
+        # the forged batch is honestly committed to its own (modified) leaves,
+        # so the Merkle step passes; signature verification must still fail
+        entries = [
+            self.entry(self.alice, b"alpha", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"beta", prime=self.G_PRIME, generator=3),
+        ]
+        forged_entry = dataclasses.replace(
+            entries[0],
+            proof=SchnorrProof(entries[0].proof.commitment, entries[0].proof.response + 1),
+        )
+        forged_entries = [forged_entry, entries[1]]
+        bad_batch, forged_root = self.build(forged_entries)
+        self.assertTrue(  # Merkle step alone passes against the forged root
+            verify_multi_inclusion(
+                [(i, bound_schnorr_leaf(e)) for i, e in enumerate(forged_entries)],
+                bad_batch.proof,
+                forged_root,
+            )
+        )
+        self.assertFalse(
+            verify_bound(bad_batch, forged_root, randbelow=counter_randbelow())
+        )
+
+    def test_tampered_siblings_return_false(self):
+        batch, root = self.honest()
+        # a complete-coverage proof consumes no siblings: any supplied
+        # sibling must be rejected as leftover/structural garbage
+        self.assertEqual(batch.proof.siblings, ())
+        bogus = MerkleMultiProof(3, batch.proof.indices, (root,))
+        bad_batch = BoundSchnorrBatch(batch.entries, 3, bogus)
+        self.assertFalse(verify_bound(bad_batch, root, randbelow=counter_randbelow()))
+        # and a wrong root digest length fails the Merkle step
+        self.assertFalse(
+            verify_bound(batch, root + b"\x00", randbelow=counter_randbelow())
+        )
+
+    # ---- randomness contract ------------------------------------------------
+
+    def test_randbelow_passed_unchanged_and_called_once_per_entry(self):
+        batch, root = self.honest()
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(verify_bound(batch, root, randbelow=recording))
+        self.assertEqual(sorted(calls), sorted([self.G_PRIME - 1, self.G_PRIME - 1, self.G2_PRIME - 1]))
+
+    def test_no_randomness_consumed_before_the_root_check(self):
+        batch, _ = self.honest()
+
+        def boom(upper):
+            raise AssertionError("randbelow must not be called before the root checks")
+
+        self.assertFalse(verify_bound(batch, bytes(32), randbelow=boom))
+
+    def test_fixed_randbelow_is_reproducible(self):
+        batch, root = self.honest()
+        first = verify_bound(batch, root, randbelow=counter_randbelow(9))
+        second = verify_bound(batch, root, randbelow=counter_randbelow(9))
+        self.assertEqual(first, second)
+
+    def test_non_random_source_invalidates_or_raises_per_schnorr_contract(self):
+        batch, root = self.honest()
+        for bad in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                verify_bound(batch, root, randbelow=lambda upper, bad=bad: bad)
+        for bad in (-1, self.G_PRIME - 1, self.G_PRIME):
+            with self.assertRaises(ValueError):
+                verify_bound(batch, root, randbelow=lambda upper, bad=bad: bad)
+
+    def test_structurally_invalid_integer_fields_return_false_without_encoding_error(self):
+        # unsigned leaf framing cannot represent negatives and verify_bound
+        # must report False rather than raise OverflowError, before drawing
+        entries = [
+            self.entry(self.alice, b"a", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"b", prime=self.G_PRIME, generator=3),
+        ]
+        batch, root = self.build(entries)
+        good = entries[0]
+        cases = [
+            dataclasses.replace(good, prime=-5),
+            dataclasses.replace(good, generator=-1),
+            dataclasses.replace(good, public_key=-1),
+            dataclasses.replace(good, proof=SchnorrProof(-1, good.proof.response)),
+            dataclasses.replace(good, proof=SchnorrProof(good.proof.commitment, -1)),
+        ]
+        for bad_entry in cases:
+            bad_batch = BoundSchnorrBatch((bad_entry, entries[1]), 2, batch.proof)
+
+            def boom(upper):
+                raise AssertionError("randbelow must not be called")
+
+            self.assertFalse(
+                verify_bound(bad_batch, root, randbelow=counter_randbelow()), bad_entry
+            )
+            self.assertFalse(verify_bound(bad_batch, bytes(32), randbelow=boom))
+
+    # ---- type errors ---------------------------------------------------------
+
+    def test_type_errors(self):
+        batch, root = self.honest()
+        with self.assertRaises(TypeError):
+            verify_bound("batch", root)
+        with self.assertRaises(TypeError):
+            verify_bound(None, root)
+        with self.assertRaises(TypeError):
+            verify_bound(BoundSchnorrBatch(list(batch.entries), 3, batch.proof), root)
+        with self.assertRaises(TypeError):
+            verify_bound(BoundSchnorrBatch(("x",) * 3, 3, batch.proof), root)
+        with self.assertRaises(TypeError):
+            verify_bound(BoundSchnorrBatch(batch.entries, True, batch.proof), root)
+        with self.assertRaises(TypeError):
+            verify_bound(BoundSchnorrBatch(batch.entries, 3.0, batch.proof), root)
+        with self.assertRaises(TypeError):
+            verify_bound(BoundSchnorrBatch(batch.entries, "3", batch.proof), root)
+        with self.assertRaises(TypeError):
+            verify_bound(BoundSchnorrBatch(batch.entries, 3, "proof"), root)
+        with self.assertRaises(TypeError):
+            verify_bound(batch, "root")
+        with self.assertRaises(TypeError):
+            verify_bound(batch, bytearray(root))
+        with self.assertRaises(TypeError):
+            verify_bound(batch, root, randbelow=7)
+        # malformed nested entry fields
+        good = batch.entries[0]
+        cases = [
+            dataclasses.replace(good, public_key="pk"),
+            dataclasses.replace(good, public_key=True),
+            dataclasses.replace(good, message="m"),
+            dataclasses.replace(good, context="ctx"),
+            dataclasses.replace(good, prime=str(self.G_PRIME)),
+            dataclasses.replace(good, prime=True),
+            dataclasses.replace(good, generator=True),
+            dataclasses.replace(good, proof=(good.proof.commitment, good.proof.response)),
+        ]
+        for bad_entry in cases:
+            entries = (bad_entry,) + batch.entries[1:]
+            bad_batch = BoundSchnorrBatch(entries, 3, batch.proof)
+            with self.assertRaises(TypeError):
+                verify_bound(bad_batch, root, randbelow=counter_randbelow())
+        for bad_proof in (
+            SchnorrProof(1.5, good.proof.response),
+            SchnorrProof(good.proof.commitment, "s"),
+            SchnorrProof(True, good.proof.response),
+            SchnorrProof(good.proof.commitment, False),
+        ):
+            entries = (dataclasses.replace(good, proof=bad_proof),) + batch.entries[1:]
+            bad_batch = BoundSchnorrBatch(entries, 3, batch.proof)
+            with self.assertRaises(TypeError):
+                verify_bound(bad_batch, root, randbelow=counter_randbelow())
+        # malformed MerkleMultiProof fields
+        with self.assertRaises(TypeError):
+            verify_bound(
+                BoundSchnorrBatch(batch.entries, 3,
+                                  MerkleMultiProof(True, (0, 1, 2), ())),
+                root,
+            )
+        with self.assertRaises(TypeError):
+            verify_bound(
+                BoundSchnorrBatch(batch.entries, 3,
+                                  MerkleMultiProof(3, [0, 1, 2], ())),
+                root,
+            )
+        with self.assertRaises(TypeError):
+            verify_bound(
+                BoundSchnorrBatch(batch.entries, 3,
+                                  MerkleMultiProof(3, (0, 1, 2.0), ())),
+                root,
+            )
+        with self.assertRaises(TypeError):
+            verify_bound(
+                BoundSchnorrBatch(batch.entries, 3,
+                                  MerkleMultiProof(3, (0, 1, 2), ["x"])),
+                root,
+            )
+
+    # ---- hygiene -------------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        batch, root = self.honest()
+        snapshot = BoundSchnorrBatch(
+            tuple(dataclasses.replace(entry) for entry in batch.entries),
+            batch.leaf_count,
+            dataclasses.replace(batch.proof),
+        )
+        verify_bound(batch, root, randbelow=counter_randbelow())
+        self.assertEqual(batch, snapshot)
 
 
 class MerkleTest(unittest.TestCase):

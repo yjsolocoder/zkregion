@@ -10,6 +10,7 @@ BoundSchnorrBatch / verify_bound /
 BoundRegionBatch / verify_region_bound /
 BoundRangeBatch / verify_range_bound /
 ReplayBinding / ReplayGuard / RangeReplayGuard / RegionReplayGuard /
+BoundRegionReplayGuard /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion.
@@ -31,6 +32,7 @@ __all__ = [
     "BoundRangeBatch",
     "BoundRegionBatch",
     "BoundSchnorrBatch",
+    "BoundRegionReplayGuard",
     "MerkleMultiProof",
     "MerkleProof",
     "MultiSchnorrEntry",
@@ -2137,6 +2139,7 @@ def verify_range_bound(
 _REPLAY_DOMAIN = b"zr/r/v1"
 _RANGE_REPLAY_DOMAIN = b"zr/rr/v1"
 _REGION_REPLAY_DOMAIN = b"zr/rg/v1"
+_BOUND_REGION_REPLAY_DOMAIN = b"zr/brg/v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -2630,6 +2633,250 @@ class RegionReplayGuard:
             entry.proof,
             entry.context,
         ):
+            return False
+        del self._pending[binding.session_id]
+        self._consumed.add(binding.session_id)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Per-instance replay protection for Merkle-committed complete region batches
+#
+# A BoundRegionReplayGuard binds a complete BoundRegionBatch together with the
+# Merkle root it is claimed under to a caller-chosen session id, using one
+# ReplayBinding. Like the other guards, bindings are single-use and local to
+# the guard instance: bind_once registers a pending binding, check accepts an
+# equal pending binding exactly once (delegating to verify_region_bound first)
+# and then consumes the session id; every rejection leaves the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || F(root) || F(U(batch.leaf_count))
+#     || Σ_i F(L(entries[i]))
+#     || F(U(proof.leaf_count))
+#     || S(proof.indices, U) || S(proof.siblings, lambda x: x) || F(E))
+#   D = b"zr/brg/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   L(entry) = the BoundRegion leaf bytes (_bound_region_leaf), raw, i.e.
+#              without an F framing
+#   E = b"\x00"                          when expires_at is None
+#     = b"\x01" + uint64be(expires_at)   otherwise
+#
+# root and every collected sibling digest must be exactly 32 bytes.
+
+
+def _frame(item: bytes) -> bytes:
+    """F(x): the four-byte unsigned big-endian length prefix followed by x."""
+    return len(item).to_bytes(4, "big") + item
+
+
+def _uint64be(value: int) -> bytes:
+    """U(n): the eight-byte unsigned big-endian encoding of n."""
+    return value.to_bytes(8, "big")
+
+
+def _check_bound_region_batch(batch: object, name: str = "batch") -> BoundRegionBatch:
+    """Validate a BoundRegionBatch and its nested field types."""
+    if not isinstance(batch, BoundRegionBatch):
+        raise TypeError(f"{name} must be a BoundRegionBatch")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(f"{name} entries must be a tuple of RegionBatchEntry")
+    _check_int(batch.leaf_count, f"{name} leaf_count")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError(f"{name} proof must be a MerkleMultiProof")
+    _check_int(proof.leaf_count, f"{name} proof leaf_count")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError(f"{name} proof indices must be a tuple of integers")
+    for position, index in enumerate(proof.indices):
+        _check_int(index, f"{name} proof indices[{position}]")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError(f"{name} proof siblings must be a tuple of bytes")
+    for position, sibling in enumerate(proof.siblings):
+        _check_bytes(sibling, f"{name} proof siblings[{position}]")
+    for position, entry in enumerate(entries):
+        _check_region_batch_entry(entry, f"{name} entries[{position}]")
+    return batch
+
+
+def _bound_region_replay_structure_valid(
+    batch: BoundRegionBatch,
+    root: bytes,
+) -> bool:
+    """Structural validity shared by bind_once (ValueError) and check (False).
+
+    ``leaf_count`` must be positive and equal to both ``len(entries)`` and
+    ``proof.leaf_count``, ``proof.indices`` must cover
+    ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering, and
+    ``root`` plus every collected sibling digest must be exactly 32 bytes.
+    """
+    entries = batch.entries
+    leaf_count = batch.leaf_count
+    proof = batch.proof
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+    if len(root) != _MERKLE_DIGEST_SIZE:
+        return False
+    return all(len(sibling) == _MERKLE_DIGEST_SIZE for sibling in proof.siblings)
+
+
+def _bound_region_replay_digest(
+    batch: BoundRegionBatch,
+    root: bytes,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the BoundRegionReplayGuard binding digest."""
+    transcript = hashlib.sha256()
+    transcript.update(_frame(_BOUND_REGION_REPLAY_DOMAIN))
+    transcript.update(_frame(session_id))
+    transcript.update(_frame(root))
+    transcript.update(_frame(_uint64be(batch.leaf_count)))
+    for entry in batch.entries:  # Σ F(L(entry)), in batch order
+        transcript.update(_frame(_bound_region_leaf(entry)))
+    proof = batch.proof
+    transcript.update(_frame(_uint64be(proof.leaf_count)))
+    # S(proof.indices, U) = F(U(|indices|)) || Σ F(U(index))
+    transcript.update(_frame(_uint64be(len(proof.indices))))
+    for index in proof.indices:
+        transcript.update(_frame(_uint64be(index)))
+    # S(proof.siblings, identity) = F(U(|siblings|)) || Σ F(sibling)
+    transcript.update(_frame(_uint64be(len(proof.siblings))))
+    for sibling in proof.siblings:
+        transcript.update(_frame(sibling))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame(expiry))
+    return transcript.digest()
+
+
+class BoundRegionReplayGuard:
+    """Per-instance, single-use replay protection for bound region batches.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a pending
+    :class:`ReplayBinding` for a session id against a complete
+    :class:`BoundRegionBatch` and its Merkle ``root``; :meth:`check` accepts
+    an equal pending binding exactly once, delegating proof verification to
+    :func:`verify_region_bound` (with the injected ``randbelow`` passed
+    through unchanged), and then marks the id consumed. Both the pending and
+    the consumed state live on this guard instance and are never shared
+    between instances.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[bytes, ReplayBinding] = {}
+        self._consumed: set[bytes] = set()
+
+    def bind_once(
+        self,
+        batch: BoundRegionBatch,
+        root: bytes,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to ``batch``.
+
+        Returns the frozen :class:`ReplayBinding`. ``session_id`` must be
+        non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
+        non-``bool`` unsigned 64-bit Unix-second timestamp. ``root`` must be
+        exactly 32 bytes, ``leaf_count`` must be positive and equal to both
+        ``len(batch.entries)`` and ``batch.proof.leaf_count``, and
+        ``batch.proof.indices`` must cover ``0 .. leaf_count - 1`` with no
+        gaps, duplicates or reordering; an empty id, an out-of-range expiry,
+        a structurally invalid batch/root, or a session id that is already
+        pending or has been consumed raises :class:`ValueError`. Wrong
+        argument types — including non-:class:`BoundRegionBatch` batches,
+        malformed nested field types or non-``bytes`` ``root`` /
+        ``session_id`` — raise :class:`TypeError`. Inputs are never mutated.
+        """
+        _check_bound_region_batch(batch)
+        _check_bytes(root, "root")
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _bound_region_replay_structure_valid(batch, root):
+            raise ValueError(
+                "batch/root structure is invalid: leaf_count must be positive and "
+                "match len(entries) and proof.leaf_count, proof.indices must cover "
+                "0 .. leaf_count - 1, and root and siblings must be 32 bytes"
+            )
+        if session_id in self._pending or session_id in self._consumed:
+            raise ValueError("session_id is already bound or has been consumed")
+        binding = ReplayBinding(
+            session_id,
+            _bound_region_replay_digest(batch, root, session_id, expires_at),
+            expires_at,
+        )
+        self._pending[session_id] = binding
+        return binding
+
+    def check(
+        self,
+        batch: BoundRegionBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+        randbelow: Callable[[int], int] = secrets.randbelow,
+    ) -> bool:
+        """Verify and consume the pending binding for ``batch`` under ``root``.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id`` against
+        the same batch and root; the digest is recomputed to confirm the
+        presented tuple is the one originally bound. For a binding with an
+        expiry, ``now >= expires_at`` makes the check fail; ``now`` defaults
+        to the current Unix seconds and must otherwise be a non-``bool``
+        unsigned 64-bit integer.
+
+        Only after those checks does the call delegate to
+        :func:`verify_region_bound` with ``batch``, ``root`` and the same
+        ``randbelow`` (default :func:`secrets.randbelow`) passed through
+        unchanged; its randomness contract therefore applies verbatim. A
+        fully successful check consumes the session id; every other
+        invalidity — unknown or consumed id, unequal binding, digest
+        mismatch, a wrong-length root or sibling digest, an empty or
+        incomplete batch, index gaps, expiry or a failing
+        :func:`verify_region_bound` — returns ``False`` and leaves the
+        registration untouched. Type errors raise :class:`TypeError`; an
+        out-of-range ``now`` raises :class:`ValueError`. Randomness errors
+        surface exactly as the delegated call surfaces them. Inputs are
+        never mutated.
+        """
+        _check_bound_region_batch(batch)
+        _check_bytes(root, "root")
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if not callable(randbelow):
+            raise TypeError("randbelow must be callable")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _bound_region_replay_structure_valid(batch, root):
+            return False
+        stored = self._pending.get(binding.session_id)
+        if stored is None or stored != binding:
+            return False  # unknown id, already consumed, or unequal binding
+        if not hmac.compare_digest(
+            binding.digest,
+            _bound_region_replay_digest(
+                batch, root, binding.session_id, binding.expires_at
+            ),
+        ):
+            return False  # the presented batch/root is not the one originally bound
+        if binding.expires_at is not None and current >= binding.expires_at:
+            return False  # expired: rejection does not consume the id
+        if not verify_region_bound(batch, root, randbelow=randbelow):
             return False
         del self._pending[binding.session_id]
         self._consumed.add(binding.session_id)

@@ -203,6 +203,14 @@ region_entry = RegionBatchEntry(
 region_binding = region_guard.bind_once(region_entry, b"session-1")
 assert region_guard.check(region_entry, region_binding)    # 验区域证明并消费 session id
 assert not region_guard.check(region_entry, region_binding)  # 二次提交被拒
+
+# Merkle 承诺的区域完整批的实例内一次性绑定
+from zkregion import BoundRegionReplayGuard
+
+brg = BoundRegionReplayGuard()
+brg_binding = brg.bind_once(bound_region, region_root, b"session-1")
+assert brg.check(bound_region, region_root, brg_binding)      # 委托 verify_region_bound 并消费
+assert not brg.check(bound_region, region_root, brg_binding)  # 二次提交被拒
 ```
 
 ## 命令行演示
@@ -259,6 +267,9 @@ python3 -m zkregion
 - `RegionReplayGuard()` — 二维区域证明的实例内防重放登记册
   - `bind_once(entry: RegionBatchEntry, session_id, *, expires_at=None) -> ReplayBinding` — 登记本实例的待用绑定；待用或已消费的 `session_id` 重绑抛 `ValueError`
   - `check(entry, binding, *, now=None) -> bool` — 验本实例的待用等值绑定，按字段顺序以 `x_commitment`、`y_commitment`、`region`、`proof`、`context` 调 `verify_region`；成功才消费 `session_id`，任何拒绝都不消费
+- `BoundRegionReplayGuard()` — Merkle 承诺的区域完整批（`BoundRegionBatch` 与 Merkle 根）的实例内防重放登记册
+  - `bind_once(batch: BoundRegionBatch, root, session_id: bytes, *, expires_at=None) -> ReplayBinding` — 登记本实例的待用绑定；空 `session_id`、非 uint64 `expires_at`、批/根结构非法或待用/已消费的 `session_id` 重绑抛 `ValueError`，类型错误抛 `TypeError`
+  - `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` — 验本实例的待用等值绑定并以同一 `randbelow` 委托 `verify_region_bound`（随机源透传）；成功才消费 `session_id`，其余无效一律返回 `False` 且不消费
 - `merkle_root(leaves) -> bytes` — 非空 `bytes` 序列的 Merkle 根
 - `prove_inclusion(leaves, index) -> MerkleProof` — 按零基索引生成包含证明
 - `verify_inclusion(leaf, proof, root) -> bool` — 验证包含证明
@@ -470,6 +481,23 @@ digest = SHA-256(F(D) || F(session_id) || L(entry) || F(E))
 `bind_once(entry, session_id, *, expires_at=None)` 登记本实例的待用绑定并返回它，参数边界与 `RangeReplayGuard` 一致：`entry` 须为 `RegionBatchEntry`（两个承诺、区域、`x_proof`/`y_proof` 及各自 `t`/`e`/`s` 元组与 `context` 的嵌套类型同样校验），类型错误抛 `TypeError`；`session_id` 为空、`expires_at` 非 uint64 或 id 已待用/已消费均抛 `ValueError`。区域叶编码以十进制 ASCII 写整数（负号保留），任何整数字段都可成帧，因此没有额外的可编码性拒绝。
 
 `check(entry, binding, *, now=None) -> bool` 的校验次序与 `RangeReplayGuard` 相同：先核对登记册中的待用绑定与提交绑定按值相等，再重算摘要确认条目一致，再检查期限（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`），最后按字段顺序以 `entry.x_commitment`、`entry.y_commitment`、`entry.region`、`entry.proof`、`entry.context` 调用 `verify_region` 验二维区域证明（先 x 后 y 的字段顺序沿用旧接口，不被改写）。只有全部成功才消费 `session_id`；未登记（含已消费）的 id、不等值绑定、摘要不符、条目任一字段被替换、过期或 `verify_region` 失败一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。绑定状态不跨实例共享；类型错误抛 `TypeError`。入口不改写任何输入。
+
+### Merkle 承诺的区域完整批的实例内一次性绑定
+
+`BoundRegionReplayGuard` 在单个实例内为 :class:`BoundRegionBatch` 与其声称的 Merkle `root` 提供一次性会话绑定，复用同一个 `ReplayBinding` 类型。绑定摘要按
+
+```
+digest = SHA-256(
+    F(D) || F(session_id) || F(root) || F(U(batch.leaf_count))
+    || Σ_i F(L(entries[i]))
+    || F(U(proof.leaf_count)) || S(proof.indices, U) || S(proof.siblings, λx.x) || F(E))
+```
+
+计算，其中域为 `D = b"zr/brg/v1"`，`F(x)` 是四字节无符号大端长度前缀加 `x`，`U(n)` 是八字节无符号大端整数编码；各 `L(entries[i])` 是"Merkle 承诺的区域证明完整批验"一节定义的 BoundRegion 叶原字节（按批内条目顺序，各自再套 `F`）；`S(a, f) = F(U(|a|)) || Σ F(f(a_i))`，即 `indices` 逐项写 `U(index)`、`siblings` 逐项原样写；`E` 的过期编码与 `ReplayGuard` 逐字节相同（无期 `b"\x00"`，有期 `b"\x01" + uint64be(expires_at)`）。
+
+`bind_once(batch, root, session_id, *, expires_at=None)` 登记本实例的待用绑定并返回它。`session_id` 须为非空 `bytes`；`expires_at` 须为 `None` 或非 `bool` uint64（越界抛 `ValueError`）；`root` 及 `proof.siblings` 中每个兄弟摘要都须恰 32 字节，`leaf_count` 须为正的非 `bool` 整数且同时等于 `len(batch.entries)` 与 `proof.leaf_count`，`proof.indices` 须无缺口、无重复、无乱序地恰好覆盖 `0 .. leaf_count - 1`——任一结构不满足抛 `ValueError`；类型错误（含非 `BoundRegionBatch`、批内嵌条目/承诺/区域/证明字段类型错误、非 `bytes` 的 `root`/`session_id`、`bool` 整数）抛 `TypeError`；`session_id` 已处于待用或已消费状态时重绑抛 `ValueError`。
+
+`check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` 的校验次序为：先确认 `binding` 是本实例中仍待用且按值相等的登记；再按上式重算摘要，确认提交的 `batch`/`root`（含条目顺序与 proof 各字段）就是绑定时的那一个；有期绑定要求 `now < expires_at`（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`）；结构与长度同样要求满足（否则返回 `False`）。随后以 `batch`、`root` 和**同一个 `randbelow`** 调用 `verify_region_bound(batch, root, randbelow=randbelow)`，随机源契约逐字节沿用后者、不做包装——先验 Merkle 根，再透传随机源验区域批。只有全部成功才把 `session_id` 从待用移入已消费；未登记（含已消费）的 id、不等值绑定、摘要不符、错误根或兄弟长度、空批/缺项/索引缺口、过期或 `verify_region_bound` 失败一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。绑定状态不跨实例共享；`check` 的参数类型错误抛 `TypeError`，`randbelow` 不可调用抛 `TypeError`（其余随机源错误按 `verify_region_bound` 的契约透出）。入口不改写任何输入。
 
 ## 限制
 

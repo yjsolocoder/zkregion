@@ -7,6 +7,7 @@ from zkregion import (
     DEFAULT_PRIME,
     BoundRangeBatch,
     BoundRegionBatch,
+    BoundRegionReplayGuard,
     BoundSchnorrBatch,
     MerkleMultiProof,
     MerkleProof,
@@ -4995,6 +4996,708 @@ class RegionReplayGuardTest(unittest.TestCase):
         binding_snapshot = dataclasses.replace(binding)
         guard.check(self.entry, binding, now=1)
         self.assertEqual(self.entry, snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+
+class BoundRegionReplayGuardTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def entry(self, x=5, y=25, region=None, context=b"ctx",
+              x_blinding=1234, y_blinding=4321):
+        region = Region(0, 10, 20, 30) if region is None else region
+        x_commitment, x_r = pedersen_commit(
+            x, region.min_x, region.max_x, blinding=x_blinding,
+            prime=self.PRIME, generator=self.G, h=self.H,
+        )
+        y_commitment, y_r = pedersen_commit(
+            y, region.min_y, region.max_y, blinding=y_blinding,
+            prime=self.PRIME, generator=self.G, h=self.H,
+        )
+        proof = prove_region(
+            x_commitment, y_commitment, x, y, x_r, y_r, region, context,
+            randbelow=counter_randbelow(),
+        )
+        return RegionBatchEntry(x_commitment, y_commitment, region, proof, context)
+
+    def build(self, entries):
+        leaves = [bound_region_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        batch = BoundRegionBatch(tuple(entries), len(entries), proof)
+        return batch, root
+
+    def honest(self):
+        entries = [
+            self.entry(context=b"a"),
+            self.entry(x=7, y=22, context=b"b"),
+            self.entry(x=0, y=30, context=b"c"),
+        ]
+        return self.build(entries)
+
+    @staticmethod
+    def frame(item):
+        return len(item).to_bytes(4, "big") + item
+
+    @staticmethod
+    def u64(value):
+        return value.to_bytes(8, "big")
+
+    def sequence(self, values, transform):
+        material = self.frame(self.u64(len(values)))
+        for value in values:
+            material += self.frame(transform(value))
+        return material
+
+    def material(self, batch, root, session_id, expires_at=None):
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = self.frame(b"zr/brg/v1") + self.frame(session_id)
+        material += self.frame(root) + self.frame(self.u64(batch.leaf_count))
+        for entry in batch.entries:
+            material += self.frame(bound_region_leaf(entry))
+        proof = batch.proof
+        material += self.frame(self.u64(proof.leaf_count))
+        material += self.sequence(proof.indices, self.u64)
+        material += self.sequence(proof.siblings, lambda sibling: sibling)
+        material += self.frame(expiry)
+        return material
+
+    def expected_digest(self, batch, root, session_id, expires_at=None):
+        return hashlib.sha256(
+            self.material(batch, root, session_id, expires_at)
+        ).digest()
+
+    # ---- binding digest -----------------------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(
+            binding.digest, self.expected_digest(batch, root, b"s1")
+        )
+        binding = guard.bind_once(batch, root, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(batch, root, b"s2", 1000)
+        )
+
+    def test_domain_separator_is_distinct(self):
+        batch, root = self.honest()
+        digest = BoundRegionReplayGuard().bind_once(batch, root, b"s").digest
+        self.assertEqual(digest, self.expected_digest(batch, root, b"s"))
+        # the plain region-replay layout over the first bound entry differs
+        region_binding = RegionReplayGuard().bind_once(batch.entries[0], b"s")
+        self.assertNotEqual(digest, region_binding.digest)
+
+    def test_digest_binds_every_component(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        base = guard.bind_once(batch, root, b"s")
+        # session id and expiry
+        self.assertNotEqual(base.digest, self.expected_digest(batch, root, b"other"))
+        self.assertNotEqual(base.digest, self.expected_digest(batch, root, b"s", 1))
+        # root
+        flipped = bytearray(root)
+        flipped[0] ^= 0x01
+        self.assertNotEqual(
+            base.digest, self.expected_digest(batch, bytes(flipped), b"s")
+        )
+        # leaf_count / proof.leaf_count
+        other_count = dataclasses.replace(batch, leaf_count=4)
+        self.assertNotEqual(
+            base.digest, self.expected_digest(other_count, root, b"s")
+        )
+        other_proof_count = dataclasses.replace(
+            batch, proof=dataclasses.replace(batch.proof, leaf_count=4)
+        )
+        self.assertNotEqual(
+            base.digest, self.expected_digest(other_proof_count, root, b"s")
+        )
+        # entry order changes the framed entry sequence
+        reordered, reordered_root = self.build(
+            [batch.entries[1], batch.entries[0], batch.entries[2]]
+        )
+        self.assertNotEqual(
+            base.digest,
+            BoundRegionReplayGuard().bind_once(reordered, reordered_root, b"s").digest,
+        )
+        # entry content changes L(entry)
+        tampered_entry = dataclasses.replace(
+            batch.entries[0], context=b"other"
+        )
+        tampered_batch, tampered_root = self.build(
+            [tampered_entry, *batch.entries[1:]]
+        )
+        self.assertNotEqual(
+            base.digest,
+            BoundRegionReplayGuard().bind_once(
+                tampered_batch, tampered_root, b"s"
+            ).digest,
+        )
+        # indices ordering
+        reversed_indices = dataclasses.replace(
+            batch,
+            proof=dataclasses.replace(
+                batch.proof, indices=tuple(reversed(batch.proof.indices))
+            ),
+        )
+        self.assertNotEqual(
+            base.digest, self.expected_digest(reversed_indices, root, b"s")
+        )
+
+    def test_digest_frames_siblings_identity(self):
+        # bind_once does not itself run multi-inclusion verification, so a
+        # full-coverage proof carrying an extra 32-byte sibling still binds;
+        # the sibling bytes enter the digest through S(siblings, identity)
+        batch, root = self.honest()
+        sibling = b"\xab" * 32
+        proof_with_sibling = dataclasses.replace(
+            batch.proof, siblings=(sibling,)
+        )
+        batch_with_sibling = dataclasses.replace(batch, proof=proof_with_sibling)
+        binding = BoundRegionReplayGuard().bind_once(
+            batch_with_sibling, root, b"s"
+        )
+        self.assertEqual(
+            binding.digest,
+            self.expected_digest(batch_with_sibling, root, b"s"),
+        )
+        self.assertNotEqual(
+            binding.digest,
+            BoundRegionReplayGuard().bind_once(batch, root, b"s").digest,
+        )
+
+    def test_counts_use_eight_byte_U_encoding(self):
+        batch, root = self.honest()
+        proof = batch.proof
+        material = self.material(batch, root, b"s")
+        # walk the frame boundaries and pull out the count frames:
+        # F(D) || F(session) || F(root) || F(U(leaf_count))
+        # || Σ F(L(entry)) || F(U(proof.leaf_count))
+        # || F(U(|indices|)) || Σ F(U(index))
+        # || F(U(|siblings|)) || Σ F(sibling) || F(E)
+        offset = 0
+
+        def read_frame():
+            nonlocal offset
+            length = int.from_bytes(material[offset:offset + 4], "big")
+            offset += 4
+            value = material[offset:offset + length]
+            offset += length
+            return value
+
+        self.assertEqual(read_frame(), b"zr/brg/v1")
+        self.assertEqual(read_frame(), b"s")
+        self.assertEqual(read_frame(), root)
+        self.assertEqual(read_frame(), batch.leaf_count.to_bytes(8, "big"))
+        for entry in batch.entries:
+            self.assertEqual(read_frame(), bound_region_leaf(entry))
+        self.assertEqual(read_frame(), proof.leaf_count.to_bytes(8, "big"))
+        self.assertEqual(read_frame(), len(proof.indices).to_bytes(8, "big"))
+        for index in proof.indices:
+            self.assertEqual(read_frame(), index.to_bytes(8, "big"))
+        self.assertEqual(read_frame(), len(proof.siblings).to_bytes(8, "big"))
+        for sibling in proof.siblings:
+            self.assertEqual(read_frame(), sibling)
+        self.assertEqual(read_frame(), b"\x00")
+        self.assertEqual(offset, len(material))
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        no_expiry = guard.bind_once(batch, root, b"a")
+        with_expiry = BoundRegionReplayGuard().bind_once(
+            batch, root, b"b", expires_at=0
+        )
+        later = BoundRegionReplayGuard().bind_once(
+            batch, root, b"c", expires_at=1
+        )
+        self.assertNotEqual(no_expiry.digest, with_expiry.digest)
+        self.assertNotEqual(with_expiry.digest, later.digest)
+
+    # ---- bind_once state and errors -----------------------------------------
+
+    def test_pending_id_cannot_be_rebound(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        guard.bind_once(batch, root, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        first = guard.bind_once(batch, root, b"s1")
+        second = guard.bind_once(batch, root, b"s2")
+        self.assertNotEqual(first, second)
+        self.assertTrue(guard.check(batch, root, first, now=1))
+        self.assertTrue(guard.check(batch, root, second, now=1))
+
+    def test_bind_once_type_errors(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        entries = batch.entries
+        proof = batch.proof
+        for bad in ("batch", 7, None, entries, proof):
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, root, b"s")
+        # entries must be a tuple, not a list
+        with self.assertRaises(TypeError):
+            guard.bind_once(BoundRegionBatch(list(entries), 3, proof), root, b"s")
+        for bad in ("root", 7, None, bytearray(b"x" * 32)):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, bad, b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, root, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, root, b"s", expires_at=bad)
+
+    def test_bind_once_nested_type_errors(self):
+        batch, root = self.honest()
+        entries = list(batch.entries)
+        proof = batch.proof
+        guard = BoundRegionReplayGuard()
+        # non-RegionBatchEntry item
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundRegionBatch(tuple(entries) + (7,), 4, proof), root, b"s"
+            )
+        # bool / non-integer leaf counts
+        with self.assertRaises(TypeError):
+            guard.bind_once(dataclasses.replace(batch, leaf_count=True), root, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                dataclasses.replace(
+                    batch, proof=dataclasses.replace(proof, leaf_count=True)
+                ),
+                root, b"s",
+            )
+        # wrong proof object and non-tuple index/sibling containers
+        with self.assertRaises(TypeError):
+            guard.bind_once(dataclasses.replace(batch, proof="p"), root, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                dataclasses.replace(
+                    batch, proof=dataclasses.replace(proof, indices=list(proof.indices))
+                ),
+                root, b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                dataclasses.replace(
+                    batch,
+                    proof=dataclasses.replace(proof, indices=(0, 1, True)),
+                ),
+                root, b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                dataclasses.replace(
+                    batch,
+                    proof=dataclasses.replace(proof, siblings=list(proof.siblings)),
+                ),
+                root, b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                dataclasses.replace(
+                    batch,
+                    proof=dataclasses.replace(proof, siblings=(7,)),
+                ),
+                root, b"s",
+            )
+        # malformed nested region entry fields
+        bad_entry = dataclasses.replace(entries[0], x_commitment="c")
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundRegionBatch(
+                    tuple([bad_entry, *entries[1:]]), 3, proof
+                ),
+                root, b"s",
+            )
+        bad_entry = dataclasses.replace(entries[0], region="r")
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundRegionBatch(
+                    tuple([bad_entry, *entries[1:]]), 3, proof
+                ),
+                root, b"s",
+            )
+
+    def test_bind_once_value_errors(self):
+        batch, root = self.honest()
+        entries = batch.entries
+        proof = batch.proof
+        guard = BoundRegionReplayGuard()
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"")
+        for bad in (-1, 2**64):
+            with self.assertRaises(ValueError):
+                guard.bind_once(batch, root, b"s", expires_at=bad)
+        # root must be exactly 32 bytes
+        for bad in (b"", b"\x00" * 31, b"\x00" * 33):
+            with self.assertRaises(ValueError):
+                BoundRegionReplayGuard().bind_once(batch, bad, b"s")
+        # empty batch
+        empty_proof = MerkleMultiProof(0, (), ())
+        with self.assertRaises(ValueError):
+            guard.bind_once(BoundRegionBatch((), 0, empty_proof), bytes(32), b"s")
+        # leaf count disagreements
+        with self.assertRaises(ValueError):
+            guard.bind_once(
+                BoundRegionBatch(entries, 2, proof), root, b"s2"
+            )
+        with self.assertRaises(ValueError):
+            guard.bind_once(
+                BoundRegionBatch(
+                    entries, 3, dataclasses.replace(proof, leaf_count=2)
+                ),
+                root, b"s3",
+            )
+        # index coverage gaps, duplicates and reordering
+        for bad_indices in ((0, 1), (0, 0, 2), (2, 1, 0), (0, 2, 1)):
+            with self.assertRaises(ValueError):
+                BoundRegionReplayGuard().bind_once(
+                    BoundRegionBatch(
+                        entries, 3, dataclasses.replace(proof, indices=bad_indices)
+                    ),
+                    root, f"s-{bad_indices}".encode(),
+                )
+        # collected siblings must be 32 bytes
+        with self.assertRaises(ValueError):
+            BoundRegionReplayGuard().bind_once(
+                BoundRegionBatch(
+                    entries,
+                    3,
+                    dataclasses.replace(proof, siblings=(b"\x00" * 31,)),
+                ),
+                root, b"s4",
+            )
+
+    # ---- honest check and single use ----------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s", expires_at=1000)
+        self.assertTrue(
+            guard.check(batch, root, binding, now=999, randbelow=counter_randbelow())
+        )
+        # the consumed id is rejected and cannot be replayed
+        self.assertFalse(
+            guard.check(batch, root, binding, now=999, randbelow=counter_randbelow())
+        )
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_check_with_default_randbelow_works(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+
+    def test_check_without_expiry_ignores_now(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding, now=0))
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding, now=2**64 - 1))
+
+    def test_check_with_default_now(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s", expires_at=10**12)
+        self.assertTrue(guard.check(batch, root, binding))
+
+    def test_expiry_boundary_is_inclusive(self):
+        batch, root = self.honest()
+        for now, expected in ((999, True), (1000, False), (1001, False)):
+            guard = BoundRegionReplayGuard()
+            binding = guard.bind_once(batch, root, f"s{now}".encode(), expires_at=1000)
+            self.assertIs(
+                guard.check(batch, root, binding, now=now), expected, now
+            )
+
+    # ---- randbelow delegation -----------------------------------------------
+
+    def test_randbelow_is_passed_through_per_branch(self):
+        batch, root = self.honest()
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        # 3 entries * 2 axes * 11 offsets (region (0,10,20,30)) = 66 branches
+        self.assertTrue(guard.check(batch, root, binding, now=1, randbelow=recording))
+        self.assertEqual(calls, [self.PRIME - 1] * 66)
+
+    def test_root_failure_draws_no_randomness(self):
+        batch, root = self.honest()
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        wrong = bytearray(root)
+        wrong[0] ^= 0x01
+        # the digest no longer matches, so verification is never delegated
+        self.assertFalse(
+            guard.check(batch, bytes(wrong), binding, now=1, randbelow=recording)
+        )
+        self.assertEqual(calls, [])  # no randomness is drawn before the root check
+
+    def test_randbelow_must_be_callable(self):
+        batch, root = self.honest()
+        binding = BoundRegionReplayGuard().bind_once(batch, root, b"s")
+        for bad in (7, None, "randbelow"):
+            with self.assertRaises(TypeError):
+                BoundRegionReplayGuard().check(
+                    batch, root, binding, now=1, randbelow=bad
+                )
+
+    def test_randbelow_errors_are_delegated(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        with self.assertRaises(TypeError):
+            guard.check(batch, root, binding, now=1, randbelow=lambda upper: True)
+        with self.assertRaises(ValueError):
+            guard.check(
+                batch, root, binding, now=1, randbelow=lambda upper: upper
+            )
+
+    # ---- rejection never consumes -------------------------------------------
+
+    def test_expired_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s", expires_at=1000)
+        self.assertFalse(
+            guard.check(batch, root, binding, now=2000, randbelow=counter_randbelow())
+        )
+        # still pending: an earlier clock succeeds and consumes it
+        self.assertTrue(
+            guard.check(batch, root, binding, now=999, randbelow=counter_randbelow())
+        )
+        self.assertFalse(
+            guard.check(batch, root, binding, now=999, randbelow=counter_randbelow())
+        )
+
+    def test_wrong_root_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        wrong = bytearray(root)
+        wrong[0] ^= 0x01
+        self.assertFalse(
+            guard.check(batch, bytes(wrong), binding, now=1,
+                        randbelow=counter_randbelow())
+        )
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_committed_but_forged_batch_rejected_without_consuming(self):
+        entries = [
+            self.entry(context=b"a"),
+            self.entry(x=7, y=22, context=b"b"),
+        ]
+        forged_entry = dataclasses.replace(
+            entries[0],
+            proof=RegionProof(
+                RangeProof(
+                    entries[0].proof.x_proof.t,
+                    entries[0].proof.x_proof.e,
+                    entries[0].proof.x_proof.s[:-1]
+                    + (entries[0].proof.x_proof.s[-1] + 1,),
+                ),
+                entries[0].proof.y_proof,
+            ),
+        )
+        forged_batch, forged_root = self.build([forged_entry, entries[1]])
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(forged_batch, forged_root, b"s")
+        self.assertFalse(
+            guard.check(forged_batch, forged_root, binding, now=1,
+                        randbelow=counter_randbelow())
+        )
+        # id still pending — rebinding is refused while the rejection stands
+        with self.assertRaises(ValueError):
+            guard.bind_once(forged_batch, forged_root, b"s")
+
+    def test_batch_mismatch_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        other_batch, other_root = self.build(
+            [self.entry(x=10, y=20, context=b"z")]
+        )
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        # different batch under the presented root
+        self.assertFalse(
+            guard.check(other_batch, root, binding, now=1,
+                        randbelow=counter_randbelow())
+        )
+        # the same batch under a different root
+        self.assertFalse(
+            guard.check(batch, other_root, binding, now=1,
+                        randbelow=counter_randbelow())
+        )
+        # the originally bound tuple still verifies once
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        guard.bind_once(batch, root, b"local")
+        foreign = BoundRegionReplayGuard().bind_once(batch, root, b"elsewhere")
+        self.assertFalse(
+            guard.check(batch, root, foreign, now=1, randbelow=counter_randbelow())
+        )
+        equal = BoundRegionReplayGuard().bind_once(batch, root, b"local")
+        self.assertTrue(
+            guard.check(batch, root, equal, now=1, randbelow=counter_randbelow())
+        )
+        unknown = ReplayBinding(b"never-bound", b"\x00" * 32)
+        guard = BoundRegionReplayGuard()
+        guard.bind_once(batch, root, b"s2")
+        self.assertFalse(
+            guard.check(batch, root, unknown, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        guard.bind_once(batch, root, b"s")
+        forged_digest = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(
+            guard.check(batch, root, forged_digest, now=1,
+                        randbelow=counter_randbelow())
+        )
+        forged_expiry = ReplayBinding(
+            b"s", self.expected_digest(batch, root, b"s", 1), 1
+        )
+        self.assertFalse(
+            guard.check(batch, root, forged_expiry, now=0,
+                        randbelow=counter_randbelow())
+        )
+
+    def test_cross_guard_binding_rejected(self):
+        batch, root = self.honest()
+        region_binding = RegionReplayGuard().bind_once(batch.entries[0], b"s")
+        guard = BoundRegionReplayGuard()
+        guard.bind_once(batch, root, b"s")
+        self.assertFalse(
+            guard.check(batch, root, region_binding, now=1,
+                        randbelow=counter_randbelow())
+        )
+
+    def test_structural_invalidity_returns_false_without_consuming(self):
+        batch, root = self.honest()
+        proof = batch.proof
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        # a type-valid but structurally invalid presented batch / root
+        short_root = b"\x00" * 31
+        self.assertFalse(
+            guard.check(batch, short_root, binding, now=1,
+                        randbelow=counter_randbelow())
+        )
+        gappy = BoundRegionBatch(
+            batch.entries,
+            3,
+            dataclasses.replace(proof, indices=(0, 1, 1)),
+        )
+        self.assertFalse(
+            guard.check(gappy, root, binding, now=1, randbelow=counter_randbelow())
+        )
+        empty = BoundRegionBatch((), 0, MerkleMultiProof(0, (), ()))
+        self.assertFalse(
+            guard.check(empty, bytes(32), binding, now=1,
+                        randbelow=counter_randbelow())
+        )
+        # none of those consumed the id: the original tuple still verifies
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    # ---- argument validation ------------------------------------------------
+
+    def test_check_type_errors(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        for bad in ("batch", 7, None, batch.entries, batch.proof):
+            with self.assertRaises(TypeError):
+                guard.check(bad, root, binding, now=1)
+        for bad in ("root", 7, None, bytearray(b"x" * 32)):
+            with self.assertRaises(TypeError):
+                guard.check(batch, bad, binding, now=1)
+        for bad in ("binding", 7, None, (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(batch, root, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(batch, root, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(batch, root, binding, now=bad)
+
+    def test_instances_are_independent(self):
+        batch, root = self.honest()
+        first = BoundRegionReplayGuard()
+        second = BoundRegionReplayGuard()
+        binding = first.bind_once(batch, root, b"s")
+        self.assertFalse(
+            second.check(batch, root, binding, now=1,
+                         randbelow=counter_randbelow())
+        )
+        # the rejected foreign check did not touch the first guard
+        self.assertTrue(
+            first.check(batch, root, binding, now=1,
+                        randbelow=counter_randbelow())
+        )
+
+    def test_inputs_are_not_mutated(self):
+        batch, root = self.honest()
+        guard = BoundRegionReplayGuard()
+        batch_snapshot = dataclasses.replace(batch)
+        root_snapshot = bytes(root)
+        binding = guard.bind_once(batch, root, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        self.assertEqual(batch, batch_snapshot)
+        self.assertEqual(root, root_snapshot)
         self.assertEqual(binding, binding_snapshot)
 
 

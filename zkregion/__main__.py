@@ -7,6 +7,7 @@ import dataclasses
 from . import (
     BoundRangeBatch,
     BoundRegionBatch,
+    BoundRegionReplayGuard,
     BoundSchnorrBatch,
     MultiSchnorrEntry,
     RangeBatchEntry,
@@ -459,6 +460,41 @@ def main() -> int:
           f"{other_region.check(bound_entry, other_region_binding, now=1)}")
     print(f"  binding from another guard instance rejected: "
           f"{not other_region.check(region_replay_entry, fresh_binding)}")
+
+    print()
+    print("per-instance replay protection for bound region batches (bind once, check once):")
+    brg = BoundRegionReplayGuard()
+    brg_binding = brg.bind_once(region_bound, region_root, b"brg-session-1", expires_at=10**12)
+    print(f"  digest={brg_binding.digest.hex()[:32]}…  expires_at={brg_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{brg.check(region_bound, region_root, brg_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not brg.check(region_bound, region_root, brg_binding, now=101, randbelow=counter_randbelow())}")
+    print(f"  consumed id cannot be rebound: ", end="")
+    try:
+        brg.bind_once(region_bound, region_root, b"brg-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    pending_brg = BoundRegionReplayGuard()
+    pending_brg_binding = pending_brg.bind_once(
+        region_bound, region_root, b"brg-session-2", expires_at=1000
+    )
+    print(f"  expired binding (now >= expires_at) rejected: "
+          f"{not pending_brg.check(region_bound, region_root, pending_brg_binding, now=1000)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{pending_brg.check(region_bound, region_root, pending_brg_binding, now=999)}")
+    other_brg = BoundRegionReplayGuard()
+    other_brg_binding = other_brg.bind_once(region_bound, region_root, b"brg-session-3")
+    print(f"  wrong root rejected without consuming the id: "
+          f"{not other_brg.check(region_bound, merkle_root(region_leaves[:1]), other_brg_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_brg.check(region_bound, region_root, other_brg_binding, now=1)}")
+    foreign_binding = BoundRegionReplayGuard().bind_once(
+        region_bound, region_root, b"brg-session-4"
+    )
+    print(f"  binding from another guard instance rejected: "
+          f"{not brg.check(region_bound, region_root, foreign_binding, now=1)}")
 
     print()
     print("region membership:")

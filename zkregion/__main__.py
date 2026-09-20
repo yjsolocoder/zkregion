@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 
 from . import (
+    BoundRangeBatch,
     BoundRegionBatch,
     BoundSchnorrBatch,
     MultiSchnorrEntry,
@@ -32,6 +33,7 @@ from . import (
     verify_pedersen_opening,
     verify_range,
     verify_range_batch,
+    verify_range_bound,
     verify_region,
     verify_region_batch,
     verify_region_bound,
@@ -111,6 +113,45 @@ def main() -> int:
     )
     tampered = [RangeBatchEntry(range_entries[0].commitment, forged, b"batch")] + range_entries[1:]
     print(f"  tampered batch rejected: {not verify_range_batch(tampered, randbelow=counter_randbelow())}")
+
+    print()
+    print("Merkle-committed range batch (root check, then batch range proofs):")
+
+    def bound_range_leaf(entry: RangeBatchEntry) -> bytes:
+        items = [b"zkregion/range-bound/v1"]
+        c = entry.commitment
+        items += [str(v).encode("ascii")
+                  for v in (c.element, c.lower, c.upper, c.prime, c.generator, c.h)]
+        items.append(entry.context)
+        for seq in (entry.proof.t, entry.proof.e, entry.proof.s):
+            items.append(str(len(seq)).encode("ascii"))
+            items += [str(v).encode("ascii") for v in seq]
+        return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+    range_leaves = [bound_range_leaf(entry) for entry in range_entries]
+    range_root = merkle_root(range_leaves)
+    range_proof = prove_multi_inclusion(range_leaves, tuple(range(len(range_entries))))
+    range_bound = BoundRangeBatch(tuple(range_entries), len(range_entries), range_proof)
+    print(f"  entries={len(range_entries)}  complete index coverage 0..{len(range_entries) - 1}")
+    print(f"  valid bound batch accepted: {verify_range_bound(range_bound, range_root, randbelow=counter_randbelow())}")
+    print(f"  wrong root rejected: {not verify_range_bound(range_bound, merkle_root(range_leaves[:1]))}")
+    committed_range = dataclasses.replace(
+        range_entries[0],
+        proof=RangeProof(
+            range_entries[0].proof.t,
+            range_entries[0].proof.e,
+            range_entries[0].proof.s[:-1]
+            + (range_entries[0].proof.s[-1] + 1,),
+        ),
+    )
+    forged_entries = [committed_range, *range_entries[1:]]
+    forged_leaves = [bound_range_leaf(entry) for entry in forged_entries]
+    forged_proof = prove_multi_inclusion(forged_leaves, tuple(range(len(forged_entries))))
+    forged_bound = BoundRangeBatch(tuple(forged_entries), len(forged_entries), forged_proof)
+    print(
+        "  committed-but-forged proof rejected: "
+        f"{not verify_range_bound(forged_bound, merkle_root(forged_leaves), randbelow=counter_randbelow())}"
+    )
 
     print()
     print("2-D region membership proof (two range proofs, one per axis):")

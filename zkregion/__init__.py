@@ -8,6 +8,7 @@ SchnorrProof / SchnorrBatchEntry / SchnorrProver /
 SchnorrVerifier / MultiSchnorrEntry / verify_schnorr_batch /
 BoundSchnorrBatch / verify_bound /
 BoundRegionBatch / verify_region_bound /
+BoundRangeBatch / verify_range_bound /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion.
@@ -25,6 +26,7 @@ from typing import Callable
 __all__ = [
     "DEFAULT_GENERATOR",
     "DEFAULT_PRIME",
+    "BoundRangeBatch",
     "BoundRegionBatch",
     "BoundSchnorrBatch",
     "MerkleMultiProof",
@@ -55,6 +57,7 @@ __all__ = [
     "verify_pedersen_opening",
     "verify_range",
     "verify_range_batch",
+    "verify_range_bound",
     "verify_region",
     "verify_region_batch",
     "verify_region_bound",
@@ -1949,3 +1952,155 @@ def verify_region_bound(
     if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
         return False
     return verify_region_batch(entries, randbelow=randbelow)
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed range batches
+#
+# A complete range batch frozen together with the Merkle proof that commits
+# to every entry. Each Merkle leaf starts from the domain separator
+# b"zkregion/range-bound/v1" and frames, in order, the six commitment
+# fields, the context and the t / e / s sequences of the proof (each
+# sequence framed as its decimal element count followed by every value).
+# Verification first checks every leaf against the Merkle root, then runs
+# the unchanged range batch verification.
+
+_RANGE_BOUND_DOMAIN = b"zkregion/range-bound/v1"
+
+
+@dataclass(frozen=True)
+class BoundRangeBatch:
+    """A complete range batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of :class:`RangeBatchEntry`;
+    ``leaf_count`` — a positive, non-``bool`` integer equal to both
+    ``len(entries)`` and ``proof.leaf_count``; ``proof`` — the
+    :class:`MerkleMultiProof` whose indices cover ``0 .. leaf_count - 1``
+    without gaps or duplicates. All three are positional construction
+    arguments; batches compare by value and are immutable.
+    """
+
+    entries: tuple[RangeBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_range_leaf(entry: RangeBatchEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`RangeBatchEntry`.
+
+    Items, in order: the domain separator, the six commitment fields
+    (dataclass field order), the context, then each of the proof's
+    ``t`` / ``e`` / ``s`` sequences framed as its decimal element count
+    followed by every value. Every item is prefixed with its four-byte
+    unsigned big-endian length; integers are encoded as decimal ASCII
+    (negative sign kept).
+    """
+    commitment = entry.commitment
+    items = [_RANGE_BOUND_DOMAIN]
+    items.extend(
+        str(getattr(commitment, name)).encode("ascii")
+        for name in ("element", "lower", "upper", "prime", "generator", "h")
+    )
+    items.append(entry.context)
+    for field_name in ("t", "e", "s"):
+        sequence = getattr(entry.proof, field_name)
+        items.append(str(len(sequence)).encode("ascii"))
+        items.extend(str(value).encode("ascii") for value in sequence)
+    leaf = bytearray()
+    for item in items:
+        leaf += len(item).to_bytes(4, "big")
+        leaf += item
+    return bytes(leaf)
+
+
+def verify_range_bound(
+    batch: BoundRangeBatch,
+    root: bytes,
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundRangeBatch`.
+
+    The Merkle binding is checked first: every entry is encoded to its leaf
+    exactly as specified by :func:`_bound_range_leaf` and the whole batch
+    is checked against ``root`` with :func:`verify_multi_inclusion`.
+    ``leaf_count`` must be a positive, non-``bool`` integer equal to both
+    ``len(entries)`` and ``proof.leaf_count``, and ``proof.indices`` must
+    cover ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering;
+    an empty batch, a missing entry or any index mismatch returns ``False``.
+    Only after the root checks does the batch go through
+    :func:`verify_range_batch` with the same ``randbelow``, under its
+    unchanged randomness contract: it is called once per structurally
+    valid range-proof branch as ``randbelow(prime - 1)``.
+
+    Type errors — a batch that is not a :class:`BoundRangeBatch`,
+    non-tuple entries, non-:class:`RangeBatchEntry` items, a non-integer
+    or ``bool`` ``leaf_count``, a wrong proof/root object, malformed nested
+    field types, or a non-callable ``randbelow`` — raise
+    :class:`TypeError`; every other invalidity (including bad randomness
+    outcomes surfaced by :func:`verify_range_batch` per its own contract)
+    behaves exactly as the delegated calls do. Inputs are never mutated.
+    """
+    if not isinstance(batch, BoundRangeBatch):
+        raise TypeError("batch must be a BoundRangeBatch")
+    _check_bytes(root, "root")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError("batch entries must be a tuple of RangeBatchEntry")
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, RangeBatchEntry):
+            raise TypeError(f"entries[{position}] must be a RangeBatchEntry")
+        commitment = entry.commitment
+        entry_proof = entry.proof
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(f"entries[{position}] commitment must be a PedersenCommitment")
+        _check_commitment_fields(commitment)
+        if not isinstance(entry_proof, RangeProof):
+            raise TypeError(f"entries[{position}] proof must be a RangeProof")
+        for field_name in ("t", "e", "s"):
+            field = getattr(entry_proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"entries[{position}] proof {field_name} "
+                    "must be a tuple of integers"
+                )
+            for item in field:
+                _check_int(
+                    item,
+                    f"entries[{position}] proof {field_name} entry",
+                )
+        _check_bytes(entry.context, f"entries[{position}] context")
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_range_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf, then
+    # 2) the unchanged range batch verification checks the proofs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_range_batch(entries, randbelow=randbelow)

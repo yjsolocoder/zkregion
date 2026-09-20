@@ -103,6 +103,26 @@ range_batch = [
 ]
 assert verify_range_batch(range_batch)
 
+# Merkle 承诺的区间证明完整批验：整批区间条目先提交到一棵 Merkle 树
+from zkregion import BoundRangeBatch, verify_range_bound
+
+def bound_range_leaf(entry):
+    c = entry.commitment
+    items = [b"zkregion/range-bound/v1"]
+    items += [str(v).encode("ascii")
+              for v in (c.element, c.lower, c.upper, c.prime, c.generator, c.h)]
+    items.append(entry.context)
+    for seq in (entry.proof.t, entry.proof.e, entry.proof.s):
+        items.append(str(len(seq)).encode("ascii"))
+        items += [str(v).encode("ascii") for v in seq]
+    return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+range_leaves = [bound_range_leaf(entry) for entry in range_batch]
+range_root = merkle_root(range_leaves)
+range_proof = prove_multi_inclusion(range_leaves, tuple(range(len(range_leaves))))
+bound_range = BoundRangeBatch(tuple(range_batch), len(range_batch), range_proof)
+assert verify_range_bound(bound_range, range_root)
+
 # 二维区域成员非交互证明：证明承诺的 (x, y) 落在矩形区域内
 from zkregion import RegionProof, prove_region, verify_region
 
@@ -170,6 +190,8 @@ python3 -m zkregion
 - `RangeProof(t, e, s)` — 不可变区间证明对象，三个字段均为长度 `upper - lower + 1` 的 `tuple[int, ...]`
 - `verify_range_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 区间证明的批量验证，按 `(prime, generator, h)` 分组做一次随机线性组合
 - `RangeBatchEntry(commitment, proof, context=b"")` — 不可变批量验证条目，字段类型依次为 `PedersenCommitment`、`RangeProof`、`bytes`，字段次序与 `verify_range` 入参一致
+- `verify_range_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的区间证明完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_range_batch` 验证明
+- `BoundRangeBatch(entries, leaf_count, proof)` — 冻结的完整批对象；字段依次为 `tuple[RangeBatchEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变
 - `prove_region(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionProof` — 生成二维矩形区域成员非交互证明
 - `verify_region(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证区域成员证明，无需坐标或盲因子
 - `RegionProof(x_proof, y_proof)` — 不可变区域证明对象，两字段均为 `RangeProof`
@@ -256,6 +278,25 @@ h**Σ(a*s) == Π(t**a * D_i**(a*e))   (mod prime)
 即把该组内所有条目的全部分支纳入同一个随机线性组合，而**不是**逐分支或逐条目验证后做布尔汇总——因此同组内响应误差可以在系数为 1 时相消，而不同 `(prime, generator, h)`（不同群或不同 `h`）之间不能跨组相消。传入固定的 `randbelow` 结果可重复，缺省为 `secrets.randbelow`。
 
 类型错误（含 `bool` 整数、非元组证明字段、非 `bytes` 的 `context`、`randbelow` 不可调用或返回非整数）抛 `TypeError`；系数来源返回值超出 `[0, prime - 1)` 抛 `ValueError`。其余非法结构、篡改、承诺/context 绑定错误均返回 `False`；入口不改写任何输入。这里的随机线性组合只供演示。
+
+### Merkle 承诺的区间证明完整批验
+
+`BoundRangeBatch(entries, leaf_count, proof)` 把一批**完整**的区间证明条目与一棵 Merkle 树的多包含证明冻结在一起，三个字段依次为：
+
+1. `entries: tuple[RangeBatchEntry, ...]` —— 必须是元组（不是列表），每项是 `RangeBatchEntry`；
+2. `leaf_count: int` —— 正的非 `bool` 整数，且必须同时等于 `len(entries)` 与 `proof.leaf_count`；
+3. `proof: MerkleMultiProof` —— 其 `indices` 必须无缺口、无重复、无乱序地恰好覆盖 `0 .. leaf_count - 1`（即等于 `tuple(range(leaf_count))`）。
+
+三字段均可位置构造，对象按值相等且不可变（冻结 dataclass）。空批（`leaf_count < 1` 或 `entries` 为空）、缺项（数量不符）、`leaf_count` 与任一方不一致、索引乱序/重复/有缺口均返回 `False`。
+
+每个条目的 Merkle 叶字节以域 `b"zkregion/range-bound/v1"` 开始，依次拼接：承诺六字段（`element`、`lower`、`upper`、`prime`、`generator`、`h`，按数据类字段顺序）与 `context`，再依次写入证明的 `t`、`e`、`s` 序列——每个序列先写十进制元素数再逐项写值。每个原子项前置四字节无符号大端长度，整数编码为十进制 ASCII（负号保留）。叶摘要仍按 Merkle 树构造一节的 `SHA-256(b"\x00" + len4 + leaf)` 计算。
+
+`verify_range_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` 的验证分两步、次序固定：
+
+1. 先以全部 `(index, leaf)`（`index` 即 0 起的条目位置）调用 `verify_multi_inclusion` 校验 Merkle 根；任一叶字节、proof 或根不符即返回 `False`，且在根校验通过前不消费任何随机数；
+2. 根通过后，以**同一个 `randbelow`** 调用 `verify_range_batch(entries, randbelow=randbelow)` 验证明，随机源契约（每结构合法分支恰调用一次 `randbelow(prime - 1)`、非整数返回 `TypeError`、越界返回 `ValueError`）与输入完全沿用后者，不做包装或改动。
+
+类型错误——`batch` 不是 `BoundRangeBatch`、`entries` 不是元组或含非 `RangeBatchEntry`、条目嵌套字段类型错误（含 `bool` 整数、非 `bytes` 的 `context`、非 `RangeProof`、非元组 `t`/`e`/`s`）、`leaf_count` 不是非 `bool` 整数、`proof`/`root` 类型错误、`randbelow` 不可调用——抛 `TypeError`；其余一切无效情形（空批、缺项、数量不符、索引缺口/重复/乱序、错误根、叶字节篡改、证明或转录不符、非随机随机源导致的 `False` 等）均返回 `False`。入口不改写任何输入。与其它批量验证一样，这里的随机线性组合只供演示。
 
 ### 二维区域成员非交互证明
 

@@ -44,6 +44,37 @@ multi = [
 ]
 assert verify_schnorr_batch(multi)
 
+# Merkle 承诺的完整批量验证（批量条目逐帧成叶，多包含证明绑定到根）
+from zkregion import BoundSchnorrBatch, verify_bound
+
+
+def encode_int(value):  # 最短无符号大端编码
+    return value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+
+
+def bound_leaf(item):  # 七个 FS 转录项目，末尾追加同样成帧的 response
+    out = bytearray()
+    for part in (
+        b"zkregion/schnorr-fs/v1", encode_int(item.prime), encode_int(item.generator),
+        encode_int(item.public_key), encode_int(item.proof.commitment),
+        item.context, item.message, encode_int(item.proof.response),
+    ):
+        out += len(part).to_bytes(4, "big")
+        out += part
+    return bytes(out)
+
+
+signers = [SchnorrProver(secret=111), other]
+items = [
+    MultiSchnorrEntry(p.public_key, m, p.prove(m, context=b"b"), b"b")
+    for p, m in ((signers[0], b"alpha"), (signers[1], b"beta"))
+]
+leaves = [bound_leaf(item) for item in items]
+root = merkle_root(leaves)
+mproof = prove_multi_inclusion(leaves, range(len(items)))
+bound = BoundSchnorrBatch(tuple(items), len(items), mproof)
+assert verify_bound(bound, root)
+
 # Merkle 包含证明
 from zkregion import merkle_root, prove_inclusion, verify_inclusion
 
@@ -144,6 +175,8 @@ python3 -m zkregion
 - `SchnorrBatchEntry(message, proof, context=b"")` — 不可变批量验证条目，字段类型依次为 `bytes`、`SchnorrProof`、`bytes`
 - `verify_schnorr_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 多公钥批量验证，按 `(prime, generator)` 分组做一次随机线性组合
 - `MultiSchnorrEntry(public_key, message, proof, context=b"", prime=DEFAULT_PRIME, generator=DEFAULT_GENERATOR)` — 不可变多公钥批量验证条目；前三字段依次为 `int`、`bytes`、`SchnorrProof`，均为必填且可位置构造，值相等即相等
+- `BoundSchnorrBatch(entries, leaf_count, proof)` — 不可变的 Merkle 承诺完整批次；三字段依次为 `tuple[MultiSchnorrEntry, ...]`、正非 bool 的 `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变
+- `verify_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — 先以 `verify_multi_inclusion` 验根，再以相同 `randbelow` 调用 `verify_schnorr_batch` 验签；类型错误抛 `TypeError`，非随机因素导致的无效一律返回 `False`
 - `merkle_root(leaves) -> bytes` — 非空 `bytes` 序列的 Merkle 根
 - `prove_inclusion(leaves, index) -> MerkleProof` — 按零基索引生成包含证明
 - `verify_inclusion(leaf, proof, root) -> bool` — 验证包含证明
@@ -256,6 +289,16 @@ g**Σ(a*s) == Π(t**a * public_key**(a*c))   (mod prime)
 即同组内所有条目（可属不同 `public_key`，各自使用自身公钥）纳入同一个随机线性组合，而**不是**逐条目验证后做布尔汇总；不同 `(prime, generator)` 群之间不能跨组相消。传入固定的 `randbelow` 结果可重复，缺省为 `secrets.randbelow`。
 
 `entries`、条目字段或 `randbelow` 的类型错误抛 `TypeError`（`bool` 不算整数；非 `bytes` 的 `message`/`context` 同样拒绝）；系数来源返回非整数抛 `TypeError`，超出 `[0, prime - 1)` 抛 `ValueError`。群参数非法、公钥或 commitment 越界、response 为负、消息/context 不匹配或任一篡改均返回 `False`，无效条目允许短路。入口不改写任何输入。与单公钥批量验证一样，这里的随机线性组合只供演示。
+
+### Merkle 承诺的完整批量验证
+
+`BoundSchnorrBatch(entries, leaf_count, proof)` 把**一整个** `verify_schnorr_batch` 批次冻结并承诺到一棵 Merkle 树：三字段依次为 `tuple[MultiSchnorrEntry, ...]`、正的非 `bool` 整数 `leaf_count`、`MerkleMultiProof`，均可位置构造、按值相等且不可变。每个条目按批次位置（从 0 起）占用一片叶子；叶子字节串复用既定 Fiat-Shamir 转录的**七个四字节无符号大端长度前缀项目**——域、`prime`、`generator`、`public_key`、`t`（commitment）、`context`、`message`，整数取最短无符号大端编码——并在末尾以同样成帧追加第八项：`response` 的最短无符号大端编码。字段顺序与上文"Fiat-Shamir 转录"一致，因此叶子逐字节绑定条目的全部签名材料（含响应）。
+
+`verify_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` 执行两步，且顺序固定：**先**以 `verify_multi_inclusion` 校验 `(index, leaf)` 序列对 `root` 的多包含关系，**仅当验根通过后**才调用 `verify_schnorr_batch` 验签，并把**同一个 `randbelow` 对象**原样转发——随机源契约（每个结构合法条目恰调用一次 `randbelow(prime - 1)`，返回值须为 `[0, prime - 1)` 内的非 bool 整数）完全沿用后者，验根失败时随机源一次都不会被调用。
+
+覆盖完整性在验根前强制：`leaf_count` 必须为正的非 bool 整数，且同时等于 `len(entries)` 与 `batch.proof.leaf_count`；`proof.indices` 必须无缺口、无重复、按序恰好覆盖 `0, 1, ..., leaf_count - 1`（即等于 `tuple(range(leaf_count))`）。因此**空批、缺项（索引有缺口）、重排或重复索引**都返回 `False`；与既有批量函数不同，这一批次的完整性由 Merkle 覆盖本身强制，不再只是"调用方保证"。
+
+`batch`、`entries`、条目字段、`proof`、其字段或 `root` 的类型错误抛 `TypeError`（`bool` 不算整数，`root` 须为 `bytes`，`randbelow` 不可调用同样抛 `TypeError`）；其余一切非类型问题——`leaf_count` 非正或三者不等、索引覆盖不完整、根不符、叶子或证明被篡改、签名无效（含随机线性组合不成立）——均返回 `False`；`randbelow` 返回值的越界错误仍按 `verify_schnorr_batch` 的契约抛 `ValueError`。入口不改写任何输入；与其它随机线性组合一样仅供演示。
 
 ## 限制
 

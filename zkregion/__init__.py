@@ -9,6 +9,7 @@ SchnorrVerifier / MultiSchnorrEntry / verify_schnorr_batch /
 BoundSchnorrBatch / verify_bound /
 BoundRegionBatch / verify_region_bound /
 BoundRangeBatch / verify_range_bound /
+BoundSchnorrReplayGuard /
 BoundRegionReplayGuard /
 BoundRangeReplayGuard /
 ReplayBinding / ReplayGuard / RangeReplayGuard / RegionReplayGuard /
@@ -35,6 +36,7 @@ __all__ = [
     "BoundRegionReplayGuard",
     "BoundRangeReplayGuard",
     "BoundSchnorrBatch",
+    "BoundSchnorrReplayGuard",
     "MerkleMultiProof",
     "MerkleProof",
     "MultiSchnorrEntry",
@@ -2143,6 +2145,7 @@ _RANGE_REPLAY_DOMAIN = b"zr/rr/v1"
 _REGION_REPLAY_DOMAIN = b"zr/rg/v1"
 _BOUND_REGION_REPLAY_DOMAIN = b"zr/brg/v1"
 _BOUND_RANGE_REPLAY_DOMAIN = b"zr/brr/v1"
+_BOUND_SCHNORR_REPLAY_DOMAIN = b"zr/bsr/v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -3164,6 +3167,276 @@ class BoundRangeReplayGuard:
         if binding.expires_at is not None and current >= binding.expires_at:
             return False  # expired: rejection does not consume the id
         if not verify_range_bound(batch, root, randbelow=randbelow):
+            return False
+        del self._pending[binding.session_id]
+        self._consumed.add(binding.session_id)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Per-instance replay protection for Merkle-committed Schnorr batches
+#
+# A BoundSchnorrReplayGuard binds a whole BoundSchnorrBatch together with the
+# Merkle root it is claimed under to a caller-chosen session id, reusing the
+# ReplayBinding type and, byte for byte, the F / U / S framing and the E
+# expiry encoding of BoundRegionReplayGuard; only the domain separator and
+# the per-entry leaves differ. Like the other guards the binding is
+# single-use and local to the guard instance: bind_once registers a pending
+# binding, check recomputes the digest, checks the expiry, delegates the
+# actual root and signature verification to verify_bound (passing the random
+# source through unchanged) and consumes the id only on full success; every
+# rejection leaves the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || F(root) || F(U(batch.leaf_count))
+#     || Σ_i F(L(entry_i))
+#     || F(U(proof.leaf_count)) || S(proof.indices, U)
+#     || S(proof.siblings, λx.x) || F(E)
+# )
+#   D = b"zr/bsr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   L(entry) = the BoundSchnorr leaf bytes (_bound_schnorr_leaf), raw under F
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+
+
+def _bound_schnorr_replay_encodable(batch: BoundSchnorrBatch) -> bool:
+    """Every U-framed integer must fit in uint64 and every L integer be >= 0.
+
+    The U-framed values (``batch.leaf_count``, ``batch.proof.leaf_count`` and
+    every proof index) follow the same rule as
+    :func:`_bound_region_replay_encodable`. The BoundSchnorr leaves encode
+    their integers (``prime``, ``generator``, ``public_key``, the proof
+    commitment and response) in shortest *unsigned* big-endian form, so a
+    negative L integer cannot be framed either.
+    """
+    proof = batch.proof
+    framed = [batch.leaf_count, proof.leaf_count, *proof.indices]
+    if not all(0 <= value <= _UINT64_MAX for value in framed):
+        return False
+    for entry in batch.entries:
+        if min(
+            entry.prime,
+            entry.generator,
+            entry.public_key,
+            entry.proof.commitment,
+            entry.proof.response,
+        ) < 0:
+            return False
+    return True
+
+
+def _bound_schnorr_replay_digest(
+    batch: BoundSchnorrBatch,
+    root: bytes,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the BoundSchnorr replay binding digest.
+
+    Byte-for-byte the :func:`_bound_region_replay_digest` framing with the
+    BoundSchnorr replay domain and the BoundSchnorr (rather than
+    BoundRegion) leaves. Writes, in order: ``F(D)``, ``F(session_id)``,
+    ``F(root)``, ``F(U(batch.leaf_count))``, one ``F(L(entry))`` per entry
+    in batch order, then ``F(U(proof.leaf_count))``,
+    ``S(proof.indices, U)``, ``S(proof.siblings, identity)`` and ``F(E)``.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_BOUND_SCHNORR_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    transcript.update(_frame_length_prefixed(root))
+    transcript.update(_frame_length_prefixed(_uint64_be(batch.leaf_count)))
+    for entry in batch.entries:  # entries order, each BoundSchnorr leaf under F
+        transcript.update(_frame_length_prefixed(_bound_schnorr_leaf(entry)))
+    proof = batch.proof
+    transcript.update(_frame_length_prefixed(_uint64_be(proof.leaf_count)))
+    # S(proof.indices, U) = F(U(|indices|)) || Σ F(U(index))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.indices))))
+    for index in proof.indices:
+        transcript.update(_frame_length_prefixed(_uint64_be(index)))
+    # S(proof.siblings, λx.x) = F(U(|siblings|)) || Σ F(sibling)
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.siblings))))
+    for sibling in proof.siblings:
+        transcript.update(_frame_length_prefixed(sibling))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+def _check_bound_schnorr_batch_types(batch: object, root: object) -> None:
+    """Validate BoundSchnorrBatch argument types for the replay guard.
+
+    Mirrors the type checks of :func:`verify_bound`: the batch must be a
+    :class:`BoundSchnorrBatch` whose entries tuple holds nestedly well-typed
+    :class:`MultiSchnorrEntry` objects, whose ``leaf_count`` is a
+    non-``bool`` integer and whose proof is a well-typed
+    :class:`MerkleMultiProof`; ``root`` must be ``bytes``. Structural and
+    value problems (coverage, digest lengths, ranges) are left to
+    :func:`verify_bound` at check time.
+    """
+    if not isinstance(batch, BoundSchnorrBatch):
+        raise TypeError("batch must be a BoundSchnorrBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError("batch entries must be a tuple of MultiSchnorrEntry")
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, MultiSchnorrEntry):
+            raise TypeError(f"entries[{position}] must be a MultiSchnorrEntry")
+        _check_int(entry.public_key, f"entries[{position}] public_key")
+        _check_bytes(entry.message, f"entries[{position}] message")
+        entry_proof = entry.proof
+        if not isinstance(entry_proof, SchnorrProof):
+            raise TypeError(f"entries[{position}] proof must be a SchnorrProof")
+        if (
+            not isinstance(entry_proof.commitment, int)
+            or isinstance(entry_proof.commitment, bool)
+            or not isinstance(entry_proof.response, int)
+            or isinstance(entry_proof.response, bool)
+        ):
+            raise TypeError(
+                f"entries[{position}] proof commitment and response must be integers"
+            )
+        _check_bytes(entry.context, f"entries[{position}] context")
+        _check_int(entry.prime, f"entries[{position}] prime")
+        _check_int(entry.generator, f"entries[{position}] generator")
+
+
+class BoundSchnorrReplayGuard:
+    """Per-instance, single-use replay protection for a bound Schnorr batch.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole
+    :class:`BoundSchnorrBatch` together with the Merkle ``root`` it is
+    claimed under; :meth:`check` accepts an equal pending binding exactly
+    once — recomputing the binding digest, checking the expiry and
+    delegating to :func:`verify_bound` with the random source passed
+    through — and then marks the id consumed. The digest reuses the
+    :class:`BoundRegionReplayGuard` framing byte for byte, with only the
+    domain separator (``b"zr/bsr/v1"``) and the per-entry leaves changed
+    to the BoundSchnorr leaves. Both the pending and the consumed state
+    live on this guard instance and are never shared.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[bytes, ReplayBinding] = {}
+        self._consumed: set[bytes] = set()
+
+    def bind_once(
+        self,
+        batch: BoundSchnorrBatch,
+        root: bytes,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to a batch/root.
+
+        Returns the frozen :class:`ReplayBinding`. ``session_id`` must be
+        non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
+        non-``bool`` unsigned 64-bit Unix-second timestamp; the U-framed
+        integers (``leaf_count`` and the proof indices) must likewise fit
+        in uint64, and every integer encoded into the BoundSchnorr leaf
+        bytes (``prime``, ``generator``, ``public_key``, the proof
+        commitment and response) must be non-negative. A session id that
+        is already pending or consumed raises :class:`ValueError`. Wrong
+        argument or nested field types raise :class:`TypeError`; an empty
+        id, an out-of-uint64 expiry or framed integer, a negative leaf
+        integer, or a rebind raise :class:`ValueError`. Inputs are never
+        mutated.
+        """
+        _check_bound_schnorr_batch_types(batch, root)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _bound_schnorr_replay_encodable(batch):
+            raise ValueError(
+                "leaf_count and proof indices must be unsigned 64-bit integers "
+                "and entry integer fields must be non-negative"
+            )
+        if session_id in self._pending or session_id in self._consumed:
+            raise ValueError("session_id is already bound or has been consumed")
+        binding = ReplayBinding(
+            session_id,
+            _bound_schnorr_replay_digest(batch, root, session_id, expires_at),
+            expires_at,
+        )
+        self._pending[session_id] = binding
+        return binding
+
+    def check(
+        self,
+        batch: BoundSchnorrBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+        randbelow: Callable[[int], int] = secrets.randbelow,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch/root.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        digest is recomputed over the presented ``batch`` / ``root``; for a
+        binding with an expiry, ``now >= expires_at`` makes the check fail
+        (``now`` defaults to the current Unix seconds and must otherwise be
+        a non-``bool`` uint64). Only then is the batch/root handed to
+        :func:`verify_bound` with ``randbelow`` passed through unchanged,
+        under that function's root, structure and randomness contract.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, unequal binding, digest
+        mismatch, expiry, a negative leaf integer, a non-32-byte root or
+        sibling, or :func:`verify_bound` returning ``False``) returns
+        ``False`` and leaves the registration untouched. Type errors raise
+        :class:`TypeError`; an out-of-range ``now`` raises
+        :class:`ValueError`, and errors surfaced by the delegated
+        verification propagate unchanged. Inputs are never mutated.
+        """
+        _check_bound_schnorr_batch_types(batch, root)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if not callable(randbelow):
+            raise TypeError("randbelow must be callable")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _bound_schnorr_replay_encodable(batch):
+            return False  # negative leaf integers or oversized U-framed integers
+        stored = self._pending.get(binding.session_id)
+        if stored is None or stored != binding:
+            return False  # unknown id, already consumed, or unequal binding
+        if not hmac.compare_digest(
+            binding.digest,
+            _bound_schnorr_replay_digest(batch, root, binding.session_id, binding.expires_at),
+        ):
+            return False  # the presented batch/root is not the one originally bound
+        if binding.expires_at is not None and current >= binding.expires_at:
+            return False  # expired: rejection does not consume the id
+        if not verify_bound(batch, root, randbelow=randbelow):
             return False
         del self._pending[binding.session_id]
         self._consumed.add(binding.session_id)

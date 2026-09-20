@@ -99,6 +99,8 @@ python3 -m zkregion
 - `prove_region(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionProof` — 生成二维矩形区域成员非交互证明
 - `verify_region(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证区域成员证明，无需坐标或盲因子
 - `RegionProof(x_proof, y_proof)` — 不可变区域证明对象，两字段均为 `RangeProof`
+- `RegionBatchEntry(x_commitment, y_commitment, region, proof, context=b"")` — 不可变区域批量验证条目
+- `verify_region_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 区域成员证明的批量验证
 - `SchnorrProver(secret, *, prime, generator, randbelow)`
   - `public_key` — `g**secret mod prime`
   - `new_commitment()` — 生成一次性随机数并返回 `g**k mod prime`
@@ -166,6 +168,18 @@ D_i = element * g**(-i) mod prime
 每条轴的子证明在派生 context 下进行，派生 context 按以下项目逐项前置四字节无符号大端长度拼接：域 `b"zkregion/region/v1"`、轴标签 `b"x"` 或 `b"y"`、外部 `context`、Region 四边界（`min_x`、`max_x`、`min_y`、`max_y`）、x 承诺六字段、y 承诺六字段（均按数据类字段顺序）；整数编码为十进制 ASCII。因此证明同时绑定区域、外部 context、两个承诺与轴分配——更换区域、context、承诺或交换两轴（含交换子证明、交换承诺）都验证失败。
 
 `context` 只接受 `bytes`，所有整数拒绝 `bool`；承诺、区域、证明对象或其字段、数值类型错误抛 `TypeError`。生成时区间不匹配、开合无效或轴区间超过 256 个整数抛 `ValueError`；验证时上述非类型错误、结构非法、篡改或绑定不符一律返回 `False`。入口均不改写输入。
+
+### 区域成员证明批量验证
+
+`verify_region_batch(entries, *, randbelow=secrets.randbelow)` 批量验证一批 `RegionBatchEntry(x_commitment, y_commitment, region, proof, context=b"")`（冻结数据类，位置构造、值相等）。`entries` 须为非字符串序列；空批返回 `False`，重复条目合法且各自独立取系数。每个条目逐项逐字节复用既定的 Region 派生 context 与 RangeProof 转录，校验承诺区间与区域边界一致、群参数与区间合法、子证明结构、`t`/`e`/`s` 范围及每个子证明的挑战和——与 `verify_region` 完全一致；唯逐分支的 Schnorr 等式不逐项求值，而是每个分支恰调用一次 `randbelow(prime - 1)` 取 `r`、得非零系数 `a = r + 1`，再按 `(prime, generator, h)` 分组，每组只检查一次聚合等式
+
+```
+h**Σ(a*s) == Π(t**a * D_i**(a*e)) (mod prime)
+```
+
+其中 `D_i = element * g**(-i) mod prime` 定义不变，禁止逐项验证的布尔汇总。缺省随机源为 `secrets.randbelow`，传入固定的 `randbelow` 结果可重复。
+
+类型错误（含 `bool` 整数、非 `bytes` 的 `context`、不可调用的 `randbelow` 或其返回非整数）抛 `TypeError`；随机值越出 `[0, prime - 1)` 抛 `ValueError`；其余非法结构、篡改、区域、承诺或 context 绑定错误、跨条目重组、子证明数量错误均返回 `False`，无效条目允许短路。验证方无法察觉漏项——批次完整性由调用方保证。入口不改写输入。
 
 ### Fiat-Shamir 转录
 

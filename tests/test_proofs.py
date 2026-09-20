@@ -7,6 +7,7 @@ from zkregion import (
     DEFAULT_PRIME,
     MerkleMultiProof,
     MerkleProof,
+    MultiSchnorrEntry,
     PedersenCommitment,
     RangeBatchEntry,
     RangeProof,
@@ -33,6 +34,7 @@ from zkregion import (
     verify_range_batch,
     verify_region,
     verify_region_batch,
+    verify_schnorr_batch,
 )
 
 SMALL_PRIME = 104729  # a small prime keeps the group arithmetic readable in tests
@@ -1907,6 +1909,340 @@ class SchnorrBatchTest(unittest.TestCase):
             SchnorrBatchEntry(b"two", prover.prove(b"two", context=b"demo"), context=b"demo"),
         ]
         self.assertTrue(verifier.verify_batch(entries, randbelow=counter_randbelow()))
+
+
+class MultiSchnorrBatchTest(unittest.TestCase):
+    G_PRIME = SMALL_PRIME
+    G2_PRIME = 104723
+
+    def prover(self, secret, prime, generator):
+        return SchnorrProver(
+            secret=secret, prime=prime, generator=generator, randbelow=counter_randbelow()
+        )
+
+    def setUp(self):
+        self.alice = self.prover(4321, self.G_PRIME, 3)
+        self.bob = self.prover(7777, self.G_PRIME, 3)
+        self.carol = self.prover(5566, self.G2_PRIME, 3)
+
+    def entry(self, prover, message, *, prime, generator, context=b"ctx"):
+        return MultiSchnorrEntry(
+            public_key=prover.public_key,
+            message=message,
+            proof=prover.prove(message, context=context),
+            context=context,
+            prime=prime,
+            generator=generator,
+        )
+
+    # ---- entry object -------------------------------------------------------
+
+    def test_entry_positional_defaults_equality_and_immutability(self):
+        proof = self.alice.prove(b"m")
+        entry = MultiSchnorrEntry(self.alice.public_key, b"m", proof)
+        self.assertEqual(entry.context, b"")
+        self.assertEqual(entry.prime, DEFAULT_PRIME)
+        self.assertEqual(entry.generator, DEFAULT_GENERATOR)
+        self.assertEqual(
+            tuple(getattr(entry, name) for name in (
+                "public_key", "message", "proof", "context", "prime", "generator")),
+            (self.alice.public_key, b"m", proof, b"", DEFAULT_PRIME, DEFAULT_GENERATOR),
+        )
+        self.assertEqual(
+            MultiSchnorrEntry(self.alice.public_key, b"m", proof, b"",
+                              DEFAULT_PRIME, DEFAULT_GENERATOR),
+            entry,
+        )
+        self.assertNotEqual(
+            MultiSchnorrEntry(self.alice.public_key, b"other", proof), entry
+        )
+        self.assertNotEqual(
+            MultiSchnorrEntry(self.alice.public_key, b"m", proof, b"c"), entry
+        )
+        self.assertNotEqual(
+            MultiSchnorrEntry(self.bob.public_key, b"m", proof), entry
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            entry.message = b"other"
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            entry.prime = 5
+
+    def test_entry_field_types(self):
+        entry = self.entry(self.alice, b"m", prime=self.G_PRIME, generator=3)
+        self.assertIsInstance(entry.public_key, int)
+        self.assertIsInstance(entry.message, bytes)
+        self.assertIsInstance(entry.proof, SchnorrProof)
+        self.assertIsInstance(entry.context, bytes)
+        self.assertIsInstance(entry.prime, int)
+        self.assertIsInstance(entry.generator, int)
+
+    # ---- honest round trip --------------------------------------------------
+
+    def test_honest_batch_verifies(self):
+        entries = [
+            self.entry(self.alice, b"alpha", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"beta", prime=self.G_PRIME, generator=3),
+        ]
+        self.assertTrue(verify_schnorr_batch(entries, randbelow=counter_randbelow()))
+        self.assertTrue(verify_schnorr_batch(tuple(entries)))  # default secrets.randbelow
+
+    def test_single_entry_agrees_with_verify_proof(self):
+        entry = self.entry(self.alice, b"m", prime=self.G_PRIME, generator=3)
+        self.assertTrue(verify_schnorr_batch([entry], randbelow=counter_randbelow()))
+        self.assertTrue(
+            SchnorrVerifier(self.alice.public_key, prime=self.G_PRIME, generator=3)
+            .verify_proof(b"m", entry.proof, context=b"ctx")
+        )
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(verify_schnorr_batch([], randbelow=counter_randbelow()))
+        self.assertFalse(verify_schnorr_batch(()))
+
+    def test_duplicate_entries_are_legal(self):
+        entry = self.entry(self.alice, b"m", prime=self.G_PRIME, generator=3)
+        self.assertTrue(
+            verify_schnorr_batch([entry, entry, entry], randbelow=counter_randbelow())
+        )
+
+    def test_mixed_groups_each_checked_under_its_own_parameters(self):
+        entries = [
+            self.entry(self.alice, b"alpha", prime=self.G_PRIME, generator=3),
+            self.entry(self.carol, b"gamma", prime=self.G2_PRIME, generator=3),
+        ]
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(verify_schnorr_batch(entries, randbelow=recording))
+        self.assertEqual(sorted(calls), sorted([self.G_PRIME - 1, self.G2_PRIME - 1]))
+
+    def test_default_group_entries_usable(self):
+        prover = SchnorrProver(secret=123456789, randbelow=counter_randbelow())
+        entry = MultiSchnorrEntry(
+            prover.public_key, b"demo", prover.prove(b"demo", context=b"c"), b"c"
+        )
+        self.assertEqual((entry.prime, entry.generator), (DEFAULT_PRIME, DEFAULT_GENERATOR))
+        self.assertTrue(verify_schnorr_batch([entry], randbelow=counter_randbelow()))
+
+    # ---- randomness ----------------------------------------------------------
+
+    def test_randbelow_called_once_per_entry_with_prime_minus_one(self):
+        entries = [
+            self.entry(self.alice, b"a", prime=self.G_PRIME, generator=3),
+            self.entry(self.carol, b"c", prime=self.G2_PRIME, generator=3),
+        ]
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(verify_schnorr_batch(entries, randbelow=recording))
+        self.assertEqual(sorted(calls), sorted([self.G_PRIME - 1, self.G2_PRIME - 1]))
+
+    def test_fixed_coefficient_source_is_reproducible(self):
+        entries = [
+            self.entry(self.alice, b"a", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"b", prime=self.G_PRIME, generator=3),
+        ]
+        first = verify_schnorr_batch(entries, randbelow=counter_randbelow(9))
+        second = verify_schnorr_batch(entries, randbelow=counter_randbelow(9))
+        self.assertEqual(first, second)
+
+    def test_random_linear_combination_not_per_item_summary(self):
+        # coefficients all 1: two individually invalid proofs under different
+        # keys, in the same group, whose response errors cancel
+        first = self.entry(self.alice, b"a", prime=self.G_PRIME, generator=3)
+        second = self.entry(self.bob, b"b", prime=self.G_PRIME, generator=3)
+        forged = [
+            MultiSchnorrEntry(first.public_key, b"a",
+                              SchnorrProof(first.proof.commitment, first.proof.response + 1),
+                              b"ctx", self.G_PRIME, 3),
+            MultiSchnorrEntry(second.public_key, b"b",
+                              SchnorrProof(second.proof.commitment, second.proof.response - 1),
+                              b"ctx", self.G_PRIME, 3),
+        ]
+        for entry in forged:
+            self.assertFalse(
+                SchnorrVerifier(entry.public_key, prime=self.G_PRIME, generator=3)
+                .verify_proof(entry.message, entry.proof, context=b"ctx")
+            )
+        self.assertTrue(verify_schnorr_batch(forged, randbelow=lambda upper: 0))
+
+    # ---- rejection -----------------------------------------------------------
+
+    def test_tampering_fails(self):
+        good_first = self.entry(self.alice, b"alpha", prime=self.G_PRIME, generator=3)
+        second = self.entry(self.bob, b"beta", prime=self.G_PRIME, generator=3)
+        forged = [
+            MultiSchnorrEntry(
+                good_first.public_key, b"alpha",
+                SchnorrProof(good_first.proof.commitment, good_first.proof.response + 1),
+                b"ctx", self.G_PRIME, 3,
+            ),
+            second,
+        ]
+        self.assertFalse(verify_schnorr_batch(forged, randbelow=counter_randbelow()))
+        # wrong message / context / public key all break the transcript binding
+        for bad in (
+            MultiSchnorrEntry(good_first.public_key, b"other", good_first.proof,
+                              b"ctx", self.G_PRIME, 3),
+            MultiSchnorrEntry(good_first.public_key, b"alpha", good_first.proof,
+                              b"other", self.G_PRIME, 3),
+            MultiSchnorrEntry(self.bob.public_key, b"alpha", good_first.proof,
+                              b"ctx", self.G_PRIME, 3),
+            MultiSchnorrEntry(good_first.public_key, b"alpha", good_first.proof,
+                              b"ctx", self.G_PRIME, 5),
+        ):
+            self.assertFalse(
+                verify_schnorr_batch([bad, second], randbelow=counter_randbelow())
+            )
+
+    def test_entry_group_fields_bind_the_proof(self):
+        # proof made under generator 3 verified under generator 5
+        entry = self.entry(self.alice, b"m", prime=self.G_PRIME, generator=3)
+        crossed = MultiSchnorrEntry(
+            entry.public_key, b"m", entry.proof, b"ctx", self.G_PRIME, 5
+        )
+        self.assertFalse(verify_schnorr_batch([crossed], randbelow=counter_randbelow()))
+
+    def test_cancellation_does_not_cross_group_boundaries(self):
+        # response deltas of +1 and -1 in two different (prime, generator)
+        # groups cannot cancel
+        first = self.entry(self.alice, b"a", prime=self.G_PRIME, generator=3)
+        second = self.entry(self.carol, b"c", prime=self.G2_PRIME, generator=3)
+        forged = [
+            MultiSchnorrEntry(first.public_key, b"a",
+                              SchnorrProof(first.proof.commitment, first.proof.response + 1),
+                              b"ctx", self.G_PRIME, 3),
+            MultiSchnorrEntry(second.public_key, b"c",
+                              SchnorrProof(second.proof.commitment, second.proof.response - 1),
+                              b"ctx", self.G2_PRIME, 3),
+        ]
+        self.assertFalse(verify_schnorr_batch(forged, randbelow=lambda upper: 0))
+
+    def test_structural_errors_return_false(self):
+        entry = self.entry(self.alice, b"m", prime=self.G_PRIME, generator=3)
+        for bad_commitment in (0, self.G_PRIME, self.G_PRIME + 1, -1):
+            bad = MultiSchnorrEntry(
+                entry.public_key, b"m",
+                SchnorrProof(bad_commitment, entry.proof.response),
+                b"ctx", self.G_PRIME, 3,
+            )
+            self.assertFalse(
+                verify_schnorr_batch([bad], randbelow=counter_randbelow()),
+                f"commitment={bad_commitment}",
+            )
+        negative = MultiSchnorrEntry(
+            entry.public_key, b"m", SchnorrProof(entry.proof.commitment, -1),
+            b"ctx", self.G_PRIME, 3,
+        )
+        self.assertFalse(verify_schnorr_batch([negative], randbelow=counter_randbelow()))
+        for bad_pk in (0, self.G_PRIME, -1):
+            bad = MultiSchnorrEntry(
+                bad_pk, b"m", entry.proof, b"ctx", self.G_PRIME, 3
+            )
+            self.assertFalse(verify_schnorr_batch([bad], randbelow=counter_randbelow()))
+        for prime, generator in ((3, 2), (self.G_PRIME, 1), (self.G_PRIME, self.G_PRIME)):
+            bad = MultiSchnorrEntry(
+                entry.public_key, b"m", entry.proof, b"ctx", prime, generator
+            )
+            self.assertFalse(verify_schnorr_batch([bad], randbelow=counter_randbelow()))
+
+    def test_invalid_entry_short_circuits_before_drawing(self):
+        valid = self.entry(self.alice, b"a", prime=self.G_PRIME, generator=3)
+        invalid = MultiSchnorrEntry(
+            valid.public_key, b"a", SchnorrProof(0, valid.proof.response),
+            b"ctx", self.G_PRIME, 3,
+        )
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertFalse(verify_schnorr_batch([invalid, valid], randbelow=recording))
+        self.assertEqual(calls, [])
+        self.assertFalse(verify_schnorr_batch([valid, invalid], randbelow=recording))
+        self.assertEqual(calls, [self.G_PRIME - 1])
+
+    # ---- type errors ---------------------------------------------------------
+
+    def test_type_errors(self):
+        entry = self.entry(self.alice, b"m", prime=self.G_PRIME, generator=3)
+        for bad in ("entries", b"entries", bytearray(b"x"), 42, None):
+            with self.assertRaises(TypeError):
+                verify_schnorr_batch(bad)
+        with self.assertRaises(TypeError):
+            verify_schnorr_batch([(entry.public_key, entry.message, entry.proof)])
+        with self.assertRaises(TypeError):
+            verify_schnorr_batch([
+                MultiSchnorrEntry("pk", b"m", entry.proof, b"ctx", self.G_PRIME, 3)
+            ])
+        with self.assertRaises(TypeError):
+            verify_schnorr_batch([
+                MultiSchnorrEntry(True, b"m", entry.proof, b"ctx", self.G_PRIME, 3)
+            ])
+        with self.assertRaises(TypeError):
+            verify_schnorr_batch([
+                MultiSchnorrEntry(entry.public_key, "m", entry.proof, b"ctx", self.G_PRIME, 3)
+            ])
+        with self.assertRaises(TypeError):
+            verify_schnorr_batch([
+                MultiSchnorrEntry(entry.public_key, b"m", entry.proof, "ctx", self.G_PRIME, 3)
+            ])
+        with self.assertRaises(TypeError):
+            verify_schnorr_batch([
+                MultiSchnorrEntry(entry.public_key, b"m",
+                                  (entry.proof.commitment, entry.proof.response),
+                                  b"ctx", self.G_PRIME, 3)
+            ])
+        with self.assertRaises(TypeError):
+            verify_schnorr_batch([
+                MultiSchnorrEntry(entry.public_key, b"m",
+                                  SchnorrProof(1.5, entry.proof.response),
+                                  b"ctx", self.G_PRIME, 3)
+            ])
+        with self.assertRaises(TypeError):
+            verify_schnorr_batch([
+                MultiSchnorrEntry(entry.public_key, b"m",
+                                  SchnorrProof(entry.proof.commitment, False),
+                                  b"ctx", self.G_PRIME, 3)
+            ])
+        with self.assertRaises(TypeError):
+            verify_schnorr_batch([
+                MultiSchnorrEntry(entry.public_key, b"m", entry.proof, b"ctx",
+                                  str(self.G_PRIME), 3)
+            ])
+        with self.assertRaises(TypeError):
+            verify_schnorr_batch([
+                MultiSchnorrEntry(entry.public_key, b"m", entry.proof, b"ctx",
+                                  self.G_PRIME, True)
+            ])
+        with self.assertRaises(TypeError):
+            verify_schnorr_batch([entry], randbelow=7)
+
+    def test_coefficient_source_errors(self):
+        entry = self.entry(self.alice, b"m", prime=self.G_PRIME, generator=3)
+        for bad in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                verify_schnorr_batch([entry], randbelow=lambda upper, bad=bad: bad)
+        for bad in (-1, self.G_PRIME - 1, self.G_PRIME):
+            with self.assertRaises(ValueError):
+                verify_schnorr_batch([entry], randbelow=lambda upper, bad=bad: bad)
+
+    # ---- hygiene -------------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        entries = [
+            self.entry(self.alice, b"a", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"b", prime=self.G_PRIME, generator=3),
+        ]
+        snapshot = [dataclasses.replace(entry) for entry in entries]
+        verify_schnorr_batch(entries, randbelow=counter_randbelow())
+        self.assertEqual(entries, snapshot)
 
 
 def leaf_digest(leaf: bytes) -> bytes:

@@ -34,6 +34,16 @@ batch = [
 ]
 assert verifier.verify_batch(batch)
 
+# 多公钥 / 多群的批量验证（每个条目自带公钥与群参数）
+from zkregion import MultiSchnorrEntry, verify_schnorr_batch
+
+other = SchnorrProver(secret=987654321)
+multi = [
+    MultiSchnorrEntry(prover.public_key, b"alpha", prover.prove(b"alpha", context=b"s1"), context=b"s1"),
+    MultiSchnorrEntry(other.public_key, b"beta", other.prove(b"beta", context=b"s1"), b"s1"),
+]
+assert verify_schnorr_batch(multi)
+
 # Merkle 包含证明
 from zkregion import merkle_root, prove_inclusion, verify_inclusion
 
@@ -132,6 +142,8 @@ python3 -m zkregion
   - `verify_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 同一公钥的批量验证
 - `SchnorrProof(commitment, response)` — 不可变证明对象（`t = g**k mod prime`，`s = k + c * secret`）
 - `SchnorrBatchEntry(message, proof, context=b"")` — 不可变批量验证条目，字段类型依次为 `bytes`、`SchnorrProof`、`bytes`
+- `verify_schnorr_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 多公钥批量验证，按 `(prime, generator)` 分组做一次随机线性组合
+- `MultiSchnorrEntry(public_key, message, proof, context=b"", prime=DEFAULT_PRIME, generator=DEFAULT_GENERATOR)` — 不可变多公钥批量验证条目；前三字段依次为 `int`、`bytes`、`SchnorrProof`，均为必填且可位置构造，值相等即相等
 - `merkle_root(leaves) -> bytes` — 非空 `bytes` 序列的 Merkle 根
 - `prove_inclusion(leaves, index) -> MerkleProof` — 按零基索引生成包含证明
 - `verify_inclusion(leaf, proof, root) -> bool` — 验证包含证明
@@ -230,6 +242,20 @@ h**Σ(a*s) == Π(t**a * D_i**(a*e))   (mod prime)
 `verify_batch` 验证同一公钥下的一批 Fiat-Shamir 证明。`entries` 须为 `SchnorrBatchEntry` 的非字符串序列（空批返回 `False`）；每个结构合法的条目按既有转录重算挑战 `c`，并恰调用一次 `randbelow(prime - 1)` 得 `r`，取非零系数 `a = r + 1`，最终只检查一次聚合等式 `g**Σ(a*s) == Π(t**a * public_key**(a*c)) (mod prime)`，而非逐项验证的布尔汇总。重复条目合法，各自独立取系数；传入固定的 `randbelow` 结果可重复，缺省为 `secrets.randbelow`。
 
 `entries`、条目字段、`proof` 或 `randbelow` 的类型错误抛 `TypeError`（`bool` 不算整数）；系数来源返回非整数抛 `TypeError`，超出 `[0, prime - 1)` 抛 `ValueError`。commitment 越界、response 为负、消息或 context 不匹配、错误公钥或任一篡改均返回 `False`，无效证明允许短路。验证不改写输入，也不触碰证明方的交互式 nonce。注意：默认群与这里的随机线性组合仅供演示，未做生产级安全分析。
+
+### 多公钥 Schnorr 批量验证
+
+`verify_schnorr_batch(entries, *, randbelow=secrets.randbelow)` 一次验证可能分属不同公钥、不同群的一批 Fiat-Shamir 证明：每个条目是冻结数据类 `MultiSchnorrEntry(public_key, message, proof, context=b"", prime=DEFAULT_PRIME, generator=DEFAULT_GENERATOR)`，字段依次为 `int`、`bytes`、`SchnorrProof` 及缺省的 `context:bytes`、`prime:int`、`generator:int`，六字段都可位置构造；条目值相等即相等且不可变。`entries` 须为非字符串、非空序列：空批返回 `False`，重复条目合法并各自独立取系数。漏项无法被发现，批次完整性由调用方保证。
+
+每个条目逐字节复用既定的 Fiat-Shamir 转录（域、`prime`、`generator`、`public_key`、`t`、`context`、`message`）重算挑战 `c`，由此把条目六字段全部绑定。通过结构校验后，**每个条目恰调用一次** `randbelow(prime - 1)` 得 `r`，取非零系数 `a = r + 1`。条目按 `(prime, generator)` 分组，每组只检查一次聚合等式
+
+```
+g**Σ(a*s) == Π(t**a * public_key**(a*c))   (mod prime)
+```
+
+即同组内所有条目（可属不同 `public_key`，各自使用自身公钥）纳入同一个随机线性组合，而**不是**逐条目验证后做布尔汇总；不同 `(prime, generator)` 群之间不能跨组相消。传入固定的 `randbelow` 结果可重复，缺省为 `secrets.randbelow`。
+
+`entries`、条目字段或 `randbelow` 的类型错误抛 `TypeError`（`bool` 不算整数；非 `bytes` 的 `message`/`context` 同样拒绝）；系数来源返回非整数抛 `TypeError`，超出 `[0, prime - 1)` 抛 `ValueError`。群参数非法、公钥或 commitment 越界、response 为负、消息/context 不匹配或任一篡改均返回 `False`，无效条目允许短路。入口不改写任何输入。与单公钥批量验证一样，这里的随机线性组合只供演示。
 
 ## 限制
 

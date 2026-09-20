@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from . import (
+    MultiSchnorrEntry,
     RangeBatchEntry,
     RangeProof,
     Region,
@@ -28,6 +29,7 @@ from . import (
     verify_range_batch,
     verify_region,
     verify_region_batch,
+    verify_schnorr_batch,
 )
 
 
@@ -185,6 +187,29 @@ def main() -> int:
     forged = SchnorrProof(batch[0].proof.commitment, batch[0].proof.response + 1)
     tampered = [SchnorrBatchEntry(b"alpha", forged, context=b"batch"), batch[1]]
     print(f"  tampered batch rejected: {not verifier.verify_batch(tampered, randbelow=counter_randbelow())}")
+
+    print()
+    print("multi-key batch Fiat-Shamir verification (entries carry their own key/group):")
+    other = SchnorrProver(secret=8888, prime=104729, generator=5, randbelow=counter_randbelow())
+    multi_batch = [
+        MultiSchnorrEntry(
+            prover.public_key, b"alpha", prover.prove(b"alpha", context=b"multi"),
+            b"multi",
+        ),
+        MultiSchnorrEntry(
+            other.public_key, b"beta", other.prove(b"beta", context=b"multi"),
+            b"multi", 104729, 5,
+        ),
+    ]
+    print(f"  mixed-key/mixed-group batch accepted: "
+          f"{verify_schnorr_batch(multi_batch, randbelow=counter_randbelow())}")
+    print(f"  duplicate entries accepted: "
+          f"{verify_schnorr_batch(multi_batch + multi_batch[:1], randbelow=counter_randbelow())}")
+    print(f"  empty batch rejected: {not verify_schnorr_batch(())}")
+    forged = SchnorrProof(multi_batch[0].proof.commitment, multi_batch[0].proof.response + 1)
+    tampered = [MultiSchnorrEntry(multi_batch[0].public_key, b"alpha", forged, b"multi"),
+                multi_batch[1]]
+    print(f"  tampered batch rejected: {not verify_schnorr_batch(tampered, randbelow=counter_randbelow())}")
 
     print()
     print("merkle inclusion proofs:")

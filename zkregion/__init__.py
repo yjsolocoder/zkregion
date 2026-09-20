@@ -9,6 +9,7 @@ SchnorrVerifier / MultiSchnorrEntry / verify_schnorr_batch /
 BoundSchnorrBatch / verify_bound /
 BoundRegionBatch / verify_region_bound /
 BoundRangeBatch / verify_range_bound /
+ReplayBinding / ReplayGuard /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion.
@@ -19,6 +20,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Callable
@@ -38,6 +40,8 @@ __all__ = [
     "Region",
     "RegionBatchEntry",
     "RegionProof",
+    "ReplayBinding",
+    "ReplayGuard",
     "SchnorrBatchEntry",
     "SchnorrProof",
     "SchnorrProver",
@@ -2104,3 +2108,230 @@ def verify_range_bound(
     if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
         return False
     return verify_range_batch(entries, randbelow=randbelow)
+
+
+# ---------------------------------------------------------------------------
+# Per-instance replay protection
+#
+# A ReplayGuard binds a MultiSchnorrEntry to a caller-chosen session id via a
+# ReplayBinding digest. Bindings are single-use and local to the guard
+# instance: bind_once registers a pending binding, check accepts an equal
+# pending binding exactly once (verifying the Schnorr proof first) and then
+# consumes the session id; every rejection leaves the id untouched, and an
+# id that is pending or already consumed can never be rebound.
+#
+# digest = SHA-256(F(D) || F(session_id) || L(entry) || F(E))
+#   D = b"zr/r/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   L(entry) = the BoundSchnorr leaf bytes (see _bound_schnorr_leaf), raw,
+#              i.e. without an F framing
+#   E = b"\x00"                          when expires_at is None
+#     = b"\x01" + uint64be(expires_at)   otherwise
+
+_REPLAY_DOMAIN = b"zr/r/v1"
+_UINT64_MAX = (1 << 64) - 1
+_REPLAY_DIGEST_SIZE = 32
+
+
+@dataclass(frozen=True)
+class ReplayBinding:
+    """A single-use replay binding of a session id to a Schnorr entry.
+
+    Fields, in order: ``session_id`` — a non-empty ``bytes`` identifier;
+    ``digest`` — the 32-byte SHA-256 binding digest; ``expires_at`` — an
+    optional non-``bool`` unsigned 64-bit Unix-second expiry. All three are
+    positional construction arguments; bindings compare by value and are
+    immutable.
+    """
+
+    session_id: bytes
+    digest: bytes
+    expires_at: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.session_id, bytes):
+            raise TypeError("session_id must be bytes")
+        if not self.session_id:
+            raise ValueError("session_id must not be empty")
+        if not isinstance(self.digest, bytes):
+            raise TypeError("digest must be bytes")
+        if len(self.digest) != _REPLAY_DIGEST_SIZE:
+            raise ValueError(f"digest must be exactly {_REPLAY_DIGEST_SIZE} bytes")
+        if self.expires_at is not None:
+            _check_uint64(self.expires_at, "expires_at")
+
+
+def _check_uint64(value: object, name: str) -> None:
+    """Non-bool integers in the unsigned 64-bit range; bool is rejected."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be a non-bool integer")
+    if not 0 <= value <= _UINT64_MAX:
+        raise ValueError(f"{name} must be an unsigned 64-bit integer")
+
+
+def _replay_expiry_bytes(expires_at: int | None) -> bytes:
+    if expires_at is None:
+        return b"\x00"
+    return b"\x01" + expires_at.to_bytes(8, "big")
+
+
+def _replay_digest(
+    entry: MultiSchnorrEntry,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute ``SHA-256(F(D) || F(session_id) || L(entry) || F(E))``."""
+    transcript = hashlib.sha256()
+    transcript.update(len(_REPLAY_DOMAIN).to_bytes(4, "big"))
+    transcript.update(_REPLAY_DOMAIN)
+    transcript.update(len(session_id).to_bytes(4, "big"))
+    transcript.update(session_id)
+    transcript.update(_bound_schnorr_leaf(entry))  # raw leaf, no F framing
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(len(expiry).to_bytes(4, "big"))
+    transcript.update(expiry)
+    return transcript.digest()
+
+
+def _check_multi_schnorr_entry(entry: object, name: str = "entry") -> MultiSchnorrEntry:
+    """Validate a MultiSchnorrEntry and its nested field types."""
+    if not isinstance(entry, MultiSchnorrEntry):
+        raise TypeError(f"{name} must be a MultiSchnorrEntry")
+    _check_int(entry.public_key, f"{name} public_key")
+    _check_bytes(entry.message, f"{name} message")
+    proof = entry.proof
+    if not isinstance(proof, SchnorrProof):
+        raise TypeError(f"{name} proof must be a SchnorrProof")
+    if (
+        not isinstance(proof.commitment, int)
+        or isinstance(proof.commitment, bool)
+        or not isinstance(proof.response, int)
+        or isinstance(proof.response, bool)
+    ):
+        raise TypeError(f"{name} proof commitment and response must be integers")
+    _check_bytes(entry.context, f"{name} context")
+    _check_int(entry.prime, f"{name} prime")
+    _check_int(entry.generator, f"{name} generator")
+    return entry
+
+
+def _multi_schnorr_entry_is_encodable(entry: MultiSchnorrEntry) -> bool:
+    """The BoundSchnorr leaf encodes integers unsignedly; negatives cannot be framed."""
+    return min(
+        entry.prime,
+        entry.generator,
+        entry.public_key,
+        entry.proof.commitment,
+        entry.proof.response,
+    ) >= 0
+
+
+class ReplayGuard:
+    """Per-instance, single-use replay protection for Schnorr entries.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a pending
+    :class:`ReplayBinding` for a session id, :meth:`check` accepts an equal
+    pending binding exactly once and then marks the id consumed. Both the
+    pending and the consumed state live on this guard instance and are never
+    shared between instances.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[bytes, ReplayBinding] = {}
+        self._consumed: set[bytes] = set()
+
+    def bind_once(
+        self,
+        entry: MultiSchnorrEntry,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to ``entry``.
+
+        Returns the frozen :class:`ReplayBinding`. ``session_id`` must be
+        non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
+        non-``bool`` unsigned 64-bit Unix-second timestamp. A session id that
+        is already pending or has been consumed raises :class:`ValueError`;
+        wrong argument types raise :class:`TypeError` (an empty id or an
+        out-of-range expiry raise :class:`ValueError`). Inputs are never
+        mutated.
+        """
+        _check_multi_schnorr_entry(entry)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _multi_schnorr_entry_is_encodable(entry):
+            raise ValueError("entry integer fields must be non-negative")
+        if session_id in self._pending or session_id in self._consumed:
+            raise ValueError("session_id is already bound or has been consumed")
+        binding = ReplayBinding(
+            session_id,
+            _replay_digest(entry, session_id, expires_at),
+            expires_at,
+        )
+        self._pending[session_id] = binding
+        return binding
+
+    def check(
+        self,
+        entry: MultiSchnorrEntry,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for ``entry``.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        entry's proof is checked with a :class:`SchnorrVerifier` built from
+        the entry's own public key and group parameters, via
+        :meth:`SchnorrVerifier.verify_proof` with ``entry.message``,
+        ``entry.proof`` and ``entry.context`` unchanged. For a binding with
+        an expiry, ``now >= expires_at`` makes the check fail; ``now``
+        defaults to the current Unix seconds and must otherwise be a
+        non-``bool`` unsigned 64-bit integer.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, unequal binding, expiry, bad
+        group parameters or a failing proof) returns ``False`` and leaves
+        the registration untouched. Type errors raise :class:`TypeError`;
+        an out-of-range ``now`` raises :class:`ValueError`. Inputs are never
+        mutated.
+        """
+        _check_multi_schnorr_entry(entry)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _multi_schnorr_entry_is_encodable(entry):
+            return False  # negative integers cannot be encoded into the bound leaf
+        stored = self._pending.get(binding.session_id)
+        if stored is None or stored != binding:
+            return False  # unknown id, already consumed, or unequal binding
+        if not hmac.compare_digest(
+            binding.digest,
+            _replay_digest(entry, binding.session_id, binding.expires_at),
+        ):
+            return False  # the presented entry is not the one originally bound
+        if binding.expires_at is not None and current >= binding.expires_at:
+            return False  # expired: rejection does not consume the id
+        try:
+            verifier = SchnorrVerifier(
+                entry.public_key, prime=entry.prime, generator=entry.generator
+            )
+            accepted = verifier.verify_proof(
+                entry.message, entry.proof, context=entry.context
+            )
+        except ValueError:
+            return False  # invalid embedded public key or group parameters
+        if not accepted:
+            return False
+        del self._pending[binding.session_id]
+        self._consumed.add(binding.session_id)
+        return True

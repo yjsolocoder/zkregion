@@ -14,6 +14,8 @@ from . import (
     Region,
     RegionBatchEntry,
     RegionProof,
+    ReplayBinding,
+    ReplayGuard,
     SchnorrBatchEntry,
     SchnorrProof,
     SchnorrProver,
@@ -364,6 +366,44 @@ def main() -> int:
     full = prove_multi_inclusion(leaves, range(len(leaves)))
     print(f"  full-leaf proof needs no siblings: {full.siblings == ()}")
     print(f"  full-leaf proof accepted: {verify_multi_inclusion(list(enumerate(leaves)), full, root)}")
+
+    print()
+    print("per-instance replay protection (bind once, check once):")
+    guard = ReplayGuard()
+    replay_entry = MultiSchnorrEntry(
+        prover.public_key, b"spend", prover.prove(b"spend", context=b"session"),
+        b"session",
+    )
+    binding = guard.bind_once(replay_entry, b"session-id-1", expires_at=10**12)
+    print(f"  digest={binding.digest.hex()[:32]}…  expires_at={binding.expires_at}")
+    print(f"  valid first check accepted: {guard.check(replay_entry, binding, now=100)}")
+    print(f"  replay rejected: {not guard.check(replay_entry, binding, now=101)}")
+    print(f"  consumed id cannot be rebound: ", end="")
+    try:
+        guard.bind_once(replay_entry, b"session-id-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    pending = ReplayGuard()
+    pending_binding = pending.bind_once(replay_entry, b"session-id-2", expires_at=1000)
+    print(f"  expired binding (now >= expires_at) rejected: "
+          f"{not pending.check(replay_entry, pending_binding, now=1000)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{pending.check(replay_entry, pending_binding, now=999)}")
+    wrong_proof = dataclasses.replace(replay_entry, proof=SchnorrProof(
+        replay_entry.proof.commitment, replay_entry.proof.response + 1,
+    ))
+    other = ReplayGuard()
+    other_binding = other.bind_once(wrong_proof, b"session-id-3")
+    print(f"  bad proof rejected without consuming the id: "
+          f"{not other.check(wrong_proof, other_binding)}")
+    fresh_binding = ReplayGuard().bind_once(replay_entry, b"x")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other.check(replay_entry, fresh_binding)}")
+    timeless_guard = ReplayGuard()
+    timeless_binding = timeless_guard.bind_once(replay_entry, b"session-id-4")
+    print(f"  binding without expiry (expires_at=None) accepted at any now: "
+          f"{timeless_guard.check(replay_entry, timeless_binding, now=(1 << 64) - 1)}")
 
     print()
     print("region membership:")

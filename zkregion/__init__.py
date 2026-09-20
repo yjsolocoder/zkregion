@@ -9,7 +9,7 @@ SchnorrVerifier / MultiSchnorrEntry / verify_schnorr_batch /
 BoundSchnorrBatch / verify_bound /
 BoundRegionBatch / verify_region_bound /
 BoundRangeBatch / verify_range_bound /
-ReplayBinding / ReplayGuard /
+ReplayBinding / ReplayGuard / RangeReplayGuard /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion.
@@ -37,6 +37,7 @@ __all__ = [
     "PedersenCommitment",
     "RangeBatchEntry",
     "RangeProof",
+    "RangeReplayGuard",
     "Region",
     "RegionBatchEntry",
     "RegionProof",
@@ -2114,31 +2115,34 @@ def verify_range_bound(
 # Per-instance replay protection
 #
 # A ReplayGuard binds a MultiSchnorrEntry to a caller-chosen session id via a
-# ReplayBinding digest. Bindings are single-use and local to the guard
-# instance: bind_once registers a pending binding, check accepts an equal
-# pending binding exactly once (verifying the Schnorr proof first) and then
-# consumes the session id; every rejection leaves the id untouched, and an
-# id that is pending or already consumed can never be rebound.
+# ReplayBinding digest; a RangeReplayGuard does the same for a
+# RangeBatchEntry. Bindings are single-use and local to the guard instance:
+# bind_once registers a pending binding, check accepts an equal pending
+# binding exactly once (verifying the proof first) and then consumes the
+# session id; every rejection leaves the id untouched, and an id that is
+# pending or already consumed can never be rebound.
 #
 # digest = SHA-256(F(D) || F(session_id) || L(entry) || F(E))
-#   D = b"zr/r/v1"
+#   D = b"zr/r/v1"   (ReplayGuard)  or  b"zr/rr/v1"  (RangeReplayGuard)
 #   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
-#   L(entry) = the BoundSchnorr leaf bytes (see _bound_schnorr_leaf), raw,
-#              i.e. without an F framing
+#   L(entry) = the BoundSchnorr / BoundRange leaf bytes (see
+#              _bound_schnorr_leaf / _bound_range_leaf), raw, i.e. without
+#              an F framing
 #   E = b"\x00"                          when expires_at is None
 #     = b"\x01" + uint64be(expires_at)   otherwise
 
 _REPLAY_DOMAIN = b"zr/r/v1"
+_RANGE_REPLAY_DOMAIN = b"zr/rr/v1"
 _UINT64_MAX = (1 << 64) - 1
-_REPLAY_DIGEST_SIZE = 32
 
 
 @dataclass(frozen=True)
 class ReplayBinding:
-    """A single-use replay binding of a session id to a Schnorr entry.
+    """A single-use replay binding of a session id to an entry.
 
     Fields, in order: ``session_id`` — a non-empty ``bytes`` identifier;
-    ``digest`` — the 32-byte SHA-256 binding digest; ``expires_at`` — an
+    ``digest`` — the ``bytes`` binding digest (no fixed length is imposed;
+    the guards always store a 32-byte SHA-256 digest); ``expires_at`` — an
     optional non-``bool`` unsigned 64-bit Unix-second expiry. All three are
     positional construction arguments; bindings compare by value and are
     immutable.
@@ -2155,8 +2159,6 @@ class ReplayBinding:
             raise ValueError("session_id must not be empty")
         if not isinstance(self.digest, bytes):
             raise TypeError("digest must be bytes")
-        if len(self.digest) != _REPLAY_DIGEST_SIZE:
-            raise ValueError(f"digest must be exactly {_REPLAY_DIGEST_SIZE} bytes")
         if self.expires_at is not None:
             _check_uint64(self.expires_at, "expires_at")
 
@@ -2331,6 +2333,142 @@ class ReplayGuard:
         except ValueError:
             return False  # invalid embedded public key or group parameters
         if not accepted:
+            return False
+        del self._pending[binding.session_id]
+        self._consumed.add(binding.session_id)
+        return True
+
+
+def _range_replay_digest(
+    entry: RangeBatchEntry,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute ``SHA-256(F(D) || F(session_id) || L(entry) || F(E))``."""
+    transcript = hashlib.sha256()
+    transcript.update(len(_RANGE_REPLAY_DOMAIN).to_bytes(4, "big"))
+    transcript.update(_RANGE_REPLAY_DOMAIN)
+    transcript.update(len(session_id).to_bytes(4, "big"))
+    transcript.update(session_id)
+    transcript.update(_bound_range_leaf(entry))  # raw leaf, no F framing
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(len(expiry).to_bytes(4, "big"))
+    transcript.update(expiry)
+    return transcript.digest()
+
+
+def _check_range_batch_entry(entry: object, name: str = "entry") -> RangeBatchEntry:
+    """Validate a RangeBatchEntry and its nested field types."""
+    if not isinstance(entry, RangeBatchEntry):
+        raise TypeError(f"{name} must be a RangeBatchEntry")
+    commitment = entry.commitment
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError(f"{name} commitment must be a PedersenCommitment")
+    _check_commitment_fields(commitment)
+    proof = entry.proof
+    if not isinstance(proof, RangeProof):
+        raise TypeError(f"{name} proof must be a RangeProof")
+    for field_name in ("t", "e", "s"):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(f"{name} proof {field_name} must be a tuple of integers")
+        for item in field:
+            _check_int(item, f"{name} proof {field_name} entry")
+    _check_bytes(entry.context, f"{name} context")
+    return entry
+
+
+class RangeReplayGuard:
+    """Per-instance, single-use replay protection for range-proof entries.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a pending
+    :class:`ReplayBinding` for a session id, :meth:`check` accepts an equal
+    pending binding exactly once and then marks the id consumed. Both the
+    pending and the consumed state live on this guard instance and are never
+    shared between instances.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[bytes, ReplayBinding] = {}
+        self._consumed: set[bytes] = set()
+
+    def bind_once(
+        self,
+        entry: RangeBatchEntry,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to ``entry``.
+
+        Returns the frozen :class:`ReplayBinding`. ``session_id`` must be
+        non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
+        non-``bool`` unsigned 64-bit Unix-second timestamp. A session id that
+        is already pending or has been consumed raises :class:`ValueError`;
+        wrong argument types raise :class:`TypeError` (an empty id or an
+        out-of-range expiry raise :class:`ValueError`). Inputs are never
+        mutated.
+        """
+        _check_range_batch_entry(entry)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if session_id in self._pending or session_id in self._consumed:
+            raise ValueError("session_id is already bound or has been consumed")
+        binding = ReplayBinding(
+            session_id,
+            _range_replay_digest(entry, session_id, expires_at),
+            expires_at,
+        )
+        self._pending[session_id] = binding
+        return binding
+
+    def check(
+        self,
+        entry: RangeBatchEntry,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for ``entry``.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        entry's range proof is checked with :func:`verify_range` called with
+        ``entry.commitment``, ``entry.proof`` and ``entry.context`` in field
+        order, unchanged. For a binding with an expiry,
+        ``now >= expires_at`` makes the check fail; ``now`` defaults to the
+        current Unix seconds and must otherwise be a non-``bool`` unsigned
+        64-bit integer.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, unequal binding, digest mismatch,
+        expiry or a failing range proof) returns ``False`` and leaves the
+        registration untouched. Type errors raise :class:`TypeError`; an
+        out-of-range ``now`` raises :class:`ValueError`. Inputs are never
+        mutated.
+        """
+        _check_range_batch_entry(entry)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        stored = self._pending.get(binding.session_id)
+        if stored is None or stored != binding:
+            return False  # unknown id, already consumed, or unequal binding
+        if not hmac.compare_digest(
+            binding.digest,
+            _range_replay_digest(entry, binding.session_id, binding.expires_at),
+        ):
+            return False  # the presented entry is not the one originally bound
+        if binding.expires_at is not None and current >= binding.expires_at:
+            return False  # expired: rejection does not consume the id
+        if not verify_range(entry.commitment, entry.proof, entry.context):
             return False
         del self._pending[binding.session_id]
         self._consumed.add(binding.session_id)

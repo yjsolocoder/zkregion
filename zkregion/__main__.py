@@ -11,6 +11,7 @@ from . import (
     MultiSchnorrEntry,
     RangeBatchEntry,
     RangeProof,
+    RangeReplayGuard,
     Region,
     RegionBatchEntry,
     RegionProof,
@@ -404,6 +405,33 @@ def main() -> int:
     timeless_binding = timeless_guard.bind_once(replay_entry, b"session-id-4")
     print(f"  binding without expiry (expires_at=None) accepted at any now: "
           f"{timeless_guard.check(replay_entry, timeless_binding, now=(1 << 64) - 1)}")
+
+    print()
+    print("per-instance replay protection for range proofs (bind once, check once):")
+    range_guard = RangeReplayGuard()
+    range_replay_entry = range_entries[0]
+    range_binding = range_guard.bind_once(
+        range_replay_entry, b"range-session-1", expires_at=10**12
+    )
+    print(f"  digest={range_binding.digest.hex()[:32]}…  expires_at={range_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{range_guard.check(range_replay_entry, range_binding, now=100)}")
+    print(f"  replay rejected: "
+          f"{not range_guard.check(range_replay_entry, range_binding, now=101)}")
+    forged_range_entry = dataclasses.replace(
+        range_replay_entry,
+        proof=RangeProof(
+            range_replay_entry.proof.t,
+            range_replay_entry.proof.e,
+            range_replay_entry.proof.s[:-1] + (range_replay_entry.proof.s[-1] + 1,),
+        ),
+    )
+    other_range = RangeReplayGuard()
+    other_range_binding = other_range.bind_once(forged_range_entry, b"range-session-2")
+    print(f"  bad range proof rejected without consuming the id: "
+          f"{not other_range.check(forged_range_entry, other_range_binding)}")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_range.check(range_replay_entry, fresh_binding)}")
 
     print()
     print("region membership:")

@@ -14,6 +14,7 @@ from zkregion import (
     PedersenCommitment,
     RangeBatchEntry,
     RangeProof,
+    RangeReplayGuard,
     Region,
     RegionBatchEntry,
     RegionProof,
@@ -3994,12 +3995,15 @@ class ReplayBindingTest(unittest.TestCase):
             with self.assertRaises(TypeError):
                 ReplayBinding(b"s", digest, bad)
 
+    def test_digest_is_any_bytes(self):
+        # digest is only required to be bytes: no fixed length any more
+        for digest in (b"", b"\x00", b"\x01" * 31, b"\x02" * 32, b"\x03" * 33, b"\x04" * 64):
+            binding = ReplayBinding(b"s", digest)
+            self.assertEqual(binding.digest, digest)
+
     def test_value_errors(self):
         with self.assertRaises(ValueError):
             ReplayBinding(b"", b"\x00" * 32)
-        for bad_length in (0, 1, 31, 33, 64):
-            with self.assertRaises(ValueError):
-                ReplayBinding(b"s", b"\x00" * bad_length)
         for bad in (-1, 2**64, 2**64 + 1):
             with self.assertRaises(ValueError):
                 ReplayBinding(b"s", b"\x00" * 32, bad)
@@ -4272,6 +4276,304 @@ class ReplayGuardTest(unittest.TestCase):
     def test_inputs_are_not_mutated(self):
         guard = ReplayGuard()
         snapshot = dataclasses.replace(self.entry)
+        binding = guard.bind_once(self.entry, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        guard.check(self.entry, binding, now=1)
+        self.assertEqual(self.entry, snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+
+class RangeReplayGuardTest(unittest.TestCase):
+    def setUp(self):
+        self.commitment, self.blinding = pedersen_commit(
+            40, 0, 100, prime=SMALL_PRIME, generator=3, blinding=12345
+        )
+        self.proof = prove_range(
+            self.commitment, 40, self.blinding, b"ctx",
+            randbelow=counter_randbelow(),
+        )
+        self.entry = RangeBatchEntry(self.commitment, self.proof, b"ctx")
+        self.schnorr_entry = MultiSchnorrEntry(
+            SchnorrProver(secret=4321, prime=SMALL_PRIME, generator=3,
+                          randbelow=counter_randbelow()).public_key,
+            b"spend",
+            SchnorrProver(secret=4321, prime=SMALL_PRIME, generator=3,
+                          randbelow=counter_randbelow()).prove(b"spend", context=b"ctx"),
+            b"ctx", SMALL_PRIME, 3,
+        )
+
+    def entry_with(self, **changes):
+        return dataclasses.replace(self.entry, **changes)
+
+    def range_bound_leaf(self, entry):
+        c = entry.commitment
+        items = [b"zkregion/range-bound/v1"]
+        items += [str(v).encode("ascii")
+                  for v in (c.element, c.lower, c.upper, c.prime, c.generator, c.h)]
+        items.append(entry.context)
+        for seq in (entry.proof.t, entry.proof.e, entry.proof.s):
+            items.append(str(len(seq)).encode("ascii"))
+            items += [str(v).encode("ascii") for v in seq]
+        return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+    def expected_digest(self, entry, session_id, expires_at=None):
+        def frame(item):
+            return len(item).to_bytes(4, "big") + item
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = frame(b"zr/rr/v1") + frame(session_id) + self.range_bound_leaf(entry) + frame(expiry)
+        return hashlib.sha256(material).digest()
+
+    def tampered_proof(self):
+        return RangeProof(
+            self.proof.t,
+            self.proof.e,
+            self.proof.s[:-1] + (self.proof.s[-1] + 1,),
+        )
+
+    # ---- binding ------------------------------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(binding.digest, self.expected_digest(self.entry, b"s1"))
+        self.assertEqual(len(binding.digest), 32)
+        binding = guard.bind_once(self.entry, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(binding.digest, self.expected_digest(self.entry, b"s2", 1000))
+
+    def test_digest_uses_range_leaf_encoding(self):
+        # L is the README range-bound leaf verbatim, with no F framing
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertEqual(binding.digest, self.expected_digest(self.entry, b"s"))
+
+    def test_digest_binds_every_component(self):
+        guard = RangeReplayGuard()
+        base = guard.bind_once(self.entry, b"s")
+        self.assertNotEqual(base.digest, self.expected_digest(self.entry, b"other"))
+        self.assertNotEqual(base.digest, self.expected_digest(self.entry, b"s", 1))
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(self.entry_with(context=b"other"), b"s"),
+        )
+        other_c, other_r = pedersen_commit(
+            41, 0, 100, prime=SMALL_PRIME, generator=3, blinding=12346
+        )
+        other_proof = prove_range(
+            other_c, 41, other_r, b"ctx", randbelow=counter_randbelow()
+        )
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(RangeBatchEntry(other_c, other_proof, b"ctx"), b"s"),
+        )
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(
+                self.entry_with(proof=self.tampered_proof()), b"s"
+            ),
+        )
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        no_expiry = RangeReplayGuard().bind_once(self.entry, b"s")
+        with_expiry = RangeReplayGuard().bind_once(self.entry, b"s", expires_at=0)
+        later = RangeReplayGuard().bind_once(self.entry, b"s", expires_at=1)
+        self.assertNotEqual(no_expiry.digest, with_expiry.digest)
+        self.assertNotEqual(with_expiry.digest, later.digest)
+
+    def test_pending_id_cannot_be_rebound(self):
+        guard = RangeReplayGuard()
+        guard.bind_once(self.entry, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        guard = RangeReplayGuard()
+        first = guard.bind_once(self.entry, b"s1")
+        second = guard.bind_once(self.entry, b"s2")
+        self.assertNotEqual(first, second)
+        self.assertTrue(guard.check(self.entry, first, now=1))
+        self.assertTrue(guard.check(self.entry, second, now=1))
+
+    def test_bind_once_type_errors(self):
+        guard = RangeReplayGuard()
+        for bad in ("entry", 7, None, self.entry.proof, self.schnorr_entry):
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(self.entry, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(self.entry, b"s", expires_at=bad)
+
+    def test_bind_once_value_errors(self):
+        guard = RangeReplayGuard()
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"")
+        for bad in (-1, 2**64):
+            with self.assertRaises(ValueError):
+                guard.bind_once(self.entry, b"s", expires_at=bad)
+
+    # ---- honest check and single use ----------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s", expires_at=1000)
+        self.assertTrue(guard.check(self.entry, binding, now=999))
+        self.assertFalse(guard.check(self.entry, binding, now=999))
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"s")
+
+    def test_check_verifies_range_proof_in_field_order(self):
+        # acceptance goes through verify_range(commitment, proof, context)
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+        wrong_context = self.entry_with(context=b"other")
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertFalse(guard.check(wrong_context, binding, now=1))
+
+    def test_check_without_expiry_ignores_now(self):
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding, now=0))
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding, now=2**64 - 1))
+
+    def test_check_with_default_now(self):
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding))
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s", expires_at=10**18)
+        self.assertTrue(guard.check(self.entry, binding))
+
+    def test_expiry_boundary_is_inclusive(self):
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s1", expires_at=1000)
+        self.assertTrue(guard.check(self.entry, binding, now=999))
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s2", expires_at=1000)
+        self.assertFalse(guard.check(self.entry, binding, now=1000))
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s3", expires_at=1000)
+        self.assertFalse(guard.check(self.entry, binding, now=1001))
+
+    # ---- rejection never consumes -------------------------------------------
+
+    def test_expired_rejection_does_not_consume(self):
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s", expires_at=1000)
+        self.assertFalse(guard.check(self.entry, binding, now=2000))
+        self.assertTrue(guard.check(self.entry, binding, now=999))
+        self.assertFalse(guard.check(self.entry, binding, now=999))
+
+    def test_bad_proof_rejection_does_not_consume(self):
+        forged = self.entry_with(proof=self.tampered_proof())
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(forged, b"s")
+        self.assertFalse(guard.check(forged, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(forged, b"s")
+
+    def test_entry_mismatch_rejection_does_not_consume(self):
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        for changed in (
+            self.entry_with(context=b"other"),
+            self.entry_with(proof=self.tampered_proof()),
+        ):
+            self.assertFalse(guard.check(changed, binding, now=1))
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+
+    def test_bad_commitment_parameters_return_false(self):
+        broken_commitment = PedersenCommitment(2, 0, 100, 3, 2, 2)
+        broken = RangeBatchEntry(broken_commitment, self.proof, b"ctx")
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(broken, b"s")
+        self.assertFalse(guard.check(broken, binding, now=1))
+        self.assertTrue(b"s" in guard._pending)
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        guard = RangeReplayGuard()
+        guard.bind_once(self.entry, b"local")
+        foreign = RangeReplayGuard().bind_once(self.entry, b"elsewhere")
+        self.assertFalse(guard.check(self.entry, foreign, now=1))
+        equal = RangeReplayGuard().bind_once(self.entry, b"local")
+        self.assertTrue(guard.check(self.entry, equal, now=1))
+        unknown = ReplayBinding(b"never-bound", b"any-bytes")
+        self.assertFalse(guard.check(self.entry, unknown, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        guard = RangeReplayGuard()
+        guard.bind_once(self.entry, b"s")
+        forged_digest = ReplayBinding(b"s", b"not-the-digest")
+        self.assertFalse(guard.check(self.entry, forged_digest, now=1))
+        forged_expiry = ReplayBinding(
+            b"s", self.expected_digest(self.entry, b"s", 1), 1
+        )
+        self.assertFalse(guard.check(self.entry, forged_expiry, now=0))
+
+    # ---- argument validation ------------------------------------------------
+
+    def test_check_type_errors(self):
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        for bad in ("entry", 7, None, self.entry.proof, self.schnorr_entry):
+            with self.assertRaises(TypeError):
+                guard.check(bad, binding, now=1)
+        for bad in ("binding", 7, None, (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(self.entry, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(self.entry, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        guard = RangeReplayGuard()
+        binding = guard.bind_once(self.entry, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(self.entry, binding, now=bad)
+
+    def test_instances_are_independent(self):
+        first = RangeReplayGuard()
+        second = RangeReplayGuard()
+        binding = first.bind_once(self.entry, b"s")
+        self.assertFalse(second.check(self.entry, binding, now=1))
+        self.assertTrue(first.check(self.entry, binding, now=1))
+
+    def test_guards_keep_entry_kinds_separate(self):
+        range_guard = RangeReplayGuard()
+        schnorr_guard = ReplayGuard()
+        with self.assertRaises(TypeError):
+            range_guard.bind_once(self.schnorr_entry, b"s")
+        with self.assertRaises(TypeError):
+            schnorr_guard.bind_once(self.entry, b"s")
+        range_binding = range_guard.bind_once(self.entry, b"s")
+        with self.assertRaises(TypeError):
+            range_guard.check(self.schnorr_entry, range_binding, now=1)
+
+    def test_inputs_are_not_mutated(self):
+        guard = RangeReplayGuard()
+        snapshot = dataclasses.replace(
+            self.entry,
+            commitment=dataclasses.replace(self.entry.commitment),
+            proof=RangeProof(self.entry.proof.t, self.entry.proof.e, self.entry.proof.s),
+        )
         binding = guard.bind_once(self.entry, b"s")
         binding_snapshot = dataclasses.replace(binding)
         guard.check(self.entry, binding, now=1)

@@ -11,6 +11,7 @@ from . import (
     MultiSchnorrEntry,
     RangeBatchEntry,
     RangeProof,
+    RangeReplayGuard,
     Region,
     RegionBatchEntry,
     RegionProof,
@@ -404,6 +405,28 @@ def main() -> int:
     timeless_binding = timeless_guard.bind_once(replay_entry, b"session-id-4")
     print(f"  binding without expiry (expires_at=None) accepted at any now: "
           f"{timeless_guard.check(replay_entry, timeless_binding, now=(1 << 64) - 1)}")
+
+    print()
+    print("per-instance replay protection for range proofs (bind once, check once):")
+    range_replay_entry = RangeBatchEntry(commitment, range_proof, b"demo")
+    range_guard = RangeReplayGuard()
+    range_binding = range_guard.bind_once(
+        range_replay_entry, b"range-session-1", expires_at=10**12
+    )
+    print(f"  digest={range_binding.digest.hex()[:32]}…  expires_at={range_binding.expires_at}")
+    print(f"  valid first check accepted: {range_guard.check(range_replay_entry, range_binding, now=100)}")
+    print(f"  replay rejected: {not range_guard.check(range_replay_entry, range_binding, now=101)}")
+    wrong_context_entry = dataclasses.replace(range_replay_entry, context=b"other")
+    pending_range_guard = RangeReplayGuard()
+    pending_range_binding = pending_range_guard.bind_once(range_replay_entry, b"range-session-2")
+    print(f"  wrong context rejected without consuming: "
+          f"{not pending_range_guard.check(wrong_context_entry, pending_range_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{pending_range_guard.check(range_replay_entry, pending_range_binding, now=1)}")
+    try:
+        RangeReplayGuard().bind_once(replay_entry, b"wrong-kind")
+    except TypeError:
+        print("  a Schnorr entry on a RangeReplayGuard raises TypeError")
 
     print()
     print("region membership:")

@@ -10,6 +10,7 @@ from . import (
     BoundRegionReplayGuard,
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
+    BoundSchnorrReplayGuard,
     MultiSchnorrEntry,
     RangeBatchEntry,
     RangeProof,
@@ -501,6 +502,26 @@ def main() -> int:
     foreign_brr_binding = foreign_brr.bind_once(range_bound, range_root, b"bound-range-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_brr.check(range_bound, range_root, foreign_brr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for bound Schnorr batches (bind once, check once):")
+    bsr = BoundSchnorrReplayGuard()
+    bsr_binding = bsr.bind_once(bound_batch, bound_root, b"bound-schnorr-session-1", expires_at=10**12)
+    print(f"  digest={bsr_binding.digest.hex()[:32]}…  expires_at={bsr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{bsr.check(bound_batch, bound_root, bsr_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not bsr.check(bound_batch, bound_root, bsr_binding, now=101, randbelow=counter_randbelow())}")
+    other_bsr = BoundSchnorrReplayGuard()
+    other_bsr_binding = other_bsr.bind_once(bound_batch, bound_root, b"bound-schnorr-session-2")
+    print(f"  wrong root rejected without consuming the id: "
+          f"{not other_bsr.check(bound_batch, merkle_root(bound_leaves[:1]), other_bsr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_bsr.check(bound_batch, bound_root, other_bsr_binding, now=1, randbelow=counter_randbelow())}")
+    foreign_bsr = BoundSchnorrReplayGuard()
+    foreign_bsr_binding = foreign_bsr.bind_once(bound_batch, bound_root, b"bound-schnorr-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_bsr.check(bound_batch, bound_root, foreign_bsr_binding, now=1)}")
 
     print()
     print("region membership:")

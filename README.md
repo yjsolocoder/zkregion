@@ -163,8 +163,8 @@ def bound_region_leaf(entry):
 
 region_leaves = [bound_region_leaf(entry) for entry in batch]
 region_root = merkle_root(region_leaves)
-region_proof = prove_multi_inclusion(region_leaves, tuple(range(len(region_leaves))))
-bound_region = BoundRegionBatch(tuple(batch), len(batch), region_proof)
+region_multi_proof = prove_multi_inclusion(region_leaves, tuple(range(len(region_leaves))))
+bound_region = BoundRegionBatch(tuple(batch), len(batch), region_multi_proof)
 assert verify_region_bound(bound_region, region_root)
 
 Region(0, 100, 0, 100).contains(50, 50)     # True
@@ -219,6 +219,24 @@ brr = BoundRangeReplayGuard()
 brr_binding = brr.bind_once(bound_range, range_root, b"session-1")
 assert brr.check(bound_range, range_root, brr_binding)         # 先验根与整批证明再消费
 assert not brr.check(bound_range, range_root, brr_binding)     # 二次提交被拒
+
+# 整批 BoundSchnorrBatch 与 bytes 根的实例内一次性绑定
+from zkregion import BoundSchnorrReplayGuard
+
+schnorr_entries = [
+    MultiSchnorrEntry(prover.public_key, b"pay", prover.prove(b"pay"), b""),
+]
+schnorr_leaves = [bound_leaf(entry) for entry in schnorr_entries]
+schnorr_root = merkle_root(schnorr_leaves)
+schnorr_bound = BoundSchnorrBatch(
+    tuple(schnorr_entries),
+    len(schnorr_entries),
+    prove_multi_inclusion(schnorr_leaves, tuple(range(len(schnorr_entries)))),
+)
+bsr = BoundSchnorrReplayGuard()
+bsr_binding = bsr.bind_once(schnorr_bound, schnorr_root, b"session-1")
+assert bsr.check(schnorr_bound, schnorr_root, bsr_binding)       # 先验根与整批验签再消费
+assert not bsr.check(schnorr_bound, schnorr_root, bsr_binding)   # 二次提交被拒
 ```
 
 ## 命令行演示
@@ -281,6 +299,9 @@ python3 -m zkregion
 - `BoundRangeReplayGuard()` — Merkle 承诺区间批与 bytes 根的实例内防重放登记册
   - `bind_once(batch: BoundRangeBatch, root: bytes, session_id: bytes, *, expires_at=None) -> ReplayBinding` — 把整批 `BoundRangeBatch` 连同其 Merkle `root` 一次性绑定到 `session_id`；空值、uint64 越界或重绑抛 `ValueError`，类型错误抛 `TypeError`
   - `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` — 重算绑定摘要、检查期限后委托 `verify_range_bound` 并透传同一随机源；成功才消费 `session_id`，其余无效一律返回 `False` 且不消费
+- `BoundSchnorrReplayGuard()` — Merkle 承诺 Schnorr 批与 bytes 根的实例内防重放登记册
+  - `bind_once(batch: BoundSchnorrBatch, root: bytes, session_id: bytes, *, expires_at=None) -> ReplayBinding` — 把整批 `BoundSchnorrBatch` 连同其 Merkle `root` 一次性绑定到 `session_id`；空值、uint64 越界、叶内负整数或重绑抛 `ValueError`，类型错误抛 `TypeError`
+  - `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` — 重算绑定摘要、检查期限后原样委托 `verify_bound` 并透传同一随机源；成功才消费 `session_id`，其余无效（含叶内负整数）一律返回 `False` 且不消费
 - `merkle_root(leaves) -> bytes` — 非空 `bytes` 序列的 Merkle 根
 - `prove_inclusion(leaves, index) -> MerkleProof` — 按零基索引生成包含证明
 - `verify_inclusion(leaf, proof, root) -> bool` — 验证包含证明
@@ -528,6 +549,19 @@ digest = SHA-256(
 `bind_once(batch, root, session_id, *, expires_at=None)` 登记本实例的待用绑定并返回它。类型边界与 `verify_range_bound` 一致（`batch` 及其嵌套条目、`proof` 的字段类型同样校验），类型错误抛 `TypeError`；`session_id` 为空、`expires_at` 非 uint64、任一 `U` 成帧整数（`leaf_count`、`proof.leaf_count` 或索引）为负或超出 uint64、或 id 已待用/已消费均抛 `ValueError`。待用与已消费状态只存在于本实例、不跨实例共享。
 
 `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` 的校验次序与 `BoundRegionReplayGuard` 相同：先核对登记册中的待用绑定与提交绑定按值相等，再重算摘要确认提交的 `batch`/`root` 就是绑定时的对象，再检查期限（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`），随后将**同一个 `randbelow` 原样**传给 `verify_range_bound(batch, root, randbelow=randbelow)`——根与兄弟摘要须恰 32 字节、Merkle 根校验与区间批验证明全部通过其随机源契约（每结构合法分支 `randbelow(prime - 1)` 一次，非整数返回 `TypeError`、越界返回 `ValueError`），不做包装或改写。只有全部成功才消费 `session_id`；未登记（含已消费）的 id、被替换的绑定、摘要不符、过期、根或兄弟长度错误、错误根、其他摘要/结构/证明无效或委托验证返回 `False` 一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。绑定状态不跨实例共享；`check` 的参数类型错误（含不可调用的 `randbelow`）抛 `TypeError`。入口不改写任何输入。
+
+### Merkle 承诺 Schnorr 批的实例内一次性绑定
+
+`BoundSchnorrReplayGuard` 在单个实例内为整批 :class:`BoundSchnorrBatch` 连同其 Merkle `root` 提供一次性会话绑定，复用同一个 `ReplayBinding` 类型，`bind_once` 的入参同为 `(batch, root, session_id, *, expires_at=None)`。绑定摘要逐字节复用 `BoundRegionReplayGuard` 的公开公式与 `F`、`U`、`S`、`E` 编码，字段次序与条目顺序不变，仅两处不同：
+
+- 域改为 `D = b"zr/bsr/v1"`；
+- 逐项成帧的 `L(entry_i)` 改为"Merkle 承诺的 Schnorr 完整批验"一节定义的 BoundSchnorr 叶原字节（`_bound_schnorr_leaf`），即以最短无符号大端编码写 `prime`、`generator`、`public_key`、commitment、`context`、`message` 与 response、域为 `b"zkregion/schnorr-fs/v1"` 的叶原字节。
+
+字段依次为 `D`、`session_id`、`root`、`batch.leaf_count`、`entries` 顺序的各 `L`，再写 `proof.leaf_count`、`indices`、`siblings`、`E`；其中 `U` 成帧的整数（`batch.leaf_count`、`proof.leaf_count`、各索引）须落在 uint64 内，而叶原字节 `L` 内的五个整数（`prime`、`generator`、`public_key`、commitment、response）使用无符号大端编码，**须非负**。
+
+`bind_once(batch, root, session_id, *, expires_at=None)` 登记本实例的待用绑定并返回它。类型边界与 `verify_bound` 一致（`batch` 及其嵌套条目、`proof` 的字段类型同样校验），类型错误抛 `TypeError`；`session_id` 为空、`expires_at` 非 uint64、任一 `U` 成帧整数（`leaf_count`、`proof.leaf_count` 或索引）为负或超出 uint64、任一叶内整数为负、或 id 已待用/已消费均抛 `ValueError`。待用与已消费状态只存在于本实例、不跨实例共享。
+
+`check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` 的校验次序与 `BoundRegionReplayGuard` 相同：先核对登记册中的待用绑定与提交绑定按值相等，再重算摘要确认提交的 `batch`/`root` 就是绑定时的对象，再检查期限（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`），随后将**同一个 `randbelow` 原样**传给 `verify_bound(batch, root, randbelow=randbelow)`——根与兄弟摘要须恰 32 字节、Merkle 根校验与多公钥批验签全部通过其随机源契约（每结构合法条目 `randbelow(prime - 1)` 一次，非整数返回 `TypeError`、越界返回 `ValueError`），不做包装或改写。只有全部成功才消费 `session_id`；未登记（含已消费）的 id、被替换的绑定、摘要不符、过期、叶内负整数、根或兄弟长度错误、错误根、其他摘要/结构/签名无效或委托验证返回 `False` 一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。绑定状态不跨实例共享；`check` 的参数类型错误（含不可调用的 `randbelow`）抛 `TypeError`。入口不改写任何输入。
 
 ## 限制
 

@@ -8,6 +8,7 @@ from . import (
     BoundRangeBatch,
     BoundRegionBatch,
     BoundRegionReplayGuard,
+    BoundRangeReplayGuard,
     BoundSchnorrBatch,
     MultiSchnorrEntry,
     RangeBatchEntry,
@@ -480,6 +481,26 @@ def main() -> int:
     foreign_binding = foreign_brg.bind_once(region_bound, region_root, b"bound-region-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_brg.check(region_bound, region_root, foreign_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for bound range batches (bind once, check once):")
+    brr = BoundRangeReplayGuard()
+    brr_binding = brr.bind_once(range_bound, range_root, b"bound-range-session-1", expires_at=10**12)
+    print(f"  digest={brr_binding.digest.hex()[:32]}…  expires_at={brr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{brr.check(range_bound, range_root, brr_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not brr.check(range_bound, range_root, brr_binding, now=101, randbelow=counter_randbelow())}")
+    other_brr = BoundRangeReplayGuard()
+    other_brr_binding = other_brr.bind_once(range_bound, range_root, b"bound-range-session-2")
+    print(f"  wrong root rejected without consuming the id: "
+          f"{not other_brr.check(range_bound, merkle_root(range_leaves[:1]), other_brr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_brr.check(range_bound, range_root, other_brr_binding, now=1, randbelow=counter_randbelow())}")
+    foreign_brr = BoundRangeReplayGuard()
+    foreign_brr_binding = foreign_brr.bind_once(range_bound, range_root, b"bound-range-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_brr.check(range_bound, range_root, foreign_brr_binding, now=1)}")
 
     print()
     print("region membership:")

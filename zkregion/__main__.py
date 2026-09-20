@@ -15,6 +15,7 @@ from . import (
     Region,
     RegionBatchEntry,
     RegionProof,
+    RegionReplayGuard,
     ReplayBinding,
     ReplayGuard,
     SchnorrBatchEntry,
@@ -432,6 +433,32 @@ def main() -> int:
           f"{not other_range.check(forged_range_entry, other_range_binding)}")
     print(f"  binding from another guard instance rejected: "
           f"{not other_range.check(range_replay_entry, fresh_binding)}")
+
+    print()
+    print("per-instance replay protection for region proofs (bind once, check once):")
+    region_guard = RegionReplayGuard()
+    region_replay_entry = batch_entries[0]
+    region_binding = region_guard.bind_once(
+        region_replay_entry, b"region-session-1", expires_at=10**12
+    )
+    print(f"  digest={region_binding.digest.hex()[:32]}…  expires_at={region_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{region_guard.check(region_replay_entry, region_binding, now=100)}")
+    print(f"  replay rejected: "
+          f"{not region_guard.check(region_replay_entry, region_binding, now=101)}")
+    other_region = RegionReplayGuard()
+    bound_entry = batch_entries[1]
+    other_region_binding = other_region.bind_once(bound_entry, b"region-session-2")
+    forged_region_entry = dataclasses.replace(
+        bound_entry,
+        region=Region(0, 100, 1, 100),
+    )
+    print(f"  replaced region field rejected without consuming the id: "
+          f"{not other_region.check(forged_region_entry, other_region_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_region.check(bound_entry, other_region_binding, now=1)}")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_region.check(region_replay_entry, fresh_binding)}")
 
     print()
     print("region membership:")

@@ -192,6 +192,17 @@ range_entry = RangeBatchEntry(commitment, proof, b"session-1")
 range_binding = range_guard.bind_once(range_entry, b"session-1")
 assert range_guard.check(range_entry, range_binding)       # 验区间证明并消费 session id
 assert not range_guard.check(range_entry, range_binding)   # 二次提交被拒
+
+# 二维区域证明的实例内一次性绑定
+from zkregion import RegionReplayGuard
+
+region_guard = RegionReplayGuard()
+region_entry = RegionBatchEntry(
+    x_commitment, y_commitment, region, region_proof, b"session-1"
+)
+region_binding = region_guard.bind_once(region_entry, b"session-1")
+assert region_guard.check(region_entry, region_binding)    # 验区域证明并消费 session id
+assert not region_guard.check(region_entry, region_binding)  # 二次提交被拒
 ```
 
 ## 命令行演示
@@ -245,6 +256,9 @@ python3 -m zkregion
 - `RangeReplayGuard()` — 区间证明的实例内防重放登记册
   - `bind_once(entry: RangeBatchEntry, session_id, *, expires_at=None) -> ReplayBinding` — 登记本实例的待用绑定；待用或已消费的 `session_id` 重绑抛 `ValueError`
   - `check(entry, binding, *, now=None) -> bool` — 验本实例的待用等值绑定，按字段顺序以 `commitment`、`proof`、`context` 调 `verify_range`；成功才消费 `session_id`，任何拒绝都不消费
+- `RegionReplayGuard()` — 二维区域证明的实例内防重放登记册
+  - `bind_once(entry: RegionBatchEntry, session_id, *, expires_at=None) -> ReplayBinding` — 登记本实例的待用绑定；待用或已消费的 `session_id` 重绑抛 `ValueError`
+  - `check(entry, binding, *, now=None) -> bool` — 验本实例的待用等值绑定，按字段顺序以 `x_commitment`、`y_commitment`、`region`、`proof`、`context` 调 `verify_region`；成功才消费 `session_id`，任何拒绝都不消费
 - `merkle_root(leaves) -> bytes` — 非空 `bytes` 序列的 Merkle 根
 - `prove_inclusion(leaves, index) -> MerkleProof` — 按零基索引生成包含证明
 - `verify_inclusion(leaf, proof, root) -> bool` — 验证包含证明
@@ -442,6 +456,20 @@ digest = SHA-256(F(D) || F(session_id) || L(entry) || F(E))
 `bind_once(entry, session_id, *, expires_at=None)` 登记本实例的待用绑定并返回它，参数边界与 `ReplayGuard` 一致：`entry` 须为 `RangeBatchEntry`（承诺、证明、`t`/`e`/`s` 元组与 `context` 的嵌套类型同样校验），类型错误抛 `TypeError`；`session_id` 为空、`expires_at` 非 uint64 或 id 已待用/已消费均抛 `ValueError`。区间叶编码以十进制 ASCII 写整数（负号保留），任何整数字段都可成帧，因此没有额外的可编码性拒绝。
 
 `check(entry, binding, *, now=None) -> bool` 的校验次序与 `ReplayGuard` 相同：先核对登记册中的待用绑定与提交绑定按值相等，再重算摘要确认条目一致，再检查期限（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`），最后按字段顺序以 `entry.commitment`、`entry.proof`、`entry.context` 调用 `verify_range` 验区间证明。只有全部成功才消费 `session_id`；未登记（含已消费）的 id、不等值绑定、摘要不符、过期或验证失败一律返回 `False` 且**不消费**。绑定状态不跨实例共享；类型错误抛 `TypeError`。入口不改写任何输入。
+
+### 二维区域证明的实例内一次性绑定
+
+`RegionReplayGuard` 在单个实例内为 :class:`RegionBatchEntry` 提供与 `RangeReplayGuard` 同构的一次性会话绑定，复用同一个 `ReplayBinding` 类型。绑定摘要按同一公式
+
+```
+digest = SHA-256(F(D) || F(session_id) || L(entry) || F(E))
+```
+
+计算，但域为 `D = b"zr/rg/v1"`，`L(entry)` 是"Merkle 承诺的区域证明完整批验"一节定义的 BoundRegion 叶原字节（**不**再套 `F`），`E` 的过期编码与 `ReplayGuard` 逐字节相同。
+
+`bind_once(entry, session_id, *, expires_at=None)` 登记本实例的待用绑定并返回它，参数边界与 `RangeReplayGuard` 一致：`entry` 须为 `RegionBatchEntry`（两个承诺、区域、`x_proof`/`y_proof` 及各自 `t`/`e`/`s` 元组与 `context` 的嵌套类型同样校验），类型错误抛 `TypeError`；`session_id` 为空、`expires_at` 非 uint64 或 id 已待用/已消费均抛 `ValueError`。区域叶编码以十进制 ASCII 写整数（负号保留），任何整数字段都可成帧，因此没有额外的可编码性拒绝。
+
+`check(entry, binding, *, now=None) -> bool` 的校验次序与 `RangeReplayGuard` 相同：先核对登记册中的待用绑定与提交绑定按值相等，再重算摘要确认条目一致，再检查期限（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`），最后按字段顺序以 `entry.x_commitment`、`entry.y_commitment`、`entry.region`、`entry.proof`、`entry.context` 调用 `verify_region` 验二维区域证明（先 x 后 y 的字段顺序沿用旧接口，不被改写）。只有全部成功才消费 `session_id`；未登记（含已消费）的 id、不等值绑定、摘要不符、条目任一字段被替换、过期或 `verify_region` 失败一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。绑定状态不跨实例共享；类型错误抛 `TypeError`。入口不改写任何输入。
 
 ## 限制
 

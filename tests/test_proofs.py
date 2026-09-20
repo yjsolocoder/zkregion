@@ -8,6 +8,7 @@ from zkregion import (
     MerkleMultiProof,
     MerkleProof,
     PedersenCommitment,
+    RangeBatchEntry,
     RangeProof,
     Region,
     RegionBatchEntry,
@@ -29,6 +30,7 @@ from zkregion import (
     verify_opening,
     verify_pedersen_opening,
     verify_range,
+    verify_range_batch,
     verify_region,
     verify_region_batch,
 )
@@ -607,6 +609,333 @@ class RangeProofTest(unittest.TestCase):
         verify_range(commitment, proof, b"ctx")
         self.assertEqual((commitment, proof), snapshot)
         self.assertEqual(blinding, 1234)
+
+
+class RangeBatchTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def commit(self, value=5, lower=0, upper=10, blinding=1234, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    def entry(self, value=5, lower=0, upper=10, context=b"ctx", blinding=1234, **kwargs):
+        commitment, returned = self.commit(value, lower, upper, blinding, **kwargs)
+        proof = prove_range(
+            commitment, value, returned, context, randbelow=counter_randbelow()
+        )
+        return RangeBatchEntry(commitment, proof, context)
+
+    # ---- entry object -------------------------------------------------------
+
+    def test_entry_positional_defaults_equality_and_immutability(self):
+        commitment, blinding = self.commit()
+        proof = prove_range(commitment, 5, blinding, b"", randbelow=counter_randbelow())
+        entry = RangeBatchEntry(commitment, proof)
+        self.assertEqual(entry.context, b"")
+        self.assertEqual(RangeBatchEntry(commitment, proof, b""), entry)
+        self.assertEqual(
+            tuple(getattr(entry, name) for name in ("commitment", "proof", "context")),
+            (commitment, proof, b""),
+        )
+        other = RangeBatchEntry(commitment, proof, b"other")
+        self.assertNotEqual(entry, other)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            entry.context = b"other"
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            entry.proof = proof
+
+    def test_entry_field_types(self):
+        entry = self.entry()
+        self.assertIsInstance(entry.commitment, PedersenCommitment)
+        self.assertIsInstance(entry.proof, RangeProof)
+        self.assertIsInstance(entry.context, bytes)
+
+    # ---- honest round trip --------------------------------------------------
+
+    def test_honest_batch_verifies(self):
+        entries = [self.entry(value=value) for value in (1, 5, 10)]
+        self.assertTrue(verify_range_batch(entries, randbelow=counter_randbelow()))
+        self.assertTrue(verify_range_batch(tuple(entries)))  # default secrets.randbelow
+
+    def test_single_entry_agrees_with_verify_range(self):
+        entry = self.entry()
+        self.assertTrue(verify_range_batch([entry], randbelow=counter_randbelow()))
+        self.assertTrue(verify_range(entry.commitment, entry.proof, entry.context))
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(verify_range_batch([], randbelow=counter_randbelow()))
+        self.assertFalse(verify_range_batch(()))
+
+    def test_duplicate_entries_are_legal(self):
+        entry = self.entry()
+        self.assertTrue(verify_range_batch([entry, entry, entry], randbelow=counter_randbelow()))
+
+    def test_distinct_ranges_share_one_group(self):
+        entries = [
+            self.entry(value=5, lower=0, upper=10),
+            self.entry(value=25, lower=20, upper=30, blinding=4321),
+        ]
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(verify_range_batch(entries, randbelow=recording))
+        # 11 branches per entry, two entries
+        self.assertEqual(calls, [self.PRIME - 1] * 22)
+
+    def test_mixed_groups_each_checked_under_its_own_parameters(self):
+        small = self.entry()
+        commitment, blinding = pedersen_commit(40, 0, 100, blinding=987654321)
+        proof = prove_range(commitment, 40, blinding, b"ctx")
+        default_entry = RangeBatchEntry(commitment, proof, b"ctx")
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(verify_range_batch([small, default_entry], randbelow=recording))
+        self.assertEqual(sorted(set(calls)), sorted({self.PRIME - 1, DEFAULT_PRIME - 1}))
+        self.assertEqual(len(calls), 112)  # 11 + 101 branches
+
+    # ---- randomness ----------------------------------------------------------
+
+    def test_randbelow_called_once_per_branch_with_prime_minus_one(self):
+        entries = [self.entry(), self.entry(blinding=4321)]
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(verify_range_batch(entries, randbelow=recording))
+        self.assertEqual(calls, [self.PRIME - 1] * 22)
+
+    def test_fixed_coefficient_source_is_reproducible(self):
+        entries = [self.entry(), self.entry(blinding=4321)]
+        first = verify_range_batch(entries, randbelow=counter_randbelow(9))
+        second = verify_range_batch(entries, randbelow=counter_randbelow(9))
+        self.assertEqual(first, second)
+
+    def test_random_linear_combination_not_per_proof_summary(self):
+        # coefficients all 1: +1 and -1 response deltas cancel in the single
+        # aggregate exponent sum, even though neither proof verifies alone
+        first, second = self.entry(blinding=1234), self.entry(blinding=5555)
+        first_tampered = RangeProof(
+            first.proof.t, first.proof.e,
+            first.proof.s[:-1] + (first.proof.s[-1] + 1,),
+        )
+        second_tampered = RangeProof(
+            second.proof.t, second.proof.e,
+            second.proof.s[:-1] + (second.proof.s[-1] - 1,),
+        )
+        self.assertFalse(verify_range(first.commitment, first_tampered, b"ctx"))
+        self.assertFalse(verify_range(second.commitment, second_tampered, b"ctx"))
+        forged = [
+            RangeBatchEntry(first.commitment, first_tampered, b"ctx"),
+            RangeBatchEntry(second.commitment, second_tampered, b"ctx"),
+        ]
+        self.assertTrue(verify_range_batch(forged, randbelow=lambda upper: 0))
+
+    # ---- rejection -----------------------------------------------------------
+
+    def test_tampering_fails(self):
+        entry = self.entry()
+        proof = entry.proof
+        cases = [
+            RangeProof(proof.t, proof.e, proof.s[:-1] + (proof.s[-1] + 1,)),
+            RangeProof(
+                proof.t,
+                proof.e[:-1] + ((proof.e[-1] + 1) % self.PRIME,),
+                proof.s,
+            ),
+            RangeProof(
+                proof.t[:-1] + ((proof.t[-1] % (self.PRIME - 1)) + 1,),
+                proof.e,
+                proof.s,
+            ),
+        ]
+        for forged in cases:
+            self.assertFalse(
+                verify_range_batch(
+                    [RangeBatchEntry(entry.commitment, forged, entry.context)],
+                    randbelow=counter_randbelow(),
+                ),
+                f"batch accepted: {forged!r}",
+            )
+
+    def test_context_binds_proof(self):
+        entry = self.entry(context=b"ctx")
+        for bad_context in (b"", b"other"):
+            bad = RangeBatchEntry(entry.commitment, entry.proof, bad_context)
+            self.assertFalse(verify_range_batch([bad], randbelow=counter_randbelow()))
+
+    def test_foreign_commitment_fails(self):
+        entry = self.entry()
+        other, _ = self.commit(value=6, blinding=4321)
+        self.assertFalse(
+            verify_range_batch(
+                [RangeBatchEntry(other, entry.proof, entry.context)],
+                randbelow=counter_randbelow(),
+            )
+        )
+        shifted = dataclasses.replace(
+            entry.commitment, element=(entry.commitment.element + 1) % self.PRIME
+        )
+        self.assertFalse(
+            verify_range_batch(
+                [RangeBatchEntry(shifted, entry.proof, entry.context)],
+                randbelow=counter_randbelow(),
+            )
+        )
+
+    def test_cancellation_does_not_cross_group_boundaries(self):
+        # same prime/generator, different h: an s delta of +1 in one group and
+        # a delta of -1 in the other cannot cancel
+        first = self.entry(blinding=1234)
+        commitment, blinding = self.commit(5, 0, 10, 333, h=7)
+        other_proof = prove_range(
+            commitment, 5, blinding, b"ctx", randbelow=counter_randbelow()
+        )
+        first_tampered = RangeProof(
+            first.proof.t, first.proof.e,
+            first.proof.s[:-1] + (first.proof.s[-1] + 1,),
+        )
+        other_tampered = RangeProof(
+            other_proof.t, other_proof.e,
+            other_proof.s[:-1] + (other_proof.s[-1] - 1,),
+        )
+        forged = [
+            RangeBatchEntry(first.commitment, first_tampered, b"ctx"),
+            RangeBatchEntry(commitment, other_tampered, b"ctx"),
+        ]
+        self.assertFalse(verify_range_batch(forged, randbelow=lambda upper: 0))
+
+    def test_structural_errors_return_false(self):
+        entry = self.entry()
+        proof = entry.proof
+        cases = [
+            RangeProof(proof.t[:-1], proof.e, proof.s),
+            RangeProof(proof.t, proof.e, proof.s + (1,)),
+            RangeProof((), (), ()),
+        ]
+        for forged in cases:
+            self.assertFalse(
+                verify_range_batch(
+                    [RangeBatchEntry(entry.commitment, forged, b"ctx")],
+                    randbelow=counter_randbelow(),
+                )
+            )
+        # oversized declared range returns False whatever the proof
+        wide_commitment, wide_blinding = self.commit(value=0, lower=0, upper=256, blinding=7)
+        self.assertFalse(
+            verify_range_batch(
+                [RangeBatchEntry(wide_commitment, RangeProof((), (), ()), b"ctx")],
+                randbelow=counter_randbelow(),
+            )
+        )
+
+    def test_bad_embedded_commitment_parameters_return_false(self):
+        entry = self.entry()
+        for name, value in (
+            ("element", 0),
+            ("prime", 3),
+            ("generator", 1),
+            ("h", self.PRIME),
+            ("lower", 11),
+        ):
+            broken = dataclasses.replace(entry.commitment, **{name: value})
+            bad = RangeBatchEntry(broken, entry.proof, entry.context)
+            self.assertFalse(
+                verify_range_batch([bad], randbelow=counter_randbelow()), name
+            )
+
+    def test_invalid_entry_short_circuits_before_drawing(self):
+        entry = self.entry()
+        short = RangeProof(entry.proof.t[:-1], entry.proof.e, entry.proof.s)
+        invalid = RangeBatchEntry(entry.commitment, short, entry.context)
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertFalse(verify_range_batch([invalid, entry], randbelow=recording))
+        self.assertEqual(calls, [])  # the invalid entry is rejected before any draw
+        self.assertFalse(verify_range_batch([entry, invalid], randbelow=recording))
+        self.assertEqual(calls, [self.PRIME - 1] * 11)  # one draw per branch of entry 1
+
+    # ---- type errors ---------------------------------------------------------
+
+    def test_type_errors(self):
+        entry = self.entry()
+        for bad in ("entries", b"entries", bytearray(b"x"), 42, None):
+            with self.assertRaises(TypeError):
+                verify_range_batch(bad)
+        with self.assertRaises(TypeError):
+            verify_range_batch([(entry.commitment, entry.proof)])
+        with self.assertRaises(TypeError):
+            verify_range_batch([
+                RangeBatchEntry(entry.commitment, entry.proof, "ctx")
+            ])
+        with self.assertRaises(TypeError):
+            verify_range_batch([
+                RangeBatchEntry(entry.commitment, (entry.proof.t, entry.proof.e, entry.proof.s), b"ctx")
+            ])
+        with self.assertRaises(TypeError):
+            verify_range_batch([
+                RangeBatchEntry("commitment", entry.proof, b"ctx")
+            ])
+        with self.assertRaises(TypeError):
+            verify_range_batch([
+                RangeBatchEntry(
+                    (entry.commitment.element, 0, 10, self.PRIME, self.G, self.H),
+                    entry.proof, b"ctx",
+                )
+            ])
+        bool_proof = RangeProof(
+            (True,) * len(entry.proof.t), entry.proof.e, entry.proof.s
+        )
+        with self.assertRaises(TypeError):
+            verify_range_batch([
+                RangeBatchEntry(entry.commitment, bool_proof, b"ctx")
+            ])
+        list_proof = RangeProof(list(entry.proof.t), entry.proof.e, entry.proof.s)
+        with self.assertRaises(TypeError):
+            verify_range_batch([
+                RangeBatchEntry(entry.commitment, list_proof, b"ctx")
+            ])
+        with self.assertRaises(TypeError):
+            verify_range_batch([entry], randbelow=7)
+
+    def test_coefficient_source_errors(self):
+        entry = self.entry()
+        for bad in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                verify_range_batch([entry], randbelow=lambda upper, bad=bad: bad)
+        for bad in (-1, self.PRIME - 1, self.PRIME):
+            with self.assertRaises(ValueError):
+                verify_range_batch([entry], randbelow=lambda upper, bad=bad: bad)
+
+    # ---- hygiene -------------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        entries = [self.entry(), self.entry(blinding=4321)]
+        snapshot = [dataclasses.replace(entry) for entry in entries]
+        verify_range_batch(entries, randbelow=counter_randbelow())
+        self.assertEqual(entries, snapshot)
+
+    def test_default_group_parameters_are_usable(self):
+        commitment, blinding = pedersen_commit(40, 0, 100, blinding=987654321)
+        proof = prove_range(commitment, 40, blinding, b"demo")
+        entry = RangeBatchEntry(commitment, proof, b"demo")
+        self.assertTrue(verify_range_batch([entry], randbelow=counter_randbelow()))
 
 
 class RegionProofTest(unittest.TestCase):

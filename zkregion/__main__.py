@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from . import (
+    RangeBatchEntry,
     RangeProof,
     Region,
     RegionBatchEntry,
@@ -24,6 +25,7 @@ from . import (
     verify_opening,
     verify_pedersen_opening,
     verify_range,
+    verify_range_batch,
     verify_region,
     verify_region_batch,
 )
@@ -81,6 +83,26 @@ def main() -> int:
     other, other_r = pedersen_commit(41, lower, upper, blinding=1001)
     print(f"  foreign commitment rejected: {not verify_range(other, range_proof, context=b'demo')}")
     print("  (Schnorr OR over the demo group; demonstration-level security only)")
+
+    print()
+    print("batch range verification (random linear combination per (prime, generator, h)):")
+    range_entries = []
+    for value in (10, 40, 90):
+        bc, bc_r = pedersen_commit(value, lower, upper, blinding=1000 + value)
+        bp = prove_range(bc, value, bc_r, context=b"batch")
+        range_entries.append(RangeBatchEntry(bc, bp, b"batch"))
+    print(f"  valid batch of {len(range_entries)} accepted: "
+          f"{verify_range_batch(range_entries, randbelow=counter_randbelow())}")
+    print(f"  duplicate entries accepted: "
+          f"{verify_range_batch(range_entries + range_entries[:1], randbelow=counter_randbelow())}")
+    print(f"  empty batch rejected: {not verify_range_batch(())}")
+    forged = RangeProof(
+        range_entries[0].proof.t,
+        range_entries[0].proof.e,
+        range_entries[0].proof.s[:-1] + (range_entries[0].proof.s[-1] + 1,),
+    )
+    tampered = [RangeBatchEntry(range_entries[0].commitment, forged, b"batch")] + range_entries[1:]
+    print(f"  tampered batch rejected: {not verify_range_batch(tampered, randbelow=counter_randbelow())}")
 
     print()
     print("2-D region membership proof (two range proofs, one per axis):")

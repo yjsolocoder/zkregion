@@ -7,6 +7,7 @@ prove_region / verify_region / RegionBatchEntry / verify_region_batch /
 SchnorrProof / SchnorrBatchEntry / SchnorrProver /
 SchnorrVerifier / MultiSchnorrEntry / verify_schnorr_batch /
 BoundSchnorrBatch / verify_bound /
+BoundRegionBatch / verify_region_bound /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion.
@@ -24,6 +25,7 @@ from typing import Callable
 __all__ = [
     "DEFAULT_GENERATOR",
     "DEFAULT_PRIME",
+    "BoundRegionBatch",
     "BoundSchnorrBatch",
     "MerkleMultiProof",
     "MerkleProof",
@@ -55,6 +57,7 @@ __all__ = [
     "verify_range_batch",
     "verify_region",
     "verify_region_batch",
+    "verify_region_bound",
     "verify_schnorr_batch",
 ]
 
@@ -1770,3 +1773,179 @@ def verify_bound(
     if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
         return False
     return verify_schnorr_batch(entries, randbelow=randbelow)
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed region batches
+#
+# A complete region batch frozen together with the Merkle proof that commits
+# to every entry. Each Merkle leaf starts from the domain separator
+# b"zkregion/region-bound/v1" and frames, in order, the six fields of the x
+# then the y commitment, the four region bounds and the context, then the
+# t / e / s sequences of the x and the y sub-proof (each sequence framed as
+# its decimal element count followed by every value). Verification first
+# checks every leaf against the Merkle root, then runs the unchanged region
+# batch verification.
+
+_REGION_BOUND_DOMAIN = b"zkregion/region-bound/v1"
+
+
+@dataclass(frozen=True)
+class BoundRegionBatch:
+    """A complete region batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of :class:`RegionBatchEntry`;
+    ``leaf_count`` — a positive, non-``bool`` integer equal to both
+    ``len(entries)`` and ``proof.leaf_count``; ``proof`` — the
+    :class:`MerkleMultiProof` whose indices cover ``0 .. leaf_count - 1``
+    without gaps or duplicates. All three are positional construction
+    arguments; batches compare by value and are immutable.
+    """
+
+    entries: tuple[RegionBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_region_leaf(entry: RegionBatchEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`RegionBatchEntry`.
+
+    Items, in order: the domain separator, the six fields of the x then the
+    y commitment (dataclass field order), the four region bounds, the
+    context, then for the x and the y sub-proof each of the ``t`` / ``e`` /
+    ``s`` sequences framed as its decimal element count followed by every
+    value. Every item is prefixed with its four-byte unsigned big-endian
+    length; integers are encoded as decimal ASCII (negative sign kept).
+    """
+    items = [_REGION_BOUND_DOMAIN]
+    for commitment in (entry.x_commitment, entry.y_commitment):
+        items.extend(
+            str(getattr(commitment, name)).encode("ascii")
+            for name in ("element", "lower", "upper", "prime", "generator", "h")
+        )
+    items.extend(
+        str(bound).encode("ascii")
+        for bound in (
+            entry.region.min_x,
+            entry.region.max_x,
+            entry.region.min_y,
+            entry.region.max_y,
+        )
+    )
+    items.append(entry.context)
+    for sub_proof in (entry.proof.x_proof, entry.proof.y_proof):
+        for field_name in ("t", "e", "s"):
+            sequence = getattr(sub_proof, field_name)
+            items.append(str(len(sequence)).encode("ascii"))
+            items.extend(str(value).encode("ascii") for value in sequence)
+    leaf = bytearray()
+    for item in items:
+        leaf += len(item).to_bytes(4, "big")
+        leaf += item
+    return bytes(leaf)
+
+
+def verify_region_bound(
+    batch: BoundRegionBatch,
+    root: bytes,
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundRegionBatch`.
+
+    The Merkle binding is checked first: every entry is encoded to its leaf
+    exactly as specified by :func:`_bound_region_leaf` and the whole batch
+    is checked against ``root`` with :func:`verify_multi_inclusion`.
+    ``leaf_count`` must be a positive, non-``bool`` integer equal to both
+    ``len(entries)`` and ``proof.leaf_count``, and ``proof.indices`` must
+    cover ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering;
+    an empty batch, a missing entry or any index mismatch returns ``False``.
+    Only after the root checks does the batch go through
+    :func:`verify_region_batch` with the same ``randbelow``, under its
+    unchanged randomness contract: it is called once per structurally
+    valid range-proof branch as ``randbelow(prime - 1)``.
+
+    Type errors — a batch that is not a :class:`BoundRegionBatch`,
+    non-tuple entries, non-:class:`RegionBatchEntry` items, a non-integer
+    or ``bool`` ``leaf_count``, a wrong proof/root object, malformed nested
+    field types, or a non-callable ``randbelow`` — raise
+    :class:`TypeError`; every other invalidity (including bad randomness
+    outcomes surfaced by :func:`verify_region_batch` per its own contract)
+    behaves exactly as the delegated calls do. Inputs are never mutated.
+    """
+    if not isinstance(batch, BoundRegionBatch):
+        raise TypeError("batch must be a BoundRegionBatch")
+    _check_bytes(root, "root")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError("batch entries must be a tuple of RegionBatchEntry")
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, RegionBatchEntry):
+            raise TypeError(f"entries[{position}] must be a RegionBatchEntry")
+        x_commitment = entry.x_commitment
+        y_commitment = entry.y_commitment
+        region = entry.region
+        entry_proof = entry.proof
+        if not isinstance(x_commitment, PedersenCommitment):
+            raise TypeError(f"entries[{position}] x_commitment must be a PedersenCommitment")
+        if not isinstance(y_commitment, PedersenCommitment):
+            raise TypeError(f"entries[{position}] y_commitment must be a PedersenCommitment")
+        _check_commitment_fields(x_commitment)
+        _check_commitment_fields(y_commitment)
+        if not isinstance(region, Region):
+            raise TypeError(f"entries[{position}] region must be a Region")
+        _check_region_fields(region)
+        if not isinstance(entry_proof, RegionProof):
+            raise TypeError(f"entries[{position}] proof must be a RegionProof")
+        if not isinstance(entry_proof.x_proof, RangeProof):
+            raise TypeError(f"entries[{position}] proof x_proof must be a RangeProof")
+        if not isinstance(entry_proof.y_proof, RangeProof):
+            raise TypeError(f"entries[{position}] proof y_proof must be a RangeProof")
+        for axis_name, sub_proof in (("x", entry_proof.x_proof), ("y", entry_proof.y_proof)):
+            for field_name in ("t", "e", "s"):
+                field = getattr(sub_proof, field_name)
+                if not isinstance(field, tuple):
+                    raise TypeError(
+                        f"entries[{position}] {axis_name}_proof {field_name} "
+                        "must be a tuple of integers"
+                    )
+                for item in field:
+                    _check_int(
+                        item,
+                        f"entries[{position}] {axis_name}_proof {field_name} entry",
+                    )
+        _check_bytes(entry.context, f"entries[{position}] context")
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_region_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf, then
+    # 2) the unchanged region batch verification checks the sub-proofs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_region_batch(entries, randbelow=randbelow)

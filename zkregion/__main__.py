@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 
 from . import (
+    BoundRegionBatch,
     BoundSchnorrBatch,
     MultiSchnorrEntry,
     RangeBatchEntry,
@@ -33,6 +34,7 @@ from . import (
     verify_range_batch,
     verify_region,
     verify_region_batch,
+    verify_region_bound,
     verify_schnorr_batch,
 )
 
@@ -159,6 +161,51 @@ def main() -> int:
         e.x_commitment, e.y_commitment, e.region, e.proof, b"other"
     ) for e in batch_entries[:1]]
     print(f"  wrong context rejected: {not verify_region_batch(wrong_context, randbelow=counter_randbelow())}")
+
+    print()
+    print("Merkle-committed region batch (root check, then batch sub-proofs):")
+
+    def bound_region_leaf(entry: RegionBatchEntry) -> bytes:
+        items = [b"zkregion/region-bound/v1"]
+        for c in (entry.x_commitment, entry.y_commitment):
+            items += [str(v).encode("ascii")
+                      for v in (c.element, c.lower, c.upper, c.prime, c.generator, c.h)]
+        r = entry.region
+        items += [str(v).encode("ascii") for v in (r.min_x, r.max_x, r.min_y, r.max_y)]
+        items.append(entry.context)
+        for sub in (entry.proof.x_proof, entry.proof.y_proof):
+            for seq in (sub.t, sub.e, sub.s):
+                items.append(str(len(seq)).encode("ascii"))
+                items += [str(v).encode("ascii") for v in seq]
+        return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+    region_leaves = [bound_region_leaf(entry) for entry in batch_entries]
+    region_root = merkle_root(region_leaves)
+    region_proof = prove_multi_inclusion(region_leaves, tuple(range(len(batch_entries))))
+    region_bound = BoundRegionBatch(tuple(batch_entries), len(batch_entries), region_proof)
+    print(f"  entries={len(batch_entries)}  complete index coverage 0..{len(batch_entries) - 1}")
+    print(f"  valid bound batch accepted: {verify_region_bound(region_bound, region_root, randbelow=counter_randbelow())}")
+    print(f"  wrong root rejected: {not verify_region_bound(region_bound, merkle_root(region_leaves[:1]))}")
+    committed_entry = dataclasses.replace(
+        batch_entries[0],
+        proof=RegionProof(
+            RangeProof(
+                batch_entries[0].proof.x_proof.t,
+                batch_entries[0].proof.x_proof.e,
+                batch_entries[0].proof.x_proof.s[:-1]
+                + (batch_entries[0].proof.x_proof.s[-1] + 1,),
+            ),
+            batch_entries[0].proof.y_proof,
+        ),
+    )
+    forged_entries = [committed_entry, *batch_entries[1:]]
+    forged_leaves = [bound_region_leaf(entry) for entry in forged_entries]
+    forged_proof = prove_multi_inclusion(forged_leaves, tuple(range(len(forged_entries))))
+    forged_bound = BoundRegionBatch(tuple(forged_entries), len(forged_entries), forged_proof)
+    print(
+        "  committed-but-forged sub-proof rejected: "
+        f"{not verify_region_bound(forged_bound, merkle_root(forged_leaves), randbelow=counter_randbelow())}"
+    )
 
     print()
     print("interactive Schnorr:")

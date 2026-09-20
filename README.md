@@ -45,7 +45,7 @@ multi = [
 assert verify_schnorr_batch(multi)
 
 # Merkle 承诺的 Schnorr 完整批验：整批条目先提交到一棵 Merkle 树
-from zkregion import BoundSchnorrBatch, verify_bound
+from zkregion import BoundSchnorrBatch, merkle_root, prove_multi_inclusion, verify_bound
 
 def enc(value):
     return value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
@@ -66,7 +66,7 @@ batch = BoundSchnorrBatch(tuple(multi), len(multi), proof)
 assert verify_bound(batch, root)
 
 # Merkle 包含证明
-from zkregion import merkle_root, prove_inclusion, verify_inclusion
+from zkregion import prove_inclusion, verify_inclusion
 
 leaves = [b"alpha", b"beta", b"gamma"]
 root = merkle_root(leaves)
@@ -74,7 +74,7 @@ inclusion = prove_inclusion(leaves, 1)
 assert verify_inclusion(b"beta", inclusion, root)
 
 # Merkle 多包含证明（一次证明多片叶子，无需完整叶集即可验证）
-from zkregion import prove_multi_inclusion, verify_multi_inclusion
+from zkregion import verify_multi_inclusion
 
 multi = prove_multi_inclusion(leaves, (0, 2))
 entries = [(0, b"alpha"), (2, b"gamma")]
@@ -124,6 +124,29 @@ batch = [
 ]
 assert verify_region_batch(batch)
 
+# Merkle 承诺的区域证明完整批验：整批区域条目先提交到一棵 Merkle 树
+from zkregion import BoundRegionBatch, verify_region_bound
+
+def bound_region_leaf(entry):
+    items = [b"zkregion/region-bound/v1"]
+    for c in (entry.x_commitment, entry.y_commitment):
+        items += [str(v).encode("ascii")
+                  for v in (c.element, c.lower, c.upper, c.prime, c.generator, c.h)]
+    r = entry.region
+    items += [str(v).encode("ascii") for v in (r.min_x, r.max_x, r.min_y, r.max_y)]
+    items.append(entry.context)
+    for sub in (entry.proof.x_proof, entry.proof.y_proof):
+        for seq in (sub.t, sub.e, sub.s):
+            items.append(str(len(seq)).encode("ascii"))
+            items += [str(v).encode("ascii") for v in seq]
+    return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+region_leaves = [bound_region_leaf(entry) for entry in batch]
+region_root = merkle_root(region_leaves)
+region_proof = prove_multi_inclusion(region_leaves, tuple(range(len(region_leaves))))
+bound_region = BoundRegionBatch(tuple(batch), len(batch), region_proof)
+assert verify_region_bound(bound_region, region_root)
+
 Region(0, 100, 0, 100).contains(50, 50)     # True
 ```
 
@@ -167,6 +190,8 @@ python3 -m zkregion
 - `MultiSchnorrEntry(public_key, message, proof, context=b"", prime=DEFAULT_PRIME, generator=DEFAULT_GENERATOR)` — 不可变多公钥批量验证条目；前三字段依次为 `int`、`bytes`、`SchnorrProof`，均为必填且可位置构造，值相等即相等
 - `verify_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的 Schnorr 完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_schnorr_batch` 验签
 - `BoundSchnorrBatch(entries, leaf_count, proof)` — 冻结的完整批对象；字段依次为 `tuple[MultiSchnorrEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变
+- `verify_region_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的区域证明完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_region_batch` 验子证明
+- `BoundRegionBatch(entries, leaf_count, proof)` — 冻结的完整批对象；字段依次为 `tuple[RegionBatchEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变
 - `merkle_root(leaves) -> bytes` — 非空 `bytes` 序列的 Merkle 根
 - `prove_inclusion(leaves, index) -> MerkleProof` — 按零基索引生成包含证明
 - `verify_inclusion(leaf, proof, root) -> bool` — 验证包含证明
@@ -298,6 +323,25 @@ g**Σ(a*s) == Π(t**a * public_key**(a*c))   (mod prime)
 2. 根通过后，以**同一个 `randbelow`** 调用 `verify_schnorr_batch(entries, randbelow=randbelow)` 验签，随机源契约（每结构合法条目恰调用一次 `randbelow(prime - 1)`、非整数返回 `TypeError`、越界返回 `ValueError`）与输入完全沿用后者，不做包装或改动。
 
 类型错误——`batch` 不是 `BoundSchnorrBatch`、`entries` 不是元组或含非 `MultiSchnorrEntry`、条目嵌套字段类型错误（含 `bool` 整数、非 `bytes` 的 `message`/`context`、非 `SchnorrProof`）、`leaf_count` 不是非 `bool` 整数、`proof`/`root` 类型错误、`randbelow` 不可调用——抛 `TypeError`；其余一切无效情形（空批、缺项、数量不符、索引缺口/重复/乱序、错误根、叶字节篡改、签名或转录不符、非随机随机源导致的 `False` 等）均返回 `False`。入口不改写任何输入。与其它批量验证一样，这里的随机线性组合只供演示。
+
+### Merkle 承诺的区域证明完整批验
+
+`BoundRegionBatch(entries, leaf_count, proof)` 把一批**完整**的区域证明条目与一棵 Merkle 树的多包含证明冻结在一起，三个字段依次为：
+
+1. `entries: tuple[RegionBatchEntry, ...]` —— 必须是元组（不是列表），每项是 `RegionBatchEntry`；
+2. `leaf_count: int` —— 正的非 `bool` 整数，且必须同时等于 `len(entries)` 与 `proof.leaf_count`；
+3. `proof: MerkleMultiProof` —— 其 `indices` 必须无缺口、无重复、无乱序地恰好覆盖 `0 .. leaf_count - 1`（即等于 `tuple(range(leaf_count))`）。
+
+三字段均可位置构造，对象按值相等且不可变（冻结 dataclass）。空批（`leaf_count < 1` 或 `entries` 为空）、缺项（数量不符）、`leaf_count` 与任一方不一致、索引乱序/重复/有缺口均返回 `False`。
+
+每个条目的 Merkle 叶字节以域 `b"zkregion/region-bound/v1"` 开始，依次拼接：x 承诺六字段、y 承诺六字段（均按数据类字段顺序）、Region 四边界（`min_x`、`max_x`、`min_y`、`max_y`）与 `context`，再依次写入 x、y 各自子证明的 `t`、`e`、`s` 序列——每个序列先写十进制元素数再逐项写值。每个原子项前置四字节无符号大端长度，整数编码为十进制 ASCII（负号保留）。叶摘要仍按 Merkle 树构造一节的 `SHA-256(b"\x00" + len4 + leaf)` 计算。
+
+`verify_region_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` 的验证分两步、次序固定：
+
+1. 先以全部 `(index, leaf)`（`index` 即 0 起的条目位置）调用 `verify_multi_inclusion` 校验 Merkle 根；任一叶字节、proof 或根不符即返回 `False`，且在根校验通过前不消费任何随机数；
+2. 根通过后，以**同一个 `randbelow`** 调用 `verify_region_batch(entries, randbelow=randbelow)` 验子证明，随机源契约（每结构合法分支恰调用一次 `randbelow(prime - 1)`、非整数返回 `TypeError`、越界返回 `ValueError`）与输入完全沿用后者，不做包装或改动。
+
+类型错误——`batch` 不是 `BoundRegionBatch`、`entries` 不是元组或含非 `RegionBatchEntry`、条目嵌套字段类型错误（含 `bool` 整数、非 `bytes` 的 `context`、非 `RegionProof`/`RangeProof`、非元组 `t`/`e`/`s`）、`leaf_count` 不是非 `bool` 整数、`proof`/`root` 类型错误、`randbelow` 不可调用——抛 `TypeError`；其余一切无效情形（空批、缺项、数量不符、索引缺口/重复/乱序、错误根、叶字节篡改、子证明或转录不符、非随机随机源导致的 `False` 等）均返回 `False`。入口不改写任何输入。与其它批量验证一样，这里的随机线性组合只供演示。
 
 ## 限制
 

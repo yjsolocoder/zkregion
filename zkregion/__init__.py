@@ -9,7 +9,7 @@ SchnorrVerifier / MultiSchnorrEntry / verify_schnorr_batch /
 BoundSchnorrBatch / verify_bound /
 BoundRegionBatch / verify_region_bound /
 BoundRangeBatch / verify_range_bound /
-BoundRegionReplayGuard /
+BoundRegionReplayGuard / BoundRangeReplayGuard /
 ReplayBinding / ReplayGuard / RangeReplayGuard / RegionReplayGuard /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
@@ -30,6 +30,7 @@ __all__ = [
     "DEFAULT_GENERATOR",
     "DEFAULT_PRIME",
     "BoundRangeBatch",
+    "BoundRangeReplayGuard",
     "BoundRegionBatch",
     "BoundRegionReplayGuard",
     "BoundSchnorrBatch",
@@ -2140,6 +2141,7 @@ _REPLAY_DOMAIN = b"zr/r/v1"
 _RANGE_REPLAY_DOMAIN = b"zr/rr/v1"
 _REGION_REPLAY_DOMAIN = b"zr/rg/v1"
 _BOUND_REGION_REPLAY_DOMAIN = b"zr/brg/v1"
+_BOUND_RANGE_REPLAY_DOMAIN = b"zr/brr/v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -2905,6 +2907,255 @@ class BoundRegionReplayGuard:
         if binding.expires_at is not None and current >= binding.expires_at:
             return False  # expired: rejection does not consume the id
         if not verify_region_bound(batch, root, randbelow=randbelow):
+            return False
+        del self._pending[binding.session_id]
+        self._consumed.add(binding.session_id)
+        return True
+
+
+# ---------------------------------------------------------------------------
+# Per-instance replay protection for Merkle-committed range batches
+#
+# A BoundRangeReplayGuard binds a whole BoundRangeBatch together with the
+# Merkle root it is claimed under to a caller-chosen session id, reusing the
+# ReplayBinding type. The binding is single-use and local to the guard
+# instance: bind_once registers a pending binding, check recomputes the
+# digest, checks the expiry, delegates the actual root and proof
+# verification to verify_range_bound (passing the random source through
+# unchanged) and consumes the id only on full success; every rejection
+# leaves the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || F(root) || F(U(batch.leaf_count))
+#     || Σ_i F(L(entry_i))
+#     || F(U(proof.leaf_count)) || S(proof.indices, U)
+#     || S(proof.siblings, λx.x) || F(E)
+# )
+#   D = b"zr/brr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   L(entry) = the BoundRange leaf bytes (_bound_range_leaf), raw under F
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+
+
+def _bound_range_replay_encodable(batch: BoundRangeBatch) -> bool:
+    """Every U-framed integer must fit in unsigned 64 bits.
+
+    ``batch.leaf_count``, ``batch.proof.leaf_count`` and every proof index
+    are written with ``U`` (eight-byte unsigned big-endian); a negative or
+    larger-than-uint64 value cannot be framed. Everything else (the
+    decimal-ASCII range leaves, raw sibling bytes, the root) encodes for
+    any value, so no additional encodability rule is needed.
+    """
+    proof = batch.proof
+    values = [batch.leaf_count, proof.leaf_count, *proof.indices]
+    return all(0 <= value <= _UINT64_MAX for value in values)
+
+
+def _bound_range_replay_digest(
+    batch: BoundRangeBatch,
+    root: bytes,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the BoundRange replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``F(root)``,
+    ``F(U(batch.leaf_count))``, one ``F(L(entry))`` per entry in batch
+    order, then ``F(U(proof.leaf_count))``, ``S(proof.indices, U)``,
+    ``S(proof.siblings, identity)`` and ``F(E)``.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_BOUND_RANGE_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    transcript.update(_frame_length_prefixed(root))
+    transcript.update(_frame_length_prefixed(_uint64_be(batch.leaf_count)))
+    for entry in batch.entries:  # entries order, each BoundRange leaf under F
+        transcript.update(_frame_length_prefixed(_bound_range_leaf(entry)))
+    proof = batch.proof
+    transcript.update(_frame_length_prefixed(_uint64_be(proof.leaf_count)))
+    # S(proof.indices, U) = F(U(|indices|)) || Σ F(U(index))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.indices))))
+    for index in proof.indices:
+        transcript.update(_frame_length_prefixed(_uint64_be(index)))
+    # S(proof.siblings, λx.x) = F(U(|siblings|)) || Σ F(sibling)
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.siblings))))
+    for sibling in proof.siblings:
+        transcript.update(_frame_length_prefixed(sibling))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+def _check_bound_range_batch_types(batch: object, root: object) -> None:
+    """Validate BoundRangeBatch argument types for the replay guard.
+
+    Mirrors the type checks of :func:`verify_range_bound`: the batch must
+    be a :class:`BoundRangeBatch` whose entries tuple holds nestedly
+    well-typed :class:`RangeBatchEntry` objects, whose ``leaf_count`` is a
+    non-``bool`` integer and whose proof is a well-typed
+    :class:`MerkleMultiProof`; ``root`` must be ``bytes``. Structural and
+    value problems (coverage, digest lengths, ranges) are left to
+    :func:`verify_range_bound` at check time.
+    """
+    if not isinstance(batch, BoundRangeBatch):
+        raise TypeError("batch must be a BoundRangeBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError("batch entries must be a tuple of RangeBatchEntry")
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, RangeBatchEntry):
+            raise TypeError(f"entries[{position}] must be a RangeBatchEntry")
+        commitment = entry.commitment
+        entry_proof = entry.proof
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(f"entries[{position}] commitment must be a PedersenCommitment")
+        _check_commitment_fields(commitment)
+        if not isinstance(entry_proof, RangeProof):
+            raise TypeError(f"entries[{position}] proof must be a RangeProof")
+        for field_name in ("t", "e", "s"):
+            field = getattr(entry_proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"entries[{position}] proof {field_name} "
+                    "must be a tuple of integers"
+                )
+            for item in field:
+                _check_int(
+                    item,
+                    f"entries[{position}] proof {field_name} entry",
+                )
+        _check_bytes(entry.context, f"entries[{position}] context")
+
+
+class BoundRangeReplayGuard:
+    """Per-instance, single-use replay protection for a bound range batch.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole
+    :class:`BoundRangeBatch` together with the Merkle ``root`` it is
+    claimed under; :meth:`check` accepts an equal pending binding exactly
+    once — recomputing the binding digest, checking the expiry and
+    delegating to :func:`verify_range_bound` with the random source passed
+    through — and then marks the id consumed. Both the pending and the
+    consumed state live on this guard instance and are never shared.
+    """
+
+    def __init__(self) -> None:
+        self._pending: dict[bytes, ReplayBinding] = {}
+        self._consumed: set[bytes] = set()
+
+    def bind_once(
+        self,
+        batch: BoundRangeBatch,
+        root: bytes,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to a batch/root.
+
+        Returns the frozen :class:`ReplayBinding`. ``session_id`` must be
+        non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
+        non-``bool`` unsigned 64-bit Unix-second timestamp; the U-framed
+        integers (``leaf_count`` and the proof indices) must likewise fit in
+        uint64. A session id that is already pending or consumed raises
+        :class:`ValueError`. Wrong argument or nested field types raise
+        :class:`TypeError`; an empty id, an out-of-uint64 expiry or framed
+        integer, or a rebind raise :class:`ValueError`. Inputs are never
+        mutated.
+        """
+        _check_bound_range_batch_types(batch, root)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _bound_range_replay_encodable(batch):
+            raise ValueError("leaf_count and proof indices must be unsigned 64-bit integers")
+        if session_id in self._pending or session_id in self._consumed:
+            raise ValueError("session_id is already bound or has been consumed")
+        binding = ReplayBinding(
+            session_id,
+            _bound_range_replay_digest(batch, root, session_id, expires_at),
+            expires_at,
+        )
+        self._pending[session_id] = binding
+        return binding
+
+    def check(
+        self,
+        batch: BoundRangeBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+        randbelow: Callable[[int], int] = secrets.randbelow,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch/root.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        digest is recomputed over the presented ``batch`` / ``root``; for a
+        binding with an expiry, ``now >= expires_at`` makes the check fail
+        (``now`` defaults to the current Unix seconds and must otherwise be
+        a non-``bool`` uint64). Only then is the batch/root handed to
+        :func:`verify_range_bound` with ``randbelow`` passed through
+        unchanged, under that function's root, structure and randomness
+        contract.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, unequal binding, digest
+        mismatch, expiry, a non-32-byte root or sibling, or
+        :func:`verify_range_bound` returning ``False``) returns ``False``
+        and leaves the registration untouched. Type errors raise
+        :class:`TypeError`; an out-of-range ``now`` raises
+        :class:`ValueError`, and errors surfaced by the delegated
+        verification propagate unchanged. Inputs are never mutated.
+        """
+        _check_bound_range_batch_types(batch, root)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if not callable(randbelow):
+            raise TypeError("randbelow must be callable")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _bound_range_replay_encodable(batch):
+            return False  # negative or oversized U-framed integers
+        stored = self._pending.get(binding.session_id)
+        if stored is None or stored != binding:
+            return False  # unknown id, already consumed, or unequal binding
+        if not hmac.compare_digest(
+            binding.digest,
+            _bound_range_replay_digest(batch, root, binding.session_id, binding.expires_at),
+        ):
+            return False  # the presented batch/root is not the one originally bound
+        if binding.expires_at is not None and current >= binding.expires_at:
+            return False  # expired: rejection does not consume the id
+        if not verify_range_bound(batch, root, randbelow=randbelow):
             return False
         del self._pending[binding.session_id]
         self._consumed.add(binding.session_id)

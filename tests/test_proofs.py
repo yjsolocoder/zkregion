@@ -6,6 +6,7 @@ from zkregion import (
     DEFAULT_GENERATOR,
     DEFAULT_PRIME,
     BoundRangeBatch,
+    BoundRangeReplayGuard,
     BoundRegionBatch,
     BoundRegionReplayGuard,
     BoundSchnorrBatch,
@@ -4997,6 +4998,481 @@ class RegionReplayGuardTest(unittest.TestCase):
         guard.check(self.entry, binding, now=1)
         self.assertEqual(self.entry, snapshot)
         self.assertEqual(binding, binding_snapshot)
+
+
+class BoundRangeReplayGuardTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def entry(self, value=5, context=b"ctx", blinding=1234):
+        commitment, r = pedersen_commit(
+            value, 0, 10, blinding=blinding,
+            prime=self.PRIME, generator=self.G, h=self.H,
+        )
+        proof = prove_range(
+            commitment, value, r, context, randbelow=counter_randbelow()
+        )
+        return RangeBatchEntry(commitment, proof, context)
+
+    def build(self, entries):
+        leaves = [bound_range_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        batch = BoundRangeBatch(tuple(entries), len(entries), proof)
+        return batch, root
+
+    def honest(self):
+        entries = [
+            self.entry(value=5, context=b"a"),
+            self.entry(value=7, context=b"b"),
+            self.entry(value=0, context=b"c"),
+        ]
+        return self.build(entries)
+
+    @staticmethod
+    def expected_digest(batch, root, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(F(transform(item)) for item in sequence)
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        proof = batch.proof
+        material = F(b"zr/brr/v1") + F(session_id) + F(root) + F(U(batch.leaf_count))
+        material += b"".join(F(bound_range_leaf(entry)) for entry in batch.entries)
+        material += (
+            F(U(proof.leaf_count)) + S(proof.indices, U)
+            + S(proof.siblings, lambda sibling: sibling) + F(expiry)
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(
+            binding.digest, self.expected_digest(batch, root, b"s1")
+        )
+        binding = guard.bind_once(batch, root, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(batch, root, b"s2", 1000)
+        )
+
+    def test_domain_separator_is_distinct(self):
+        batch, root = self.honest()
+        binding = BoundRangeReplayGuard().bind_once(batch, root, b"s")
+        self.assertEqual(binding.digest, self.expected_digest(batch, root, b"s"))
+        # the single-entry RangeReplayGuard domain must produce another digest
+        material = (
+            len(b"zr/rr/v1").to_bytes(4, "big") + b"zr/rr/v1"
+            + len(b"s").to_bytes(4, "big") + b"s"
+            + bound_range_leaf(batch.entries[0])
+            + len(b"\x00").to_bytes(4, "big") + b"\x00"
+        )
+        self.assertNotEqual(binding.digest, hashlib.sha256(material).digest())
+
+    def test_digest_binds_every_component(self):
+        entries = [
+            self.entry(value=5, context=b"a"),
+            self.entry(value=7, context=b"b"),
+            self.entry(value=0, context=b"c"),
+        ]
+        batch, root = self.build(entries)
+        guard = BoundRangeReplayGuard()
+        base = guard.bind_once(batch, root, b"s")
+        self.assertNotEqual(
+            base.digest, self.expected_digest(batch, root, b"other")
+        )
+        self.assertNotEqual(
+            base.digest, self.expected_digest(batch, root, b"s", 1)
+        )
+        self.assertNotEqual(
+            base.digest, self.expected_digest(batch, hashlib.sha256(root).digest(), b"s")
+        )
+        # leaf_count and the per-entry leaves (entry order) participate
+        single, single_root = self.build(entries[:1])
+        self.assertNotEqual(
+            base.digest, self.expected_digest(single, single_root, b"s")
+        )
+        reordered, reordered_root = self.build(
+            [entries[1], entries[0], entries[2]]
+        )
+        self.assertNotEqual(
+            base.digest, self.expected_digest(reordered, reordered_root, b"s")
+        )
+        # proof indices and siblings participate: a partial multi proof differs
+        leaves = [bound_range_leaf(entry) for entry in entries]
+        partial = prove_multi_inclusion(leaves, (0, 1))
+        partial_batch = BoundRangeBatch(tuple(entries), len(entries), partial)
+        self.assertNotEqual(
+            base.digest, self.expected_digest(partial_batch, root, b"s")
+        )
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        batch, root = self.honest()
+        none = BoundRangeReplayGuard().bind_once(batch, root, b"s")
+        zero = BoundRangeReplayGuard().bind_once(batch, root, b"s", expires_at=0)
+        one = BoundRangeReplayGuard().bind_once(batch, root, b"s", expires_at=1)
+        self.assertNotEqual(none.digest, zero.digest)
+        self.assertNotEqual(zero.digest, one.digest)
+
+    def test_pending_id_cannot_be_rebound(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        guard.bind_once(batch, root, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        first = guard.bind_once(batch, root, b"s1")
+        second = guard.bind_once(batch, root, b"s2")
+        self.assertNotEqual(first, second)
+        self.assertTrue(guard.check(batch, root, first, now=1))
+        self.assertTrue(guard.check(batch, root, second, now=1))
+
+    # ---- bind argument validation -------------------------------------------
+
+    def test_bind_type_errors(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        for bad in ("batch", 7, None, batch.entries, batch.proof):
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, root, b"s")
+        for bad in (bytearray(root), None, 7, "root"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, bad, b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, root, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, root, b"s", expires_at=bad)
+
+    def test_bind_nested_type_errors(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        entries = batch.entries
+        proof = batch.proof
+        with self.assertRaises(TypeError):
+            guard.bind_once(BoundRangeBatch(list(entries), 3, proof), root, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(BoundRangeBatch(("x",) * 3, 3, proof), root, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(BoundRangeBatch(entries, True, proof), root, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(BoundRangeBatch(entries, 3.0, proof), root, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(BoundRangeBatch(entries, 3, "proof"), root, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundRangeBatch(
+                    entries, 3,
+                    MerkleMultiProof(3, [0, 1, 2], ()),
+                ), root, b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundRangeBatch(
+                    entries, 3,
+                    MerkleMultiProof(3, (0, 1, True), ()),
+                ), root, b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundRangeBatch(
+                    entries, 3,
+                    MerkleMultiProof(3, (0, 1, 2), (b"ok", 7)),
+                ), root, b"s",
+            )
+        entry = entries[0]
+        bad_entry_cases = [
+            dataclasses.replace(entry, commitment="c"),
+            dataclasses.replace(
+                entry,
+                commitment=dataclasses.replace(entry.commitment, h=True),
+            ),
+            dataclasses.replace(entry, proof=entry.commitment),
+            dataclasses.replace(entry, proof="p"),
+            dataclasses.replace(
+                entry,
+                proof=RangeProof(
+                    list(entry.proof.t),
+                    entry.proof.e,
+                    entry.proof.s,
+                ),
+            ),
+            dataclasses.replace(
+                entry,
+                proof=RangeProof(
+                    entry.proof.t,
+                    entry.proof.e + (True,),
+                    entry.proof.s,
+                ),
+            ),
+            dataclasses.replace(entry, context="ctx"),
+        ]
+        for bad_entry in bad_entry_cases:
+            with self.assertRaises(TypeError):
+                guard.bind_once(
+                    BoundRangeBatch((bad_entry,) + entries[1:], 3, proof),
+                    root, b"s",
+                )
+
+    def test_bind_value_errors(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"")
+        for bad in (-1, 2**64):
+            with self.assertRaises(ValueError):
+                guard.bind_once(batch, root, b"s", expires_at=bad)
+        with self.assertRaises(ValueError):
+            guard.bind_once(
+                BoundRangeBatch(batch.entries, 2**64, batch.proof), root, b"t"
+            )
+        negative = MerkleMultiProof(1, (-1,), ())
+        with self.assertRaises(ValueError):
+            guard.bind_once(
+                BoundRangeBatch(batch.entries[:1], 1, negative), root, b"t"
+            )
+
+    # ---- honest check and single use ----------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s", expires_at=1000)
+        self.assertTrue(guard.check(batch, root, binding, now=999))
+        self.assertFalse(guard.check(batch, root, binding, now=999))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_check_with_default_now_and_randbelow(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        batch, root = self.honest()
+        for now in (0, 2**64 - 1):
+            guard = BoundRangeReplayGuard()
+            binding = guard.bind_once(batch, root, b"s")
+            self.assertTrue(guard.check(batch, root, binding, now=now))
+
+    def test_expiry_boundary_is_inclusive(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s1", expires_at=1000)
+        self.assertTrue(guard.check(batch, root, binding, now=999))
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s2", expires_at=1000)
+        self.assertFalse(guard.check(batch, root, binding, now=1000))
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s3", expires_at=1000)
+        self.assertFalse(guard.check(batch, root, binding, now=1001))
+
+    # ---- random source passthrough ------------------------------------------
+
+    def test_randbelow_is_passed_through_to_delegation(self):
+        batch, root = self.honest()
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding, now=1, randbelow=recording))
+        # 3 entries * 11 range values, one draw per branch
+        self.assertEqual(calls, [self.PRIME - 1] * 33)
+
+    def test_no_randomness_drawn_for_a_replayed_id(self):
+        batch, root = self.honest()
+
+        def boom(upper):
+            raise AssertionError("randbelow must not be called")
+
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+        self.assertFalse(guard.check(batch, root, binding, now=1, randbelow=boom))
+
+    def test_delegated_randomness_errors_propagate(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        with self.assertRaises(TypeError):
+            guard.check(batch, root, binding, now=1, randbelow=lambda upper: True)
+        # the failed check did not consume the id
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s2")
+        with self.assertRaises(ValueError):
+            guard.check(batch, root, binding, now=1, randbelow=lambda upper: -1)
+
+    # ---- rejection never consumes -------------------------------------------
+
+    def test_expired_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s", expires_at=1000)
+        self.assertFalse(guard.check(batch, root, binding, now=2000))
+        self.assertTrue(guard.check(batch, root, binding, now=999))
+        self.assertFalse(guard.check(batch, root, binding, now=999))
+
+    def test_wrong_root_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        leaves = [bound_range_leaf(entry) for entry in batch.entries]
+        wrong_root = merkle_root(leaves[:1])
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertFalse(guard.check(batch, wrong_root, binding, now=1))
+        # the original binding still verifies once
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+
+    def test_bad_proof_rejection_does_not_consume(self):
+        entries = [
+            self.entry(value=5, context=b"a"),
+            self.entry(value=7, context=b"b"),
+            self.entry(value=0, context=b"c"),
+        ]
+        tampered = RangeProof(
+            entries[0].proof.t,
+            entries[0].proof.e,
+            entries[0].proof.s[:-1]
+            + (entries[0].proof.s[-1] + 1,),
+        )
+        forged_entries = [
+            dataclasses.replace(entries[0], proof=tampered),
+            entries[1],
+            entries[2],
+        ]
+        forged_batch, forged_root = self.build(forged_entries)
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(forged_batch, forged_root, b"s")
+        self.assertFalse(guard.check(forged_batch, forged_root, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(forged_batch, forged_root, b"s")
+
+    def test_short_sibling_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        bogus_proof = MerkleMultiProof(
+            batch.proof.leaf_count, batch.proof.indices, (b"short",)
+        )
+        bogus_batch = BoundRangeBatch(batch.entries, batch.leaf_count, bogus_proof)
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(bogus_batch, root, b"s")
+        self.assertFalse(guard.check(bogus_batch, root, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(bogus_batch, root, b"s")
+
+    def test_short_root_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        short_root = root[:-1]
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, short_root, b"s")
+        self.assertFalse(guard.check(batch, short_root, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, short_root, b"s")
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        guard.bind_once(batch, root, b"local")
+        foreign = BoundRangeReplayGuard().bind_once(batch, root, b"elsewhere")
+        self.assertFalse(guard.check(batch, root, foreign, now=1))
+        equal = BoundRangeReplayGuard().bind_once(batch, root, b"local")
+        self.assertTrue(guard.check(batch, root, equal, now=1))
+        unknown = ReplayBinding(b"never-bound", b"\x00" * 32)
+        self.assertFalse(guard.check(batch, root, unknown, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        guard.bind_once(batch, root, b"s")
+        forged_digest = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(guard.check(batch, root, forged_digest, now=1))
+        forged_expiry = ReplayBinding(
+            b"s", self.expected_digest(batch, root, b"s", 1), 1
+        )
+        self.assertFalse(guard.check(batch, root, forged_expiry, now=0))
+
+    def test_instances_are_independent(self):
+        batch, root = self.honest()
+        first = BoundRangeReplayGuard()
+        second = BoundRangeReplayGuard()
+        binding = first.bind_once(batch, root, b"s")
+        self.assertFalse(second.check(batch, root, binding, now=1))
+        self.assertTrue(first.check(batch, root, binding, now=1))
+
+    # ---- check argument validation ------------------------------------------
+
+    def test_check_type_errors(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        for bad in ("batch", 7, None, batch.entries):
+            with self.assertRaises(TypeError):
+                guard.check(bad, root, binding, now=1)
+        for bad in (None, 7, "root", bytearray(root)):
+            with self.assertRaises(TypeError):
+                guard.check(batch, bad, binding, now=1)
+        for bad in ("binding", 7, None, (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(batch, root, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(batch, root, binding, now=bad)
+        with self.assertRaises(TypeError):
+            guard.check(batch, root, binding, now=1, randbelow=7)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(batch, root, binding, now=bad)
+
+    def test_inputs_are_not_mutated(self):
+        batch, root = self.honest()
+        guard = BoundRangeReplayGuard()
+        batch_snapshot = BoundRangeBatch(batch.entries, batch.leaf_count, batch.proof)
+        binding = guard.bind_once(batch, root, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        held_root = bytes(root)
+        guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        self.assertEqual(batch, batch_snapshot)
+        self.assertEqual(binding, binding_snapshot)
+        self.assertEqual(root, held_root)
 
 
 class BoundRegionReplayGuardTest(unittest.TestCase):

@@ -211,6 +211,14 @@ brg = BoundRegionReplayGuard()
 brg_binding = brg.bind_once(bound_region, region_root, b"session-1")
 assert brg.check(bound_region, region_root, brg_binding)       # 先验根与整批证明再消费
 assert not brg.check(bound_region, region_root, brg_binding)   # 二次提交被拒
+
+# 整批 BoundRangeBatch 与 Merkle 根的实例内一次性绑定
+from zkregion import BoundRangeReplayGuard
+
+brr = BoundRangeReplayGuard()
+brr_binding = brr.bind_once(bound_range, range_root, b"session-1")
+assert brr.check(bound_range, range_root, brr_binding)         # 先验根与整批证明再消费
+assert not brr.check(bound_range, range_root, brr_binding)     # 二次提交被拒
 ```
 
 ## 命令行演示
@@ -270,6 +278,9 @@ python3 -m zkregion
 - `BoundRegionReplayGuard()` — Merkle 承诺区域批与 Merkle 根的实例内防重放登记册
   - `bind_once(batch: BoundRegionBatch, root: bytes, session_id: bytes, *, expires_at=None) -> ReplayBinding` — 把整批 `BoundRegionBatch` 连同其 Merkle `root` 一次性绑定到 `session_id`；空值、uint64 越界或重绑抛 `ValueError`，类型错误抛 `TypeError`
   - `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` — 重算绑定摘要、检查期限后委托 `verify_region_bound` 并透传同一随机源；成功才消费 `session_id`，其余无效一律返回 `False` 且不消费
+- `BoundRangeReplayGuard()` — Merkle 承诺区间批与 Merkle 根的实例内防重放登记册
+  - `bind_once(batch: BoundRangeBatch, root: bytes, session_id: bytes, *, expires_at=None) -> ReplayBinding` — 把整批 `BoundRangeBatch` 连同其 Merkle `root` 一次性绑定到 `session_id`；空值、uint64 越界或重绑抛 `ValueError`，类型错误抛 `TypeError`
+  - `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` — 重算绑定摘要、检查期限后委托 `verify_range_bound` 并透传同一随机源；成功才消费 `session_id`，其余无效一律返回 `False` 且不消费
 - `merkle_root(leaves) -> bytes` — 非空 `bytes` 序列的 Merkle 根
 - `prove_inclusion(leaves, index) -> MerkleProof` — 按零基索引生成包含证明
 - `verify_inclusion(leaf, proof, root) -> bool` — 验证包含证明
@@ -506,6 +517,28 @@ digest = SHA-256(
 `bind_once(batch, root, session_id, *, expires_at=None)` 登记本实例的待用绑定并返回它。类型边界与 `verify_region_bound` 一致（`batch` 及其嵌套条目、`proof` 的字段类型同样校验），类型错误抛 `TypeError`；`session_id` 为空、`expires_at` 非 uint64、任一 `U` 成帧整数（`leaf_count`、`proof.leaf_count` 或索引）为负或超出 uint64、或 id 已待用/已消费均抛 `ValueError`。
 
 `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` 的校验次序为：先核对登记册中的待用绑定与提交绑定按值相等，再重算摘要确认提交的 `batch`/`root` 就是绑定时的对象，再检查期限（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`），随后以**同一个 `randbelow`** 调用 `verify_region_bound(batch, root, randbelow=randbelow)`——根与兄弟摘要须恰 32 字节、Merkle 根校验与区域批验证明全部通过其随机源契约（每结构合法分支 `randbelow(prime - 1)` 一次，非整数返回 `TypeError`、越界返回 `ValueError`），不做包装或改写。只有全部成功才消费 `session_id`；未登记（含已消费）的 id、不等值绑定、摘要不符、过期、根或兄弟长度错误、错误根、任何结构/证明无效或委托验证返回 `False` 一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。绑定状态不跨实例共享；`check` 的参数类型错误（含不可调用的 `randbelow`）抛 `TypeError`。入口不改写任何输入。
+
+### Merkle 承诺区间批的实例内一次性绑定
+
+`BoundRangeReplayGuard` 在单个实例内为整批 :class:`BoundRangeBatch` 连同其 Merkle `root` 提供一次性会话绑定，复用同一个 `ReplayBinding` 类型，入参与 `BoundRegionReplayGuard` 同形：`bind_once(batch, root, session_id, *, expires_at=None)`、`check(batch, root, binding, *, now=None, randbelow=secrets.randbelow)`，状态同样不跨实例。绑定摘要逐项复用 `BoundRegionReplayGuard` 的公开公式与 `F`、`U`、`S`、`E` 编码、条目顺序不变，仅做两处替换：
+
+- 域改为 `D = b"zr/brr/v1"`；
+- 每个 `L(entry_i)` 改用"Merkle 承诺的区间证明完整批验"一节定义的 BoundRange 叶原字节（`_bound_range_leaf`），按 `batch.entries` 的顺序逐个以 `F` 成帧。
+
+即
+
+```
+digest = SHA-256(
+    F(D) || F(session_id) || F(root) || F(U(batch.leaf_count))
+    || Σ_i F(L(entry_i))
+    || F(U(proof.leaf_count)) || S(proof.indices, U)
+    || S(proof.siblings, λx.x) || F(E)
+)
+```
+
+`bind_once` 的类型边界与 `verify_range_bound` 一致（`batch` 及其嵌套 `RangeBatchEntry`、承诺、`RangeProof` 的 `t`/`e`/`s` 元组、`proof` 的字段类型同样校验），类型错误抛 `TypeError`；`session_id` 须为非空 `bytes`，`session_id` 为空、`expires_at` 非 uint64、任一 `U` 成帧整数（`leaf_count`、`proof.leaf_count` 或索引）为负或超出 uint64、或 id 已待用/已消费均抛 `ValueError`。
+
+`check` 先核对本实例待用等值绑定、再重算摘要确认提交的 `batch`/`root` 就是绑定时的对象、再检查期限（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`），随后把**同一个 `randbelow` 原样**传给 `verify_range_bound(batch, root, randbelow=randbelow)`——根与兄弟摘要须恰 32 字节、Merkle 根校验与区间批验证明全部通过其随机源契约，不做包装或改写。仅验证成功才消费 `session_id`；未登记（含已消费）的 id、替换对象（不等值绑定或摘要不符）、过期、`root` 或任一兄弟摘要非 32 字节、错误根、其他摘要/结构/证明无效或委托验证返回 `False` 一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。绑定状态不跨实例共享；`check` 的参数类型错误（含不可调用的 `randbelow`）抛 `TypeError`，委托验证抛出的随机源异常（非整数 `TypeError`、越界 `ValueError`）原样传播。入口不改写任何输入。
 
 ## 限制
 

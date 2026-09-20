@@ -203,6 +203,14 @@ region_entry = RegionBatchEntry(
 region_binding = region_guard.bind_once(region_entry, b"session-1")
 assert region_guard.check(region_entry, region_binding)    # 验区域证明并消费 session id
 assert not region_guard.check(region_entry, region_binding)  # 二次提交被拒
+
+# 整批 BoundRegionBatch 与 Merkle 根的实例内一次性绑定
+from zkregion import BoundRegionReplayGuard
+
+brg = BoundRegionReplayGuard()
+brg_binding = brg.bind_once(bound_region, region_root, b"session-1")
+assert brg.check(bound_region, region_root, brg_binding)       # 先验根与整批证明再消费
+assert not brg.check(bound_region, region_root, brg_binding)   # 二次提交被拒
 ```
 
 ## 命令行演示
@@ -259,6 +267,9 @@ python3 -m zkregion
 - `RegionReplayGuard()` — 二维区域证明的实例内防重放登记册
   - `bind_once(entry: RegionBatchEntry, session_id, *, expires_at=None) -> ReplayBinding` — 登记本实例的待用绑定；待用或已消费的 `session_id` 重绑抛 `ValueError`
   - `check(entry, binding, *, now=None) -> bool` — 验本实例的待用等值绑定，按字段顺序以 `x_commitment`、`y_commitment`、`region`、`proof`、`context` 调 `verify_region`；成功才消费 `session_id`，任何拒绝都不消费
+- `BoundRegionReplayGuard()` — Merkle 承诺区域批与 Merkle 根的实例内防重放登记册
+  - `bind_once(batch: BoundRegionBatch, root: bytes, session_id: bytes, *, expires_at=None) -> ReplayBinding` — 把整批 `BoundRegionBatch` 连同其 Merkle `root` 一次性绑定到 `session_id`；空值、uint64 越界或重绑抛 `ValueError`，类型错误抛 `TypeError`
+  - `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` — 重算绑定摘要、检查期限后委托 `verify_region_bound` 并透传同一随机源；成功才消费 `session_id`，其余无效一律返回 `False` 且不消费
 - `merkle_root(leaves) -> bytes` — 非空 `bytes` 序列的 Merkle 根
 - `prove_inclusion(leaves, index) -> MerkleProof` — 按零基索引生成包含证明
 - `verify_inclusion(leaf, proof, root) -> bool` — 验证包含证明
@@ -470,6 +481,31 @@ digest = SHA-256(F(D) || F(session_id) || L(entry) || F(E))
 `bind_once(entry, session_id, *, expires_at=None)` 登记本实例的待用绑定并返回它，参数边界与 `RangeReplayGuard` 一致：`entry` 须为 `RegionBatchEntry`（两个承诺、区域、`x_proof`/`y_proof` 及各自 `t`/`e`/`s` 元组与 `context` 的嵌套类型同样校验），类型错误抛 `TypeError`；`session_id` 为空、`expires_at` 非 uint64 或 id 已待用/已消费均抛 `ValueError`。区域叶编码以十进制 ASCII 写整数（负号保留），任何整数字段都可成帧，因此没有额外的可编码性拒绝。
 
 `check(entry, binding, *, now=None) -> bool` 的校验次序与 `RangeReplayGuard` 相同：先核对登记册中的待用绑定与提交绑定按值相等，再重算摘要确认条目一致，再检查期限（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`），最后按字段顺序以 `entry.x_commitment`、`entry.y_commitment`、`entry.region`、`entry.proof`、`entry.context` 调用 `verify_region` 验二维区域证明（先 x 后 y 的字段顺序沿用旧接口，不被改写）。只有全部成功才消费 `session_id`；未登记（含已消费）的 id、不等值绑定、摘要不符、条目任一字段被替换、过期或 `verify_region` 失败一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。绑定状态不跨实例共享；类型错误抛 `TypeError`。入口不改写任何输入。
+
+### Merkle 承诺区域批的实例内一次性绑定
+
+`BoundRegionReplayGuard` 在单个实例内为整批 :class:`BoundRegionBatch` 连同其 Merkle `root` 提供一次性会话绑定，复用同一个 `ReplayBinding` 类型；`bind_once` 的入参为 `(batch, root, session_id, *, expires_at=None)`，旧接口（单条目的三个守卫）的入参与行为完全不变。绑定摘要为
+
+```
+digest = SHA-256(
+    F(D) || F(session_id) || F(root) || F(U(batch.leaf_count))
+    || Σ_i F(L(entry_i))
+    || F(U(proof.leaf_count)) || S(proof.indices, U)
+    || S(proof.siblings, λx.x) || F(E)
+)
+```
+
+其中：
+
+- 域 `D = b"zr/brg/v1"`；
+- `F(x)` 是四字节无符号大端长度前缀加 `x`，`U(n)` 是八字节无符号大端整数编码；
+- `L(entry_i)` 沿用"Merkle 承诺的区域证明完整批验"一节定义的 BoundRegion 叶原字节，按 `batch.entries` 的顺序逐个以 `F` 成帧；
+- `S(a, f) = F(U(|a|)) || Σ F(f(a_i))`，即 `proof.indices` 逐项以 `U` 成帧、`proof.siblings` 逐项以恒等映射（原字节）成帧，两段都先写以 `U` 编码的元素数；
+- `E` 的过期编码与 `ReplayGuard` 逐字节相同：无期 `E = b"\x00"`，有期 `E = b"\x01" + uint64be(expires_at)`。
+
+`bind_once(batch, root, session_id, *, expires_at=None)` 登记本实例的待用绑定并返回它。类型边界与 `verify_region_bound` 一致（`batch` 及其嵌套条目、`proof` 的字段类型同样校验），类型错误抛 `TypeError`；`session_id` 为空、`expires_at` 非 uint64、任一 `U` 成帧整数（`leaf_count`、`proof.leaf_count` 或索引）为负或超出 uint64、或 id 已待用/已消费均抛 `ValueError`。
+
+`check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` 的校验次序为：先核对登记册中的待用绑定与提交绑定按值相等，再重算摘要确认提交的 `batch`/`root` 就是绑定时的对象，再检查期限（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`），随后以**同一个 `randbelow`** 调用 `verify_region_bound(batch, root, randbelow=randbelow)`——根与兄弟摘要须恰 32 字节、Merkle 根校验与区域批验证明全部通过其随机源契约（每结构合法分支 `randbelow(prime - 1)` 一次，非整数返回 `TypeError`、越界返回 `ValueError`），不做包装或改写。只有全部成功才消费 `session_id`；未登记（含已消费）的 id、不等值绑定、摘要不符、过期、根或兄弟长度错误、错误根、任何结构/证明无效或委托验证返回 `False` 一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。绑定状态不跨实例共享；`check` 的参数类型错误（含不可调用的 `randbelow`）抛 `TypeError`。入口不改写任何输入。
 
 ## 限制
 

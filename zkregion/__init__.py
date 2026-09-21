@@ -3426,7 +3426,7 @@ def _check_bound_region_batch_types(batch: object, root: object) -> None:
 
 
 class BoundRegionReplayGuard:
-    """Per-instance, single-use replay protection for a bound region batch.
+    """Single-use replay protection for a Merkle-committed region batch.
 
     A fresh guard has no registrations. :meth:`bind_once` registers a
     pending :class:`ReplayBinding` that commits a whole
@@ -3434,24 +3434,38 @@ class BoundRegionReplayGuard:
     claimed under; :meth:`check` accepts an equal pending binding exactly
     once — recomputing the binding digest, checking the expiry and
     delegating to :func:`verify_region_bound` with the random source passed
-    through — and then marks the id consumed. Both the pending and the
-    consumed state live on this guard instance and are never shared.
+    through — and then marks the id consumed. By default both the pending
+    and the consumed state live on this guard instance and are never shared
+    between instances; passing an :class:`SQLiteReplayStore` as ``store``
+    instead keeps the state in that store under the ``b"zr/brg/v1"`` key
+    domain, so bound-region guards attached to the same store namespace
+    share pending, claimed and consumed ids across independent instances,
+    processes and process restarts.
 
     Concurrent checks of the same id are decided by an atomic claim taken
-    before the (potentially slow) delegated batch verification; the claim is
-    per-id registry state rather than a global lock, so a batch being
-    verified under one id never serializes checks or binds of other ids.
+    before the (potentially slow) delegated batch verification (the
+    in-instance registry lock, or the store's short transaction and unique
+    claim token); the claim is per-id registry state rather than a global
+    lock, so a batch being verified under one id never serializes checks or
+    binds of other ids.
     """
 
-    def __init__(self) -> None:
-        self._registry = _ReplayRegistry()
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = None if store is None else store._view(_BOUND_REGION_REPLAY_DOMAIN)
+        self._registry = None if store is not None else _ReplayRegistry()
 
     @property
     def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
         return self._registry.pending_snapshot()
 
     @property
     def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
         return self._registry.consumed_snapshot()
 
     def bind_once(
@@ -3487,7 +3501,10 @@ class BoundRegionReplayGuard:
             _bound_region_replay_digest(batch, root, session_id, expires_at),
             expires_at,
         )
-        self._registry.register(session_id, binding)
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
         return binding
 
     def check(
@@ -3540,6 +3557,10 @@ class BoundRegionReplayGuard:
         if not _bound_region_replay_encodable(batch):
             return False  # negative or oversized U-framed integers
         session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(
+                batch, root, binding, session_id, current, randbelow
+            )
         if not self._registry.claim(session_id, binding):
             return False  # unknown id, already consumed, claimed, or unequal binding
         committed = False
@@ -3559,6 +3580,52 @@ class BoundRegionReplayGuard:
         finally:
             if not committed:
                 self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        batch: BoundRegionBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+        randbelow: Callable[[int], int],
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over); the digest and expiry are checked and the batch is
+        verified with no transaction held, passing ``randbelow`` through to
+        :func:`verify_region_bound` unchanged. Only the token returned by
+        the winning claim can consume the id, and every rejection or
+        escaped error restores the id to pending with that same token. A
+        stale token (a claim taken over while verification ran) neither
+        consumes nor restores anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_region_replay_digest(batch, root, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_region_bound(batch, root, randbelow=randbelow):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
 
 
 # ---------------------------------------------------------------------------

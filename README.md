@@ -237,13 +237,21 @@ assert brg_b.check(bound_region, region_root, brg_binding)    # 认领、验根�
 assert not brg_a.check(bound_region, region_root, brg_binding)  # 已消费，二次提交被拒
 store.close()
 
-# 整批 BoundRangeBatch 与 bytes 根的实例内一次性绑定
+# 整批 BoundRangeBatch 与 bytes 根的一次性绑定（可经 SQLiteReplayStore 跨实例/重启共享）
 from zkregion import BoundRangeReplayGuard
 
 brr = BoundRangeReplayGuard()
 brr_binding = brr.bind_once(bound_range, range_root, b"session-1")
 assert brr.check(bound_range, range_root, brr_binding)         # 先验根与整批证明再消费
 assert not brr.check(bound_range, range_root, brr_binding)     # 二次提交被拒
+
+store = SQLiteReplayStore(tempfile.mktemp(suffix=".db"))
+brr_a = BoundRangeReplayGuard(store=store)
+brr_binding = brr_a.bind_once(bound_range, range_root, b"session-2")
+brr_b = BoundRangeReplayGuard(store=store)                     # 另一个独立实例
+assert brr_b.check(bound_range, range_root, brr_binding)       # 认领、验根与整批证明并消费
+assert not brr_a.check(bound_range, range_root, brr_binding)   # 已消费，二次提交被拒
+store.close()
 
 # 整批 BoundSchnorrBatch 与 bytes 根的实例内一次性绑定
 from zkregion import BoundSchnorrReplayGuard
@@ -312,7 +320,7 @@ python3 -m zkregion
 - `ReplayGuard(*, store=None)` — 防重放登记册（线程安全）；无参时状态隔离在本实例内存中，传入 `SQLiteReplayStore` 时待用/认领/已消费状态落在该存储中
   - `bind_once(entry: MultiSchnorrEntry, session_id, *, expires_at=None) -> ReplayBinding` — 登记待用绑定；待用、正在校验（认领未过期）或已消费的 `session_id` 重绑抛 `ValueError`；存储后端下连过期认领的 id 也不能重绑（只有 `check` 能接管过期认领）
   - `check(entry, binding, *, now=None) -> bool` — 原子认领等值待用绑定（存储后端可在认领租约过期后接管旧认领），再以条目的公钥与群参数构造 `SchnorrVerifier` 并以 `message`、`proof`、`context` 调 `verify_proof`；成功才消费 `session_id`，任何拒绝（含竞争失败）都返回 `False` 且不消费；存储后端下只有持有当前认领 token 的一方能消费，拒绝或异常时以该 token 把 id 复原为待用
-- `SQLiteReplayStore(path: str, namespace: bytes = b"default", *, lease_seconds: int = 30, clock=None)` — `ReplayGuard`、`RangeReplayGuard`、`RegionReplayGuard` 与 `BoundRegionReplayGuard` 的可选 SQLite 后端：同一文件同一命名空间的独立实例（含重启后、跨进程）共享待用、认领与已消费状态；行键为 `namespace`、守卫域（`ReplayGuard` 为 `b"zr/r/v1"`、`RangeReplayGuard` 为 `b"zr/rr/v1"`、`RegionReplayGuard` 为 `b"zr/rg/v1"`、`BoundRegionReplayGuard` 为 `b"zr/brg/v1"`）、`session_id` 三段 `bytes`，值保存等值 `ReplayBinding`（摘要与 `E` 期限编码逐字节沿用绑定摘要的编码）及状态、认领 token 与租约截止；`clock` 缺省取整数 Unix 秒，返回值须为非 `bool` uint64，否则 `ValueError`/`TypeError`；`lease_seconds` 须为正的非 `bool` 整数否则 `ValueError`；`store` 参数类型错误抛 `TypeError`；数据库错误原样透传 `sqlite3.Error`
+- `SQLiteReplayStore(path: str, namespace: bytes = b"default", *, lease_seconds: int = 30, clock=None)` — `ReplayGuard`、`RangeReplayGuard`、`RegionReplayGuard`、`BoundRegionReplayGuard` 与 `BoundRangeReplayGuard` 的可选 SQLite 后端：同一文件同一命名空间的独立实例（含重启后、跨进程）共享待用、认领与已消费状态；行键为 `namespace`、守卫域（`ReplayGuard` 为 `b"zr/r/v1"`、`RangeReplayGuard` 为 `b"zr/rr/v1"`、`RegionReplayGuard` 为 `b"zr/rg/v1"`、`BoundRegionReplayGuard` 为 `b"zr/brg/v1"`、`BoundRangeReplayGuard` 为 `b"zr/brr/v1"`）、`session_id` 三段 `bytes`，值保存等值 `ReplayBinding`（摘要与 `E` 期限编码逐字节沿用绑定摘要的编码）及状态、认领 token 与租约截止；`clock` 缺省取整数 Unix 秒，返回值须为非 `bool` uint64，否则 `ValueError`/`TypeError`；`lease_seconds` 须为正的非 `bool` 整数否则 `ValueError`；`store` 参数类型错误抛 `TypeError`；数据库错误原样透传 `sqlite3.Error`
 - `RangeReplayGuard(*, store=None)` — 区间证明的防重放登记册（线程安全）；无参时状态隔离在本实例内存中，传入 `SQLiteReplayStore` 时待用/认领/已消费状态落在该存储中（行键域为 `b"zr/rr/v1"`）
   - `bind_once(entry: RangeBatchEntry, session_id, *, expires_at=None) -> ReplayBinding` — 登记待用绑定；待用、正在校验（认领未过期）或已消费的 `session_id` 重绑抛 `ValueError`；存储键已存在即抛 `ValueError`，存储后端下连过期认领的 id 也不能重绑（只有 `check` 能接管过期认领）
   - `check(entry, binding, *, now=None) -> bool` — 原子认领等值待用绑定（存储后端可在认领租约过期后接管旧认领），再按字段顺序以 `commitment`、`proof`、`context` 调 `verify_range`；成功才消费 `session_id`，任何拒绝（含竞争失败）都返回 `False` 且不消费；存储后端下只有持有当前认领 token 的一方能消费，拒绝或异常时以该 token 把 id 复原为待用
@@ -322,9 +330,9 @@ python3 -m zkregion
 - `BoundRegionReplayGuard(*, store=None)` — Merkle 承诺区域批与 Merkle 根的防重放登记册（线程安全）；无参时状态隔离在本实例内存中，传入 `SQLiteReplayStore` 时待用/认领/已消费状态落在该存储中（行键域为 `b"zr/brg/v1"`）
   - `bind_once(batch: BoundRegionBatch, root: bytes, session_id: bytes, *, expires_at=None) -> ReplayBinding` — 把整批 `BoundRegionBatch` 连同其 Merkle `root` 一次性绑定到 `session_id`；空值、uint64 越界或待用/校验中（存储后端下含过期认领）/已消费 id 重绑抛 `ValueError`，类型错误抛 `TypeError`
   - `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` — 原子认领、重算绑定摘要、检查期限后委托 `verify_region_bound` 并透传同一随机源；成功才消费 `session_id`，其余无效一律返回 `False` 且撤销认领、保持待用，`randbelow` 抛错时同样撤销认领并原样抛出；存储后端下只有持有当前认领 token 的一方能消费，拒绝或异常时以该 token 把 id 复原为待用（token 已失效则为无操作）
-- `BoundRangeReplayGuard()` — Merkle 承诺区间批与 bytes 根的实例内防重放登记册（线程安全）
-  - `bind_once(batch: BoundRangeBatch, root: bytes, session_id: bytes, *, expires_at=None) -> ReplayBinding` — 把整批 `BoundRangeBatch` 连同其 Merkle `root` 一次性绑定到 `session_id`；空值、uint64 越界或待用/校验中/已消费 id 重绑抛 `ValueError`，类型错误抛 `TypeError`
-  - `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` — 原子认领、重算绑定摘要、检查期限后委托 `verify_range_bound` 并透传同一随机源；成功才消费 `session_id`，其余无效一律返回 `False` 且撤销认领、保持待用，`randbelow` 抛错时同样撤销认领并原样抛出
+- `BoundRangeReplayGuard(*, store=None)` — Merkle 承诺区间批与 bytes 根的防重放登记册（线程安全）；无参时状态隔离在本实例内存中，传入 `SQLiteReplayStore` 时待用/认领/已消费状态落在该存储中（行键域为 `b"zr/brr/v1"`）
+  - `bind_once(batch: BoundRangeBatch, root: bytes, session_id: bytes, *, expires_at=None) -> ReplayBinding` — 把整批 `BoundRangeBatch` 连同其 Merkle `root` 一次性绑定到 `session_id`；空值、uint64 越界或待用/校验中（存储后端下含过期认领）/已消费 id 重绑抛 `ValueError`，类型错误抛 `TypeError`
+  - `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` — 原子认领、重算绑定摘要、检查期限后委托 `verify_range_bound` 并透传同一随机源；成功才消费 `session_id`，其余无效一律返回 `False` 且撤销认领、保持待用，`randbelow` 抛错时同样撤销认领并原样抛出；存储后端下只有持有当前认领 token 的一方能消费，拒绝或异常时以该 token 把 id 复原为待用（token 已失效则为无操作）
 - `BoundSchnorrReplayGuard()` — Merkle 承诺 Schnorr 批与 bytes 根的实例内防重放登记册（线程安全）
   - `bind_once(batch: BoundSchnorrBatch, root: bytes, session_id: bytes, *, expires_at=None) -> ReplayBinding` — 把整批 `BoundSchnorrBatch` 连同其 Merkle `root` 一次性绑定到 `session_id`；空值、uint64 越界、叶内负整数或待用/校验中/已消费 id 重绑抛 `ValueError`，类型错误抛 `TypeError`
   - `check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` — 原子认领、重算绑定摘要、检查期限后原样委托 `verify_bound` 并透传同一随机源；成功才消费 `session_id`，其余无效（含叶内负整数）一律返回 `False` 且撤销认领、保持待用，`randbelow` 抛错时同样撤销认领并原样抛出
@@ -581,16 +589,18 @@ digest = SHA-256(
 
 存储后端下 `BoundRegionReplayGuard` 复用 `SQLiteReplayStore` 的全部机制，仅行键的域段不同。行键为 `namespace`、`b"zr/brg/v1"`、`session_id` 三段 `bytes`（与同一存储上 `ReplayGuard` 的 `b"zr/r/v1"`、`RangeReplayGuard` 的 `b"zr/rr/v1"`、`RegionReplayGuard` 的 `b"zr/rg/v1"` 行互不冲突），值保存等值 `ReplayBinding`（摘要与 `E` 期限编码逐字节沿用绑定摘要的编码）、状态、认领 token 与租约截止：`bind_once` 在一个短事务中插入待用行，键已存在（待用、被认领——**即使租约已过期**——或已消费）即抛 `ValueError`；`check` 在一个短事务内写入随机认领 token 与八字节无符号大端的 `clock() + lease_seconds` 租约截止完成认领（行不存在、已消费、认领仍有效或存储绑定不等值时认领失败返回 `False`；过期认领可被等值 `binding` 的 `check` 接管并换发新 token），随后在**不持任何事务**的情况下重算摘要、检查期限并把 `randbelow` 原样传给 `verify_region_bound`；只有持有当前 token 的一方能把 id 置为已消费，一切拒绝（返回 `False`）或验证期间逃出的异常都以当前 token 把 id 复原为待用（token 已失效则为无操作，保持已消费或新认领方的状态不变），旧认领方在被接管后既不能消费也不能复原；数据库错误原样透传 `sqlite3.Error`。守卫的摘要公式、`ReplayBinding` 类型与 `bind_once`/`check` 的参数边界在内存与 SQLite 两种模式下逐字节、逐类型保持一致，旧绑定在两种后端下均兼容。
 
-### Merkle 承诺区间批的实例内一次性绑定
+### Merkle 承诺区间批的一次性绑定
 
-`BoundRangeReplayGuard` 在单个实例内为整批 :class:`BoundRangeBatch` 连同其 Merkle `root` 提供一次性会话绑定，复用同一个 `ReplayBinding` 类型，`bind_once` 的入参同为 `(batch, root, session_id, *, expires_at=None)`。绑定摘要逐字节复用 `BoundRegionReplayGuard` 的公开公式与 `F`、`U`、`S`、`E` 编码，条目顺序不变，仅两处不同：
+`BoundRangeReplayGuard(*, store=None)` 为整批 :class:`BoundRangeBatch` 连同其 Merkle `root` 提供一次性会话绑定，复用同一个 `ReplayBinding` 类型，`bind_once` 的入参同为 `(batch, root, session_id, *, expires_at=None)`。无参构造时待用/已消费状态隔离在本实例内存中，旧接口的入参与行为完全不变；传入 `SQLiteReplayStore` 时待用/认领/已消费状态落在该存储中，同文件同命名空间的独立实例（含重启后、跨进程）共享状态。绑定摘要逐字节复用 `BoundRegionReplayGuard` 的公开公式与 `F`、`U`、`S`、`E` 编码，条目顺序不变，仅两处不同：
 
 - 域改为 `D = b"zr/brr/v1"`；
 - 逐项成帧的 `L(entry_i)` 改为"Merkle 承诺的区间证明完整批验"一节定义的 BoundRange 叶原字节（`_bound_range_leaf`），即以十进制 ASCII 写六个承诺字段、`context` 与证明的 `t`/`e`/`s` 序列、域为 `b"zkregion/range-bound/v1"` 的叶原字节。
 
-`bind_once(batch, root, session_id, *, expires_at=None)` 登记本实例的待用绑定并返回它。类型边界与 `verify_range_bound` 一致（`batch` 及其嵌套条目、`proof` 的字段类型同样校验），类型错误抛 `TypeError`；`session_id` 为空、`expires_at` 非 uint64、任一 `U` 成帧整数（`leaf_count`、`proof.leaf_count` 或索引）为负或超出 uint64、或 id 已待用/已消费均抛 `ValueError`。待用与已消费状态只存在于本实例、不跨实例共享。
+`bind_once(batch, root, session_id, *, expires_at=None)` 登记待用绑定并返回它。类型边界与 `verify_range_bound` 一致（`batch` 及其嵌套条目、`proof` 的字段类型同样校验），类型错误抛 `TypeError`；`session_id` 为空、`expires_at` 非 uint64、任一 `U` 成帧整数（`leaf_count`、`proof.leaf_count` 或索引）为负或超出 uint64、或 id 已待用/校验中（存储后端下含过期认领）/已消费均抛 `ValueError`。
 
-`check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` 的校验次序与 `BoundRegionReplayGuard` 相同：先核对登记册中的待用绑定与提交绑定按值相等，再重算摘要确认提交的 `batch`/`root` 就是绑定时的对象，再检查期限（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`），随后将**同一个 `randbelow` 原样**传给 `verify_range_bound(batch, root, randbelow=randbelow)`——根与兄弟摘要须恰 32 字节、Merkle 根校验与区间批验证明全部通过其随机源契约（每结构合法分支 `randbelow(prime - 1)` 一次，非整数返回 `TypeError`、越界返回 `ValueError`），不做包装或改写。只有全部成功才消费 `session_id`；未登记（含已消费）的 id、被替换的绑定、摘要不符、过期、根或兄弟长度错误、错误根、其他摘要/结构/证明无效或委托验证返回 `False` 一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。绑定状态不跨实例共享；`check` 的参数类型错误（含不可调用的 `randbelow`）抛 `TypeError`。入口不改写任何输入。
+`check(batch, root, binding, *, now=None, randbelow=secrets.randbelow) -> bool` 的校验次序与 `BoundRegionReplayGuard` 相同：先原子认领登记册中的待用绑定（与提交绑定按值相等），再重算摘要确认提交的 `batch`/`root` 就是绑定时的对象，再检查期限（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`），随后将**同一个 `randbelow` 原样**传给 `verify_range_bound(batch, root, randbelow=randbelow)`——根与兄弟摘要须恰 32 字节、Merkle 根校验与区间批验证明全部通过其随机源契约（每结构合法分支 `randbelow(prime - 1)` 一次，非整数返回 `TypeError`、越界返回 `ValueError`），不做包装或改写。只有全部成功才消费 `session_id`；未登记（含已消费）的 id、竞争失败、被替换的绑定、摘要不符、过期、根或兄弟长度错误、错误根、其他摘要/结构/证明无效或委托验证返回 `False` 一律返回 `False` 且撤销认领、**不消费**，因此被拒的绑定稍后仍可成功一次；`randbelow` 等委托验证抛出的异常同样先撤销认领再原样透传。无参构造时绑定状态不跨实例共享；`check` 的参数类型错误（含不可调用的 `randbelow`）抛 `TypeError`，`store` 参数类型错误抛 `TypeError`。入口不改写任何输入。
+
+存储后端下 `BoundRangeReplayGuard` 复用 `SQLiteReplayStore` 的全部机制，仅行键的域段不同。行键为 `namespace`、`b"zr/brr/v1"`、`session_id` 三段 `bytes`（与同一存储上 `ReplayGuard` 的 `b"zr/r/v1"`、`RangeReplayGuard` 的 `b"zr/rr/v1"`、`RegionReplayGuard` 的 `b"zr/rg/v1"`、`BoundRegionReplayGuard` 的 `b"zr/brg/v1"` 行互不冲突），值保存等值 `ReplayBinding`（摘要与 `E` 期限编码逐字节沿用绑定摘要的编码）、状态、认领 token 与租约截止：`bind_once` 在一个短事务中插入待用行，键已存在（待用、被认领——**即使租约已过期**——或已消费）即抛 `ValueError`；`check` 在一个短事务内写入随机认领 token 与八字节无符号大端的 `clock() + lease_seconds` 租约截止完成认领（行不存在、已消费、认领仍有效或存储绑定不等值时认领失败返回 `False`；过期认领可被等值 `binding` 的 `check` 接管并换发新 token），随后在**不持任何事务**的情况下重算摘要、检查期限并把 `randbelow` 原样传给 `verify_range_bound`；只有持有当前 token 的一方能把 id 置为已消费，一切拒绝（返回 `False`）或验证期间逃出的异常都以当前 token 把 id 复原为待用（token 已失效则为无操作，保持已消费或新认领方的状态不变），旧认领方在被接管后既不能消费也不能复原；数据库错误原样透传 `sqlite3.Error`。守卫的摘要公式、`ReplayBinding` 类型与 `bind_once`/`check` 的参数边界在内存与 SQLite 两种模式下逐字节、逐类型保持一致，旧绑定在两种后端下均兼容。
 
 ### Merkle 承诺 Schnorr 批的实例内一次性绑定
 
@@ -613,7 +623,7 @@ digest = SHA-256(
 - **短暂认领、无全局锁**：认领只是按 id 记录的登记册状态（每次只在极短临界区内用一个 `threading.Lock` 改写字典），锁在委托验证之前就已释放。一个标识的耗时验证**不会**持有阻塞其他标识的全局锁——不同 `session_id` 的 `check` 与 `bind_once` 可以全程并发，互不串行。
 - **已消费或校验中均不可重绑**：`bind_once` 对待用、校验中、已消费三种状态的 id 都抛 `ValueError`。
 - **成功后原子消费；失败即撤销**：只有全部校验通过才把 id 原子移入已消费。返回 `False`（竞争失败、摘要不符、过期、委托验证返回 `False` 等）、过期，或委托验证/`randbelow` 抛出异常（Bound 守卫透传其 `TypeError` / `ValueError` 等）时，认领都被撤销，id 恢复为待用并保留原绑定，因此稍后仍可成功一次；整个过程不产生 `KeyError`，也不改写任何输入。
-- **实例隔离或共享存储**：无参构造时，待用/校验中/已消费状态只存在于单个守卫实例内，不同实例（即便同 id）完全独立、互不阻塞；传入同一 `SQLiteReplayStore`（同文件、同命名空间）的守卫实例则经由短事务与唯一认领 token 共享三种状态，跨实例、跨进程并在重启后保持一致，认领租约过期后只能由等值 `binding` 的 `check` 接管，不同守卫域（`zr/r/v1`、`zr/rr/v1`、`zr/rg/v1`、`zr/brg/v1`）的行互不冲突。
+- **实例隔离或共享存储**：无参构造时，待用/校验中/已消费状态只存在于单个守卫实例内，不同实例（即便同 id）完全独立、互不阻塞；传入同一 `SQLiteReplayStore`（同文件、同命名空间）的守卫实例则经由短事务与唯一认领 token 共享三种状态，跨实例、跨进程并在重启后保持一致，认领租约过期后只能由等值 `binding` 的 `check` 接管，不同守卫域（`zr/r/v1`、`zr/rr/v1`、`zr/rg/v1`、`zr/brg/v1`、`zr/brr/v1`）的行互不冲突。
 - **字节级兼容**：并发改造不改变 `ReplayBinding` 的任何字节——各守卫既有域标签、`F`/`U`/`S`/`E` 成帧、叶字段与整数顺序、Merkle 根与期限编码逐字节不变，方法签名（单条 `bind_once(entry, session_id, *, expires_at=None)` / `check(entry, binding, *, now=None)`；Bound 批 `bind_once(batch, root, session_id, *, expires_at=None)` / `check(batch, root, binding, *, now=None, randbelow=...)`）与既有 `TypeError`/`ValueError` 边界保持不变，旧绑定与单线程行为完全兼容。
 
 ## 限制

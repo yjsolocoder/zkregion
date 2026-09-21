@@ -184,6 +184,22 @@ try:
 except ValueError:
     pass
 
+# 可选 SQLite 后端：同文件同命名空间的独立实例（含重启后）共享状态
+import tempfile
+from zkregion import SQLiteReplayStore
+
+store = SQLiteReplayStore(tempfile.mktemp(suffix=".db"))
+shared_a = ReplayGuard(store=store)
+binding = shared_a.bind_once(entry, b"session-2")         # 短事务写入待用
+shared_b = ReplayGuard(store=store)                       # 另一个独立实例
+assert shared_b.check(entry, binding)                     # 认领、验签并消费
+assert not shared_a.check(entry, binding)                 # 已消费，二次提交被拒
+try:
+    shared_b.bind_once(entry, b"session-2")
+except ValueError:
+    pass
+store.close()
+
 # 区间证明的实例内一次性绑定
 from zkregion import RangeReplayGuard
 
@@ -284,9 +300,10 @@ python3 -m zkregion
 - `verify_region_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的区域证明完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_region_batch` 验子证明
 - `BoundRegionBatch(entries, leaf_count, proof)` — 冻结的完整批对象；字段依次为 `tuple[RegionBatchEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变
 - `ReplayBinding(session_id, digest, expires_at=None)` — 冻结的一次性防重放绑定；字段依次为非空 `bytes`、`bytes` 摘要（不限定长度；各守卫登记的均为 32 字节 SHA-256 摘要）、`None` 或非 `bool` 的 uint64 Unix 秒过期时间；可位置构造、按值相等且不可变
-- `ReplayGuard()` — 实例内防重放登记册（线程安全）
-  - `bind_once(entry: MultiSchnorrEntry, session_id, *, expires_at=None) -> ReplayBinding` — 登记本实例的待用绑定；待用、正在校验或已消费的 `session_id` 重绑抛 `ValueError`
-  - `check(entry, binding, *, now=None) -> bool` — 原子认领本实例的待用等值绑定，再以条目的公钥与群参数构造 `SchnorrVerifier` 并以 `message`、`proof`、`context` 调 `verify_proof`；成功才消费 `session_id`，任何拒绝（含竞争失败）都返回 `False` 且不消费
+- `ReplayGuard(*, store=None)` — 防重放登记册（线程安全）；无参时状态隔离在本实例内存中，传入 `SQLiteReplayStore` 时待用/认领/已消费状态落在该存储中
+  - `bind_once(entry: MultiSchnorrEntry, session_id, *, expires_at=None) -> ReplayBinding` — 登记待用绑定；待用、正在校验（认领未过期）或已消费的 `session_id` 重绑抛 `ValueError`；存储后端下连过期认领的 id 也不能重绑（只有 `check` 能接管过期认领）
+  - `check(entry, binding, *, now=None) -> bool` — 原子认领等值待用绑定（存储后端可在认领租约过期后接管旧认领），再以条目的公钥与群参数构造 `SchnorrVerifier` 并以 `message`、`proof`、`context` 调 `verify_proof`；成功才消费 `session_id`，任何拒绝（含竞争失败）都返回 `False` 且不消费；存储后端下只有持有当前认领 token 的一方能消费，拒绝或异常时以该 token 把 id 复原为待用
+- `SQLiteReplayStore(path: str, namespace: bytes = b"default", *, lease_seconds: int = 30, clock=None)` — `ReplayGuard` 的可选 SQLite 后端：同一文件同一命名空间的独立实例（含重启后、跨进程）共享待用、认领与已消费状态；行键为 `namespace`、`b"zr/r/v1"`、`session_id` 三段 `bytes`，值保存等值 `ReplayBinding`（摘要与 `E` 期限编码逐字节沿用绑定摘要的编码）及状态；`clock` 缺省取整数 Unix 秒，返回值须为非 `bool` uint64，否则 `ValueError`/`TypeError`；`lease_seconds` 须为正的非 `bool` 整数否则 `ValueError`；`store` 参数类型错误抛 `TypeError`；数据库错误原样透传 `sqlite3.Error`
 - `RangeReplayGuard()` — 区间证明的实例内防重放登记册（线程安全）
   - `bind_once(entry: RangeBatchEntry, session_id, *, expires_at=None) -> ReplayBinding` — 登记本实例的待用绑定；待用、正在校验或已消费的 `session_id` 重绑抛 `ValueError`
   - `check(entry, binding, *, now=None) -> bool` — 原子认领后按字段顺序以 `commitment`、`proof`、`context` 调 `verify_range`；成功才消费 `session_id`，任何拒绝（含竞争失败）都返回 `False` 且不消费
@@ -484,7 +501,17 @@ digest = SHA-256(F(D) || F(session_id) || L(entry) || F(E))
 
 `bind_once(entry, session_id, *, expires_at=None)` 登记本实例的待用绑定并返回它：`session_id` 为空抛 `ValueError`，`expires_at` 越界（非 uint64）抛 `ValueError`，类型错误（含 `bool`、非 `bytes` 的 `session_id`、非 `MultiSchnorrEntry` 条目或其嵌套字段类型错误）抛 `TypeError`；`session_id` 已处于待用或已消费状态时重绑抛 `ValueError`。
 
-`check(entry, binding, *, now=None) -> bool` 只接受本实例内仍待用且与登记值相等的绑定。校验次序为：在登记册中查到 `binding.session_id` 的待用绑定且与 `binding` 按值相等；重算摘要确认提交的 `entry` 就是绑定时的条目；有期绑定要求 `now < expires_at`（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`）；随后以条目的公钥与群参数构造 `SchnorrVerifier(public_key, prime=entry.prime, generator=entry.generator)`，再以 `entry.message`、`entry.proof`、`entry.context`（keyword `context=`）调用 `verify_proof`，旧接口的入参与行为完全不变——非法群参数或验签失败均返回 `False`。只有全部成功才把 `session_id` 从待用移入已消费；未登记（含已消费）的 id、不等值绑定、摘要不符、过期或验签失败一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。绑定状态不跨实例共享；`check` 的参数类型错误抛 `TypeError`。入口不改写任何输入。
+`check(entry, binding, *, now=None) -> bool` 只接受仍待用且与登记值相等的绑定。校验次序为：在登记册中查到 `binding.session_id` 的待用绑定且与 `binding` 按值相等；重算摘要确认提交的 `entry` 就是绑定时的条目；有期绑定要求 `now < expires_at`（`now` 缺省取当前 Unix 秒，显式给出时须为非 `bool` uint64，越界抛 `ValueError`）；随后以条目的公钥与群参数构造 `SchnorrVerifier(public_key, prime=entry.prime, generator=entry.generator)`，再以 `entry.message`、`entry.proof`、`entry.context`（keyword `context=`）调用 `verify_proof`，旧接口的入参与行为完全不变——非法群参数或验签失败均返回 `False`。只有全部成功才把 `session_id` 从待用移入已消费；未登记（含已消费）的 id、不等值绑定、摘要不符、过期或验签失败一律返回 `False` 且**不消费**，因此被拒的绑定稍后仍可成功一次。无参构造时绑定状态不跨实例共享；`check` 的参数类型错误抛 `TypeError`。入口不改写任何输入。
+
+#### 可选 SQLite 后端
+
+`ReplayGuard(*, store=None)` 在传入 `SQLiteReplayStore` 时，待用、认领与已消费三种状态改由该存储保存，守卫的摘要公式、`ReplayBinding` 类型与 `bind_once`/`check` 的参数边界逐字节、逐类型保持不变。
+
+`SQLiteReplayStore(path: str, namespace: bytes = b"default", *, lease_seconds: int = 30, clock=None)` 打开（必要时创建）`path` 处的 SQLite 数据库：`path` 须为 `str`、`namespace` 须为 `bytes`，否则 `TypeError`；`lease_seconds` 须为正的非 `bool` 整数，类型错抛 `TypeError`、非正抛 `ValueError`；`clock` 缺省为返回整数 Unix 秒的可调用对象，显式给出时必须可调用（否则 `TypeError`），其返回值须为非 `bool` 整数且落在 uint64 范围内——`bool`/非整数抛 `TypeError`，越界抛 `ValueError`；`clock() + lease_seconds` 越出 uint64 同样抛 `ValueError`。每个状态行的键为 `namespace`、`b"zr/r/v1"`、`session_id` 三段 `bytes`，值保存与 `ReplayBinding` 等值的摘要与期限（无期 `b"\x00"`、有期 `b"\x01" + uint64be(expires_at)`，与摘要中的 `E` 编码一致；租约截止时间因 SQLite 整数为有符号 64 位而以 8 字节大端 `BLOB` 保存）以及状态与认领 token。同一文件同一命名空间的多个独立 `SQLiteReplayStore`（包括重启后与其它进程中的实例）共享全部状态，不同命名空间互不影响；数据库错误原样透传 `sqlite3.Error`。
+
+`bind_once` 在一个短事务中插入待用行；键已存在即抛 `ValueError`——待用、被认领（**即使认领租约已过期**；过期认领只能由 `check` 接管）或已消费的 id 都不能重绑。
+
+`check` 在一个短事务内写入随机认领 token 与 `clock() + lease_seconds` 截止时间后完成认领（待用时要求存储的绑定与提交的 `binding` 按值相等；行不存在、已消费或认领仍有效时认领失败返回 `False`），随后在**不持任何事务**的情况下重算摘要、检查期限并验签。认领截止时间已过的旧认领可被等值 `binding` 的 `check` 接管并换发新 token；只有持有当前 token 的一方能把 id 置为已消费，旧 token 在被接管后既不能消费也不能复原。验签失败、摘要不符、过期等一切拒绝以及验证期间逃出的异常，都以当前 token 在短事务中把 id 复原为待用（token 已失效则为无操作，保持已消费或新认领方的状态不变）；旧认领方因此不可能在被接管后消费成功。
 
 ### 区间证明的实例内一次性绑定
 

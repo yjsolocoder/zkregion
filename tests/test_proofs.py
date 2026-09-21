@@ -1,5 +1,9 @@
 import dataclasses
 import hashlib
+import os
+import sqlite3
+import tempfile
+import threading
 import unittest
 
 from zkregion import (
@@ -24,6 +28,7 @@ from zkregion import (
     RegionReplayGuard,
     ReplayBinding,
     ReplayGuard,
+    SQLiteReplayStore,
     SchnorrBatchEntry,
     SchnorrProof,
     SchnorrProver,
@@ -4286,6 +4291,418 @@ class ReplayGuardTest(unittest.TestCase):
         guard.check(self.entry, binding, now=1)
         self.assertEqual(self.entry, snapshot)
         self.assertEqual(binding, binding_snapshot)
+
+
+class SQLiteReplayStoreTest(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "replay.db")
+        self.prover = SchnorrProver(secret=4321, prime=SMALL_PRIME, generator=3,
+                                    randbelow=counter_randbelow())
+        self.entry = MultiSchnorrEntry(
+            self.prover.public_key, b"spend",
+            self.prover.prove(b"spend", context=b"ctx"),
+            b"ctx", SMALL_PRIME, 3,
+        )
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state, digest, "
+                "expires_at, token, claim_expires FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    # ---- construction -------------------------------------------------------
+
+    def test_construction_validation(self):
+        with self.assertRaises(TypeError):
+            SQLiteReplayStore(123)
+        with self.assertRaises(TypeError):
+            SQLiteReplayStore(self.path, namespace="default")
+        with self.assertRaises(TypeError):
+            SQLiteReplayStore(self.path, namespace=b"default", lease_seconds="30")
+        with self.assertRaises(TypeError):
+            SQLiteReplayStore(self.path, lease_seconds=True)
+        with self.assertRaises(TypeError):
+            SQLiteReplayStore(self.path, clock=123)
+        for bad in (0, -1, -100):
+            with self.assertRaises(ValueError):
+                SQLiteReplayStore(self.path, lease_seconds=bad)
+
+    def test_defaults(self):
+        store = self.make_store()
+        self.assertEqual(store._namespace, b"default")
+        now = store._clock()
+        self.assertIsInstance(now, int)
+        self.assertNotIsInstance(now, bool)
+        self.assertGreater(now, 10**9)
+
+    def test_guard_rejects_non_store(self):
+        for bad in (object(), "path", 1, True, b"ns", {}):
+            with self.assertRaises(TypeError):
+                ReplayGuard(store=bad)
+
+    # ---- sharing, persistence, isolation ------------------------------------
+
+    def test_independent_instances_share_pending_and_consumed(self):
+        store = self.make_store()
+        first = ReplayGuard(store=store)
+        second = ReplayGuard(store=store)
+        binding = first.bind_once(self.entry, b"s")
+        self.assertIn(b"s", second._pending)
+        self.assertTrue(second.check(self.entry, binding, now=1))
+        self.assertIn(b"s", first._consumed)
+        self.assertFalse(first.check(self.entry, binding, now=1))
+        with self.assertRaises(ValueError):
+            second.bind_once(self.entry, b"s")
+
+    def test_state_survives_store_reopen(self):
+        store = self.make_store()
+        with_expiry = ReplayGuard(store=store).bind_once(
+            self.entry, b"a", expires_at=1000
+        )
+        ReplayGuard(store=store).bind_once(self.entry, b"b")
+        store.close()
+        store = self.make_store()
+        guard = ReplayGuard(store=store)
+        pending = guard._pending
+        self.assertEqual(pending[b"a"], with_expiry)
+        self.assertEqual(pending[b"b"].session_id, b"b")
+        self.assertTrue(guard.check(self.entry, with_expiry, now=999))
+        store.close()
+        store = self.make_store()
+        guard = ReplayGuard(store=store)
+        self.assertEqual(guard._consumed, {b"a"})
+        self.assertNotIn(b"a", guard._pending)
+        self.assertFalse(
+            guard.check(self.entry, with_expiry, now=999)
+        )
+
+    def test_namespaces_in_one_file_are_independent(self):
+        a = self.make_store(namespace=b"alpha")
+        b = self.make_store(namespace=b"beta")
+        binding_a = ReplayGuard(store=a).bind_once(self.entry, b"s")
+        self.assertFalse(ReplayGuard(store=b).check(self.entry, binding_a, now=1))
+        binding_b = ReplayGuard(store=b).bind_once(self.entry, b"s")
+        self.assertTrue(ReplayGuard(store=b).check(self.entry, binding_b, now=1))
+        self.assertTrue(ReplayGuard(store=a).check(self.entry, binding_a, now=1))
+
+    def test_in_memory_default_remains_isolated(self):
+        first, second = ReplayGuard(), ReplayGuard()
+        binding = first.bind_once(self.entry, b"s")
+        self.assertFalse(second.check(self.entry, binding, now=1))
+        self.assertTrue(first.check(self.entry, binding, now=1))
+
+    # ---- database contents --------------------------------------------------
+
+    def test_row_key_and_value_use_spec_segments_and_e_encoding(self):
+        store = self.make_store(namespace=b"ns1")
+        guard = ReplayGuard(store=store)
+        no_expiry = guard.bind_once(self.entry, b"s0")
+        with_expiry = guard.bind_once(self.entry, b"s1", expires_at=12345)
+        rows = {row[2]: row for row in self.raw_rows()}
+        for binding, expected_expiry in (
+            (no_expiry, b"\x00"),
+            (with_expiry, b"\x01" + (12345).to_bytes(8, "big")),
+        ):
+            namespace, domain, session_id, state, digest, expiry, token, deadline = rows[
+                binding.session_id
+            ]
+            self.assertEqual(namespace, b"ns1")
+            self.assertEqual(domain, b"zr/r/v1")
+            self.assertEqual(session_id, binding.session_id)
+            self.assertEqual(state, "pending")
+            self.assertEqual(digest, binding.digest)
+            self.assertEqual(expiry, expected_expiry)
+            self.assertIsNone(token)
+            self.assertIsNone(deadline)
+
+    def test_persisted_binding_digest_matches_spec(self):
+        store = self.make_store()
+        binding = ReplayGuard(store=store).bind_once(self.entry, b"s")
+
+        def enc(value):
+            return value.to_bytes(max(1, (value.bit_length() + 7) // 8), "big")
+
+        items = (
+            b"zkregion/schnorr-fs/v1",
+            enc(self.entry.prime), enc(self.entry.generator),
+            enc(self.entry.public_key),
+            enc(self.entry.proof.commitment), self.entry.context,
+            self.entry.message, enc(self.entry.proof.response),
+        )
+        leaf = b"".join(len(x).to_bytes(4, "big") + x for x in items)
+
+        def frame(item):
+            return len(item).to_bytes(4, "big") + item
+
+        expected = hashlib.sha256(
+            frame(b"zr/r/v1") + frame(b"s") + leaf + frame(b"\x00")
+        ).digest()
+        self.assertEqual(binding.digest, expected)
+
+    # ---- bind_once ----------------------------------------------------------
+
+    def test_bind_once_rejects_pending_claimed_expired_claim_and_consumed(self):
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = ReplayGuard(store=store)
+        binding = guard.bind_once(self.entry, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"s")
+        token = store.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):  # live claim cannot be rebound
+            guard.bind_once(self.entry, b"s")
+        clock["t"] = 2000  # let the claim lease expire
+        with self.assertRaises(ValueError):  # expired claim still cannot be rebound
+            guard.bind_once(self.entry, b"s")
+        new_token = store.claim(b"s", binding)
+        self.assertTrue(store.commit(b"s", new_token))
+        with self.assertRaises(ValueError):  # consumed id can never be rebound
+            guard.bind_once(self.entry, b"s")
+
+    def test_bind_once_validation_matches_memory_guard(self):
+        store = self.make_store()
+        guard = ReplayGuard(store=store)
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"")
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"s", expires_at=-1)
+        with self.assertRaises(TypeError):
+            guard.bind_once(self.entry, "s")
+        with self.assertRaises(TypeError):
+            guard.bind_once("entry", b"s")
+
+    # ---- check: accept, reject, consume -------------------------------------
+
+    def test_check_accepts_then_consumes_across_instances(self):
+        store = self.make_store()
+        binder = ReplayGuard(store=store)
+        binding = binder.bind_once(self.entry, b"s", expires_at=1000)
+        checker = ReplayGuard(store=store)
+        self.assertTrue(checker.check(self.entry, binding, now=999))
+        self.assertFalse(checker.check(self.entry, binding, now=999))
+        state = {row[2]: row[3] for row in self.raw_rows()}
+        self.assertEqual(state[b"s"], "consumed")
+
+    def test_expired_binding_rejection_leaves_pending(self):
+        store = self.make_store()
+        guard = ReplayGuard(store=store)
+        binding = guard.bind_once(self.entry, b"s", expires_at=1000)
+        self.assertFalse(guard.check(self.entry, binding, now=1000))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(self.entry, binding, now=999))
+
+    def test_bad_proof_and_unequal_binding_rejected_without_consuming(self):
+        store = self.make_store()
+        guard = ReplayGuard(store=store)
+        forged_entry = MultiSchnorrEntry(
+            self.entry.public_key, b"spend",
+            SchnorrProof(self.entry.proof.commitment,
+                         self.entry.proof.response + 1),
+            b"ctx", SMALL_PRIME, 3,
+        )
+        binding = guard.bind_once(forged_entry, b"s")
+        self.assertFalse(guard.check(forged_entry, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        # an unequal binding cannot even take the pending claim
+        forged_binding = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertIsNone(store.claim(b"s", forged_binding))
+        # other session ids remain fully usable on the same store
+        other_guard = ReplayGuard(store=store)
+        fresh = other_guard.bind_once(self.entry, b"t")
+        self.assertTrue(other_guard.check(self.entry, fresh, now=1))
+
+    def test_unknown_and_consumed_ids_rejected(self):
+        store = self.make_store()
+        guard = ReplayGuard(store=store)
+        self.assertFalse(
+            guard.check(self.entry, ReplayBinding(b"never", b"\x00" * 32), now=1)
+        )
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+        self.assertFalse(guard.check(self.entry, binding, now=1))
+
+    # ---- claim tokens and lease takeover ------------------------------------
+
+    def test_only_current_token_consumes_stale_token_loses(self):
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = ReplayGuard(store=store).bind_once(self.entry, b"s")
+        old_token = store.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(store.claim(b"s", binding))  # a live claim blocks takeover
+        clock["t"] = 1010
+        new_token = store.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        # the stale claim can neither consume nor restore
+        self.assertFalse(store.commit(b"s", old_token))
+        self.assertFalse(store.release(b"s", old_token))
+        self.assertTrue(store.commit(b"s", new_token))
+        self.assertEqual(
+            {row[2]: row[3] for row in self.raw_rows()}[b"s"], "consumed"
+        )
+
+    def test_takeover_check_must_equal_stored_binding(self):
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = ReplayGuard(store=store).bind_once(self.entry, b"s")
+        self.assertIsNotNone(store.claim(b"s", binding))
+        clock["t"] = 1010
+        forged = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertIsNone(store.claim(b"s", forged))
+
+    def test_check_releases_claim_after_rejection(self):
+        store = self.make_store()
+        guard = ReplayGuard(store=store)
+        forged_entry = MultiSchnorrEntry(
+            self.entry.public_key, b"spend",
+            SchnorrProof(self.entry.proof.commitment,
+                         self.entry.proof.response + 1),
+            b"ctx", SMALL_PRIME, 3,
+        )
+        binding = guard.bind_once(forged_entry, b"s")
+        self.assertFalse(guard.check(forged_entry, binding, now=1))
+        rows = {row[2]: row for row in self.raw_rows()}
+        self.assertEqual(rows[b"s"][3], "pending")
+        self.assertIsNone(rows[b"s"][6])
+        self.assertIsNone(rows[b"s"][7])
+
+    def test_exception_during_verification_restores_pending(self):
+        import zkregion
+
+        class BoomVerifier:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def verify_proof(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        store = self.make_store()
+        guard = ReplayGuard(store=store)
+        binding = guard.bind_once(self.entry, b"s")
+        original = zkregion.SchnorrVerifier
+        zkregion.SchnorrVerifier = BoomVerifier
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(self.entry, binding, now=1)
+        finally:
+            zkregion.SchnorrVerifier = original
+        self.assertEqual(
+            {row[2]: row[3] for row in self.raw_rows()}[b"s"], "pending"
+        )
+
+    def test_concurrent_checks_have_exactly_one_winner(self):
+        store = self.make_store()
+        guard = ReplayGuard(store=store)
+        binding = guard.bind_once(self.entry, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = ReplayGuard(store=store).check(self.entry, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+
+    def test_bind_refused_while_claim_is_live(self):
+        import zkregion
+
+        started = threading.Event()
+
+        class SlowVerifier:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def verify_proof(self, *args, **kwargs):
+                started.set()
+                event.wait(0.5)
+                return True
+
+        store = self.make_store(lease_seconds=60)
+        binding = ReplayGuard(store=store).bind_once(self.entry, b"s")
+        event = threading.Event()
+        original = zkregion.SchnorrVerifier
+        zkregion.SchnorrVerifier = SlowVerifier
+        try:
+            thread = threading.Thread(
+                target=lambda: ReplayGuard(store=store).check(
+                    self.entry, binding, now=1
+                )
+            )
+            thread.start()
+            started.wait(2)
+            with self.assertRaises(ValueError):
+                ReplayGuard(store=store).bind_once(self.entry, b"s")
+            event.set()
+            thread.join()
+        finally:
+            zkregion.SchnorrVerifier = original
+        self.assertEqual(
+            {row[2]: row[3] for row in self.raw_rows()}[b"s"], "consumed"
+        )
+
+    # ---- clock / lease boundaries -------------------------------------------
+
+    def test_check_clock_validation(self):
+        for i, (bad, error) in enumerate((
+            (-1, ValueError), (2**64, ValueError),
+            (1.5, TypeError), (True, TypeError),
+        )):
+            store = self.make_store(clock=lambda b=bad: b)
+            guard = ReplayGuard(store=store)
+            binding = guard.bind_once(self.entry, f"s{i}".encode())
+            with self.assertRaises(error):
+                guard.check(self.entry, binding)
+
+    def test_lease_deadline_overflow_is_value_error(self):
+        store = self.make_store(
+            lease_seconds=10, clock=lambda: 2**64 - 5
+        )
+        guard = ReplayGuard(store=store)
+        binding = guard.bind_once(self.entry, b"s")
+        with self.assertRaises(ValueError):
+            guard.check(self.entry, binding)
+        # an overflow must not have consumed the id
+        self.assertIn(b"s", guard._pending)
+
+    def test_deadline_uses_full_uint64_range_in_database(self):
+        # SQLite integers are signed 64-bit, so the uint64 deadline must
+        # survive as an 8-byte big-endian value even in the top half.
+        store = self.make_store(
+            lease_seconds=1, clock=lambda: 2**64 - 2
+        )
+        binding = ReplayGuard(store=store).bind_once(self.entry, b"s")
+        token = store.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        deadline = {row[2]: row[7] for row in self.raw_rows()}[b"s"]
+        self.assertEqual(deadline, (2**64 - 1).to_bytes(8, "big"))
+
+    # ---- database errors ----------------------------------------------------
+
+    def test_sqlite_errors_propagate(self):
+        store = self.make_store()
+        store._connection.execute("DROP TABLE replay_sessions_v1")
+        guard = ReplayGuard(store=store)
+        with self.assertRaises(sqlite3.Error):
+            guard.bind_once(self.entry, b"s")
 
 
 class RangeReplayGuardTest(unittest.TestCase):

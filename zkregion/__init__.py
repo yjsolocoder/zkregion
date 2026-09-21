@@ -12,7 +12,8 @@ BoundRangeBatch / verify_range_bound /
 BoundSchnorrReplayGuard /
 BoundRegionReplayGuard /
 BoundRangeReplayGuard /
-ReplayBinding / ReplayGuard / RangeReplayGuard / RegionReplayGuard /
+ReplayBinding / ReplayGuard / SQLiteReplayStore /
+RangeReplayGuard / RegionReplayGuard /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion.
@@ -23,9 +24,11 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+import sqlite3
 import threading
 import time
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Callable
 
@@ -55,6 +58,7 @@ __all__ = [
     "SchnorrProof",
     "SchnorrProver",
     "SchnorrVerifier",
+    "SQLiteReplayStore",
     "commit",
     "commit_coordinate",
     "merkle_root",
@@ -2275,6 +2279,257 @@ class _ReplayRegistry:
             return set(self._consumed)
 
 
+class SQLiteReplayStore:
+    """Persistent, shareable pending/claimed/consumed state for ReplayGuard.
+
+    A store persists the same three states as the in-instance
+    :class:`_ReplayRegistry` in an SQLite database file: every row is keyed
+    by the three ``bytes`` segments ``namespace``, ``b"zr/r/v1"`` and
+    ``session_id``; its value is the registered :class:`ReplayBinding`
+    (digest and the same ``E`` expiry framing used by the binding digest)
+    together with its state. Independent :class:`ReplayGuard` instances
+    attached to the same file (including ones opened in another process or
+    after a restart) therefore share pending, claimed and consumed ids; two
+    stores using different namespaces in the same file never interact.
+
+    A ``check`` writes a fresh random claim token together with the lease
+    deadline ``clock() + lease_seconds`` in one short transaction, then runs
+    its proof verification without holding any transaction. Only the holder
+    of the current token may consume the id; a rejection or an escaped
+    verification error restores the id to ``pending`` using that same token.
+    When a claim's deadline has passed, a later ``bind_once`` rejects (as it
+    does for any live id) while a later ``check`` with an equal binding may
+    take the expired claim over with a new token, after which the stale token
+    can no longer consume or release anything.
+
+    All mutations are short ``BEGIN IMMEDIATE`` transactions, so concurrent
+    instances in other processes are serialized at claim time; SQLite errors
+    propagate as :class:`sqlite3.Error`. ``lease_seconds`` must be a positive
+    non-``bool`` integer; ``clock`` defaults to integer Unix seconds and,
+    when supplied, must be a callable returning a non-``bool`` integer inside
+    the unsigned 64-bit range (a value outside it raises :class:`ValueError`).
+    """
+
+    _TABLE = "replay_sessions_v1"
+    _DOMAIN = _REPLAY_DOMAIN
+    _CLAIM_TOKEN_BYTES = 16
+
+    def __init__(
+        self,
+        path: str,
+        namespace: bytes = b"default",
+        *,
+        lease_seconds: int = 30,
+        clock: Callable[[], int] | None = None,
+    ) -> None:
+        if not isinstance(path, str):
+            raise TypeError("path must be a str")
+        _check_bytes(namespace, "namespace")
+        if not isinstance(lease_seconds, int) or isinstance(lease_seconds, bool):
+            raise TypeError("lease_seconds must be a non-bool integer")
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
+        if clock is not None and not callable(clock):
+            raise TypeError("clock must be callable")
+        self._path = path
+        self._namespace = namespace
+        self._lease_seconds = lease_seconds
+        self._clock = clock if clock is not None else self._default_clock
+        # One connection per store; the RLock keeps this process's callers
+        # out of one another's transactions while BEGIN IMMEDIATE serializes
+        # writers in other processes. isolation_level=None puts the
+        # connection in autocommit mode so the explicit short transactions
+        # below are the only transactions in flight.
+        self._lock = threading.RLock()
+        self._connection = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+        try:
+            self._connection.execute("PRAGMA busy_timeout=5000")
+            self._connection.execute("PRAGMA journal_mode=WAL")
+            self._connection.execute(
+                f"CREATE TABLE IF NOT EXISTS {self._TABLE} ("
+                "namespace BLOB NOT NULL, "
+                "domain BLOB NOT NULL, "
+                "session_id BLOB NOT NULL, "
+                "state TEXT NOT NULL CHECK (state IN ('pending', 'claimed', 'consumed')), "
+                "digest BLOB NOT NULL, "
+                "expires_at BLOB NOT NULL, "
+                "token BLOB, "
+                "claim_expires BLOB, "
+                "PRIMARY KEY (namespace, domain, session_id)"
+                ") WITHOUT ROWID"
+            )
+        except BaseException:
+            self._connection.close()
+            raise
+
+    @staticmethod
+    def _default_clock() -> int:
+        return int(time.time())
+
+    def _now(self) -> int:
+        """Read the clock once, enforcing the non-bool uint64 contract."""
+        now = self._clock()
+        if not isinstance(now, int) or isinstance(now, bool):
+            raise TypeError("clock must return a non-bool integer")
+        if not 0 <= now <= _UINT64_MAX:
+            raise ValueError("clock value must be an unsigned 64-bit integer")
+        return now
+
+    @contextmanager
+    def _transaction(self) -> Iterator[sqlite3.Connection]:
+        """A short process-locked ``BEGIN IMMEDIATE`` transaction."""
+        with self._lock:
+            self._connection.execute("BEGIN IMMEDIATE")
+            try:
+                yield self._connection
+            except BaseException:
+                self._connection.rollback()
+                raise
+            else:
+                self._connection.commit()
+
+    def _row(self, connection: sqlite3.Connection, session_id: bytes) -> tuple | None:
+        return connection.execute(
+            f"SELECT state, digest, expires_at, token, claim_expires "
+            f"FROM {self._TABLE} WHERE namespace = ? AND domain = ? AND session_id = ?",
+            (self._namespace, self._DOMAIN, session_id),
+        ).fetchone()
+
+    def register(self, session_id: bytes, binding: ReplayBinding) -> None:
+        """Insert ``binding`` as a fresh pending id in one short transaction.
+
+        Any existing row rejects the rebind with :class:`ValueError`: a
+        pending id, a claimed id (even one whose lease has expired — only
+        :meth:`claim` may take an expired claim over) or a consumed id.
+        """
+        with self._transaction() as connection:
+            row = self._row(connection, session_id)
+            if row is not None:
+                raise ValueError("session_id is already bound or has been consumed")
+            connection.execute(
+                f"INSERT INTO {self._TABLE} "
+                "(namespace, domain, session_id, state, digest, expires_at, token, claim_expires) "
+                "VALUES (?, ?, ?, 'pending', ?, ?, NULL, NULL)",
+                (
+                    self._namespace,
+                    self._DOMAIN,
+                    session_id,
+                    binding.digest,
+                    _replay_expiry_bytes(binding.expires_at),
+                ),
+            )
+
+    def claim(self, session_id: bytes, binding: ReplayBinding) -> bytes | None:
+        """Atomically claim a pending id or an expired, equal claim.
+
+        Returns the opaque claim token on success, otherwise ``None``
+        (unknown/consumed id, a live claim held by someone else, or an
+        unequal stored binding). The token and ``clock() + lease_seconds``
+        are written in the same short transaction; the deadline is stored as
+        an unsigned 64-bit big-endian value because SQLite integers are
+        signed and lease deadlines may reach the top half of the uint64
+        range.
+        """
+        token = secrets.token_bytes(self._CLAIM_TOKEN_BYTES)
+        now = self._now()
+        claim_expires = now + self._lease_seconds
+        if claim_expires > _UINT64_MAX:
+            raise ValueError("claim expiry must be an unsigned 64-bit integer")
+        deadline = claim_expires.to_bytes(8, "big")
+        with self._transaction() as connection:
+            row = self._row(connection, session_id)
+            if row is None:
+                return None
+            state, digest, expiry, _old_token, old_deadline = row
+            # The presented binding must equal the stored one whether the id
+            # is pending or held by an expired claim; otherwise a check for a
+            # different entry could consume an id bound to someone else.
+            if digest != binding.digest or expiry != _replay_expiry_bytes(
+                binding.expires_at
+            ):
+                return None
+            if state == "consumed":
+                return None
+            if state == "claimed" and (
+                old_deadline is None or now < int.from_bytes(old_deadline, "big")
+            ):
+                return None
+            connection.execute(
+                f"UPDATE {self._TABLE} SET state = 'claimed', token = ?, "
+                "claim_expires = ? WHERE namespace = ? AND domain = ? AND session_id = ?",
+                (token, deadline, self._namespace, self._DOMAIN, session_id),
+            )
+            return token
+
+    def commit(self, session_id: bytes, token: bytes) -> bool:
+        """Move the id claimed with ``token`` to consumed; stale tokens fail."""
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                f"UPDATE {self._TABLE} SET state = 'consumed', token = NULL, "
+                "claim_expires = NULL WHERE namespace = ? AND domain = ? "
+                "AND session_id = ? AND state = 'claimed' AND token = ?",
+                (self._namespace, self._DOMAIN, session_id, token),
+            )
+            return cursor.rowcount == 1
+
+    def release(self, session_id: bytes, token: bytes) -> bool:
+        """Restore the id claimed with ``token`` to pending; stale tokens no-op."""
+        with self._transaction() as connection:
+            cursor = connection.execute(
+                f"UPDATE {self._TABLE} SET state = 'pending', token = NULL, "
+                "claim_expires = NULL WHERE namespace = ? AND domain = ? "
+                "AND session_id = ? AND state = 'claimed' AND token = ?",
+                (self._namespace, self._DOMAIN, session_id, token),
+            )
+            return cursor.rowcount == 1
+
+    @staticmethod
+    def _decode_binding(session_id: bytes, digest: bytes, expiry: bytes) -> ReplayBinding:
+        if expiry == b"\x00":
+            expires_at = None
+        else:
+            expires_at = int.from_bytes(expiry[1:], "big")
+        return ReplayBinding(session_id, digest, expires_at)
+
+    def pending_snapshot(self) -> dict[bytes, ReplayBinding]:
+        """A point-in-time copy of the pending bindings (compat/tests).
+
+        Claims whose lease has expired read as pending, mirroring the
+        takeover rule used by :meth:`claim`.
+        """
+        now = self._now()
+        with self._lock:
+            rows = self._connection.execute(
+                f"SELECT session_id, digest, expires_at, claim_expires "
+                f"FROM {self._TABLE} WHERE namespace = ? AND domain = ? "
+                "AND (state = 'pending' OR state = 'claimed')",
+                (self._namespace, self._DOMAIN),
+            ).fetchall()
+        result = {}
+        for session_id, digest, expiry, claim_expires in rows:
+            if claim_expires is not None and now < int.from_bytes(
+                claim_expires, "big"
+            ):
+                continue  # a live claim is not pending
+            result[session_id] = self._decode_binding(session_id, digest, expiry)
+        return result
+
+    def consumed_snapshot(self) -> set[bytes]:
+        """A point-in-time copy of the consumed ids (compat/tests)."""
+        with self._lock:
+            rows = self._connection.execute(
+                f"SELECT session_id FROM {self._TABLE} "
+                "WHERE namespace = ? AND domain = ? AND state = 'consumed'",
+                (self._namespace, self._DOMAIN),
+            ).fetchall()
+        return {session_id for (session_id,) in rows}
+
+    def close(self) -> None:
+        """Close the underlying SQLite connection."""
+        with self._lock:
+            self._connection.close()
+
+
 def _replay_digest(
     entry: MultiSchnorrEntry,
     session_id: bytes,
@@ -2331,27 +2586,38 @@ class ReplayGuard:
 
     A fresh guard has no registrations. :meth:`bind_once` registers a pending
     :class:`ReplayBinding` for a session id, :meth:`check` accepts an equal
-    pending binding exactly once and then marks the id consumed. Both the
-    pending and the consumed state live on this guard instance and are never
-    shared between instances.
+    pending binding exactly once and then marks the id consumed. By default
+    both the pending and the consumed state live on this guard instance and
+    are never shared between instances; passing an :class:`SQLiteReplayStore`
+    as ``store`` instead keeps the state in that store, so guards attached to
+    the same store namespace share pending, claimed and consumed ids across
+    independent instances and process restarts.
 
     Concurrent ``check`` calls for the same session id are resolved by an
-    atomic in-instance claim: at most one call claims the pending id and
-    proceeds to the (potentially slow) signature verification; every other
-    call sees the id as in-flight or consumed and returns ``False``. The
-    claim is held only as per-id registry state, never as a global lock, so
+    atomic claim (the in-instance registry lock, or the store's short
+    transaction and unique claim token): at most one call claims the pending
+    id and proceeds to the (potentially slow) signature verification; every
+    other call sees the id as in-flight or consumed and returns ``False``.
+    The claim is held only as per-id state, never as a global lock, so
     verifying one id does not block checks or binds of other ids.
     """
 
-    def __init__(self) -> None:
-        self._registry = _ReplayRegistry()
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = store
+        self._registry = None if store is not None else _ReplayRegistry()
 
     @property
     def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
         return self._registry.pending_snapshot()
 
     @property
     def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
         return self._registry.consumed_snapshot()
 
     def bind_once(
@@ -2384,7 +2650,10 @@ class ReplayGuard:
             _replay_digest(entry, session_id, expires_at),
             expires_at,
         )
-        self._registry.register(session_id, binding)
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
         return binding
 
     def check(
@@ -2428,6 +2697,8 @@ class ReplayGuard:
         if not _multi_schnorr_entry_is_encodable(entry):
             return False  # negative integers cannot be encoded into the bound leaf
         session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(entry, binding, session_id, current)
         if not self._registry.claim(session_id, binding):
             return False  # unknown id, already consumed, claimed, or unequal binding
         committed = False
@@ -2459,6 +2730,57 @@ class ReplayGuard:
             # is a no-op, leaving the id consumed.
             if not committed:
                 self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entry: MultiSchnorrEntry,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over); verification runs with no transaction held; only the
+        token returned by the winning claim can consume the id, and every
+        rejection or escaped error restores the id to pending with that same
+        token. A stale token (a claim taken over while verification ran)
+        neither consumes nor restores anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            try:
+                verifier = SchnorrVerifier(
+                    entry.public_key, prime=entry.prime, generator=entry.generator
+                )
+                accepted = verifier.verify_proof(
+                    entry.message, entry.proof, context=entry.context
+                )
+            except ValueError:
+                return False  # invalid embedded public key or group parameters
+            if not accepted:
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
 
 
 def _range_replay_digest(

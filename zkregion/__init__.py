@@ -2133,7 +2133,11 @@ def verify_range_bound(
 # bind_once registers a pending binding, check accepts an equal pending
 # binding exactly once (verifying the proof first) and then consumes the
 # session id; every rejection leaves the id untouched, and an id that is
-# pending or already consumed can never be rebound.
+# pending or already consumed can never be rebound. A ReplayGuard or a
+# RangeReplayGuard constructed with an SQLiteReplayStore keeps this state in
+# the store instead (keyed under b"zr/r/v1" resp. b"zr/rr/v1"), shared with
+# every other guard attached to the same store namespace, across instances
+# and process restarts.
 #
 # digest = SHA-256(F(D) || F(session_id) || L(entry) || F(E))
 #   D = b"zr/r/v1"   (ReplayGuard),  b"zr/rr/v1"  (RangeReplayGuard)
@@ -2394,6 +2398,25 @@ class SQLiteReplayStore:
             f"FROM {self._TABLE} WHERE namespace = ? AND domain = ? AND session_id = ?",
             (self._namespace, self._DOMAIN, session_id),
         ).fetchone()
+
+    def _domain_view(self, domain: bytes) -> "SQLiteReplayStore":
+        """A view of this store keyed under a different domain segment.
+
+        The view shares the connection, lock, namespace, lease and clock
+        with this store; only the domain segment of the row key differs, so
+        a guard for another entry type (a :class:`RangeReplayGuard` keys its
+        rows with ``b"zr/rr/v1"``) can persist its state in the same store
+        file and namespace without colliding with this store's rows.
+        """
+        view = object.__new__(type(self))
+        view._path = self._path
+        view._namespace = self._namespace
+        view._lease_seconds = self._lease_seconds
+        view._clock = self._clock
+        view._lock = self._lock
+        view._connection = self._connection
+        view._DOMAIN = domain
+        return view
 
     def register(self, session_id: bytes, binding: ReplayBinding) -> None:
         """Insert ``binding`` as a fresh pending id in one short transaction.
@@ -2827,25 +2850,39 @@ class RangeReplayGuard:
 
     A fresh guard has no registrations. :meth:`bind_once` registers a pending
     :class:`ReplayBinding` for a session id, :meth:`check` accepts an equal
-    pending binding exactly once and then marks the id consumed. Both the
-    pending and the consumed state live on this guard instance and are never
-    shared between instances.
+    pending binding exactly once and then marks the id consumed. By default
+    both the pending and the consumed state live on this guard instance and
+    are never shared between instances; passing an :class:`SQLiteReplayStore`
+    as ``store`` instead keeps the state in that store under the
+    ``b"zr/rr/v1"`` key domain, so guards attached to the same store
+    namespace share pending, claimed and consumed ids across independent
+    instances and process restarts.
 
     As with :class:`ReplayGuard`, concurrent checks of the same id are
-    decided by an atomic claim taken before the range proof is verified; the
-    verification runs without any lock held, so different ids are never
-    serialized.
+    decided by an atomic claim taken before the range proof is verified (the
+    in-instance registry lock, or the store's short transaction and unique
+    claim token); the verification runs without any lock held, so different
+    ids are never serialized.
     """
 
-    def __init__(self) -> None:
-        self._registry = _ReplayRegistry()
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None if store is None else store._domain_view(_RANGE_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
 
     @property
     def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
         return self._registry.pending_snapshot()
 
     @property
     def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
         return self._registry.consumed_snapshot()
 
     def bind_once(
@@ -2876,7 +2913,10 @@ class RangeReplayGuard:
             _range_replay_digest(entry, session_id, expires_at),
             expires_at,
         )
-        self._registry.register(session_id, binding)
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
         return binding
 
     def check(
@@ -2917,6 +2957,8 @@ class RangeReplayGuard:
             _check_uint64(now, "now")
             current = now
         session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(entry, binding, session_id, current)
         if not self._registry.claim(session_id, binding):
             return False  # unknown id, already consumed, claimed, or unequal binding
         committed = False
@@ -2936,6 +2978,48 @@ class RangeReplayGuard:
         finally:
             if not committed:
                 self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entry: RangeBatchEntry,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over); verification runs with no transaction held; only the
+        token returned by the winning claim can consume the id, and every
+        rejection or escaped error restores the id to pending with that same
+        token. A stale token (a claim taken over while verification ran)
+        neither consumes nor restores anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _range_replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_range(entry.commitment, entry.proof, entry.context):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
 
 
 def _region_replay_digest(

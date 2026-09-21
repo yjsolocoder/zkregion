@@ -1,5 +1,8 @@
 import dataclasses
 import hashlib
+import os
+import sqlite3
+import tempfile
 import unittest
 
 from zkregion import (
@@ -24,6 +27,7 @@ from zkregion import (
     RegionReplayGuard,
     ReplayBinding,
     ReplayGuard,
+    SQLiteReplayStore,
     SchnorrBatchEntry,
     SchnorrProof,
     SchnorrProver,
@@ -4286,6 +4290,163 @@ class ReplayGuardTest(unittest.TestCase):
         guard.check(self.entry, binding, now=1)
         self.assertEqual(self.entry, snapshot)
         self.assertEqual(binding, binding_snapshot)
+
+
+class SQLiteReplayStoreTest(unittest.TestCase):
+    def setUp(self):
+        self.prover = SchnorrProver(secret=4321, prime=SMALL_PRIME, generator=3,
+                                    randbelow=counter_randbelow())
+        self.entry = MultiSchnorrEntry(
+            self.prover.public_key, b"spend",
+            self.prover.prove(b"spend", context=b"ctx"),
+            b"ctx", SMALL_PRIME, 3,
+        )
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "replay.db")
+
+    def store(self, namespace=b"ns", **kwargs):
+        return SQLiteReplayStore(self.path, namespace, **kwargs)
+
+    def guard(self, namespace=b"ns", **kwargs):
+        return ReplayGuard(store=self.store(namespace, **kwargs))
+
+    # ---- construction validation ---------------------------------------------
+
+    def test_constructor_type_errors(self):
+        with self.assertRaises(TypeError):
+            SQLiteReplayStore(123)
+        with self.assertRaises(TypeError):
+            SQLiteReplayStore(self.path, "ns")
+        with self.assertRaises(TypeError):
+            SQLiteReplayStore(self.path, lease_seconds="30")
+        with self.assertRaises(TypeError):
+            SQLiteReplayStore(self.path, lease_seconds=True)
+        with self.assertRaises(TypeError):
+            SQLiteReplayStore(self.path, clock=42)
+        with self.assertRaises(TypeError):
+            ReplayGuard(store="not a store")
+
+    def test_lease_seconds_must_be_positive(self):
+        for bad in (0, -1, -30):
+            with self.assertRaises(ValueError):
+                SQLiteReplayStore(self.path, lease_seconds=bad)
+
+    def test_default_namespace(self):
+        store = SQLiteReplayStore(self.path)
+        self.assertEqual(store._namespace, b"default")
+
+    def test_guard_without_store_keeps_isolated_memory_state(self):
+        first = ReplayGuard()
+        second = ReplayGuard()
+        binding = first.bind_once(self.entry, b"s")
+        self.assertFalse(second.check(self.entry, binding, now=1))
+        self.assertTrue(first.check(self.entry, binding, now=1))
+
+    # ---- shared state ---------------------------------------------------------
+
+    def test_instances_share_state_through_one_path_and_namespace(self):
+        first = self.guard()
+        second = self.guard()
+        binding = first.bind_once(self.entry, b"s")
+        self.assertTrue(second.check(self.entry, binding, now=1))
+        self.assertFalse(first.check(self.entry, binding, now=1))
+        with self.assertRaises(ValueError):
+            second.bind_once(self.entry, b"s")
+
+    def test_state_survives_a_restart(self):
+        binding = self.guard().bind_once(self.entry, b"s")
+        reopened = self.guard()
+        self.assertTrue(reopened.check(self.entry, binding, now=1))
+        with self.assertRaises(ValueError):
+            self.guard().bind_once(self.entry, b"s")
+
+    def test_namespaces_are_isolated(self):
+        binding = self.guard(b"one").bind_once(self.entry, b"s")
+        other = self.guard(b"two")
+        self.assertFalse(other.check(self.entry, binding, now=1))
+        # the rejected foreign check did not touch the first namespace
+        self.assertTrue(self.guard(b"one").check(self.entry, binding, now=1))
+
+    def test_binding_digest_matches_the_memory_guard(self):
+        memory = ReplayGuard().bind_once(self.entry, b"s", expires_at=1000)
+        stored = self.guard().bind_once(self.entry, b"s", expires_at=1000)
+        self.assertEqual(stored, memory)
+
+    # ---- claim lease ------------------------------------------------------------
+
+    def test_expired_claim_can_be_taken_over_and_stale_token_cannot_consume(self):
+        now = [1000]
+        store = self.store(lease_seconds=10, clock=lambda: now[0])
+        guard = ReplayGuard(store=store)
+        binding = guard.bind_once(self.entry, b"s")
+        stale = store.claim(b"s", binding)
+        self.assertIsNotNone(stale)
+        now[0] += 10  # lease expired: now >= clock()+lease_seconds
+        current = store.claim(b"s", binding)
+        self.assertIsNotNone(current)
+        self.assertNotEqual(stale, current)
+        self.assertFalse(store.commit(b"s", stale))
+        store.release(b"s", stale)  # a stale release must not clobber the new claim
+        self.assertTrue(store.commit(b"s", current))
+        self.assertFalse(guard.check(self.entry, binding, now=1))
+
+    def test_live_claim_blocks_a_second_claim(self):
+        store = self.store(lease_seconds=30, clock=lambda: 1000)
+        ReplayGuard(store=store).bind_once(self.entry, b"s")
+        binding = ReplayBinding(b"s", b"\x00" * 32)
+        stored = ReplayGuard(store=store).bind_once(self.entry, b"t")
+        self.assertIsNotNone(store.claim(b"t", stored))
+        self.assertIsNone(store.claim(b"t", stored))
+        self.assertIsNone(store.claim(b"s", binding))  # unequal binding
+
+    def test_rebind_over_expired_claim_is_a_value_error(self):
+        now = [1000]
+        store = self.store(lease_seconds=10, clock=lambda: now[0])
+        guard = ReplayGuard(store=store)
+        binding = guard.bind_once(self.entry, b"s")
+        self.assertIsNotNone(store.claim(b"s", binding))
+        now[0] += 10
+        with self.assertRaises(ValueError):
+            guard.bind_once(self.entry, b"s")
+
+    def test_clock_outside_uint64_is_a_value_error(self):
+        guard = self.guard(clock=lambda: 2**64)
+        binding = guard.bind_once(self.entry, b"s")
+        with self.assertRaises(ValueError):
+            guard.check(self.entry, binding, now=1)
+
+    # ---- check semantics --------------------------------------------------------
+
+    def test_rejection_restores_the_pending_state(self):
+        guard = self.guard()
+        binding = guard.bind_once(self.entry, b"s")
+        wrong = dataclasses.replace(self.entry, message=b"other")
+        self.assertFalse(guard.check(wrong, binding, now=1))
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+
+    def test_binding_expiry_is_honored_through_the_store(self):
+        guard = self.guard()
+        binding = guard.bind_once(self.entry, b"s", expires_at=500)
+        self.assertFalse(guard.check(self.entry, binding, now=500))
+        self.assertTrue(guard.check(self.entry, binding, now=499))
+
+    def test_check_type_errors_with_store(self):
+        guard = self.guard()
+        binding = guard.bind_once(self.entry, b"s")
+        for bad in ("entry", 7, None, self.entry.proof):
+            with self.assertRaises(TypeError):
+                guard.check(bad, binding, now=1)
+        for bad in ("binding", 7, None):
+            with self.assertRaises(TypeError):
+                guard.check(self.entry, bad, now=1)
+
+    def test_database_errors_propagate_as_sqlite_error(self):
+        store = self.store()
+        store._path = os.path.join(self.tmp.name, "missing-dir", "replay.db")
+        binding = ReplayBinding(b"s", b"\x00" * 32)
+        with self.assertRaises(sqlite3.Error):
+            store.register(b"s", binding)
 
 
 class RangeReplayGuardTest(unittest.TestCase):

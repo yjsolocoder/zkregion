@@ -184,6 +184,16 @@ try:
 except ValueError:
     pass
 
+# 可选 SQLite 后端：同路径同命名空间的实例（含重启后）共享待用/认领/消费状态
+from zkregion import SQLiteReplayStore
+
+store = SQLiteReplayStore("replay.db", b"default", lease_seconds=30)
+shared = ReplayGuard(store=store)
+shared_binding = shared.bind_once(entry, b"session-2")
+assert ReplayGuard(store=SQLiteReplayStore("replay.db", b"default")).check(
+    entry, shared_binding
+)                                                            # 另一实例消费同一绑定
+
 # 区间证明的实例内一次性绑定
 from zkregion import RangeReplayGuard
 
@@ -284,9 +294,10 @@ python3 -m zkregion
 - `verify_region_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的区域证明完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_region_batch` 验子证明
 - `BoundRegionBatch(entries, leaf_count, proof)` — 冻结的完整批对象；字段依次为 `tuple[RegionBatchEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变
 - `ReplayBinding(session_id, digest, expires_at=None)` — 冻结的一次性防重放绑定；字段依次为非空 `bytes`、`bytes` 摘要（不限定长度；各守卫登记的均为 32 字节 SHA-256 摘要）、`None` 或非 `bool` 的 uint64 Unix 秒过期时间；可位置构造、按值相等且不可变
-- `ReplayGuard()` — 实例内防重放登记册（线程安全）
+- `ReplayGuard(*, store: SQLiteReplayStore | None = None)` — 实例内防重放登记册（线程安全）；`store=None`（默认）时状态仅存于本实例，传入 `SQLiteReplayStore` 则待用、认领、消费状态共享于同路径同命名空间的所有实例（含重启后）；其他类型抛 `TypeError`
   - `bind_once(entry: MultiSchnorrEntry, session_id, *, expires_at=None) -> ReplayBinding` — 登记本实例的待用绑定；待用、正在校验或已消费的 `session_id` 重绑抛 `ValueError`
   - `check(entry, binding, *, now=None) -> bool` — 原子认领本实例的待用等值绑定，再以条目的公钥与群参数构造 `SchnorrVerifier` 并以 `message`、`proof`、`context` 调 `verify_proof`；成功才消费 `session_id`，任何拒绝（含竞争失败）都返回 `False` 且不消费
+- `SQLiteReplayStore(path: str, namespace: bytes = b"default", *, lease_seconds: int = 30, clock=None)` — `ReplayGuard` 的 SQLite 共享状态后端；数据库键为 `namespace`、`b"zr/r/v1"`、`session_id` 三段 bytes，值保存等值 `ReplayBinding`（期限沿用 E 编码）与状态。`bind_once` 以短事务插入待用行，已有键（含过期认领）抛 `ValueError`；`check` 以短事务写入随机 token 与 `clock() + lease_seconds` 的租约期限完成认领，验证期间不持事务；过期认领可被 `check` 接管，仅当前 token 可消费或复原待用，旧认领不得成功。`lease_seconds` 非正抛 `ValueError`，`clock` 为 `None` 时取整数 Unix 秒、越出 uint64 抛 `ValueError`，类型错误抛 `TypeError`，数据库错误透传 `sqlite3.Error`
 - `RangeReplayGuard()` — 区间证明的实例内防重放登记册（线程安全）
   - `bind_once(entry: RangeBatchEntry, session_id, *, expires_at=None) -> ReplayBinding` — 登记本实例的待用绑定；待用、正在校验或已消费的 `session_id` 重绑抛 `ValueError`
   - `check(entry, binding, *, now=None) -> bool` — 原子认领后按字段顺序以 `commitment`、`proof`、`context` 调 `verify_range`；成功才消费 `session_id`，任何拒绝（含竞争失败）都返回 `False` 且不消费

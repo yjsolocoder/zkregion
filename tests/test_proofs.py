@@ -15,6 +15,7 @@ from zkregion import (
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
+    MerkleConsistencyChain,
     MerkleConsistencyProof,
     MerkleMultiProof,
     MerkleProof,
@@ -39,12 +40,14 @@ from zkregion import (
     merkle_root,
     pedersen_commit,
     prove_consistency,
+    prove_consistency_chain,
     prove_inclusion,
     prove_multi_inclusion,
     prove_range,
     prove_region,
     verify_bound,
     verify_consistency,
+    verify_consistency_chain,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
@@ -7119,6 +7122,258 @@ class MerkleConsistencyTest(unittest.TestCase):
         multi = prove_multi_inclusion(leaves, (1, 3))
         self.assertTrue(
             verify_multi_inclusion([(1, leaves[1]), (3, leaves[3])], multi, root)
+        )
+
+
+class MerkleConsistencyChainTest(unittest.TestCase):
+    """Multi-checkpoint Merkle consistency chains."""
+
+    def _leaves(self, count):
+        return [f"chain-{i}".encode() for i in range(count)]
+
+    def test_round_trip_many_checkpoints(self):
+        for size in range(2, 34):
+            leaves = self._leaves(size)
+            counts = tuple(sorted({1, size, (size // 2) or 1}))
+            chain = prove_consistency_chain(leaves, counts)
+            self.assertIsInstance(chain.roots, tuple)
+            self.assertIsInstance(chain.proofs, tuple)
+            self.assertEqual(len(chain.roots), len(counts))
+            self.assertEqual(len(chain.proofs), len(counts) - 1)
+            for count, root in zip(counts, chain.roots):
+                self.assertEqual(root, merkle_root(leaves[:count]))
+            for index, proof in enumerate(chain.proofs):
+                self.assertEqual(proof.old_count, counts[index])
+                self.assertEqual(proof.new_count, counts[index + 1])
+                self.assertTrue(
+                    verify_consistency(
+                        chain.roots[index], chain.roots[index + 1], proof
+                    )
+                )
+            self.assertTrue(verify_consistency_chain(chain))
+
+    def test_two_checkpoints_and_full_prefixes(self):
+        leaves = self._leaves(10)
+        chain = prove_consistency_chain(leaves, (3, 10))
+        self.assertEqual(chain.roots, (merkle_root(leaves[:3]), merkle_root(leaves)))
+        self.assertEqual(len(chain.proofs), 1)
+        self.assertEqual(chain.proofs[0], prove_consistency(leaves, 3))
+        self.assertTrue(verify_consistency_chain(chain))
+        # every checkpoint count up to the leaf total, including the end
+        chain = prove_consistency_chain(leaves, tuple(range(1, 11)))
+        self.assertEqual(len(chain.roots), 10)
+        self.assertEqual(len(chain.proofs), 9)
+        self.assertTrue(verify_consistency_chain(chain))
+
+    def test_chain_is_frozen_positional_and_value_equal(self):
+        leaves = self._leaves(8)
+        chain = prove_consistency_chain(leaves, (2, 5, 8))
+        clone = MerkleConsistencyChain(chain.roots, chain.proofs)
+        self.assertEqual(chain, clone)
+        self.assertTrue(dataclasses.is_dataclass(chain))
+        with self.assertRaises(AttributeError):
+            chain.roots = ()
+        # differing roots or proofs compare unequal
+        other = prove_consistency_chain(
+            [f"other-{i}".encode() for i in range(8)], (2, 5, 8)
+        )
+        self.assertNotEqual(chain, MerkleConsistencyChain(other.roots, chain.proofs))
+        self.assertNotEqual(chain, MerkleConsistencyChain(chain.roots, other.proofs))
+
+    def test_prove_type_errors(self):
+        leaves = self._leaves(6)
+        good_counts = (2, 4)
+        with self.assertRaises(TypeError):
+            prove_consistency_chain(b"abcdef", good_counts)
+        with self.assertRaises(TypeError):
+            prove_consistency_chain([b"a", 1], good_counts)
+        # counts must be a tuple (lists are rejected), never a bytes/str
+        for bad_counts in ([2, 4], b"24", "(2, 4)", None, 2):
+            with self.assertRaises(TypeError, msg=repr(bad_counts)):
+                prove_consistency_chain(leaves, bad_counts)
+        for bad_counts in (
+            (True, 4),
+            (2, False),
+            (1.0, 4),
+            (2, "4"),
+            (2, None),
+        ):
+            with self.assertRaises(TypeError, msg=repr(bad_counts)):
+                prove_consistency_chain(leaves, bad_counts)
+
+    def test_prove_value_errors(self):
+        leaves = self._leaves(6)
+        for bad_counts in (
+            (),
+            (3,),
+            (0, 3),
+            (-1, 3),
+            (3, 7),
+            (3, 100),
+            (3, 3),
+            (4, 3),
+            (1, 3, 3),
+            (1, 5, 4),
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad_counts)):
+                prove_consistency_chain(leaves, bad_counts)
+        with self.assertRaises(ValueError):
+            prove_consistency_chain([], (1, 2))
+
+    def test_verify_type_errors(self):
+        leaves = self._leaves(6)
+        chain = prove_consistency_chain(leaves, (2, 4, 6))
+        with self.assertRaises(TypeError):
+            verify_consistency_chain(object())
+        with self.assertRaises(TypeError):
+            verify_consistency_chain(MerkleConsistencyChain(list(chain.roots), chain.proofs))
+        with self.assertRaises(TypeError):
+            verify_consistency_chain(MerkleConsistencyChain(chain.roots, list(chain.proofs)))
+        with self.assertRaises(TypeError):
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots[:-1] + (1,), chain.proofs)
+            )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots, chain.proofs[:-1] + (object(),))
+            )
+        bad_proof = MerkleConsistencyProof(True, 4, chain.proofs[0].nodes)
+        with self.assertRaises(TypeError):
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots, (bad_proof, chain.proofs[1]))
+            )
+        bad_proof = MerkleConsistencyProof(2, False, chain.proofs[0].nodes)
+        with self.assertRaises(TypeError):
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots, (bad_proof, chain.proofs[1]))
+            )
+        bad_proof = MerkleConsistencyProof(2, 4, list(chain.proofs[0].nodes))
+        with self.assertRaises(TypeError):
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots, (bad_proof, chain.proofs[1]))
+            )
+        bad_proof = MerkleConsistencyProof(
+            2, 4, chain.proofs[0].nodes[:-1] + (1,)
+        )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots, (bad_proof, chain.proofs[1]))
+            )
+
+    def test_verify_invalid_chains_return_false(self):
+        leaves = self._leaves(9)
+        chain = prove_consistency_chain(leaves, (2, 5, 9))
+        node = b"\x00" * 32
+        # empty chain, count mismatch, single root, bad digest lengths
+        self.assertFalse(
+            verify_consistency_chain(MerkleConsistencyChain((), ()))
+        )
+        self.assertFalse(
+            verify_consistency_chain(MerkleConsistencyChain((chain.roots[0],), ()))
+        )
+        self.assertFalse(
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots, chain.proofs + chain.proofs[:1])
+            )
+        )
+        self.assertFalse(
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots, chain.proofs[1:])
+            )
+        )
+        self.assertFalse(
+            verify_consistency_chain(
+                MerkleConsistencyChain(
+                    chain.roots[:-1] + (b"\x00" * 31,), chain.proofs
+                )
+            )
+        )
+        # segment counts do not line up between adjacent proofs
+        p0, p1 = chain.proofs
+        spliced = MerkleConsistencyProof(p0.old_count, 6, p0.nodes)
+        self.assertFalse(
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots, (spliced, p1))
+            )
+        )
+        # reordered / replaced proofs fail even if counts look adjacent
+        self.assertFalse(
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots, (p1, p0))
+            )
+        )
+        # tampered root
+        self.assertFalse(
+            verify_consistency_chain(
+                MerkleConsistencyChain(
+                    (node,) + chain.roots[1:], chain.proofs
+                )
+            )
+        )
+        self.assertFalse(
+            verify_consistency_chain(
+                MerkleConsistencyChain(
+                    chain.roots[:-1] + (node,), chain.proofs
+                )
+            )
+        )
+        # tampered proof node
+        bad_nodes = (node,) + p0.nodes[1:]
+        tampered = MerkleConsistencyProof(p0.old_count, p0.new_count, bad_nodes)
+        self.assertFalse(
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots, (tampered, p1))
+            )
+        )
+        # structurally malformed proof (zero old count) returns False
+        bad = MerkleConsistencyProof(0, 5, p0.nodes)
+        self.assertFalse(
+            verify_consistency_chain(
+                MerkleConsistencyChain(chain.roots, (bad, p1))
+            )
+        )
+
+    def test_chain_does_not_accept_unrelated_prefixes(self):
+        leaves = self._leaves(9)
+        chain = prove_consistency_chain(leaves, (2, 5, 9))
+        # a root from a different leaf sequence is rejected
+        other = self._leaves(9)
+        other[0] = b"different"
+        self.assertFalse(
+            verify_consistency_chain(
+                MerkleConsistencyChain((merkle_root(other[:2]),) + chain.roots[1:],
+                                       chain.proofs)
+            )
+        )
+
+    def test_inputs_not_mutated(self):
+        leaves = self._leaves(11)
+        counts = (1, 4, 7, 11)
+        leaves_snapshot = list(leaves)
+        counts_snapshot = counts
+        chain = prove_consistency_chain(leaves, counts)
+        roots_snapshot = chain.roots
+        proofs_snapshot = chain.proofs
+        self.assertEqual(leaves, leaves_snapshot)
+        self.assertEqual(counts, counts_snapshot)
+        self.assertTrue(verify_consistency_chain(chain))
+        self.assertEqual(leaves, leaves_snapshot)
+        self.assertEqual(counts, counts_snapshot)
+        self.assertEqual(chain.roots, roots_snapshot)
+        self.assertEqual(chain.proofs, proofs_snapshot)
+
+    def test_existing_merkle_interfaces_still_compatible(self):
+        leaves = self._leaves(5)
+        root = merkle_root(leaves)
+        inclusion = prove_inclusion(leaves, 2)
+        self.assertTrue(verify_inclusion(leaves[2], inclusion, root))
+        multi = prove_multi_inclusion(leaves, (1, 3))
+        self.assertTrue(
+            verify_multi_inclusion([(1, leaves[1]), (3, leaves[3])], multi, root)
+        )
+        consistency = prove_consistency(leaves, 3)
+        self.assertTrue(
+            verify_consistency(merkle_root(leaves[:3]), root, consistency)
         )
 
 

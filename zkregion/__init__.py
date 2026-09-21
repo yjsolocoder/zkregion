@@ -17,7 +17,8 @@ RangeReplayGuard / RegionReplayGuard /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion / MerkleConsistencyProof / prove_consistency /
-verify_consistency.
+verify_consistency / MerkleConsistencyChain / prove_consistency_chain /
+verify_consistency_chain.
 """
 
 from __future__ import annotations
@@ -42,6 +43,7 @@ __all__ = [
     "BoundRangeReplayGuard",
     "BoundSchnorrBatch",
     "BoundSchnorrReplayGuard",
+    "MerkleConsistencyChain",
     "MerkleConsistencyProof",
     "MerkleMultiProof",
     "MerkleProof",
@@ -66,12 +68,14 @@ __all__ = [
     "merkle_root",
     "pedersen_commit",
     "prove_consistency",
+    "prove_consistency_chain",
     "prove_inclusion",
     "prove_multi_inclusion",
     "prove_range",
     "prove_region",
     "verify_bound",
     "verify_consistency",
+    "verify_consistency_chain",
     "verify_inclusion",
     "verify_multi_inclusion",
     "verify_opening",
@@ -1790,6 +1794,140 @@ def verify_consistency(
             merged = _node_digest(peaks[-2][1], peaks[-1][1])
             peaks[-2:] = [(peaks[-1][0] + 1, merged)]
     return hmac.compare_digest(_peaks_root(peaks), new_root)
+
+
+# ---------------------------------------------------------------------------
+# Multi-checkpoint Merkle consistency chains
+#
+# A chain bundles the prefix roots of several strictly increasing leaf
+# counts together with one append-only consistency proof per adjacent pair,
+# so a single confirmation shows that every checkpoint tree grows from the
+# previous one by appending leaves. Roots and proofs reuse the existing
+# Merkle protocol byte for byte; no new encoding is introduced.
+
+
+@dataclass(frozen=True)
+class MerkleConsistencyChain:
+    """Several Merkle checkpoints linked by adjacent consistency proofs.
+
+    ``roots`` is a tuple of 32-byte Merkle root digests, one per checkpoint;
+    ``proofs`` is a tuple of :class:`MerkleConsistencyProof`, one per
+    adjacent pair (``proofs[i]`` links ``roots[i]`` to ``roots[i + 1]``),
+    so ``len(proofs) == len(roots) - 1`` and there are at least two roots.
+    Both fields are positional construction arguments; chains compare by
+    value and are immutable.
+    """
+
+    roots: tuple[bytes, ...]
+    proofs: tuple[MerkleConsistencyProof, ...]
+
+
+def _checked_chain_counts(counts: tuple[int, ...], leaf_total: int) -> list[int]:
+    """Validate the checkpoint ``counts`` argument of :func:`prove_consistency_chain`.
+
+    ``counts`` must be a tuple of at least two non-``bool`` integers,
+    strictly increasing without duplicates, each satisfying
+    ``1 <= count <= leaf_total``.
+    """
+    if isinstance(counts, (bytes, bytearray, str)) or not isinstance(counts, tuple):
+        raise TypeError("counts must be a tuple of integers")
+    items = list(counts)  # copy: inputs are never mutated
+    if len(items) < 2:
+        raise ValueError("counts must contain at least two checkpoints")
+    previous: int | None = None
+    for position, count in enumerate(items):
+        if not isinstance(count, int) or isinstance(count, bool):
+            raise TypeError(f"counts[{position}] must be an integer")
+        if not 1 <= count <= leaf_total:
+            raise ValueError(
+                f"counts[{position}] must satisfy 1 <= count <= number of leaves"
+            )
+        if previous is not None and count <= previous:
+            raise ValueError("counts must be strictly increasing without duplicates")
+        previous = count
+    return items
+
+
+def prove_consistency_chain(
+    leaves: Sequence[bytes],
+    counts: tuple[int, ...],
+) -> MerkleConsistencyChain:
+    """Build a :class:`MerkleConsistencyChain` over several prefix checkpoints.
+
+    ``leaves`` must be a non-empty sequence of ``bytes``. ``counts`` must
+    be a tuple of at least two non-``bool`` integers, strictly increasing
+    without duplicates, with each entry satisfying
+    ``1 <= count <= len(leaves)``. The returned chain holds the prefix
+    roots at the given counts, in order, and one
+    :class:`MerkleConsistencyProof` per adjacent pair of checkpoints — each
+    proof is the ordinary :func:`prove_consistency` proof for the shared
+    leaf sequence, reusing the existing Merkle protocol byte for byte.
+
+    Type errors (including a non-tuple ``counts``, ``bool`` counts or
+    leaves) raise :class:`TypeError`; an empty tree, fewer than two
+    counts, duplicates, out-of-order or out-of-range counts raise
+    :class:`ValueError`. Inputs are never mutated.
+    """
+    items = _checked_leaves(leaves)
+    checkpoints = _checked_chain_counts(counts, len(items))
+    roots = tuple(merkle_root(items[:count]) for count in checkpoints)
+    proofs = tuple(
+        prove_consistency(items[:later], earlier)
+        for earlier, later in zip(checkpoints, checkpoints[1:])
+    )
+    return MerkleConsistencyChain(roots=roots, proofs=proofs)
+
+
+def verify_consistency_chain(chain: MerkleConsistencyChain) -> bool:
+    """Verify every adjacent checkpoint link in a :class:`MerkleConsistencyChain`.
+
+    The chain must hold at least two 32-byte roots with exactly one fewer
+    :class:`MerkleConsistencyProof`, and each proof's ``old_count`` /
+    ``new_count`` must match the adjacent checkpoint pair in order; each
+    pair is then checked with :func:`verify_consistency`, so roots and
+    nodes follow the existing Merkle protocol with no new encoding.
+
+    A wrong object, non-tuple field, non-``bytes`` root or a proof or
+    nested proof field of the wrong type (including ``bool`` counts) raises
+    :class:`TypeError`. An empty chain, a root/proof count mismatch,
+    mismatched or out-of-order segment counts, malformed digest lengths or
+    any root or node mismatch returns ``False``. The input is never
+    mutated.
+    """
+    if not isinstance(chain, MerkleConsistencyChain):
+        raise TypeError("chain must be a MerkleConsistencyChain")
+    if not isinstance(chain.roots, tuple):
+        raise TypeError("chain roots must be a tuple of bytes")
+    if not isinstance(chain.proofs, tuple):
+        raise TypeError("chain proofs must be a tuple of MerkleConsistencyProof")
+    for root in chain.roots:
+        _check_bytes(root, "chain root")
+    for proof in chain.proofs:
+        if not isinstance(proof, MerkleConsistencyProof):
+            raise TypeError("chain proofs must be a tuple of MerkleConsistencyProof")
+        for name in ("old_count", "new_count"):
+            value = getattr(proof, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(f"proof {name} must be an integer")
+        if not isinstance(proof.nodes, tuple):
+            raise TypeError("proof nodes must be a tuple of bytes")
+        for node in proof.nodes:
+            _check_bytes(node, "proof node")
+    roots = chain.roots
+    proofs = chain.proofs
+    if len(roots) < 2 or len(proofs) != len(roots) - 1:
+        return False
+    if any(len(root) != _MERKLE_DIGEST_SIZE for root in roots):
+        return False
+    # Adjacent segments share a checkpoint, so the new count of one
+    # segment must equal the old count of the next.
+    for earlier, later in zip(proofs, proofs[1:]):
+        if earlier.new_count != later.old_count:
+            return False
+    for root, next_root, proof in zip(roots, roots[1:], proofs):
+        if not verify_consistency(root, next_root, proof):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -2297,10 +2297,11 @@ class SQLiteReplayStore:
     after a restart) therefore share pending, claimed and consumed ids; two
     stores using different namespaces in the same file never interact. A
     guard for another entry kind (see :class:`RangeReplayGuard`,
-    :class:`RegionReplayGuard`, :class:`BoundRegionReplayGuard` and
-    :class:`BoundRangeReplayGuard`) keeps its rows in the same table under
-    its own domain segment via :meth:`_view`, so one store file and
-    namespace can serve several guard kinds without their ids colliding.
+    :class:`RegionReplayGuard`, :class:`BoundRegionReplayGuard`,
+    :class:`BoundRangeReplayGuard` and :class:`BoundSchnorrReplayGuard`)
+    keeps its rows in the same table under its own domain segment via
+    :meth:`_view`, so one store file and namespace can serve several guard
+    kinds without their ids colliding.
 
     A ``check`` writes a fresh random claim token together with the lease
     deadline ``clock() + lease_seconds`` in one short transaction, then runs
@@ -3977,18 +3978,20 @@ class BoundRangeReplayGuard:
 
 
 # ---------------------------------------------------------------------------
-# Per-instance replay protection for Merkle-committed Schnorr batches
+# Replay protection for Merkle-committed Schnorr batches
 #
 # A BoundSchnorrReplayGuard binds a whole BoundSchnorrBatch together with the
 # Merkle root it is claimed under to a caller-chosen session id, reusing the
 # ReplayBinding type and, byte for byte, the F / U / S framing and the E
 # expiry encoding of BoundRegionReplayGuard; only the domain separator and
 # the per-entry leaves differ. Like the other bound guards the binding is
-# single-use and local to the guard instance: bind_once registers a pending
-# binding, check recomputes the digest, checks the expiry, delegates the
-# actual root and signature verification to verify_bound (passing the random
-# source through unchanged) and consumes the id only on full success; every
-# rejection leaves the id untouched.
+# single-use: without a store the state is local to the guard instance,
+# while an SQLiteReplayStore keeps pending, claimed and consumed ids in the
+# store under b"zr/bsr/v1", shared across instances, processes and restarts.
+# bind_once registers a pending binding, check recomputes the digest, checks
+# the expiry, delegates the actual root and signature verification to
+# verify_bound (passing the random source through unchanged) and consumes
+# the id only on full success; every rejection leaves the id untouched.
 #
 # digest = SHA-256(
 #     F(D) || F(session_id) || F(root) || F(U(batch.leaf_count))
@@ -4126,7 +4129,7 @@ def _check_bound_schnorr_batch_types(batch: object, root: object) -> None:
 
 
 class BoundSchnorrReplayGuard:
-    """Per-instance, single-use replay protection for a bound Schnorr batch.
+    """Single-use replay protection for a Merkle-committed Schnorr batch.
 
     A fresh guard has no registrations. :meth:`bind_once` registers a
     pending :class:`ReplayBinding` that commits a whole
@@ -4137,24 +4140,38 @@ class BoundSchnorrReplayGuard:
     through — and then marks the id consumed. The digest reuses the
     :class:`BoundRegionReplayGuard` framing byte for byte, with only the
     domain separator (``b"zr/bsr/v1"``) and the per-entry leaves changed
-    to the BoundSchnorr leaves. Both the pending and the consumed state
-    live on this guard instance and are never shared.
+    to the BoundSchnorr leaves. By default both the pending and the
+    consumed state live on this guard instance and are never shared
+    between instances; passing an :class:`SQLiteReplayStore` as ``store``
+    instead keeps the state in that store under the ``b"zr/bsr/v1"`` key
+    domain, so bound-schnorr guards attached to the same store namespace
+    share pending, claimed and consumed ids across independent instances,
+    processes and process restarts.
 
     Concurrent checks of the same id are decided by an atomic claim taken
-    before the (potentially slow) delegated batch verification; the claim is
-    per-id registry state rather than a global lock, so a batch being
-    verified under one id never serializes checks or binds of other ids.
+    before the (potentially slow) delegated batch verification (the
+    in-instance registry lock, or the store's short transaction and unique
+    claim token); the claim is per-id registry state rather than a global
+    lock, so a batch being verified under one id never serializes checks or
+    binds of other ids.
     """
 
-    def __init__(self) -> None:
-        self._registry = _ReplayRegistry()
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = None if store is None else store._view(_BOUND_SCHNORR_REPLAY_DOMAIN)
+        self._registry = None if store is not None else _ReplayRegistry()
 
     @property
     def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
         return self._registry.pending_snapshot()
 
     @property
     def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
         return self._registry.consumed_snapshot()
 
     def bind_once(
@@ -4195,7 +4212,10 @@ class BoundSchnorrReplayGuard:
             _bound_schnorr_replay_digest(batch, root, session_id, expires_at),
             expires_at,
         )
-        self._registry.register(session_id, binding)
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
         return binding
 
     def check(
@@ -4229,11 +4249,14 @@ class BoundSchnorrReplayGuard:
         registration pending. An exception escaping the delegated
         verification (such as the :class:`TypeError` / :class:`ValueError`
         raised by a bad ``randbelow``) likewise releases the claim and then
-        propagates unchanged, leaving the id usable. Verification runs
-        without any lock held, so other ids are never serialized. Argument
-        type errors (including a non-callable ``randbelow``) raise
-        :class:`TypeError`; an out-of-range ``now`` raises
-        :class:`ValueError`. Inputs are never mutated.
+        propagates unchanged, leaving the id usable. With a store backend,
+        only the holder of the current claim token can consume the id (an
+        expired claim may be taken over by a later equal ``check``); a stale
+        token neither consumes nor restores anything. Verification runs
+        without any lock or transaction held, so other ids are never
+        serialized. Argument type errors (including a non-callable
+        ``randbelow``) raise :class:`TypeError`; an out-of-range ``now``
+        raises :class:`ValueError`. Inputs are never mutated.
         """
         _check_bound_schnorr_batch_types(batch, root)
         if not isinstance(binding, ReplayBinding):
@@ -4248,6 +4271,8 @@ class BoundSchnorrReplayGuard:
         if not _bound_schnorr_replay_encodable(batch):
             return False  # negative or oversized framed/leaf integers
         session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(batch, root, binding, session_id, current, randbelow)
         if not self._registry.claim(session_id, binding):
             return False  # unknown id, already consumed, claimed, or unequal binding
         committed = False
@@ -4267,3 +4292,48 @@ class BoundSchnorrReplayGuard:
         finally:
             if not committed:
                 self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        batch: BoundSchnorrBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+        randbelow: Callable[[int], int],
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_schnorr_replay_digest(batch, root, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_bound(batch, root, randbelow=randbelow):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)

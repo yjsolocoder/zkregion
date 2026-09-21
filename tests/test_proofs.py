@@ -16,6 +16,7 @@ from zkregion import (
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
     MerkleConsistencyBatchEntry,
+    MerkleConsistencyBatchReplayGuard,
     MerkleConsistencyChain,
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyProof,
@@ -8609,6 +8610,689 @@ class MerkleConsistencyReplayGuardTest(unittest.TestCase):
         store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
         binding = MerkleConsistencyReplayGuard(store=store).bind_once(
             old_root, new_root, proof, b"s"
+        )
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+
+class MerkleConsistencyBatchReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for independent consistency-pair batches."""
+
+    DOMAIN = b"zr/mcbr/v1"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "mcbr.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _leaves(self, count):
+        return [f"mcbr-leaf-{i}".encode() for i in range(count)]
+
+    def _entry(self, old_count=3, size=7):
+        leaves = self._leaves(size)
+        return MerkleConsistencyBatchEntry(
+            merkle_root(leaves[:old_count]),
+            merkle_root(leaves),
+            prove_consistency(leaves, old_count),
+        )
+
+    def _batch(self, old_counts=(1, 3, 5), size=6):
+        leaves = self._leaves(size)
+        return [
+            MerkleConsistencyBatchEntry(
+                merkle_root(leaves[:old_count]),
+                merkle_root(leaves),
+                prove_consistency(leaves, old_count),
+            )
+            for old_count in old_counts
+        ]
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def expected_digest(entries, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(F(transform(item)) for item in sequence)
+
+        def Q(entry):
+            proof = entry.proof
+            return (
+                F(entry.old_root)
+                + F(entry.new_root)
+                + F(U(proof.old_count))
+                + F(U(proof.new_count))
+                + S(proof.nodes, lambda node: node)
+            )
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = F(b"zr/mcbr/v1") + F(session_id) + S(entries, Q) + F(expiry)
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(entries, b"s1"))
+        binding = guard.bind_once(entries, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(entries, b"s2", 1000)
+        )
+
+    def test_tuple_entries_match_list_entries(self):
+        entries = self._batch()
+        as_list = MerkleConsistencyBatchReplayGuard().bind_once(entries, b"s").digest
+        as_tuple = MerkleConsistencyBatchReplayGuard().bind_once(tuple(entries), b"s").digest
+        self.assertEqual(as_list, as_tuple)
+
+    def test_domain_separator_is_distinct(self):
+        entries = self._batch()
+        binding = MerkleConsistencyBatchReplayGuard().bind_once(entries, b"s")
+
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(
+                F(transform(item)) for item in sequence
+            )
+
+        def Q(entry):
+            proof = entry.proof
+            return (
+                F(entry.old_root)
+                + F(entry.new_root)
+                + F(U(proof.old_count))
+                + F(U(proof.new_count))
+                + S(proof.nodes, lambda node: node)
+            )
+
+        framing = F(b"s") + S(entries, Q) + F(b"\x00")
+        for other_domain in (
+            b"zr/r/v1",
+            b"zr/rr/v1",
+            b"zr/rg/v1",
+            b"zr/brg/v1",
+            b"zr/brr/v1",
+            b"zr/bsr/v1",
+            b"zr/mccr/v1",
+            b"zr/mcr/v1",
+            b"zr/mir/v1",
+            b"zr/mmr/v1",
+        ):
+            foreign_digest = hashlib.sha256(F(other_domain) + framing).digest()
+            self.assertNotEqual(binding.digest, foreign_digest)
+
+    def test_digest_binds_every_component(self):
+        entries = self._batch()
+        base = MerkleConsistencyBatchReplayGuard().bind_once(entries, b"s")
+
+        def bind(es, s=b"s", **kw):
+            return MerkleConsistencyBatchReplayGuard().bind_once(es, s, **kw).digest
+
+        # the session id and expiry are framed
+        self.assertNotEqual(base.digest, bind(entries, s=b"other"))
+        self.assertNotEqual(base.digest, bind(entries, expires_at=1))
+        self.assertNotEqual(
+            bind(entries, expires_at=1), bind(entries, expires_at=2)
+        )
+        # a substituted root on one entry binds
+        self.assertNotEqual(
+            base.digest,
+            bind([dataclasses.replace(entries[0], old_root=b"\x7f" * 32)] + entries[1:]),
+        )
+        self.assertNotEqual(
+            base.digest,
+            bind([dataclasses.replace(entries[0], new_root=b"\x7f" * 32)] + entries[1:]),
+        )
+        # swapping the roots of one entry binds
+        swapped = dataclasses.replace(
+            entries[0], old_root=entries[0].new_root, new_root=entries[0].old_root
+        )
+        self.assertNotEqual(base.digest, bind([swapped] + entries[1:]))
+        # the proof counts of one entry bind
+        proof = entries[1].proof
+        bigger_old = dataclasses.replace(
+            entries[1],
+            proof=MerkleConsistencyProof(proof.old_count + 1, proof.new_count, proof.nodes),
+        )
+        bigger_new = dataclasses.replace(
+            entries[1],
+            proof=MerkleConsistencyProof(proof.old_count, proof.new_count + 1, proof.nodes),
+        )
+        self.assertNotEqual(base.digest, bind([entries[0], bigger_old, entries[2]]))
+        self.assertNotEqual(base.digest, bind([entries[0], bigger_new, entries[2]]))
+        # a node of one entry binds
+        node = entries[0].proof.nodes[0]
+        tampered_node = bytes([node[0] ^ 0x01]) + node[1:]
+        re_noded = dataclasses.replace(
+            entries[0],
+            proof=dataclasses.replace(
+                entries[0].proof,
+                nodes=(tampered_node,) + entries[0].proof.nodes[1:],
+            ),
+        )
+        self.assertNotEqual(base.digest, bind([re_noded] + entries[1:]))
+        # node order within one entry binds
+        if len(entries[0].proof.nodes) >= 2:
+            reordered_nodes = dataclasses.replace(
+                entries[0],
+                proof=dataclasses.replace(
+                    entries[0].proof, nodes=entries[0].proof.nodes[::-1]
+                ),
+            )
+            self.assertNotEqual(
+                base.digest, bind([reordered_nodes] + entries[1:])
+            )
+
+    def test_digest_binds_batch_order_count_and_duplicates(self):
+        entries = self._batch()
+        base = MerkleConsistencyBatchReplayGuard().bind_once(entries, b"s").digest
+
+        def bind(es):
+            return MerkleConsistencyBatchReplayGuard().bind_once(es, b"s").digest
+
+        # the batch keeps order: reordered entries change the digest
+        self.assertNotEqual(base, bind([entries[2], entries[0], entries[1]]))
+        # a deleted item changes the digest
+        self.assertNotEqual(base, bind(entries[:1]))
+        self.assertNotEqual(base, bind(entries[:-1]))
+        # a duplicated item changes the digest (duplicates are kept, not a set)
+        self.assertNotEqual(base, bind(entries + entries[:1]))
+        self.assertNotEqual(base, bind(entries + entries))
+        # two copies of the same item are still distinguishable from one
+        self.assertNotEqual(bind(entries[:1]), bind(entries[:1] + entries[:1]))
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        entries = self._batch()
+
+        def bind(session_id, **kw):
+            return MerkleConsistencyBatchReplayGuard().bind_once(
+                entries, session_id, **kw
+            )
+
+        digests = {
+            bind(b"a").digest,
+            bind(b"b", expires_at=0).digest,
+            bind(b"c", expires_at=1).digest,
+        }
+        self.assertEqual(len(digests), 3)
+
+    # ---- bind_once state and validation -------------------------------------
+
+    def test_pending_id_cannot_be_rebound(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        guard.bind_once(entries, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_claimed_id_cannot_be_rebound(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard._registry.claim(b"s", binding))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_rebind_rejected_for_any_state(self):
+        # even a rebind to a different batch is rejected while the id is live
+        entries = self._batch()
+        other = self._batch(old_counts=(1, 2), size=4)
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(other, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(other, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        first = guard.bind_once(entries, b"s1")
+        second = guard.bind_once(entries, b"s2")
+        self.assertTrue(guard.check(entries, first, now=1))
+        self.assertFalse(guard.check(entries, first, now=1))
+        self.assertTrue(guard.check(entries, second, now=1))
+
+    def test_bind_empty_batch_is_a_value_error(self):
+        guard = MerkleConsistencyBatchReplayGuard()
+        with self.assertRaises(ValueError):
+            guard.bind_once((), b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once([], b"s")
+
+    def test_bind_type_errors(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        for bad in (b"bytes", bytearray(b"bytes"), "string", 7, None, True):
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, b"s")
+        for bad in ("entry", 7, None, True, entries[0].proof):
+            with self.assertRaises(TypeError):
+                guard.bind_once([bad], b"s")
+        guard.bind_once(entries, b"taken")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entries, bad)
+        with self.assertRaises(TypeError):
+            guard.bind_once(entries, b"x", expires_at="1000")
+        with self.assertRaises(TypeError):
+            guard.bind_once(entries, b"x", expires_at=True)
+
+    def test_bind_nested_type_errors(self):
+        entry = self._entry()
+        bad_entries = [
+            [dataclasses.replace(entry, old_root="root")],
+            [dataclasses.replace(entry, new_root=7)],
+            [dataclasses.replace(entry, old_root=bytearray(entry.old_root))],
+            [dataclasses.replace(entry, proof="proof")],
+            [dataclasses.replace(
+                entry,
+                proof=MerkleConsistencyProof(True, entry.proof.new_count, entry.proof.nodes),
+            )],
+            [dataclasses.replace(
+                entry,
+                proof=MerkleConsistencyProof(entry.proof.old_count, True, entry.proof.nodes),
+            )],
+            [dataclasses.replace(
+                entry,
+                proof=MerkleConsistencyProof("3", entry.proof.new_count, entry.proof.nodes),
+            )],
+            [dataclasses.replace(
+                entry,
+                proof=MerkleConsistencyProof(entry.proof.old_count, 7.0, entry.proof.nodes),
+            )],
+            [dataclasses.replace(
+                entry,
+                proof=MerkleConsistencyProof(
+                    entry.proof.old_count, entry.proof.new_count, list(entry.proof.nodes)
+                ),
+            )],
+            [dataclasses.replace(
+                entry,
+                proof=MerkleConsistencyProof(
+                    entry.proof.old_count,
+                    entry.proof.new_count,
+                    entry.proof.nodes[:-1] + ("node",),
+                ),
+            )],
+        ]
+        for bad in bad_entries:
+            with self.assertRaises(TypeError):
+                MerkleConsistencyBatchReplayGuard().bind_once(bad, b"s")
+
+    def test_bind_value_errors(self):
+        entries = self._batch()
+        with self.assertRaises(ValueError):
+            MerkleConsistencyBatchReplayGuard().bind_once(entries, b"")
+        for bad_expiry in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                MerkleConsistencyBatchReplayGuard().bind_once(
+                    entries, b"s", expires_at=bad_expiry
+                )
+        entry = entries[0]
+        proof = entry.proof
+        huge = 2**64
+        for oversized in (
+            MerkleConsistencyProof(huge, proof.new_count, proof.nodes),
+            MerkleConsistencyProof(proof.old_count, huge, proof.nodes),
+            MerkleConsistencyProof(-1, proof.new_count, proof.nodes),
+        ):
+            with self.assertRaises(ValueError):
+                MerkleConsistencyBatchReplayGuard().bind_once(
+                    [dataclasses.replace(entry, proof=oversized)], b"s"
+                )
+
+    def test_construction_rejects_non_store(self):
+        for bad in (object(), "path", 1, True, b"ns", {}):
+            with self.assertRaises(TypeError):
+                MerkleConsistencyBatchReplayGuard(store=bad)
+
+    # ---- check: accept, reject, consume -------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entries, binding, now=999))
+        self.assertFalse(guard.check(entries, binding, now=999))
+        self.assertEqual(guard._consumed, {b"s"})
+        self.assertNotIn(b"s", guard._pending)
+
+    def test_check_with_default_now(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=2**64 - 1))
+
+    def test_expiry_boundary_is_inclusive(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entries, binding, now=999))
+        for now in (1000, 1001, 2**64 - 1):
+            guard = MerkleConsistencyBatchReplayGuard()
+            binding = guard.bind_once(entries, b"s", expires_at=1000)
+            self.assertFalse(guard.check(entries, binding, now=now))
+            self.assertIn(b"s", guard._pending)
+
+    def test_expired_rejection_does_not_consume(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertFalse(guard.check(entries, binding, now=2000))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=999))
+
+    def test_check_accepts_duplicate_entries(self):
+        entries = self._batch()
+        duplicated = list(entries) + entries[:1]
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(duplicated, b"s")
+        self.assertTrue(guard.check(duplicated, binding, now=1))
+        self.assertEqual(guard._consumed, {b"s"})
+
+    def test_wrong_batch_rejected_without_consuming(self):
+        entries = self._batch()
+        other = self._batch(old_counts=(1, 2), size=4)
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        # a different batch, a reordered batch and a deleted item all miss the
+        # digest and must neither verify nor consume the id
+        self.assertFalse(guard.check(other, binding, now=1))
+        self.assertFalse(guard.check([entries[2], entries[0], entries[1]], binding, now=1))
+        self.assertFalse(guard.check(entries[:-1], binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_one_invalid_entry_rejects_the_batch_and_restores(self):
+        # bind_once never verifies: a well-typed, U-encodable but internally
+        # inconsistent entry binds, and check must reach
+        # verify_consistency_batch, get False, release and leave the id pending.
+        bogus = b"\xcd" * 32
+        good = self._entry(old_count=3, size=7)
+        bad_entry = MerkleConsistencyBatchEntry(
+            b"\x00" * 32, b"\x01" * 32, MerkleConsistencyProof(2, 4, (bogus,) * 3)
+        )
+        self.assertFalse(verify_consistency_batch([good, bad_entry]))
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once([good, bad_entry], b"s")
+        self.assertFalse(guard.check([good, bad_entry], binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        with self.assertRaises(ValueError):  # still bound: rebind rejected
+            guard.bind_once([good, bad_entry], b"s")
+
+    def test_empty_batch_at_check_is_false_without_consuming(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertFalse(guard.check([], binding, now=1))
+        self.assertFalse(guard.check((), binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        self.assertFalse(
+            guard.check(entries, ReplayBinding(b"never", b"\x00" * 32), now=1)
+        )
+        binding = guard.bind_once(entries, b"s")
+        # a binding from another isolated instance carries no registration on
+        # a fresh instance, even though the binding values are equal
+        foreign = MerkleConsistencyBatchReplayGuard().bind_once(entries, b"s")
+        self.assertEqual(foreign, binding)
+        self.assertFalse(
+            MerkleConsistencyBatchReplayGuard().check(entries, foreign, now=1)
+        )
+        # while the instance that owns the registration accepts it
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        guard.bind_once(entries, b"s")
+        forged = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(guard._registry.claim(b"s", forged))
+        self.assertIn(b"s", guard._pending)
+
+    def test_instances_are_independent(self):
+        entries = self._batch()
+        first = MerkleConsistencyBatchReplayGuard()
+        second = MerkleConsistencyBatchReplayGuard()
+        binding = first.bind_once(entries, b"s")
+        self.assertFalse(second.check(entries, binding, now=1))
+        self.assertTrue(first.check(entries, binding, now=1))
+
+    def test_delegation_error_propagates_and_restores_pending(self):
+        import zkregion
+
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        original = zkregion.verify_consistency_batch
+
+        def boom(_entries):
+            raise RuntimeError("boom")
+
+        zkregion.verify_consistency_batch = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entries, binding, now=1)
+        finally:
+            zkregion.verify_consistency_batch = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_check_type_errors(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in (b"bytes", bytearray(b"bytes"), "string", 7, None, True):
+            with self.assertRaises(TypeError):
+                guard.check(bad, binding, now=1)
+        for bad in ("entry", 7, None, True, entries[0].proof):
+            with self.assertRaises(TypeError):
+                guard.check([bad], binding, now=1)
+        for bad in ("binding", 7, None, (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(entries, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(entries, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(entries, binding, now=bad)
+
+    def test_inputs_are_not_mutated(self):
+        entries = self._batch()
+        guard = MerkleConsistencyBatchReplayGuard()
+        snapshot = [dataclasses.replace(entry) for entry in entries]
+        binding = guard.bind_once(entries, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        guard.check(entries, binding, now=1)
+        self.assertEqual(entries, snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        entries = self._batch()
+        store = self.make_store()
+        binder = MerkleConsistencyBatchReplayGuard(store=store)
+        binding = binder.bind_once(entries, b"s", expires_at=1000)
+        checker = MerkleConsistencyBatchReplayGuard(store=store)
+        self.assertTrue(checker.check(entries, binding, now=999))
+        self.assertFalse(binder.check(entries, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        entries = self._batch()
+        store = self.make_store()
+        binding = MerkleConsistencyBatchReplayGuard(store=store).bind_once(
+            entries, b"s"
+        )
+        store.close()
+        reopened = self.make_store()
+        guard = MerkleConsistencyBatchReplayGuard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = MerkleConsistencyBatchReplayGuard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(entries, b"s")
+        reopened_again.close()
+
+    def test_store_domain_isolation_from_other_guards(self):
+        entries = self._batch()
+        old_root, new_root, proof = (
+            entries[1].old_root,
+            entries[1].new_root,
+            entries[1].proof,
+        )
+        store = self.make_store()
+        batch_guard = MerkleConsistencyBatchReplayGuard(store=store)
+        single_guard = MerkleConsistencyReplayGuard(store=store)
+        batch_binding = batch_guard.bind_once(entries, b"same-id")
+        single_binding = single_guard.bind_once(
+            old_root, new_root, proof, b"same-id"
+        )
+        self.assertTrue(batch_guard.check(entries, batch_binding, now=1))
+        self.assertTrue(
+            single_guard.check(old_root, new_root, proof, single_binding, now=1)
+        )
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/mcr/v1", domains)
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        entries = self._batch()
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = MerkleConsistencyBatchReplayGuard(store=first).bind_once(
+            entries, b"s"
+        )
+        # a fresh id in namespace b does not see the pending id in namespace a
+        self.assertFalse(
+            MerkleConsistencyBatchReplayGuard(store=second).check(
+                entries, binding_a, now=1
+            )
+        )
+        self.assertTrue(
+            MerkleConsistencyBatchReplayGuard(store=first).check(
+                entries, binding_a, now=1
+            )
+        )
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        entries = self._batch()
+        other = self._batch(old_counts=(1, 2), size=4)
+        store = self.make_store()
+        binder = MerkleConsistencyBatchReplayGuard(store=store)
+        binding = binder.bind_once(entries, b"s")
+        checker = MerkleConsistencyBatchReplayGuard(store=store)
+        self.assertFalse(checker.check(other, binding, now=1))
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(
+            MerkleConsistencyBatchReplayGuard(store=store).check(
+                entries, binding, now=1
+            )
+        )
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        entries = self._batch()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = MerkleConsistencyBatchReplayGuard(store=store)
+        binding = guard.bind_once(entries, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):  # live claim cannot be rebound
+            guard.bind_once(entries, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):  # expired claim still cannot be rebound
+            guard.bind_once(entries, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):  # consumed id can never be rebound
+            guard.bind_once(entries, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        entries = self._batch()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = MerkleConsistencyBatchReplayGuard(store=store).bind_once(
+            entries, b"s"
         )
         view = store._view(self.DOMAIN)
         old_token = view.claim(b"s", binding)

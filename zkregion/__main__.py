@@ -12,6 +12,7 @@ from . import (
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
     MerkleConsistencyBatchEntry,
+    MerkleConsistencyBatchReplayGuard,
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyReplayGuard,
     MultiSchnorrEntry,
@@ -599,6 +600,38 @@ def main() -> int:
     foreign_mcr_binding = foreign_mcr.bind_once(old_root, new_root, consistency, b"consistency-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_mcr.check(old_root, new_root, consistency, foreign_mcr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for consistency batches (bind once, check once):")
+    mcbr = MerkleConsistencyBatchReplayGuard()
+    mcbr_binding = mcbr.bind_once(consistency_entries, b"consistency-batch-session-1", expires_at=10**12)
+    print(f"  digest={mcbr_binding.digest.hex()[:32]}…  expires_at={mcbr_binding.expires_at}")
+    print(f"  valid first check accepted: {mcbr.check(consistency_entries, mcbr_binding, now=100)}")
+    print(f"  replay rejected: {not mcbr.check(consistency_entries, mcbr_binding, now=101)}")
+    other_mcbr = MerkleConsistencyBatchReplayGuard()
+    other_mcbr_binding = other_mcbr.bind_once(consistency_entries, b"consistency-batch-session-2")
+    last_batch_node = consistency_entries[0].proof.nodes[-1]
+    tampered_batch_node = bytes([last_batch_node[0] ^ 1]) + last_batch_node[1:]
+    tampered_batch = [dataclasses.replace(
+        consistency_entries[0],
+        proof=dataclasses.replace(
+            consistency_entries[0].proof,
+            nodes=consistency_entries[0].proof.nodes[:-1] + (tampered_batch_node,),
+        ),
+    )] + consistency_entries[1:]
+    print(f"  tampered entry rejected without consuming the id: "
+          f"{not other_mcbr.check(tampered_batch, other_mcbr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mcbr.check(consistency_entries, other_mcbr_binding, now=1)}")
+    print(f"  duplicate entries bind and verify: ", end="")
+    dup_mcbr = MerkleConsistencyBatchReplayGuard()
+    dup_batch = list(consistency_entries) + consistency_entries[:1]
+    dup_binding = dup_mcbr.bind_once(dup_batch, b"consistency-batch-session-3")
+    print(dup_mcbr.check(dup_batch, dup_binding, now=1))
+    foreign_mcbr = MerkleConsistencyBatchReplayGuard()
+    foreign_mcbr_binding = foreign_mcbr.bind_once(consistency_entries, b"consistency-batch-session-4")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mcbr.check(consistency_entries, foreign_mcbr_binding, now=2)}")
 
     print()
     print("region membership:")

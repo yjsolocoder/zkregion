@@ -10,6 +10,7 @@ BoundSchnorrBatch / verify_bound /
 BoundRegionBatch / verify_region_bound /
 BoundRangeBatch / verify_range_bound /
 BoundSchnorrReplayGuard /
+MerkleConsistencyBatchReplayGuard /
 MerkleConsistencyChainReplayGuard /
 MerkleConsistencyReplayGuard /
 MerkleInclusionReplayGuard /
@@ -49,6 +50,7 @@ __all__ = [
     "BoundSchnorrBatch",
     "BoundSchnorrReplayGuard",
     "MerkleConsistencyBatchEntry",
+    "MerkleConsistencyBatchReplayGuard",
     "MerkleConsistencyChain",
     "MerkleConsistencyChainReplayGuard",
     "MerkleConsistencyProof",
@@ -2489,6 +2491,7 @@ _BOUND_REGION_REPLAY_DOMAIN = b"zr/brg/v1"
 _BOUND_RANGE_REPLAY_DOMAIN = b"zr/brr/v1"
 _BOUND_SCHNORR_REPLAY_DOMAIN = b"zr/bsr/v1"
 _MERKLE_CHAIN_REPLAY_DOMAIN = b"zr/mccr/v1"
+_MERKLE_CONSISTENCY_BATCH_REPLAY_DOMAIN = b"zr/mcbr/v1"
 _MERKLE_CONSISTENCY_REPLAY_DOMAIN = b"zr/mcr/v1"
 _MERKLE_INCLUSION_REPLAY_DOMAIN = b"zr/mir/v1"
 _MERKLE_MULTI_REPLAY_DOMAIN = b"zr/mmr/v1"
@@ -2636,6 +2639,7 @@ class SQLiteReplayStore:
     guard for another entry kind (see :class:`RangeReplayGuard`,
     :class:`RegionReplayGuard`, :class:`BoundRegionReplayGuard`,
     :class:`BoundRangeReplayGuard`, :class:`BoundSchnorrReplayGuard`,
+    :class:`MerkleConsistencyBatchReplayGuard`,
     :class:`MerkleConsistencyChainReplayGuard`,
     :class:`MerkleConsistencyReplayGuard`,
     :class:`MerkleInclusionReplayGuard` and
@@ -5974,6 +5978,393 @@ class MerkleMultiReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_multi_inclusion(entries, proof, root):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for batches of independent Merkle consistency proofs
+#
+# A MerkleConsistencyBatchReplayGuard binds a whole non-empty batch of
+# independent MerkleConsistencyBatchEntry items (the same entry type and the
+# same per-item rules as verify_consistency_batch) to a caller-chosen session
+# id, reusing the ReplayBinding type and, byte for byte, the F / U / S framing
+# and the E expiry encoding of the Bound and other Merkle guards. Like the
+# other guards the binding is single-use: without a store the state is local
+# to the guard instance, while an SQLiteReplayStore keeps pending, claimed and
+# consumed ids in the store under b"zr/mcbr/v1", shared across instances,
+# processes and restarts. bind_once registers a pending binding, check
+# recomputes the digest, checks the expiry, delegates the actual per-item
+# consistency verification to verify_consistency_batch and consumes the id
+# only on full success; every rejection leaves the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || S(entries, Q) || F(E)
+# )
+#   D = b"zr/mcbr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   id(x) = x, i.e. a node digest is framed raw under F, order preserved
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   Q(entry) = F(old_root) || F(new_root)
+#             || F(U(old_count)) || F(U(new_count)) || S(proof.nodes, id)
+#   entries keep their batch order and duplicates are kept verbatim
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+
+
+def _check_merkle_consistency_batch_entry(
+    entry: object, position: int
+) -> None:
+    """Validate one consistency batch entry and its nested field types.
+
+    Mirrors the type checks of :func:`verify_consistency`: the entry must be
+    a :class:`MerkleConsistencyBatchEntry` whose two roots are ``bytes`` and
+    whose ``proof`` is a :class:`MerkleConsistencyProof` with non-``bool``
+    integer counts and a tuple-of-bytes ``nodes``. Structural and value
+    problems (count ranges, node count, digest lengths, root mismatch) are
+    left to :func:`verify_consistency_batch` at check time.
+    """
+    if not isinstance(entry, MerkleConsistencyBatchEntry):
+        raise TypeError(
+            f"entries[{position}] must be a MerkleConsistencyBatchEntry"
+        )
+    _check_bytes(entry.old_root, f"entries[{position}] old_root")
+    _check_bytes(entry.new_root, f"entries[{position}] new_root")
+    proof = entry.proof
+    if not isinstance(proof, MerkleConsistencyProof):
+        raise TypeError(
+            f"entries[{position}] proof must be a MerkleConsistencyProof"
+        )
+    for name in ("old_count", "new_count"):
+        value = getattr(proof, name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(
+                f"entries[{position}] proof {name} must be an integer"
+            )
+    if not isinstance(proof.nodes, tuple):
+        raise TypeError(
+            f"entries[{position}] proof nodes must be a tuple of bytes"
+        )
+    for node_position, node in enumerate(proof.nodes):
+        _check_bytes(
+            node, f"entries[{position}] proof nodes[{node_position}]"
+        )
+
+
+def _check_merkle_consistency_batch_types(
+    entries: object,
+) -> list[MerkleConsistencyBatchEntry]:
+    """Validate the consistency-batch argument types for the replay guard.
+
+    Mirrors the type checks of :func:`verify_consistency_batch`: ``entries``
+    must be a non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`MerkleConsistencyBatchEntry` objects with nestedly well-typed
+    fields; the items are copied into a fresh list so the inputs are never
+    mutated. Emptiness, structure and value problems are dealt with by the
+    caller (bind-time emptiness) and :func:`verify_consistency_batch`
+    (check time).
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(
+        entries, Sequence
+    ):
+        raise TypeError(
+            "entries must be a sequence of MerkleConsistencyBatchEntry"
+        )
+    items = list(entries)  # copy: inputs are never mutated
+    for position, entry in enumerate(items):
+        _check_merkle_consistency_batch_entry(entry, position)
+    return items
+
+
+def _merkle_consistency_batch_replay_encodable(
+    entries: Sequence[MerkleConsistencyBatchEntry],
+) -> bool:
+    """Every U-framed count must fit in unsigned 64 bits.
+
+    The two proof counts of every entry, each ``nodes`` tuple length and
+    the outer batch length are all encoded with ``U``; the raw root and
+    node bytes need no encodability rule.
+    """
+    values = [len(entries)]
+    for entry in entries:
+        values.extend(
+            (entry.proof.old_count, entry.proof.new_count, len(entry.proof.nodes))
+        )
+    return all(0 <= value <= _UINT64_MAX for value in values)
+
+
+def _merkle_consistency_batch_item_material(
+    entry: MerkleConsistencyBatchEntry,
+) -> bytes:
+    """``Q(entry)``: both roots, both U-framed counts and the S-framed nodes.
+
+    The roots and node digests are framed raw under F (``id`` is the
+    identity transform); the nodes keep their proof order.
+    """
+    proof = entry.proof
+    material = b"".join(
+        (
+            _frame_length_prefixed(entry.old_root),
+            _frame_length_prefixed(entry.new_root),
+            _frame_length_prefixed(_uint64_be(proof.old_count)),
+            _frame_length_prefixed(_uint64_be(proof.new_count)),
+        )
+    )
+    # S(proof.nodes, id) = F(U(|nodes|)) || Σ F(node)
+    material += _frame_length_prefixed(_uint64_be(len(proof.nodes)))
+    for node in proof.nodes:
+        material += _frame_length_prefixed(node)
+    return material
+
+
+def _merkle_consistency_batch_replay_digest(
+    entries: Sequence[MerkleConsistencyBatchEntry],
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the consistency-batch replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``S(entries, Q)`` and
+    ``F(E)``; the entries keep their batch order and duplicates are framed
+    one for one. Each item is framed as
+    ``Q = F(old_root) || F(new_root) || F(U(old_count))``
+    ``|| F(U(new_count)) || S(proof.nodes, id)``.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(
+        _frame_length_prefixed(_MERKLE_CONSISTENCY_BATCH_REPLAY_DOMAIN)
+    )
+    transcript.update(_frame_length_prefixed(session_id))
+    # S(entries, Q) = F(U(|entries|)) || Σ F(Q(entry))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(entries))))
+    for entry in entries:
+        transcript.update(
+            _frame_length_prefixed(
+                _merkle_consistency_batch_item_material(entry)
+            )
+        )
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+class MerkleConsistencyBatchReplayGuard:
+    """Single-use replay protection for an independent consistency-pair batch.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole non-empty batch of
+    :class:`MerkleConsistencyBatchEntry` items — the same entry type and
+    per-item rules as :func:`verify_consistency_batch`; :meth:`check`
+    accepts an equal pending binding exactly once, recomputing the binding
+    digest, checking the expiry and delegating to
+    :func:`verify_consistency_batch`, and then marks the id consumed. The
+    digest frames the batch under
+    ``SHA-256(F(D) || F(session_id) || S(entries, Q) || F(E))`` with domain
+    ``b"zr/mcbr/v1"``, where each item is framed as
+    ``Q = F(old_root) || F(new_root) || F(U(old_count)) || F(U(new_count))``
+    ``|| S(proof.nodes, id)``; entries and nodes keep their order and
+    duplicate entries are kept verbatim. The F / U / S framing and the E
+    expiry encoding are reused byte for byte from the Bound and other
+    Merkle guards. By default both the pending and the consumed state live
+    on this guard instance and are never shared between instances; passing
+    an :class:`SQLiteReplayStore` as ``store`` instead keeps the state in
+    that store under the ``b"zr/mcbr/v1"`` key domain, so consistency-batch
+    guards attached to the same store namespace share pending, claimed and
+    consumed ids across independent instances, processes and process
+    restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the digest/expiry work and the delegated batch verification (the
+    in-instance registry lock, or the store's short transaction and unique
+    claim token); the claim is per-id registry state rather than a global
+    lock, so a batch being verified under one id never serializes checks or
+    binds of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = None if store is None else store._view(
+            _MERKLE_CONSISTENCY_BATCH_REPLAY_DOMAIN
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        entries: Sequence[MerkleConsistencyBatchEntry],
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to the batch.
+
+        Returns the frozen :class:`ReplayBinding`. ``entries`` must be a
+        non-empty, non-``bytes`` / ``bytearray`` / ``str`` sequence of
+        :class:`MerkleConsistencyBatchEntry` objects (lists, tuples and
+        duplicate entries are legal, order preserved); each entry's two
+        roots must be ``bytes`` and its ``proof`` a
+        :class:`MerkleConsistencyProof` with non-``bool`` integer counts and
+        a tuple-of-bytes ``nodes``. ``session_id`` must be non-empty
+        ``bytes`` and ``expires_at`` must be either ``None`` or a
+        non-``bool`` unsigned 64-bit Unix-second timestamp; the U-framed
+        counts (every proof's ``old_count`` / ``new_count``, every node
+        tuple length and the batch length) must likewise fit in uint64. A
+        session id that is already pending, being checked or consumed
+        raises :class:`ValueError`. Wrong argument or nested field types
+        raise :class:`TypeError`; an empty batch or id, an out-of-uint64
+        expiry or framed count, or a rebind raise :class:`ValueError`.
+        Inputs are never mutated.
+        """
+        items = _check_merkle_consistency_batch_types(entries)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if not items:
+            raise ValueError("entries must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _merkle_consistency_batch_replay_encodable(items):
+            raise ValueError("proof counts must be unsigned 64-bit integers")
+        binding = ReplayBinding(
+            session_id,
+            _merkle_consistency_batch_replay_digest(
+                items, session_id, expires_at
+            ),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entries: Sequence[MerkleConsistencyBatchEntry],
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id
+        at most one can return ``True``. The digest is recomputed over the
+        presented ``entries`` (order and duplicates included); for a
+        binding with an expiry, ``now >= expires_at`` makes the check fail
+        (``now`` defaults to the current Unix seconds and must otherwise be
+        a non-``bool`` uint64). Only then is the batch handed to
+        :func:`verify_consistency_batch`, which checks every independent
+        pair with :func:`verify_consistency` in order.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, an empty batch or
+        :func:`verify_consistency_batch` returning ``False``) returns
+        ``False``, releases the claim and leaves the registration pending.
+        An exception escaping the delegated verification likewise releases
+        the claim and then propagates unchanged, leaving the id usable.
+        With a store backend, only the holder of the current claim token
+        can consume the id (an expired claim may be taken over by a later
+        equal ``check``); a stale token neither consumes nor restores
+        anything. Verification runs without any lock or transaction held,
+        so other ids are never serialized. Argument or nested field type
+        errors (including ``bool`` counts) raise :class:`TypeError`; an
+        out-of-range ``now`` raises :class:`ValueError`. Inputs are never
+        mutated.
+        """
+        items = _check_merkle_consistency_batch_types(entries)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not items or not _merkle_consistency_batch_replay_encodable(items):
+            return False  # empty batch or negative/oversized U-framed counts
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(items, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _merkle_consistency_batch_replay_digest(
+                    items, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_consistency_batch(items):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entries: Sequence[MerkleConsistencyBatchEntry],
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _merkle_consistency_batch_replay_digest(
+                    entries, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_consistency_batch(entries):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

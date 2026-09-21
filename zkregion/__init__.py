@@ -21,7 +21,8 @@ RangeReplayGuard / RegionReplayGuard /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion / MerkleConsistencyProof / prove_consistency /
-verify_consistency / MerkleConsistencyChain / prove_consistency_chain /
+verify_consistency / MerkleConsistencyBatchEntry / verify_consistency_batch /
+MerkleConsistencyChain / prove_consistency_chain /
 verify_consistency_chain.
 """
 
@@ -47,6 +48,7 @@ __all__ = [
     "BoundRangeReplayGuard",
     "BoundSchnorrBatch",
     "BoundSchnorrReplayGuard",
+    "MerkleConsistencyBatchEntry",
     "MerkleConsistencyChain",
     "MerkleConsistencyChainReplayGuard",
     "MerkleConsistencyProof",
@@ -83,6 +85,7 @@ __all__ = [
     "prove_region",
     "verify_bound",
     "verify_consistency",
+    "verify_consistency_batch",
     "verify_consistency_chain",
     "verify_inclusion",
     "verify_multi_inclusion",
@@ -1920,6 +1923,64 @@ def verify_consistency_chain(chain: MerkleConsistencyChain) -> bool:
         verify_consistency(roots[position], roots[position + 1], proof)
         for position, proof in enumerate(proofs)
     )
+
+
+# ---------------------------------------------------------------------------
+# Batched Merkle consistency verification
+#
+# A batch checks several independent consistency proofs at once: each entry
+# carries its own old root, new root and proof, and every entry is verified
+# with the established single-proof rules. Entries are unrelated to each
+# other — unlike a chain, neighbouring counts are not required to connect —
+# and no new hash encoding or cryptographic aggregation is introduced.
+
+
+@dataclass(frozen=True)
+class MerkleConsistencyBatchEntry:
+    """One item of a consistency batch: ``old_root``, ``new_root`` and ``proof``.
+
+    All three fields are positional construction arguments; entries compare
+    by value and are immutable.
+    """
+
+    old_root: bytes
+    new_root: bytes
+    proof: MerkleConsistencyProof
+
+
+def verify_consistency_batch(entries: Sequence[MerkleConsistencyBatchEntry]) -> bool:
+    """Verify a batch of independent Merkle consistency proofs.
+
+    ``entries`` must be a non-string, non-``bytes`` sequence of
+    :class:`MerkleConsistencyBatchEntry`; an empty batch returns ``False``
+    and lists, tuples and duplicate entries are legal. Each entry is
+    checked with the established :func:`verify_consistency` against its own
+    ``old_root``, ``new_root`` and ``proof``, in that order, reusing its
+    root, count, node and append rules unchanged. Entries are independent
+    of each other: no chaining of counts between neighbours is required.
+    Type errors (a wrong entry, root, proof or nested field type, including
+    ``bool`` counts, non-tuple ``nodes`` or non-``bytes`` nodes) raise
+    :class:`TypeError` and are never converted into a batch rejection;
+    any invalid entry returns ``False`` and short-circuiting is allowed.
+    Inputs are never mutated.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of MerkleConsistencyBatchEntry")
+    items = list(entries)  # copy: inputs are never mutated
+    if not items:
+        return False
+    for position, entry in enumerate(items):
+        if not isinstance(entry, MerkleConsistencyBatchEntry):
+            raise TypeError(f"entries[{position}] must be a MerkleConsistencyBatchEntry")
+        _check_bytes(entry.old_root, f"entries[{position}] old_root")
+        _check_bytes(entry.new_root, f"entries[{position}] new_root")
+        if not isinstance(entry.proof, MerkleConsistencyProof):
+            raise TypeError(
+                f"entries[{position}] proof must be a MerkleConsistencyProof"
+            )
+        if not verify_consistency(entry.old_root, entry.new_root, entry.proof):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------

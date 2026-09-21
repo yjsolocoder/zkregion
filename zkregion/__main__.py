@@ -12,6 +12,7 @@ from . import (
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
     MerkleConsistencyBatchEntry,
+    MerkleConsistencyBatchReplayGuard,
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyReplayGuard,
     MultiSchnorrEntry,
@@ -599,6 +600,30 @@ def main() -> int:
     foreign_mcr_binding = foreign_mcr.bind_once(old_root, new_root, consistency, b"consistency-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_mcr.check(old_root, new_root, consistency, foreign_mcr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for consistency batches (bind once, check once):")
+    mcbr = MerkleConsistencyBatchReplayGuard()
+    mcbr_binding = mcbr.bind_once(consistency_entries, b"consistency-batch-session-1", expires_at=10**12)
+    print(f"  digest={mcbr_binding.digest.hex()[:32]}…  expires_at={mcbr_binding.expires_at}")
+    print(f"  valid first check accepted: {mcbr.check(consistency_entries, mcbr_binding, now=100)}")
+    print(f"  replay rejected: {not mcbr.check(consistency_entries, mcbr_binding, now=101)}")
+    other_mcbr = MerkleConsistencyBatchReplayGuard()
+    other_mcbr_binding = other_mcbr.bind_once(consistency_entries, b"consistency-batch-session-2")
+    print(f"  shortened batch rejected without consuming the id: "
+          f"{not other_mcbr.check(consistency_entries[:-1], other_mcbr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mcbr.check(consistency_entries, other_mcbr_binding, now=1)}")
+    try:
+        mcbr.bind_once(consistency_entries, b"consistency-batch-session-1")
+    except ValueError:
+        print("  rebind of a consumed id rejected: True")
+    else:
+        print("  rebind of a consumed id rejected: False")
+    foreign_mcbr = MerkleConsistencyBatchReplayGuard()
+    foreign_mcbr_binding = foreign_mcbr.bind_once(consistency_entries, b"consistency-batch-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mcbr.check(consistency_entries, foreign_mcbr_binding, now=1)}")
 
     print()
     print("region membership:")

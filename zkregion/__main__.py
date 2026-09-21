@@ -12,6 +12,7 @@ from . import (
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
     MerkleConsistencyChainReplayGuard,
+    MerkleConsistencyReplayGuard,
     MultiSchnorrEntry,
     RangeBatchEntry,
     RangeProof,
@@ -30,6 +31,7 @@ from . import (
     commit_coordinate,
     merkle_root,
     pedersen_commit,
+    prove_consistency,
     prove_consistency_chain,
     prove_inclusion,
     prove_multi_inclusion,
@@ -544,6 +546,28 @@ def main() -> int:
     foreign_mccr_binding = foreign_mccr.bind_once(chain, b"chain-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_mccr.check(chain, foreign_mccr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for single consistency proofs (bind once, check once):")
+    old_root = merkle_root(leaves[:2])
+    new_root = merkle_root(leaves)
+    consistency = prove_consistency(leaves, 2)
+    mcr = MerkleConsistencyReplayGuard()
+    mcr_binding = mcr.bind_once(old_root, new_root, consistency, b"consistency-session-1", expires_at=10**12)
+    print(f"  digest={mcr_binding.digest.hex()[:32]}…  expires_at={mcr_binding.expires_at}")
+    print(f"  valid first check accepted: {mcr.check(old_root, new_root, consistency, mcr_binding, now=100)}")
+    print(f"  replay rejected: {not mcr.check(old_root, new_root, consistency, mcr_binding, now=101)}")
+    other_mcr = MerkleConsistencyReplayGuard()
+    other_mcr_binding = other_mcr.bind_once(old_root, new_root, consistency, b"consistency-session-2")
+    wrong_root = merkle_root(leaves[:3])
+    print(f"  wrong root rejected without consuming the id: "
+          f"{not other_mcr.check(old_root, wrong_root, consistency, other_mcr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mcr.check(old_root, new_root, consistency, other_mcr_binding, now=1)}")
+    foreign_mcr = MerkleConsistencyReplayGuard()
+    foreign_mcr_binding = foreign_mcr.bind_once(old_root, new_root, consistency, b"consistency-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mcr.check(old_root, new_root, consistency, foreign_mcr_binding, now=1)}")
 
     print()
     print("region membership:")

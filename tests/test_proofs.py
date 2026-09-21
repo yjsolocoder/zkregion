@@ -15,6 +15,7 @@ from zkregion import (
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
+    MerkleConsistencyProof,
     MerkleMultiProof,
     MerkleProof,
     MultiSchnorrEntry,
@@ -37,11 +38,13 @@ from zkregion import (
     commit_coordinate,
     merkle_root,
     pedersen_commit,
+    prove_consistency,
     prove_inclusion,
     prove_multi_inclusion,
     prove_range,
     prove_region,
     verify_bound,
+    verify_consistency,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
@@ -6965,6 +6968,158 @@ class BoundSchnorrReplayGuardTest(unittest.TestCase):
             self.entry(self.bob, b"beta", prime=self.G_PRIME, generator=3),
             self.entry(self.carol, b"gamma", prime=self.G2_PRIME, generator=3),
         ]
+
+
+class MerkleConsistencyTest(unittest.TestCase):
+    """Append-only consistency proofs between two Merkle roots."""
+
+    def _leaves(self, count):
+        return [f"cons-{i}".encode() for i in range(count)]
+
+    def test_round_trip_all_prefixes(self):
+        for size in range(1, 34):
+            leaves = self._leaves(size)
+            new_root = merkle_root(leaves)
+            for old_count in range(1, size + 1):
+                old_root = merkle_root(leaves[:old_count])
+                proof = prove_consistency(leaves, old_count)
+                self.assertEqual(proof.old_count, old_count)
+                self.assertEqual(proof.new_count, size)
+                self.assertIsInstance(proof.nodes, tuple)
+                self.assertTrue(
+                    verify_consistency(old_root, new_root, proof),
+                    (old_count, size),
+                )
+
+    def test_nodes_layout(self):
+        # nodes = popcount(old_count) subtree roots + one digest per new leaf
+        for size in range(1, 20):
+            leaves = self._leaves(size)
+            for old_count in range(1, size + 1):
+                proof = prove_consistency(leaves, old_count)
+                expected = bin(old_count).count("1") + (size - old_count)
+                self.assertEqual(len(proof.nodes), expected, (old_count, size))
+                appended = proof.nodes[bin(old_count).count("1"):]
+                self.assertEqual(
+                    appended,
+                    tuple(merkle_root([leaf]) for leaf in leaves[old_count:]),
+                )
+
+    def test_no_append_keeps_root(self):
+        leaves = self._leaves(5)
+        root = merkle_root(leaves)
+        proof = prove_consistency(leaves, 5)
+        self.assertEqual(proof.old_count, proof.new_count)
+        self.assertTrue(verify_consistency(root, root, proof))
+        self.assertFalse(verify_consistency(root, merkle_root(leaves + [b"x"]), proof))
+
+    def test_proof_is_frozen_positional_and_value_equal(self):
+        leaves = self._leaves(6)
+        proof = prove_consistency(leaves, 3)
+        clone = MerkleConsistencyProof(3, 6, proof.nodes)
+        self.assertEqual(proof, clone)
+        self.assertTrue(dataclasses.is_dataclass(proof))
+        with self.assertRaises(AttributeError):
+            proof.old_count = 1
+
+    def test_type_errors(self):
+        leaves = self._leaves(4)
+        for bad_count in (True, False, 1.5, "2", None, b"2"):
+            with self.assertRaises(TypeError, msg=repr(bad_count)):
+                prove_consistency(leaves, bad_count)
+        with self.assertRaises(TypeError):
+            prove_consistency(b"abcd", 1)
+        with self.assertRaises(TypeError):
+            prove_consistency([b"a", 1], 1)
+        proof = prove_consistency(leaves, 2)
+        old_root = merkle_root(leaves[:2])
+        new_root = merkle_root(leaves)
+        with self.assertRaises(TypeError):
+            verify_consistency(1, new_root, proof)
+        with self.assertRaises(TypeError):
+            verify_consistency(old_root, "root", proof)
+        with self.assertRaises(TypeError):
+            verify_consistency(old_root, new_root, object())
+        with self.assertRaises(TypeError):
+            verify_consistency(
+                old_root, new_root, MerkleConsistencyProof(True, 4, proof.nodes)
+            )
+        with self.assertRaises(TypeError):
+            verify_consistency(
+                old_root, new_root, MerkleConsistencyProof(2, False, proof.nodes)
+            )
+        with self.assertRaises(TypeError):
+            verify_consistency(
+                old_root, new_root, MerkleConsistencyProof(2, 4, list(proof.nodes))
+            )
+        with self.assertRaises(TypeError):
+            verify_consistency(
+                old_root,
+                new_root,
+                MerkleConsistencyProof(2, 4, proof.nodes[:-1] + (1,)),
+            )
+
+    def test_value_errors(self):
+        leaves = self._leaves(3)
+        for bad_count in (0, -1, 4, 100):
+            with self.assertRaises(ValueError, msg=repr(bad_count)):
+                prove_consistency(leaves, bad_count)
+        with self.assertRaises(ValueError):
+            prove_consistency([], 1)
+
+    def test_invalid_proofs_return_false(self):
+        leaves = self._leaves(7)
+        old_root = merkle_root(leaves[:3])
+        new_root = merkle_root(leaves)
+        proof = prove_consistency(leaves, 3)
+        node = b"\x00" * 32
+        cases = [
+            # wrong counts
+            MerkleConsistencyProof(0, 7, proof.nodes),
+            MerkleConsistencyProof(-1, 7, proof.nodes),
+            MerkleConsistencyProof(7, 3, proof.nodes),
+            MerkleConsistencyProof(3, 8, proof.nodes),
+            MerkleConsistencyProof(4, 7, proof.nodes),
+            # wrong node count (truncated / extra / missing remainder)
+            MerkleConsistencyProof(3, 7, proof.nodes[:-1]),
+            MerkleConsistencyProof(3, 7, proof.nodes + (node,)),
+            MerkleConsistencyProof(3, 3, proof.nodes),
+            # bad digest length
+            MerkleConsistencyProof(3, 7, (b"\x00" * 31,) * len(proof.nodes)),
+            # tampered node
+            MerkleConsistencyProof(3, 7, (node,) + proof.nodes[1:]),
+            MerkleConsistencyProof(3, 7, proof.nodes[:-1] + (node,)),
+        ]
+        for bad in cases:
+            self.assertFalse(verify_consistency(old_root, new_root, bad), bad)
+        # bad root lengths and swapped / tampered roots
+        self.assertFalse(verify_consistency(b"\x00" * 31, new_root, proof))
+        self.assertFalse(verify_consistency(old_root, b"\x00" * 31, proof))
+        self.assertFalse(verify_consistency(new_root, old_root, proof))
+        self.assertFalse(verify_consistency(old_root, merkle_root(leaves[:6]), proof))
+        self.assertFalse(verify_consistency(merkle_root(leaves[:2]), new_root, proof))
+
+    def test_inputs_not_mutated(self):
+        leaves = self._leaves(9)
+        snapshot = list(leaves)
+        proof = prove_consistency(leaves, 4)
+        nodes_snapshot = proof.nodes
+        self.assertEqual(leaves, snapshot)
+        self.assertTrue(
+            verify_consistency(merkle_root(snapshot[:4]), merkle_root(snapshot), proof)
+        )
+        self.assertEqual(leaves, snapshot)
+        self.assertEqual(proof.nodes, nodes_snapshot)
+
+    def test_existing_merkle_interfaces_unchanged(self):
+        leaves = self._leaves(5)
+        root = merkle_root(leaves)
+        inclusion = prove_inclusion(leaves, 2)
+        self.assertTrue(verify_inclusion(leaves[2], inclusion, root))
+        multi = prove_multi_inclusion(leaves, (1, 3))
+        self.assertTrue(
+            verify_multi_inclusion([(1, leaves[1]), (3, leaves[3])], multi, root)
+        )
 
 
 if __name__ == "__main__":

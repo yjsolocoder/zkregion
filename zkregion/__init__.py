@@ -16,7 +16,8 @@ ReplayBinding / ReplayGuard / SQLiteReplayStore /
 RangeReplayGuard / RegionReplayGuard /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
-verify_multi_inclusion.
+verify_multi_inclusion / MerkleConsistencyProof / prove_consistency /
+verify_consistency.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ __all__ = [
     "BoundRangeReplayGuard",
     "BoundSchnorrBatch",
     "BoundSchnorrReplayGuard",
+    "MerkleConsistencyProof",
     "MerkleMultiProof",
     "MerkleProof",
     "MultiSchnorrEntry",
@@ -63,11 +65,13 @@ __all__ = [
     "commit_coordinate",
     "merkle_root",
     "pedersen_commit",
+    "prove_consistency",
     "prove_inclusion",
     "prove_multi_inclusion",
     "prove_range",
     "prove_region",
     "verify_bound",
+    "verify_consistency",
     "verify_inclusion",
     "verify_multi_inclusion",
     "verify_opening",
@@ -1636,6 +1640,156 @@ def verify_multi_inclusion(
     if cursor != len(siblings):
         return False  # every sibling must be consumed
     return hmac.compare_digest(known[0], root)
+
+
+# ---------------------------------------------------------------------------
+# Merkle append-only consistency proofs
+#
+# Same digests and odd-node duplication as the inclusion proofs above. A
+# consistency proof shows that the tree committed by ``new_root`` is exactly
+# the tree committed by ``old_root`` with extra leaves appended, so the
+# verifier needs only the two roots and the proof — never the leaves.
+#
+# The tree of ``n`` leaves decomposes into the complete subtrees of the
+# binary expansion of ``n`` (heights strictly decreasing); the root is
+# recovered from these peaks by promoting the rightmost peak through
+# self-hashes up to its left neighbour's height and then merging left/right,
+# mirroring the odd-node duplication of the layer-by-layer construction.
+# Appending a leaf folds into the peak list by binary carry: adjacent
+# equal-height peaks merge into one peak one level higher.
+
+
+@dataclass(frozen=True)
+class MerkleConsistencyProof:
+    """Append-only consistency proof between two Merkle roots.
+
+    ``old_count`` and ``new_count`` are the leaf counts of the old and new
+    trees; ``nodes`` first lists the complete-subtree roots of the binary
+    decomposition of the old prefix (decreasing heights), then the digests
+    of the appended leaves in order.
+    """
+
+    old_count: int
+    new_count: int
+    nodes: tuple[bytes, ...]
+
+
+def _peak_heights(count: int) -> list[int]:
+    """Heights of the complete subtrees in the binary expansion of ``count``."""
+    return [
+        bit
+        for bit in range(count.bit_length() - 1, -1, -1)
+        if count & (1 << bit)
+    ]
+
+
+def _subtree_root(digests: Sequence[bytes], offset: int, size: int) -> bytes:
+    """Root of the complete subtree over ``size`` leaf digests at ``offset``."""
+    level = list(digests[offset : offset + size])
+    while len(level) > 1:
+        level = [
+            _node_digest(level[position], level[position + 1])
+            for position in range(0, len(level), 2)
+        ]
+    return level[0]
+
+
+def _peaks_root(peaks: list[tuple[int, bytes]]) -> bytes:
+    """Recover the tree root from peaks of strictly decreasing height.
+
+    Starting from the rightmost peak, the accumulator is promoted by
+    self-hashing up to the height of its left neighbour and then merged as
+    the right child — the peak view of the odd-node duplication rule.
+    """
+    height, digest = peaks[-1]
+    for left_height, left in reversed(peaks[:-1]):
+        while height < left_height:
+            digest = _node_digest(digest, digest)
+            height += 1
+        digest = _node_digest(left, digest)
+        height = left_height + 1
+    return digest
+
+
+def prove_consistency(leaves: Sequence[bytes], old_count: int) -> MerkleConsistencyProof:
+    """Build a :class:`MerkleConsistencyProof` for the ``old_count`` prefix.
+
+    ``leaves`` must be a non-empty sequence of ``bytes`` and ``old_count``
+    must satisfy ``1 <= old_count <= len(leaves)``; the proof commits to
+    ``new_count = len(leaves)``. ``nodes`` lists the complete-subtree roots
+    of the binary decomposition of the old prefix (decreasing heights)
+    followed by the digests of the appended leaves in order. Type errors
+    (including ``bool`` counts) raise :class:`TypeError`; an empty tree or
+    an out-of-range count raises :class:`ValueError`. Inputs are never
+    mutated.
+    """
+    items = _checked_leaves(leaves)
+    if not isinstance(old_count, int) or isinstance(old_count, bool):
+        raise TypeError("old_count must be an integer")
+    if not 1 <= old_count <= len(items):
+        raise ValueError("old_count must satisfy 1 <= old_count <= len(leaves)")
+    digests = [_leaf_digest(leaf) for leaf in items]
+    nodes: list[bytes] = []
+    offset = 0
+    for height in _peak_heights(old_count):
+        size = 1 << height
+        nodes.append(_subtree_root(digests, offset, size))
+        offset += size
+    nodes.extend(digests[old_count:])
+    return MerkleConsistencyProof(
+        old_count=old_count,
+        new_count=len(items),
+        nodes=tuple(nodes),
+    )
+
+
+def verify_consistency(
+    old_root: bytes,
+    new_root: bytes,
+    proof: MerkleConsistencyProof,
+) -> bool:
+    """Check that ``new_root`` commits to ``old_root``'s leaves plus appended ones.
+
+    The old peaks are recombined into a root that must equal ``old_root``;
+    the appended leaf digests are then folded in by binary carry
+    (equal-height peaks merge) and the resulting root must equal
+    ``new_root``. Type errors raise :class:`TypeError`; invalid counts, a
+    wrong node count, malformed digest lengths, a missing remainder or any
+    root mismatch return False. Inputs are never mutated.
+    """
+    _check_bytes(old_root, "old_root")
+    _check_bytes(new_root, "new_root")
+    if not isinstance(proof, MerkleConsistencyProof):
+        raise TypeError("proof must be a MerkleConsistencyProof")
+    for name in ("old_count", "new_count"):
+        value = getattr(proof, name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"proof {name} must be an integer")
+    if not isinstance(proof.nodes, tuple):
+        raise TypeError("proof nodes must be a tuple of bytes")
+    for node in proof.nodes:
+        _check_bytes(node, "proof node")
+    if len(old_root) != _MERKLE_DIGEST_SIZE or len(new_root) != _MERKLE_DIGEST_SIZE:
+        return False
+    old_count = proof.old_count
+    new_count = proof.new_count
+    if old_count < 1 or new_count < old_count:
+        return False
+    heights = _peak_heights(old_count)
+    if len(proof.nodes) != len(heights) + (new_count - old_count):
+        return False
+    if any(len(node) != _MERKLE_DIGEST_SIZE for node in proof.nodes):
+        return False
+    old_peaks = list(zip(heights, proof.nodes[: len(heights)]))
+    if not hmac.compare_digest(_peaks_root(old_peaks), old_root):
+        return False
+    peaks = old_peaks
+    for digest in proof.nodes[len(heights) :]:
+        peaks.append((0, digest))
+        while len(peaks) >= 2 and peaks[-2][0] == peaks[-1][0]:
+            merged = _node_digest(peaks[-2][1], peaks[-1][1])
+            peaks[-2:] = [(peaks[-1][0] + 1, merged)]
+    return hmac.compare_digest(_peaks_root(peaks), new_root)
 
 
 # ---------------------------------------------------------------------------

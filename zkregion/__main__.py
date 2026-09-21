@@ -11,6 +11,7 @@ from . import (
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
+    MerkleConsistencyChainReplayGuard,
     MultiSchnorrEntry,
     RangeBatchEntry,
     RangeProof,
@@ -29,6 +30,7 @@ from . import (
     commit_coordinate,
     merkle_root,
     pedersen_commit,
+    prove_consistency_chain,
     prove_inclusion,
     prove_multi_inclusion,
     prove_range,
@@ -522,6 +524,26 @@ def main() -> int:
     foreign_bsr_binding = foreign_bsr.bind_once(bound_batch, bound_root, b"bound-schnorr-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_bsr.check(bound_batch, bound_root, foreign_bsr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for consistency chains (bind once, check once):")
+    chain = prove_consistency_chain(leaves, (1, 2, 4))
+    mccr = MerkleConsistencyChainReplayGuard()
+    mccr_binding = mccr.bind_once(chain, b"chain-session-1", expires_at=10**12)
+    print(f"  digest={mccr_binding.digest.hex()[:32]}…  expires_at={mccr_binding.expires_at}")
+    print(f"  valid first check accepted: {mccr.check(chain, mccr_binding, now=100)}")
+    print(f"  replay rejected: {not mccr.check(chain, mccr_binding, now=101)}")
+    other_mccr = MerkleConsistencyChainReplayGuard()
+    other_mccr_binding = other_mccr.bind_once(chain, b"chain-session-2")
+    tampered_chain = prove_consistency_chain(leaves, (1, 2, 3))
+    print(f"  different chain rejected without consuming the id: "
+          f"{not other_mccr.check(tampered_chain, other_mccr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mccr.check(chain, other_mccr_binding, now=1)}")
+    foreign_mccr = MerkleConsistencyChainReplayGuard()
+    foreign_mccr_binding = foreign_mccr.bind_once(chain, b"chain-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mccr.check(chain, foreign_mccr_binding, now=1)}")
 
     print()
     print("region membership:")

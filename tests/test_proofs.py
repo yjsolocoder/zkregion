@@ -16,6 +16,7 @@ from zkregion import (
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
     MerkleConsistencyChain,
+    MerkleConsistencyChainReplayGuard,
     MerkleConsistencyProof,
     MerkleMultiProof,
     MerkleProof,
@@ -7283,6 +7284,586 @@ class MerkleConsistencyChainTest(unittest.TestCase):
         self.assertEqual(leaves, snapshot)
         self.assertEqual(chain.roots, roots_snapshot)
         self.assertEqual(chain.proofs, proofs_snapshot)
+
+
+class MerkleConsistencyChainReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for multi-checkpoint consistency chains."""
+
+    DOMAIN = b"zr/mccr/v1"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "mccr.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _leaves(self, count):
+        return [f"mccr-leaf-{i}".encode() for i in range(count)]
+
+    def _chain(self, counts=(2, 4, 7), size=9):
+        return prove_consistency_chain(self._leaves(size), counts)
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def expected_digest(chain, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(F(transform(item)) for item in sequence)
+
+        def P(proof):
+            return (
+                F(U(proof.old_count))
+                + F(U(proof.new_count))
+                + S(proof.nodes, lambda node: node)
+            )
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = (
+            F(b"zr/mccr/v1")
+            + F(session_id)
+            + S(chain.roots, lambda root: root)
+            + S(chain.proofs, P)
+            + F(expiry)
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(chain, b"s1"))
+        binding = guard.bind_once(chain, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(chain, b"s2", 1000)
+        )
+
+    def test_domain_separator_is_distinct(self):
+        chain = self._chain()
+        binding = MerkleConsistencyChainReplayGuard().bind_once(chain, b"s")
+
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(
+                F(transform(item)) for item in sequence
+            )
+
+        def P(proof):
+            return (
+                F(U(proof.old_count))
+                + F(U(proof.new_count))
+                + S(proof.nodes, lambda node: node)
+            )
+
+        framing = (
+            F(b"s") + S(chain.roots, lambda root: root)
+            + S(chain.proofs, P) + F(b"\x00")
+        )
+        # the identical chain framing under every other guard domain differs
+        for other_domain in (
+            b"zr/r/v1",
+            b"zr/rr/v1",
+            b"zr/rg/v1",
+            b"zr/brg/v1",
+            b"zr/brr/v1",
+            b"zr/bsr/v1",
+        ):
+            foreign_digest = hashlib.sha256(F(other_domain) + framing).digest()
+            self.assertNotEqual(binding.digest, foreign_digest)
+
+    def test_digest_binds_every_component(self):
+        leaves = self._leaves(9)
+        chain = prove_consistency_chain(leaves, (2, 4, 7))
+        guard = MerkleConsistencyChainReplayGuard()
+        base = guard.bind_once(chain, b"s")
+        # the session id is framed
+        self.assertNotEqual(
+            base.digest, MerkleConsistencyChainReplayGuard().bind_once(chain, b"other").digest
+        )
+        # root order binds
+        reordered = MerkleConsistencyChain(
+            (chain.roots[0], chain.roots[2], chain.roots[1]), chain.proofs
+        )
+        self.assertNotEqual(
+            base.digest, MerkleConsistencyChainReplayGuard().bind_once(reordered, b"s").digest
+        )
+        # a substituted root binds
+        swapped_root = MerkleConsistencyChain(
+            chain.roots[:-1] + (b"\x7f" * 32,), chain.proofs
+        )
+        self.assertNotEqual(
+            base.digest, MerkleConsistencyChainReplayGuard().bind_once(swapped_root, b"s").digest
+        )
+        # proof order binds
+        reordered_proofs = MerkleConsistencyChain(
+            chain.roots[::-1], chain.proofs[::-1]
+        )
+        self.assertNotEqual(
+            base.digest,
+            MerkleConsistencyChainReplayGuard().bind_once(reordered_proofs, b"s").digest,
+        )
+        # proof counts bind
+        proof = chain.proofs[0]
+        changed_count = MerkleConsistencyProof(
+            proof.old_count, proof.new_count + 1, proof.nodes
+        )
+        changed = MerkleConsistencyChain(
+            chain.roots, (changed_count, *chain.proofs[1:])
+        )
+        self.assertNotEqual(
+            base.digest, MerkleConsistencyChainReplayGuard().bind_once(changed, b"s").digest
+        )
+        # a proof node binds
+        changed_node_proof = MerkleConsistencyProof(
+            proof.old_count,
+            proof.new_count,
+            ((bytes([proof.nodes[0][0] ^ 0x01]) + proof.nodes[0][1:]),)
+            + proof.nodes[1:],
+        )
+        changed_nodes = MerkleConsistencyChain(
+            chain.roots, (changed_node_proof, *chain.proofs[1:])
+        )
+        self.assertNotEqual(
+            base.digest,
+            MerkleConsistencyChainReplayGuard().bind_once(changed_nodes, b"s").digest,
+        )
+        # the expiry framing binds
+        self.assertNotEqual(
+            base.digest,
+            MerkleConsistencyChainReplayGuard().bind_once(chain, b"s", expires_at=1).digest,
+        )
+        self.assertNotEqual(
+            MerkleConsistencyChainReplayGuard().bind_once(chain, b"s", expires_at=1).digest,
+            MerkleConsistencyChainReplayGuard().bind_once(chain, b"s", expires_at=2).digest,
+        )
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        chain = self._chain()
+        none_binding = MerkleConsistencyChainReplayGuard().bind_once(chain, b"a")
+        zero_binding = MerkleConsistencyChainReplayGuard().bind_once(chain, b"b", expires_at=0)
+        one_binding = MerkleConsistencyChainReplayGuard().bind_once(chain, b"c", expires_at=1)
+        digests = {none_binding.digest, zero_binding.digest, one_binding.digest}
+        self.assertEqual(len(digests), 3)
+
+    # ---- bind_once state and validation -------------------------------------
+
+    def test_pending_id_cannot_be_rebound(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        guard.bind_once(chain, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(chain, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s")
+        self.assertTrue(guard.check(chain, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(chain, b"s")
+
+    def test_claimed_id_cannot_be_rebound(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s")
+        self.assertTrue(guard._registry.claim(b"s", binding))
+        with self.assertRaises(ValueError):
+            guard.bind_once(chain, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        first = guard.bind_once(chain, b"s1")
+        second = guard.bind_once(chain, b"s2")
+        self.assertTrue(guard.check(chain, first, now=1))
+        self.assertTrue(guard.check(chain, first, now=1) is False)
+        self.assertTrue(guard.check(chain, second, now=1))
+
+    def test_bind_type_errors(self):
+        chain = self._chain()
+        for bad in ("chain", 7, None, chain.roots, chain.proofs, True):
+            with self.assertRaises(TypeError):
+                MerkleConsistencyChainReplayGuard().bind_once(bad, b"s")
+        guard = MerkleConsistencyChainReplayGuard()
+        guard.bind_once(chain, b"taken")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(chain, bad)
+        with self.assertRaises(TypeError):
+            guard.bind_once(chain, b"x", expires_at="1000")
+        with self.assertRaises(TypeError):
+            guard.bind_once(chain, b"x", expires_at=True)
+
+    def test_bind_nested_type_errors(self):
+        chain = self._chain()
+        proof = chain.proofs[0]
+        bad_chains = [
+            MerkleConsistencyChain(list(chain.roots), chain.proofs),
+            MerkleConsistencyChain(chain.roots, list(chain.proofs)),
+            MerkleConsistencyChain(chain.roots + ("root",), chain.proofs),
+            MerkleConsistencyChain(chain.roots, chain.proofs + (object(),)),
+            # bool counts
+            MerkleConsistencyChain(chain.roots[:2],
+                                   (MerkleConsistencyProof(True, 4, proof.nodes),)),
+            MerkleConsistencyChain(chain.roots[:2],
+                                   (MerkleConsistencyProof(2, True, proof.nodes),)),
+            # counts as non-integers
+            MerkleConsistencyChain(chain.roots[:2],
+                                   (MerkleConsistencyProof("2", 4, proof.nodes),)),
+            # nodes as a list / holding non-bytes
+            MerkleConsistencyChain(chain.roots[:2],
+                                   (MerkleConsistencyProof(2, 4, list(proof.nodes)),)),
+            MerkleConsistencyChain(
+                chain.roots[:2],
+                (MerkleConsistencyProof(2, 4, proof.nodes[:-1] + ("node",)),),
+            ),
+            # non-bytes root
+            MerkleConsistencyChain((b"\x00" * 32, 1),
+                                   chain.proofs[:1]),
+        ]
+        for bad in bad_chains:
+            with self.assertRaises(TypeError):
+                MerkleConsistencyChainReplayGuard().bind_once(bad, b"s")
+
+    def test_bind_value_errors(self):
+        chain = self._chain()
+        with self.assertRaises(ValueError):
+            MerkleConsistencyChainReplayGuard().bind_once(chain, b"")
+        for bad_expiry in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                MerkleConsistencyChainReplayGuard().bind_once(chain, b"s", expires_at=bad_expiry)
+        huge = 2**64
+        oversized = MerkleConsistencyChain(
+            (b"\x00" * 32, b"\x01" * 32),
+            (MerkleConsistencyProof(huge, huge + 1, (b"\x00" * 32,)),),
+        )
+        with self.assertRaises(ValueError):
+            MerkleConsistencyChainReplayGuard().bind_once(oversized, b"s")
+
+    def test_construction_rejects_non_store(self):
+        for bad in (object(), "path", 1, True, b"ns", {}):
+            with self.assertRaises(TypeError):
+                MerkleConsistencyChainReplayGuard(store=bad)
+
+    # ---- check: accept, reject, consume -------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s", expires_at=1000)
+        self.assertTrue(guard.check(chain, binding, now=999))
+        self.assertFalse(guard.check(chain, binding, now=999))
+        self.assertEqual(guard._consumed, {b"s"})
+        self.assertNotIn(b"s", guard._pending)
+
+    def test_check_with_default_now(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s")
+        self.assertTrue(guard.check(chain, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s")
+        self.assertTrue(guard.check(chain, binding, now=2**64 - 1))
+
+    def test_expiry_boundary_is_inclusive(self):
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(self._chain(), b"s", expires_at=1000)
+        self.assertTrue(guard.check(self._chain(), binding, now=999))
+        for now in (1000, 1001, 2**64 - 1):
+            guard = MerkleConsistencyChainReplayGuard()
+            binding = guard.bind_once(self._chain(), b"s", expires_at=1000)
+            self.assertFalse(guard.check(self._chain(), binding, now=now))
+            self.assertIn(b"s", guard._pending)
+
+    def test_expired_rejection_does_not_consume(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s", expires_at=1000)
+        self.assertFalse(guard.check(chain, binding, now=2000))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(chain, binding, now=999))
+
+    def test_wrong_chain_rejected_without_consuming(self):
+        leaves = self._leaves(9)
+        chain = prove_consistency_chain(leaves, (2, 4, 7))
+        other = prove_consistency_chain([b"different"] * 9, (2, 4, 7))
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s")
+        self.assertFalse(guard.check(other, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(chain, binding, now=1))
+
+    def test_structurally_invalid_chain_rejected_without_consuming(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s")
+        # empty chain: well-typed but its digest cannot match the bound one
+        empty = MerkleConsistencyChain((), ())
+        self.assertFalse(guard.check(empty, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        # a valid shape with a broken final root: digest mismatch, then False
+        broken = MerkleConsistencyChain(
+            chain.roots[:-1] + (b"\xab" * 32,), chain.proofs
+        )
+        self.assertFalse(guard.check(broken, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(chain, binding, now=1))
+
+    def test_bound_but_unverifiable_chain_rejected_and_restored(self):
+        # bind_once never verifies the chain: a well-typed, U-encodable but
+        # internally inconsistent chain binds, and check must reach
+        # verify_consistency_chain, get False, release the claim and leave
+        # the id pending.
+        bogus = b"\xcd" * 32
+        invalid = MerkleConsistencyChain(
+            (b"\x00" * 32, b"\x01" * 32, b"\x02" * 32),
+            (
+                MerkleConsistencyProof(2, 4, (bogus,) * 3),
+                MerkleConsistencyProof(4, 7, (bogus,) * 3),
+            ),
+        )
+        self.assertFalse(verify_consistency_chain(invalid))
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(invalid, b"s")
+        self.assertFalse(guard.check(invalid, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        with self.assertRaises(ValueError):  # still bound: rebind rejected
+            guard.bind_once(invalid, b"s")
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        self.assertFalse(
+            guard.check(chain, ReplayBinding(b"never", b"\x00" * 32), now=1)
+        )
+        binding = guard.bind_once(chain, b"s")
+        # a binding from another isolated instance carries no registration
+        # on a fresh instance, even though the binding values are equal
+        foreign = MerkleConsistencyChainReplayGuard().bind_once(chain, b"s")
+        self.assertEqual(foreign, binding)
+        self.assertFalse(MerkleConsistencyChainReplayGuard().check(chain, foreign, now=1))
+        # while the instance that owns the registration accepts it
+        self.assertTrue(guard.check(chain, binding, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        guard.bind_once(chain, b"s")
+        forged = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(guard._registry.claim(b"s", forged))
+        self.assertIn(b"s", guard._pending)
+
+    def test_instances_are_independent(self):
+        chain = self._chain()
+        first = MerkleConsistencyChainReplayGuard()
+        second = MerkleConsistencyChainReplayGuard()
+        binding = first.bind_once(chain, b"s")
+        self.assertFalse(second.check(chain, binding, now=1))
+        self.assertTrue(first.check(chain, binding, now=1))
+
+    def test_delegation_error_propagates_and_restores_pending(self):
+        import zkregion
+
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s")
+        original = zkregion.verify_consistency_chain
+
+        def boom(_chain):
+            raise RuntimeError("boom")
+
+        zkregion.verify_consistency_chain = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(chain, binding, now=1)
+        finally:
+            zkregion.verify_consistency_chain = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(chain, binding, now=1))
+
+    def test_check_type_errors(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s")
+        for bad in ("chain", 7, None, chain.roots, True):
+            with self.assertRaises(TypeError):
+                guard.check(bad, binding, now=1)
+        for bad in ("binding", 7, None, (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(chain, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(chain, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        binding = guard.bind_once(chain, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(chain, binding, now=bad)
+
+    def test_inputs_are_not_mutated(self):
+        chain = self._chain()
+        guard = MerkleConsistencyChainReplayGuard()
+        roots_snapshot = chain.roots
+        proofs_snapshot = chain.proofs
+        binding = guard.bind_once(chain, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        guard.check(chain, binding, now=1)
+        self.assertEqual(chain.roots, roots_snapshot)
+        self.assertEqual(chain.proofs, proofs_snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        chain = self._chain()
+        store = self.make_store()
+        binder = MerkleConsistencyChainReplayGuard(store=store)
+        binding = binder.bind_once(chain, b"s", expires_at=1000)
+        checker = MerkleConsistencyChainReplayGuard(store=store)
+        self.assertTrue(checker.check(chain, binding, now=999))
+        self.assertFalse(binder.check(chain, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        chain = self._chain()
+        store = self.make_store()
+        binding = MerkleConsistencyChainReplayGuard(store=store).bind_once(chain, b"s")
+        store.close()
+        reopened = self.make_store()
+        guard = MerkleConsistencyChainReplayGuard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(chain, binding, now=1))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = MerkleConsistencyChainReplayGuard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(chain, b"s")
+        reopened_again.close()
+
+    def test_store_domain_isolation_from_other_guards(self):
+        chain = self._chain()
+        store = self.make_store()
+        prover = SchnorrProver(secret=4321, prime=SMALL_PRIME, generator=3,
+                               randbelow=counter_randbelow())
+        entry = MultiSchnorrEntry(
+            prover.public_key, b"m", prover.prove(b"m", context=b"c"),
+            b"c", SMALL_PRIME, 3,
+        )
+        replay_guard = ReplayGuard(store=store)
+        chain_guard = MerkleConsistencyChainReplayGuard(store=store)
+        replay_binding = replay_guard.bind_once(entry, b"same-id")
+        chain_binding = chain_guard.bind_once(chain, b"same-id")
+        self.assertTrue(replay_guard.check(entry, replay_binding))
+        self.assertTrue(chain_guard.check(chain, chain_binding, now=1))
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/r/v1", domains)
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        chain = self._chain()
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = MerkleConsistencyChainReplayGuard(store=first).bind_once(chain, b"s")
+        # a fresh id in namespace b does not see the pending id in namespace a
+        self.assertFalse(
+            MerkleConsistencyChainReplayGuard(store=second).check(chain, binding_a, now=1)
+        )
+        self.assertTrue(
+            MerkleConsistencyChainReplayGuard(store=first).check(chain, binding_a, now=1)
+        )
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        leaves = self._leaves(9)
+        chain = prove_consistency_chain(leaves, (2, 4, 7))
+        store = self.make_store()
+        binder = MerkleConsistencyChainReplayGuard(store=store)
+        binding = binder.bind_once(chain, b"s")
+        other_leaves = prove_consistency_chain([b"x"] * 9, (2, 4, 7))
+        checker = MerkleConsistencyChainReplayGuard(store=store)
+        self.assertFalse(checker.check(other_leaves, binding, now=1))
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(MerkleConsistencyChainReplayGuard(store=store).check(chain, binding, now=1))
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        chain = self._chain()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = MerkleConsistencyChainReplayGuard(store=store)
+        binding = guard.bind_once(chain, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(chain, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):  # live claim cannot be rebound
+            guard.bind_once(chain, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):  # expired claim still cannot be rebound
+            guard.bind_once(chain, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):  # consumed id can never be rebound
+            guard.bind_once(chain, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        chain = self._chain()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = MerkleConsistencyChainReplayGuard(store=store).bind_once(chain, b"s")
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
 
 
 if __name__ == "__main__":

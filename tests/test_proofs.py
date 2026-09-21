@@ -19,6 +19,7 @@ from zkregion import (
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyProof,
     MerkleConsistencyReplayGuard,
+    MerkleInclusionReplayGuard,
     MerkleMultiProof,
     MerkleProof,
     MultiSchnorrEntry,
@@ -8411,6 +8412,579 @@ class MerkleConsistencyReplayGuardTest(unittest.TestCase):
         store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
         binding = MerkleConsistencyReplayGuard(store=store).bind_once(
             old_root, new_root, proof, b"s"
+        )
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+
+class MerkleInclusionReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for single-leaf Merkle inclusion proofs."""
+
+    DOMAIN = b"zr/mir/v1"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "mir.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _leaves(self, count):
+        return [f"mir-leaf-{i}".encode() for i in range(count)]
+
+    def _inclusion(self, index=1, size=4):
+        leaves = self._leaves(size)
+        root = merkle_root(leaves)
+        proof = prove_inclusion(leaves, index)
+        return leaves[index], root, proof
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def expected_digest(leaf, root, proof, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(F(transform(item)) for item in sequence)
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = (
+            F(b"zr/mir/v1")
+            + F(session_id)
+            + F(leaf)
+            + F(root)
+            + F(U(proof.index))
+            + S(proof.siblings, lambda node: node)
+            + F(expiry)
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(
+            binding.digest, self.expected_digest(leaf, root, proof, b"s1")
+        )
+        binding = guard.bind_once(leaf, root, proof, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(leaf, root, proof, b"s2", 1000)
+        )
+
+    def test_single_leaf_tree_empty_path_uses_spec_digest(self):
+        root = merkle_root([b"only"])
+        proof = prove_inclusion([b"only"], 0)
+        binding = MerkleInclusionReplayGuard().bind_once(b"only", root, proof, b"s")
+        self.assertEqual(
+            binding.digest, self.expected_digest(b"only", root, proof, b"s")
+        )
+
+    def test_domain_separator_is_distinct(self):
+        leaf, root, proof = self._inclusion()
+        binding = MerkleInclusionReplayGuard().bind_once(leaf, root, proof, b"s")
+
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(
+                F(transform(item)) for item in sequence
+            )
+
+        framing = (
+            F(b"s") + F(leaf) + F(root)
+            + F(U(proof.index))
+            + S(proof.siblings, lambda node: node) + F(b"\x00")
+        )
+        # the identical proof framing under every other guard domain differs
+        for other_domain in (
+            b"zr/r/v1",
+            b"zr/rr/v1",
+            b"zr/rg/v1",
+            b"zr/brg/v1",
+            b"zr/brr/v1",
+            b"zr/bsr/v1",
+            b"zr/mccr/v1",
+            b"zr/mcr/v1",
+        ):
+            foreign_digest = hashlib.sha256(F(other_domain) + framing).digest()
+            self.assertNotEqual(binding.digest, foreign_digest)
+
+    def test_digest_binds_every_component(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        base = guard.bind_once(leaf, root, proof, b"s")
+
+        def bind(l=leaf, r=root, p=proof, s=b"s", **kw):
+            return MerkleInclusionReplayGuard().bind_once(l, r, p, s, **kw).digest
+
+        # the session id is framed
+        self.assertNotEqual(base.digest, bind(s=b"other"))
+        # the leaf and root bind
+        self.assertNotEqual(base.digest, bind(l=b"\x7f" * 4))
+        self.assertNotEqual(base.digest, bind(r=b"\x7f" * 32))
+        # the index binds (a valid inclusion proof at another position)
+        other_leaf, _other_root, other_proof = self._inclusion(index=2)
+        self.assertNotEqual(base.digest, bind(l=other_leaf, p=other_proof))
+        # an index-only change with the same siblings misses the digest
+        self.assertNotEqual(
+            base.digest,
+            bind(p=MerkleProof(proof.index ^ 1, proof.siblings)),
+        )
+        # a sibling binds
+        tampered_sibling = bytes([proof.siblings[0][0] ^ 0x01]) + proof.siblings[0][1:]
+        self.assertNotEqual(
+            base.digest,
+            bind(p=MerkleProof(
+                proof.index, (tampered_sibling,) + proof.siblings[1:]
+            )),
+        )
+        # sibling order binds
+        if len(proof.siblings) >= 2:
+            self.assertNotEqual(
+                base.digest,
+                bind(p=MerkleProof(proof.index, proof.siblings[::-1])),
+            )
+        # the expiry framing binds
+        self.assertNotEqual(base.digest, bind(expires_at=1))
+        self.assertNotEqual(bind(expires_at=1), bind(expires_at=2))
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        leaf, root, proof = self._inclusion()
+        none_binding = MerkleInclusionReplayGuard().bind_once(leaf, root, proof, b"a")
+        zero_binding = MerkleInclusionReplayGuard().bind_once(
+            leaf, root, proof, b"b", expires_at=0
+        )
+        one_binding = MerkleInclusionReplayGuard().bind_once(
+            leaf, root, proof, b"c", expires_at=1
+        )
+        digests = {none_binding.digest, zero_binding.digest, one_binding.digest}
+        self.assertEqual(len(digests), 3)
+
+    # ---- bind_once state and validation -------------------------------------
+
+    def test_pending_id_cannot_be_rebound(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        guard.bind_once(leaf, root, proof, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(leaf, root, proof, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        self.assertTrue(guard.check(leaf, root, proof, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(leaf, root, proof, b"s")
+
+    def test_claimed_id_cannot_be_rebound(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        self.assertTrue(guard._registry.claim(b"s", binding))
+        with self.assertRaises(ValueError):
+            guard.bind_once(leaf, root, proof, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        first = guard.bind_once(leaf, root, proof, b"s1")
+        second = guard.bind_once(leaf, root, proof, b"s2")
+        self.assertTrue(guard.check(leaf, root, proof, first, now=1))
+        self.assertFalse(guard.check(leaf, root, proof, first, now=1))
+        self.assertTrue(guard.check(leaf, root, proof, second, now=1))
+
+    def test_bind_type_errors(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        for bad in ("leaf", 7, None, True, bytearray(leaf)):
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, root, proof, b"s")
+        for bad in ("root", 7, None, True, bytearray(root)):
+            with self.assertRaises(TypeError):
+                guard.bind_once(leaf, bad, proof, b"s")
+        for bad in ("proof", 7, None, proof.siblings, True):
+            with self.assertRaises(TypeError):
+                guard.bind_once(leaf, root, bad, b"s")
+        guard.bind_once(leaf, root, proof, b"taken")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(leaf, root, proof, bad)
+        with self.assertRaises(TypeError):
+            guard.bind_once(leaf, root, proof, b"x", expires_at="1000")
+        with self.assertRaises(TypeError):
+            guard.bind_once(leaf, root, proof, b"x", expires_at=True)
+
+    def test_bind_nested_type_errors(self):
+        leaf, root, proof = self._inclusion()
+        bad_proofs = [
+            # bool index
+            MerkleProof(True, proof.siblings),
+            # index as a non-integer
+            MerkleProof("1", proof.siblings),
+            MerkleProof(1.0, proof.siblings),
+            # siblings as a list / holding non-bytes
+            MerkleProof(proof.index, list(proof.siblings)),
+            MerkleProof(proof.index, proof.siblings[:-1] + ("sibling",)),
+        ]
+        for bad in bad_proofs:
+            with self.assertRaises(TypeError):
+                MerkleInclusionReplayGuard().bind_once(leaf, root, bad, b"s")
+
+    def test_bind_value_errors(self):
+        leaf, root, proof = self._inclusion()
+        with self.assertRaises(ValueError):
+            MerkleInclusionReplayGuard().bind_once(leaf, root, proof, b"")
+        for bad_expiry in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                MerkleInclusionReplayGuard().bind_once(
+                    leaf, root, proof, b"s", expires_at=bad_expiry
+                )
+        for oversized in (
+            MerkleProof(2**64, proof.siblings),
+            MerkleProof(-1, proof.siblings),
+        ):
+            with self.assertRaises(ValueError):
+                MerkleInclusionReplayGuard().bind_once(leaf, root, oversized, b"s")
+
+    def test_construction_rejects_non_store(self):
+        for bad in (object(), "path", 1, True, b"ns", {}):
+            with self.assertRaises(TypeError):
+                MerkleInclusionReplayGuard(store=bad)
+
+    # ---- check: accept, reject, consume -------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s", expires_at=1000)
+        self.assertTrue(guard.check(leaf, root, proof, binding, now=999))
+        self.assertFalse(guard.check(leaf, root, proof, binding, now=999))
+        self.assertEqual(guard._consumed, {b"s"})
+        self.assertNotIn(b"s", guard._pending)
+
+    def test_check_with_default_now(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        self.assertTrue(guard.check(leaf, root, proof, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        self.assertTrue(guard.check(leaf, root, proof, binding, now=2**64 - 1))
+
+    def test_expiry_boundary_is_inclusive(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s", expires_at=1000)
+        self.assertTrue(guard.check(leaf, root, proof, binding, now=999))
+        for now in (1000, 1001, 2**64 - 1):
+            guard = MerkleInclusionReplayGuard()
+            binding = guard.bind_once(leaf, root, proof, b"s", expires_at=1000)
+            self.assertFalse(guard.check(leaf, root, proof, binding, now=now))
+            self.assertIn(b"s", guard._pending)
+
+    def test_expired_rejection_does_not_consume(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s", expires_at=1000)
+        self.assertFalse(guard.check(leaf, root, proof, binding, now=2000))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(leaf, root, proof, binding, now=999))
+
+    def test_wrong_inclusion_rejected_without_consuming(self):
+        leaf, root, proof = self._inclusion(index=1, size=4)
+        other_leaf, _other_root, other_proof = self._inclusion(index=2, size=4)
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        # a different proof/leaf pair, a substituted leaf or a wrong root all
+        # miss the digest
+        self.assertFalse(guard.check(other_leaf, root, other_proof, binding, now=1))
+        self.assertFalse(guard.check(other_leaf, root, proof, binding, now=1))
+        self.assertFalse(guard.check(leaf, b"\x01" * 32, proof, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(leaf, root, proof, binding, now=1))
+
+    def test_bound_but_unverifiable_proof_rejected_and_restored(self):
+        # bind_once never verifies the proof: a well-typed, U-encodable but
+        # internally invalid proof binds, and check must reach
+        # verify_inclusion, get False, release the claim and leave the id
+        # pending.
+        leaf = b"leaf"
+        root = merkle_root([leaf, b"other"])
+        bogus = b"\xcd" * 32
+        proof = MerkleProof(0, (bogus,))
+        self.assertFalse(verify_inclusion(leaf, proof, root))
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        self.assertFalse(guard.check(leaf, root, proof, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        with self.assertRaises(ValueError):  # still bound: rebind rejected
+            guard.bind_once(leaf, root, proof, b"s")
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        self.assertFalse(
+            guard.check(leaf, root, proof, ReplayBinding(b"never", b"\x00" * 32), now=1)
+        )
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        # a binding from another isolated instance carries no registration
+        # on a fresh instance, even though the binding values are equal
+        foreign = MerkleInclusionReplayGuard().bind_once(leaf, root, proof, b"s")
+        self.assertEqual(foreign, binding)
+        self.assertFalse(
+            MerkleInclusionReplayGuard().check(leaf, root, proof, foreign, now=1)
+        )
+        # while the instance that owns the registration accepts it
+        self.assertTrue(guard.check(leaf, root, proof, binding, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        guard.bind_once(leaf, root, proof, b"s")
+        forged = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(guard._registry.claim(b"s", forged))
+        self.assertIn(b"s", guard._pending)
+
+    def test_instances_are_independent(self):
+        leaf, root, proof = self._inclusion()
+        first = MerkleInclusionReplayGuard()
+        second = MerkleInclusionReplayGuard()
+        binding = first.bind_once(leaf, root, proof, b"s")
+        self.assertFalse(second.check(leaf, root, proof, binding, now=1))
+        self.assertTrue(first.check(leaf, root, proof, binding, now=1))
+
+    def test_delegation_error_propagates_and_restores_pending(self):
+        import zkregion
+
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        original = zkregion.verify_inclusion
+
+        def boom(_leaf, _proof, _root):
+            raise RuntimeError("boom")
+
+        zkregion.verify_inclusion = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(leaf, root, proof, binding, now=1)
+        finally:
+            zkregion.verify_inclusion = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(leaf, root, proof, binding, now=1))
+
+    def test_check_type_errors(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        for bad in ("leaf", 7, None, True):
+            with self.assertRaises(TypeError):
+                guard.check(bad, root, proof, binding, now=1)
+        for bad in ("root", 7, None, True):
+            with self.assertRaises(TypeError):
+                guard.check(leaf, bad, proof, binding, now=1)
+        for bad in ("proof", 7, None, proof.siblings, True):
+            with self.assertRaises(TypeError):
+                guard.check(leaf, root, bad, binding, now=1)
+        for bad in ("binding", 7, None, (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(leaf, root, proof, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(leaf, root, proof, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(leaf, root, proof, binding, now=bad)
+
+    def test_negative_index_presented_at_check_returns_false(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        # a negative index is U-unencodable: False, no TypeError, no consume
+        self.assertFalse(
+            guard.check(leaf, root, MerkleProof(-1, proof.siblings), binding, now=1)
+        )
+        self.assertIn(b"s", guard._pending)
+
+    def test_inputs_are_not_mutated(self):
+        leaf, root, proof = self._inclusion()
+        guard = MerkleInclusionReplayGuard()
+        siblings_snapshot = proof.siblings
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        guard.check(leaf, root, proof, binding, now=1)
+        self.assertEqual(proof.siblings, siblings_snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        leaf, root, proof = self._inclusion()
+        store = self.make_store()
+        binder = MerkleInclusionReplayGuard(store=store)
+        binding = binder.bind_once(leaf, root, proof, b"s", expires_at=1000)
+        checker = MerkleInclusionReplayGuard(store=store)
+        self.assertTrue(checker.check(leaf, root, proof, binding, now=999))
+        self.assertFalse(binder.check(leaf, root, proof, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        leaf, root, proof = self._inclusion()
+        store = self.make_store()
+        binding = MerkleInclusionReplayGuard(store=store).bind_once(
+            leaf, root, proof, b"s"
+        )
+        store.close()
+        reopened = self.make_store()
+        guard = MerkleInclusionReplayGuard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(leaf, root, proof, binding, now=1))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = MerkleInclusionReplayGuard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(leaf, root, proof, b"s")
+        reopened_again.close()
+
+    def test_store_domain_isolation_from_other_guards(self):
+        leaf, root, proof = self._inclusion()
+        old_root = merkle_root(self._leaves(3))
+        new_root = merkle_root(self._leaves(7))
+        consistency = prove_consistency(self._leaves(7), 3)
+        store = self.make_store()
+        consistency_guard = MerkleConsistencyReplayGuard(store=store)
+        inclusion_guard = MerkleInclusionReplayGuard(store=store)
+        consistency_binding = consistency_guard.bind_once(
+            old_root, new_root, consistency, b"same-id"
+        )
+        inclusion_binding = inclusion_guard.bind_once(
+            leaf, root, proof, b"same-id"
+        )
+        self.assertTrue(
+            consistency_guard.check(
+                old_root, new_root, consistency, consistency_binding, now=1
+            )
+        )
+        self.assertTrue(
+            inclusion_guard.check(leaf, root, proof, inclusion_binding, now=1)
+        )
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/mcr/v1", domains)
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        leaf, root, proof = self._inclusion()
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = MerkleInclusionReplayGuard(store=first).bind_once(
+            leaf, root, proof, b"s"
+        )
+        # a fresh id in namespace b does not see the pending id in namespace a
+        self.assertFalse(
+            MerkleInclusionReplayGuard(store=second).check(
+                leaf, root, proof, binding_a, now=1
+            )
+        )
+        self.assertTrue(
+            MerkleInclusionReplayGuard(store=first).check(
+                leaf, root, proof, binding_a, now=1
+            )
+        )
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        leaf, root, proof = self._inclusion(index=1, size=4)
+        other_leaf, _other_root, other_proof = self._inclusion(index=2, size=4)
+        store = self.make_store()
+        binder = MerkleInclusionReplayGuard(store=store)
+        binding = binder.bind_once(leaf, root, proof, b"s")
+        checker = MerkleInclusionReplayGuard(store=store)
+        self.assertFalse(checker.check(other_leaf, root, other_proof, binding, now=1))
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(
+            MerkleInclusionReplayGuard(store=store).check(
+                leaf, root, proof, binding, now=1
+            )
+        )
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        leaf, root, proof = self._inclusion()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = MerkleInclusionReplayGuard(store=store)
+        binding = guard.bind_once(leaf, root, proof, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(leaf, root, proof, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):  # live claim cannot be rebound
+            guard.bind_once(leaf, root, proof, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):  # expired claim still cannot be rebound
+            guard.bind_once(leaf, root, proof, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):  # consumed id can never be rebound
+            guard.bind_once(leaf, root, proof, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        leaf, root, proof = self._inclusion()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = MerkleInclusionReplayGuard(store=store).bind_once(
+            leaf, root, proof, b"s"
         )
         view = store._view(self.DOMAIN)
         old_token = view.claim(b"s", binding)

@@ -2296,8 +2296,9 @@ class SQLiteReplayStore:
     attached to the same file (including ones opened in another process or
     after a restart) therefore share pending, claimed and consumed ids; two
     stores using different namespaces in the same file never interact. A
-    guard for another entry kind (see :class:`RangeReplayGuard`) keeps its
-    rows in the same table under its own domain segment via :meth:`_view`,
+    guard for another entry kind (see :class:`RangeReplayGuard` and
+    :class:`RegionReplayGuard`) keeps its rows in the same table under its
+    own domain segment via :meth:`_view`,
     so one store file and namespace can serve several guard kinds without
     their ids colliding.
 
@@ -3080,29 +3081,41 @@ def _check_region_batch_entry(entry: object, name: str = "entry") -> RegionBatch
 
 
 class RegionReplayGuard:
-    """Per-instance, single-use replay protection for region-proof entries.
+    """Single-use replay protection for region-proof entries.
 
     A fresh guard has no registrations. :meth:`bind_once` registers a pending
     :class:`ReplayBinding` for a session id, :meth:`check` accepts an equal
-    pending binding exactly once and then marks the id consumed. Both the
-    pending and the consumed state live on this guard instance and are never
-    shared between instances.
+    pending binding exactly once and then marks the id consumed. By default
+    both the pending and the consumed state live on this guard instance and
+    are never shared between instances; passing an
+    :class:`SQLiteReplayStore` as ``store`` instead keeps the state in that
+    store under the ``b"zr/rg/v1"`` key domain, so region guards attached to
+    the same store namespace share pending, claimed and consumed ids across
+    independent instances and process restarts.
 
     As with the other single-entry guards, concurrent checks of the same id
     are decided by an atomic claim taken before the region proof is
-    verified; the verification runs without any lock held, so different ids
-    are never serialized.
+    verified (the in-instance registry lock, or the store's short
+    transaction and unique claim token); the verification runs without any
+    lock or transaction held, so different ids are never serialized.
     """
 
-    def __init__(self) -> None:
-        self._registry = _ReplayRegistry()
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = None if store is None else store._view(_REGION_REPLAY_DOMAIN)
+        self._registry = None if store is not None else _ReplayRegistry()
 
     @property
     def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
         return self._registry.pending_snapshot()
 
     @property
     def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
         return self._registry.consumed_snapshot()
 
     def bind_once(
@@ -3133,7 +3146,10 @@ class RegionReplayGuard:
             _region_replay_digest(entry, session_id, expires_at),
             expires_at,
         )
-        self._registry.register(session_id, binding)
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
         return binding
 
     def check(
@@ -3174,6 +3190,8 @@ class RegionReplayGuard:
             _check_uint64(now, "now")
             current = now
         session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(entry, binding, session_id, current)
         if not self._registry.claim(session_id, binding):
             return False  # unknown id, already consumed, claimed, or unequal binding
         committed = False
@@ -3199,6 +3217,54 @@ class RegionReplayGuard:
         finally:
             if not committed:
                 self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entry: RegionBatchEntry,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over); verification runs with no transaction held; only the
+        token returned by the winning claim can consume the id, and every
+        rejection or escaped error restores the id to pending with that same
+        token. A stale token (a claim taken over while verification ran)
+        neither consumes nor restores anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _region_replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_region(
+                entry.x_commitment,
+                entry.y_commitment,
+                entry.region,
+                entry.proof,
+                entry.context,
+            ):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
 
 
 # ---------------------------------------------------------------------------

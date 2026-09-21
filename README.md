@@ -88,6 +88,13 @@ leaves = leaves + [b"delta", b"epsilon"]
 consistency = prove_consistency(leaves, 3)
 assert verify_consistency(old_root, merkle_root(leaves), consistency)
 
+# 多检查点 Merkle 一致性链：一次确认递增检查点均由前树连续追加
+from zkregion import prove_consistency_chain, verify_consistency_chain
+
+chain = prove_consistency_chain(leaves, (1, 3, 5))
+assert chain.roots == tuple(merkle_root(leaves[:n]) for n in (1, 3, 5))
+assert verify_consistency_chain(chain)
+
 # Pedersen 陷门承诺：对区间 [lower, upper] 内的量化整数值做承诺
 from zkregion import pedersen_commit, verify_pedersen_opening
 
@@ -362,6 +369,9 @@ python3 -m zkregion
 - `prove_consistency(leaves, old_count) -> MerkleConsistencyProof` — 生成追加一致性证明，证明新树由前 `old_count` 片旧叶追加所得
 - `verify_consistency(old_root, new_root, proof) -> bool` — 仅凭旧根、新根与证明验证追加一致性
 - `MerkleConsistencyProof(old_count, new_count, nodes)` — 不可变一致性证明对象，`nodes` 为 `tuple[bytes, ...]`
+- `prove_consistency_chain(leaves, counts) -> MerkleConsistencyChain` — 生成多检查点一致性链，`roots` 按 `counts` 取前缀根，`proofs` 为相邻段的一致性证明
+- `verify_consistency_chain(chain) -> bool` — 一次确认链上每个检查点均由前一棵树连续追加所得
+- `MerkleConsistencyChain(roots, proofs)` — 冻结的一致性链对象，`roots` 为 `tuple[bytes, ...]`，`proofs` 为 `tuple[MerkleConsistencyProof, ...]`，可位置构造、按值相等且不可变
 - `Region(min_x, max_x, min_y, max_y)` — 闭区间矩形；`contains(x, y)`
 
 ### Merkle 树构造
@@ -381,6 +391,14 @@ python3 -m zkregion
 `n` 片叶子的树可分解为 `n` 的二进制展开对应的若干完整子树（高度严格递减），称为峰；`nodes` 先列旧前缀的各峰根（树高递减），再按顺序列新增叶的摘要，摘要逐字节复用同一套 Merkle 协议（`SHA-256(b"\x00" + len4 + leaf)` / `SHA-256(b"\x01" + left + right)`，奇数末项自复制）。验证时先按二进制进位把同高峰合并、再从最右峰起自哈希提升至左邻高度后按 left、right 合并求根：先核对 `old_root`，再把新增叶摘要逐个按进位规则折入峰表并核对 `new_root`。
 
 生成时 `leaves` 须为非空 `bytes` 序列且 `1 <= old_count <= len(leaves)`；叶或计数错型（含 `bool`）抛 `TypeError`，空树或计数越界抛 `ValueError`。验证时根、证明或 `nodes` 的类型错误（含 `bool` 计数）抛 `TypeError`；计数非法（`old_count < 1` 或 `new_count < old_count`）、节点数不符、摘要长度非 32 字节、缺余项或任一根不符均返回 `False`。所有入口均不改写输入。
+
+### 多检查点 Merkle 一致性链
+
+一致性链把单段一致性证明扩展成一串递增检查点：`prove_consistency_chain(leaves, counts)` 对 `counts` 给出的每个检查点取前缀根（`merkle_root(leaves[:count])`）组成 `roots`，并对每对相邻检查点复用 `prove_consistency` 生成段证明组成 `proofs`，一次确认每个检查点都由前一棵树连续追加所得。链为冻结的 `MerkleConsistencyChain(roots, proofs)`，`roots` 为 `tuple[bytes, ...]`、`proofs` 为 `tuple[MerkleConsistencyProof, ...]`，两字段均可位置构造、按值相等且不可变；根与证明节点逐字节沿用既有 Merkle 协议，不新增任何编码。
+
+生成时 `leaves` 须为非空 `bytes` 序列；`counts` 须为至少两项、严格递增且无重复的非 `bool` 整数 `tuple`，每项满足 `1 <= count <= len(leaves)`。叶、`counts` 或计数项错型（含 `bool`）抛 `TypeError`；空树、项数不足、重复、乱序或计数越界抛 `ValueError`。
+
+`verify_consistency_chain(chain)` 要求根数等于证明数加一且至少两个根；每段证明的 `old_count`/`new_count` 须严格递增并与相邻段首尾相接（`proofs[i].new_count == proofs[i+1].old_count`），随后逐段复用 `verify_consistency` 核对相邻两个根。链、根、证明或嵌套字段（计数、`nodes`）错型（含 `bool` 计数）抛 `TypeError`；空链、根或证明数量不符、段间计数断裂或乱序、根非 32 字节、节点摘要长度错误或任一根/节点不符均返回 `False`。入口不改写任何输入。
 
 ### Pedersen 量化坐标陷门承诺
 

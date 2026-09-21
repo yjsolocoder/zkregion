@@ -11,6 +11,7 @@ from . import (
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
+    MerkleConsistencyBatchEntry,
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyReplayGuard,
     MultiSchnorrEntry,
@@ -38,6 +39,7 @@ from . import (
     prove_range,
     prove_region,
     verify_bound,
+    verify_consistency_batch,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
@@ -375,6 +377,35 @@ def main() -> int:
     full = prove_multi_inclusion(leaves, range(len(leaves)))
     print(f"  full-leaf proof needs no siblings: {full.siblings == ()}")
     print(f"  full-leaf proof accepted: {verify_multi_inclusion(list(enumerate(leaves)), full, root)}")
+
+    print()
+    print("independent Merkle consistency batch verification:")
+    batch_leaves = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon", b"zeta"]
+    consistency_entries = []
+    for old_count in (1, 3, 5):
+        consistency_entries.append(MerkleConsistencyBatchEntry(
+            merkle_root(batch_leaves[:old_count]),
+            merkle_root(batch_leaves),
+            prove_consistency(batch_leaves, old_count),
+        ))
+    print(f"  valid batch of {len(consistency_entries)} independent pairs accepted: "
+          f"{verify_consistency_batch(consistency_entries)}")
+    print(f"  tuple and duplicate entries accepted: "
+          f"{verify_consistency_batch(tuple(consistency_entries) + tuple(consistency_entries[:1]))}")
+    print(f"  empty batch rejected: {not verify_consistency_batch(())}")
+    last_node = consistency_entries[0].proof.nodes[-1]
+    tampered_node = bytes([last_node[0] ^ 1]) + last_node[1:]
+    tampered = [dataclasses.replace(
+        consistency_entries[0],
+        proof=dataclasses.replace(
+            consistency_entries[0].proof,
+            nodes=consistency_entries[0].proof.nodes[:-1] + (tampered_node,),
+        ),
+    )] + consistency_entries[1:]
+    print(f"  tampered entry rejected: {not verify_consistency_batch(tampered)}")
+    # entries are independent: counts need not chain to their neighbours
+    unordered = [consistency_entries[2], consistency_entries[0], consistency_entries[1]]
+    print(f"  non-adjacent, reordered counts accepted: {verify_consistency_batch(unordered)}")
 
     print()
     print("per-instance replay protection (bind once, check once):")

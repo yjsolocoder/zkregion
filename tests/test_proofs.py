@@ -15,6 +15,7 @@ from zkregion import (
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
+    MerkleConsistencyBatchEntry,
     MerkleConsistencyChain,
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyProof,
@@ -50,6 +51,7 @@ from zkregion import (
     prove_region,
     verify_bound,
     verify_consistency,
+    verify_consistency_batch,
     verify_consistency_chain,
     verify_inclusion,
     verify_multi_inclusion,
@@ -7126,6 +7128,201 @@ class MerkleConsistencyTest(unittest.TestCase):
         self.assertTrue(
             verify_multi_inclusion([(1, leaves[1]), (3, leaves[3])], multi, root)
         )
+
+
+class MerkleConsistencyBatchTest(unittest.TestCase):
+    """Batch verification of independent append-only consistency proofs."""
+
+    def _leaves(self, count):
+        return [f"cbatch-{i}".encode() for i in range(count)]
+
+    def _entry(self, leaves, old_count):
+        return MerkleConsistencyBatchEntry(
+            merkle_root(leaves[:old_count]),
+            merkle_root(leaves),
+            prove_consistency(leaves, old_count),
+        )
+
+    def test_valid_batch_all_prefixes(self):
+        for size in range(1, 18):
+            leaves = self._leaves(size)
+            entries = [self._entry(leaves, old) for old in range(1, size + 1)]
+            self.assertTrue(verify_consistency_batch(entries), size)
+
+    def test_lists_tuples_and_duplicates(self):
+        leaves = self._leaves(6)
+        entries = [self._entry(leaves, old) for old in (1, 3, 5)]
+        self.assertTrue(verify_consistency_batch(entries))
+        self.assertTrue(verify_consistency_batch(tuple(entries)))
+        self.assertTrue(verify_consistency_batch(entries + entries[:1]))
+        self.assertTrue(verify_consistency_batch((entries[0],) * 3))
+
+    def test_single_entry_matches_single_verify(self):
+        leaves = self._leaves(5)
+        entry = self._entry(leaves, 2)
+        self.assertTrue(verify_consistency_batch([entry]))
+        self.assertTrue(
+            verify_consistency_batch([entry])
+            == verify_consistency(entry.old_root, entry.new_root, entry.proof)
+        )
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(verify_consistency_batch(()))
+        self.assertFalse(verify_consistency_batch([]))
+
+    def test_entries_are_independent_no_count_chain_required(self):
+        leaves = self._leaves(8)
+        entries = [self._entry(leaves, old) for old in (1, 4, 2, 7, 1)]
+        # reordered, repeated and non-adjacent counts all verify independently
+        self.assertTrue(verify_consistency_batch(entries))
+        # even pairs over unrelated leaf sets need not relate to one another
+        other = [b"x", b"y", b"z", b"w"]
+        mixed = [self._entry(other, 2), self._entry(leaves, 5)]
+        self.assertTrue(verify_consistency_batch(mixed))
+
+    def test_one_invalid_entry_returns_false(self):
+        leaves = self._leaves(7)
+        good = [self._entry(leaves, old) for old in (2, 5)]
+        node = b"\x00" * 32
+        proof = prove_consistency(leaves, 3)
+        new_root = merkle_root(leaves)
+        bad_entries = [
+            MerkleConsistencyBatchEntry(b"\x00" * 32, new_root, proof),  # bad old root
+            MerkleConsistencyBatchEntry(merkle_root(leaves[:3]), b"\x00" * 32, proof),
+            MerkleConsistencyBatchEntry(  # bad root length
+                b"\x00" * 31, new_root, proof
+            ),
+            MerkleConsistencyBatchEntry(  # illegal count
+                merkle_root(leaves[:3]), new_root,
+                MerkleConsistencyProof(0, 7, proof.nodes),
+            ),
+            MerkleConsistencyBatchEntry(  # node count mismatch
+                merkle_root(leaves[:3]), new_root,
+                MerkleConsistencyProof(3, 7, proof.nodes[:-1]),
+            ),
+            MerkleConsistencyBatchEntry(  # bad node digest length
+                merkle_root(leaves[:3]), new_root,
+                MerkleConsistencyProof(3, 7, (b"\x00" * 31,) * len(proof.nodes)),
+            ),
+            MerkleConsistencyBatchEntry(  # tampered node
+                merkle_root(leaves[:3]), new_root,
+                MerkleConsistencyProof(3, 7, (node,) + proof.nodes[1:]),
+            ),
+            MerkleConsistencyBatchEntry(  # append relation broken
+                merkle_root(leaves[:4]), new_root, proof
+            ),
+        ]
+        for bad in bad_entries:
+            self.assertFalse(verify_consistency_batch([good[0], bad, good[1]]), bad)
+            self.assertFalse(verify_consistency_batch([bad]), bad)
+
+    def test_short_circuits_on_first_invalid_entry(self):
+        calls = []
+
+        import zkregion
+        original = zkregion.verify_consistency
+
+        def tracking(old_root, new_root, proof):
+            calls.append((old_root, new_root, proof))
+            return original(old_root, new_root, proof)
+
+        leaves = self._leaves(5)
+        good = self._entry(leaves, 2)
+        proof = prove_consistency(leaves, 3)
+        bad = MerkleConsistencyBatchEntry(b"\x00" * 32, merkle_root(leaves), proof)
+        zkregion.verify_consistency = tracking
+        try:
+            self.assertFalse(verify_consistency_batch([good, bad, good]))
+        finally:
+            zkregion.verify_consistency = original
+        self.assertEqual(len(calls), 2)
+
+    def test_entries_type_errors(self):
+        leaves = self._leaves(4)
+        for bad in (b"abc", bytearray(b"abc"), "abc", 123, None, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                verify_consistency_batch(bad)
+        with self.assertRaises(TypeError):
+            verify_consistency_batch([object()])
+        with self.assertRaises(TypeError):
+            verify_consistency_batch([("a", "b")])
+        # the offending entry is reported even when later items are fine
+        good = self._entry(leaves, 2)
+        with self.assertRaises(TypeError):
+            verify_consistency_batch([good, 42, good])
+
+    def test_field_type_errors_propagate(self):
+        leaves = self._leaves(4)
+        entry = self._entry(leaves, 2)
+        proof = entry.proof
+        bad_entries = [
+            MerkleConsistencyBatchEntry(1, entry.new_root, proof),
+            MerkleConsistencyBatchEntry(entry.old_root, "root", proof),
+            MerkleConsistencyBatchEntry(entry.old_root, entry.new_root, object()),
+            MerkleConsistencyBatchEntry(
+                entry.old_root, entry.new_root,
+                MerkleConsistencyProof(True, 4, proof.nodes),
+            ),
+            MerkleConsistencyBatchEntry(
+                entry.old_root, entry.new_root,
+                MerkleConsistencyProof(2, False, proof.nodes),
+            ),
+            MerkleConsistencyBatchEntry(
+                entry.old_root, entry.new_root,
+                MerkleConsistencyProof(2, 4, list(proof.nodes)),
+            ),
+            MerkleConsistencyBatchEntry(
+                entry.old_root, entry.new_root,
+                MerkleConsistencyProof(2, 4, proof.nodes[:-1] + (1,)),
+            ),
+        ]
+        for bad in bad_entries:
+            with self.assertRaises(TypeError, msg=bad):
+                verify_consistency_batch([bad])
+            with self.assertRaises(TypeError, msg=bad):
+                verify_consistency_batch([entry, bad])
+
+    def test_entry_is_frozen_positional_and_value_equal(self):
+        leaves = self._leaves(6)
+        proof = prove_consistency(leaves, 3)
+        old_root = merkle_root(leaves[:3])
+        new_root = merkle_root(leaves)
+        entry = MerkleConsistencyBatchEntry(old_root, new_root, proof)
+        clone = MerkleConsistencyBatchEntry(old_root, new_root, proof)
+        keyword = MerkleConsistencyBatchEntry(
+            old_root=old_root, new_root=new_root, proof=proof
+        )
+        self.assertEqual(entry, clone)
+        self.assertEqual(entry, keyword)
+        self.assertEqual(
+            (entry.old_root, entry.new_root, entry.proof),
+            (old_root, new_root, proof),
+        )
+        self.assertTrue(dataclasses.is_dataclass(entry))
+        with self.assertRaises(AttributeError):
+            entry.old_root = b"\x00" * 32
+        self.assertNotEqual(entry, MerkleConsistencyBatchEntry(new_root, new_root, proof))
+        self.assertEqual(hash(entry), hash(clone))
+
+    def test_inputs_not_mutated(self):
+        leaves = self._leaves(9)
+        entries = [self._entry(leaves, old) for old in (1, 4, 8)]
+        snapshots = [
+            (entry.old_root, entry.new_root, entry.proof.nodes) for entry in entries
+        ]
+        self.assertTrue(verify_consistency_batch(entries))
+        self.assertEqual(
+            [(e.old_root, e.new_root, e.proof.nodes) for e in entries], snapshots
+        )
+        # a rejected batch leaves its inputs untouched as well
+        node = b"\x00" * 32
+        bad_proof = MerkleConsistencyProof(4, 9, (node,) * len(entries[1].proof.nodes))
+        bad = MerkleConsistencyBatchEntry(
+            merkle_root(leaves[:4]), merkle_root(leaves), bad_proof
+        )
+        mixed = [entries[0], bad]
+        self.assertFalse(verify_consistency_batch(mixed))
+        self.assertEqual(bad.proof.nodes, bad_proof.nodes)
 
 
 class MerkleConsistencyChainTest(unittest.TestCase):

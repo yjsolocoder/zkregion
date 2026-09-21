@@ -95,6 +95,21 @@ chain = prove_consistency_chain(leaves, (1, 3, 5))
 assert chain.roots == tuple(merkle_root(leaves[:n]) for n in (1, 3, 5))
 assert verify_consistency_chain(chain)
 
+# 独立 Merkle 一致性证明批验：一次检查多组互不相关的旧根、新根与证明
+from zkregion import MerkleConsistencyBatchEntry, verify_consistency_batch
+
+more_leaves = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon", b"zeta"]
+batch = [
+    MerkleConsistencyBatchEntry(
+        merkle_root(more_leaves[:old_count]),
+        merkle_root(more_leaves),
+        prove_consistency(more_leaves, old_count),
+    )
+    for old_count in (1, 3, 5)
+]
+assert verify_consistency_batch(batch)
+assert not verify_consistency_batch(())
+
 # Pedersen 陷门承诺：对区间 [lower, upper] 内的量化整数值做承诺
 from zkregion import pedersen_commit, verify_pedersen_opening
 
@@ -457,6 +472,8 @@ python3 -m zkregion
 - `prove_consistency(leaves, old_count) -> MerkleConsistencyProof` — 生成追加一致性证明，证明新树由前 `old_count` 片旧叶追加所得
 - `verify_consistency(old_root, new_root, proof) -> bool` — 仅凭旧根、新根与证明验证追加一致性
 - `MerkleConsistencyProof(old_count, new_count, nodes)` — 不可变一致性证明对象，`nodes` 为 `tuple[bytes, ...]`
+- `MerkleConsistencyBatchEntry(old_root, new_root, proof)` — 不可变一致性批验条目，字段依次为 `bytes`、`bytes`、`MerkleConsistencyProof`，次序与 `verify_consistency` 入参一致；三字段均可位置构造、按值相等且不可变
+- `verify_consistency_batch(entries) -> bool` — 独立一致性证明的批量验证：逐项以 `old_root`、`new_root`、`proof` 调 `verify_consistency`，各条目计数互不要求衔接，不做密码学聚合
 - `prove_consistency_chain(leaves, counts) -> MerkleConsistencyChain` — 生成多检查点一致性链，`roots` 按 `counts` 取前缀根，`proofs` 为相邻段的一致性证明
 - `verify_consistency_chain(chain) -> bool` — 一次确认链上每个检查点均由前一棵树连续追加所得
 - `MerkleConsistencyChain(roots, proofs)` — 冻结的一致性链对象，`roots` 为 `tuple[bytes, ...]`，`proofs` 为 `tuple[MerkleConsistencyProof, ...]`，可位置构造、按值相等且不可变
@@ -487,6 +504,14 @@ python3 -m zkregion
 生成时 `leaves` 须为非空 `bytes` 序列；`counts` 须为至少两项、严格递增且无重复的非 `bool` 整数 `tuple`，每项满足 `1 <= count <= len(leaves)`。叶、`counts` 或计数项错型（含 `bool`）抛 `TypeError`；空树、项数不足、重复、乱序或计数越界抛 `ValueError`。
 
 `verify_consistency_chain(chain)` 要求根数等于证明数加一且至少两个根；每段证明的 `old_count`/`new_count` 须严格递增并与相邻段首尾相接（`proofs[i].new_count == proofs[i+1].old_count`），随后逐段复用 `verify_consistency` 核对相邻两个根。链、根、证明或嵌套字段（计数、`nodes`）错型（含 `bool` 计数）抛 `TypeError`；空链、根或证明数量不符、段间计数断裂或乱序、根非 32 字节、节点摘要长度错误或任一根/节点不符均返回 `False`。入口不改写任何输入。
+
+### 独立 Merkle 一致性证明批验
+
+`verify_consistency_batch(entries)` 一次检查多组彼此独立的旧根、新根与一致性证明。每个条目是把 `verify_consistency` 的三个入参（`old_root`、`new_root`、`proof`）按原顺序冻结成的不可变数据类 `MerkleConsistencyBatchEntry(old_root, new_root, proof)`，字段类型依次为 `bytes`、`bytes`、`MerkleConsistencyProof`；三字段均可位置构造，对象按值相等且不可变。
+
+`entries` 须为非 `bytes`/`bytearray`/`str` 的序列：空批返回 `False`，列表、元组以及重复条目均合法。验证逐项按 `old_root`、`new_root`、`proof` 顺序委托既有 `verify_consistency`，完全沿用其根长度、计数、节点数量与长度、缺余节点及追加关系规则；任一条目无效即返回 `False`，允许短路。各条目彼此独立：不要求相邻计数衔接（与一致性链不同），可以乱序、可以重复；批验不新增任何哈希编码，也不做密码学聚合。
+
+`entries` 本身不是序列或是 `bytes`/`bytearray`/`str`、条目不是 `MerkleConsistencyBatchEntry`、任一字段错型——含嵌套证明的 `bool` 计数、`nodes` 非元组或节点非 `bytes`——均抛 `TypeError`，即类型错误不会被转换为批量拒绝（返回 `False`）。除空批外，根非 32 字节、计数非法（`old_count < 1` 或 `new_count < old_count`）、节点数量或长度不符、缺余节点、任一根或追加关系不符均返回 `False`。入口不改写任何输入。
 
 ### Pedersen 量化坐标陷门承诺
 

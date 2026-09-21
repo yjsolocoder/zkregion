@@ -12,6 +12,7 @@ BoundRangeBatch / verify_range_bound /
 BoundSchnorrReplayGuard /
 MerkleConsistencyChainReplayGuard /
 MerkleConsistencyReplayGuard /
+MerkleInclusionReplayGuard /
 BoundRegionReplayGuard /
 BoundRangeReplayGuard /
 ReplayBinding / ReplayGuard / SQLiteReplayStore /
@@ -49,6 +50,7 @@ __all__ = [
     "MerkleConsistencyChainReplayGuard",
     "MerkleConsistencyProof",
     "MerkleConsistencyReplayGuard",
+    "MerkleInclusionReplayGuard",
     "MerkleMultiProof",
     "MerkleProof",
     "MultiSchnorrEntry",
@@ -2437,6 +2439,7 @@ _BOUND_RANGE_REPLAY_DOMAIN = b"zr/brr/v1"
 _BOUND_SCHNORR_REPLAY_DOMAIN = b"zr/bsr/v1"
 _MERKLE_CHAIN_REPLAY_DOMAIN = b"zr/mccr/v1"
 _MERKLE_CONSISTENCY_REPLAY_DOMAIN = b"zr/mcr/v1"
+_MERKLE_INCLUSION_REPLAY_DOMAIN = b"zr/mir/v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -2581,8 +2584,9 @@ class SQLiteReplayStore:
     guard for another entry kind (see :class:`RangeReplayGuard`,
     :class:`RegionReplayGuard`, :class:`BoundRegionReplayGuard`,
     :class:`BoundRangeReplayGuard`, :class:`BoundSchnorrReplayGuard`,
-    :class:`MerkleConsistencyChainReplayGuard` and
-    :class:`MerkleConsistencyReplayGuard`)
+    :class:`MerkleConsistencyChainReplayGuard`,
+    :class:`MerkleConsistencyReplayGuard` and
+    :class:`MerkleInclusionReplayGuard`)
     keeps its rows in the same table under its own domain segment via
     :meth:`_view`, so one store file and namespace can serve several guard
     kinds without their ids colliding.
@@ -5235,6 +5239,313 @@ class MerkleConsistencyReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_consistency(old_root, new_root, proof):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for single-leaf Merkle inclusion proofs
+#
+# A MerkleInclusionReplayGuard binds one MerkleProof together with the leaf
+# it places and the Merkle root it is claimed under to a caller-chosen
+# session id, reusing the ReplayBinding type and, byte for byte, the F / U /
+# S framing and the E expiry encoding of the other guards. Like the other
+# guards the binding is single-use: without a store the state is local to
+# the guard instance, while an SQLiteReplayStore keeps pending, claimed and
+# consumed ids in the store under b"zr/mir/v1", shared across instances,
+# processes and restarts. bind_once registers a pending binding, check
+# recomputes the digest, checks the expiry, delegates the inclusion
+# verification to verify_inclusion and consumes the id only on full
+# success; every rejection leaves the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || F(leaf) || F(root)
+#     || F(U(proof.index)) || S(proof.siblings, id) || F(E)
+# )
+#   D = b"zr/mir/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   id(x) = x, i.e. a sibling digest is framed raw under F, order preserved
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+
+
+def _merkle_inclusion_replay_encodable(proof: MerkleProof) -> bool:
+    """Every U-framed integer must fit in unsigned 64 bits.
+
+    The proof ``index`` and the ``siblings`` tuple length written by the S
+    sequence are encoded with ``U``; the raw leaf, root and sibling bytes
+    need no encodability rule.
+    """
+    values = [proof.index, len(proof.siblings)]
+    return all(0 <= value <= _UINT64_MAX for value in values)
+
+
+def _merkle_inclusion_replay_digest(
+    leaf: bytes,
+    root: bytes,
+    proof: MerkleProof,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the Merkle-inclusion replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``F(leaf)``, ``F(root)``,
+    ``F(U(proof.index))``, ``S(proof.siblings, id)`` and ``F(E)``; the
+    siblings keep their leaf-to-root proof order.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_MERKLE_INCLUSION_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    transcript.update(_frame_length_prefixed(leaf))
+    transcript.update(_frame_length_prefixed(root))
+    transcript.update(_frame_length_prefixed(_uint64_be(proof.index)))
+    # S(proof.siblings, id) = F(U(|siblings|)) || Σ F(sibling)
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.siblings))))
+    for sibling in proof.siblings:
+        transcript.update(_frame_length_prefixed(sibling))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+def _check_merkle_inclusion_proof_types(
+    leaf: object,
+    root: object,
+    proof: object,
+) -> None:
+    """Validate inclusion-proof argument types for the replay guard.
+
+    Mirrors the type checks of :func:`verify_inclusion`: the leaf and root
+    must be ``bytes`` and ``proof`` must be a :class:`MerkleProof` with a
+    non-``bool`` integer ``index`` and a tuple-of-bytes ``siblings``.
+    Structural and value problems (digest lengths, a path too short for the
+    index) are left to :func:`verify_inclusion` at check time.
+    """
+    _check_bytes(leaf, "leaf")
+    _check_bytes(root, "root")
+    if not isinstance(proof, MerkleProof):
+        raise TypeError("proof must be a MerkleProof")
+    if not isinstance(proof.index, int) or isinstance(proof.index, bool):
+        raise TypeError("proof index must be an integer")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+
+
+class MerkleInclusionReplayGuard:
+    """Single-use replay protection for one single-leaf inclusion proof.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a single
+    :class:`MerkleProof` together with the ``leaf`` it places and the
+    Merkle ``root`` it is claimed under; :meth:`check` accepts an equal
+    pending binding exactly once, recomputing the binding digest, checking
+    the expiry and delegating to :func:`verify_inclusion`, and then marks
+    the id consumed. The digest frames the proof under
+    ``SHA-256(F(D) || F(session_id) || F(leaf) || F(root) ||``
+    ``F(U(index)) || S(siblings, id) || F(E))`` with domain
+    ``b"zr/mir/v1"``, reusing the F / U / S framing and the E expiry
+    encoding of the Bound guards byte for byte. By default both the pending
+    and the consumed state live on this guard instance and are never shared
+    between instances; passing an :class:`SQLiteReplayStore` as ``store``
+    instead keeps the state in that store under the ``b"zr/mir/v1"`` key
+    domain, so inclusion guards attached to the same store namespace share
+    pending, claimed and consumed ids across independent instances,
+    processes and process restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the digest/expiry work and the delegated verification (the
+    in-instance registry lock, or the store's short transaction and unique
+    claim token); the claim is per-id registry state rather than a global
+    lock, so a proof being verified under one id never serializes checks or
+    binds of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = None if store is None else store._view(_MERKLE_INCLUSION_REPLAY_DOMAIN)
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        leaf: bytes,
+        root: bytes,
+        proof: MerkleProof,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to the proof.
+
+        Returns the frozen :class:`ReplayBinding`. ``leaf``, ``root`` and
+        ``session_id`` must be ``bytes`` and ``session_id`` must be
+        non-empty; ``expires_at`` must be either ``None`` or a non-``bool``
+        unsigned 64-bit Unix-second timestamp; the U-framed
+        ``proof.index`` and the ``siblings`` count must likewise fit in
+        uint64. A session id that is already pending, being checked or
+        consumed raises :class:`ValueError`. Wrong argument or nested field
+        types raise :class:`TypeError`; an empty id, an out-of-uint64
+        expiry or framed index/count, or a rebind raise
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_merkle_inclusion_proof_types(leaf, root, proof)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _merkle_inclusion_replay_encodable(proof):
+            raise ValueError(
+                "proof index and siblings count must be unsigned 64-bit integers"
+            )
+        binding = ReplayBinding(
+            session_id,
+            _merkle_inclusion_replay_digest(
+                leaf, root, proof, session_id, expires_at
+            ),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        leaf: bytes,
+        root: bytes,
+        proof: MerkleProof,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for the proof.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id at
+        most one can return ``True``. The digest is recomputed over the
+        presented ``leaf`` / ``root`` / ``proof``; for a binding with an
+        expiry, ``now >= expires_at`` makes the check fail (``now``
+        defaults to the current Unix seconds and must otherwise be a
+        non-``bool`` uint64). Only then are the leaf, proof and root handed
+        to :func:`verify_inclusion`, which walks the sibling path from the
+        leaf to the root and compares the recomputed digest.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, or
+        :func:`verify_inclusion` returning ``False``) returns ``False``,
+        releases the claim and leaves the registration pending. An exception
+        escaping the delegated verification likewise releases the claim and
+        then propagates unchanged, leaving the id usable. With a store
+        backend, only the holder of the current claim token can consume the
+        id (an expired claim may be taken over by a later equal ``check``);
+        a stale token neither consumes nor restores anything. Verification
+        runs without any lock or transaction held, so other ids are never
+        serialized. Argument type errors raise :class:`TypeError`; an
+        out-of-range ``now`` raises :class:`ValueError`. Inputs are never
+        mutated.
+        """
+        _check_merkle_inclusion_proof_types(leaf, root, proof)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _merkle_inclusion_replay_encodable(proof):
+            return False  # negative or oversized U-framed index/count
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(
+                leaf, root, proof, binding, session_id, current
+            )
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _merkle_inclusion_replay_digest(
+                    leaf, root, proof, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented leaf/root/proof are not the ones bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_inclusion(leaf, proof, root):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        leaf: bytes,
+        root: bytes,
+        proof: MerkleProof,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _merkle_inclusion_replay_digest(
+                    leaf, root, proof, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented leaf/root/proof are not the ones bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_inclusion(leaf, proof, root):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

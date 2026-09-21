@@ -13,6 +13,7 @@ from . import (
     BoundSchnorrReplayGuard,
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyReplayGuard,
+    MerkleInclusionReplayGuard,
     MultiSchnorrEntry,
     RangeBatchEntry,
     RangeProof,
@@ -568,6 +569,28 @@ def main() -> int:
     foreign_mcr_binding = foreign_mcr.bind_once(old_root, new_root, consistency, b"consistency-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_mcr.check(old_root, new_root, consistency, foreign_mcr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for inclusion proofs (bind once, check once):")
+    incl_root = merkle_root(leaves)
+    incl_proof = prove_inclusion(leaves, 2)
+    incl_leaf = leaves[2]
+    mir = MerkleInclusionReplayGuard()
+    mir_binding = mir.bind_once(incl_leaf, incl_root, incl_proof, b"inclusion-session-1", expires_at=10**12)
+    print(f"  digest={mir_binding.digest.hex()[:32]}…  expires_at={mir_binding.expires_at}")
+    print(f"  valid first check accepted: {mir.check(incl_leaf, incl_root, incl_proof, mir_binding, now=100)}")
+    print(f"  replay rejected: {not mir.check(incl_leaf, incl_root, incl_proof, mir_binding, now=101)}")
+    other_mir = MerkleInclusionReplayGuard()
+    other_mir_binding = other_mir.bind_once(incl_leaf, incl_root, incl_proof, b"inclusion-session-2")
+    wrong_leaf = leaves[3]
+    print(f"  wrong leaf rejected without consuming the id: "
+          f"{not other_mir.check(wrong_leaf, incl_root, incl_proof, other_mir_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mir.check(incl_leaf, incl_root, incl_proof, other_mir_binding, now=1)}")
+    foreign_mir = MerkleInclusionReplayGuard()
+    foreign_mir_binding = foreign_mir.bind_once(incl_leaf, incl_root, incl_proof, b"inclusion-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mir.check(incl_leaf, incl_root, incl_proof, foreign_mir_binding, now=1)}")
 
     print()
     print("region membership:")

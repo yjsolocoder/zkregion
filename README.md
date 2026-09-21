@@ -1,6 +1,6 @@
 # zkregion
 
-面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含证明、量化区间的 Pedersen 陷门承诺及其上的 Schnorr OR 非交互区间证明、二维矩形区域成员非交互证明，以及量化整数坐标下的矩形区域判定。
+面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含/多包含/追加一致性证明、量化区间的 Pedersen 陷门承诺及其上的 Schnorr OR 非交互区间证明、二维矩形区域成员非交互证明，以及量化整数坐标下的矩形区域判定。
 
 ## 环境
 
@@ -351,6 +351,9 @@ python3 -m zkregion
 - `prove_multi_inclusion(leaves, indices) -> MerkleMultiProof` — 为多片叶子生成紧凑的合并包含证明
 - `verify_multi_inclusion(entries, proof, root) -> bool` — 无需完整叶集验证多包含证明；`entries` 按 `proof.indices` 顺序给出 `(index, leaf)`
 - `MerkleMultiProof(leaf_count, indices, siblings)` — 不可变多包含证明对象，`indices` 为 `tuple[int, ...]`，`siblings` 为 `tuple[bytes, ...]`
+- `prove_consistency(leaves, old_count) -> MerkleConsistencyProof` — 生成追加一致性证明：证明全树由前 `old_count` 片叶子的旧树追加所得
+- `verify_consistency(old_root, new_root, proof) -> bool` — 仅凭旧根与新根验证新树确为旧叶序列追加所得
+- `MerkleConsistencyProof(old_count, new_count, nodes)` — 不可变一致性证明对象，`nodes` 为 `tuple[bytes, ...]`
 - `Region(min_x, max_x, min_y, max_y)` — 闭区间矩形；`contains(x, y)`
 
 ### Merkle 树构造
@@ -362,6 +365,12 @@ python3 -m zkregion
 多包含证明复用同一套哈希与奇数末项复制规则，把多片叶子的路径合并为一个证明。`indices` 须非空、严格递增且无重复；生成时逐层从左到右处理：兄弟节点本身也在被证明之列则直接合并、无需收集，奇数层末项无兄弟则自复制，其余情况才收集兄弟摘要；父层位置按 `position // 2` 去重。证明确定且最小——证明全部叶子时 `siblings` 为空。验证方只需 `entries`（按 `proof.indices` 顺序给出的 `(index, leaf)`）、证明与根，无需完整叶集；按同一规则逐层恢复根，且必须恰好耗尽全部 `siblings`，否则返回 `False`。
 
 生成时 `leaves` 须为非空 `bytes` 序列；`leaf_count` 须为正的非 bool 整数，索引须为范围内的非 bool 整数。类型错误抛 `TypeError`，`indices` 为空、重复或乱序抛 `ValueError`，越界抛 `IndexError`。验证时 `entries` 的索引序列须与 `proof.indices` 完全一致；`entries`、`proof`、`root` 或摘要的类型错误抛 `TypeError`；空项、乱序、越界、数量不符、摘要长度错误及任何篡改均返回 `False`。
+
+### Merkle 追加一致性证明
+
+一致性证明复用同一套叶/内部节点摘要与奇数末项复制规则，让验证方仅凭旧根与新根确认新树由旧叶序列原样追加所得。`prove_consistency(leaves, old_count)` 令 `new_count = len(leaves)`，`nodes` 先按树高递减列出旧前缀二进制分解的各完整子树根（峰），再顺序列出各新增叶摘要。验证时先由旧峰折叠核对 `old_root`——从最右峰起自哈希（奇数末项复制）提升至左邻高度再按 `(left, right)` 合并——再逐个追加剩余叶摘要、同高峰按二进制进位合并，最后由全部峰折叠核对 `new_root`。
+
+`leaves` 须为非空 `bytes` 序列且 `1 <= old_count <= len(leaves)`；叶或计数错型（含 bool）抛 `TypeError`，空树或计数越界抛 `ValueError`。验证时计数非法、节点数不符、摘要长度错误、缺追加项或任一根不符均返回 `False`，类型错误抛 `TypeError`。所有入口均不改写输入。
 
 ### Pedersen 量化坐标陷门承诺
 

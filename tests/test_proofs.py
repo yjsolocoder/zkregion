@@ -15,6 +15,7 @@ from zkregion import (
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
+    MerkleConsistencyProof,
     MerkleMultiProof,
     MerkleProof,
     MultiSchnorrEntry,
@@ -37,11 +38,13 @@ from zkregion import (
     commit_coordinate,
     merkle_root,
     pedersen_commit,
+    prove_consistency,
     prove_inclusion,
     prove_multi_inclusion,
     prove_range,
     prove_region,
     verify_bound,
+    verify_consistency,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
@@ -3970,6 +3973,157 @@ class MerkleMultiProofTest(unittest.TestCase):
         proof = prove_multi_inclusion(leaves, indices)
         verify_multi_inclusion(entries, proof, merkle_root(leaves))
         self.assertEqual((leaves, indices, entries), snapshot)
+
+
+class MerkleConsistencyProofTest(unittest.TestCase):
+    LEAVES = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon"]
+
+    def test_roundtrip_for_every_split(self):
+        for size in range(1, 9):
+            leaves = [f"leaf{index}".encode() for index in range(size)]
+            new_root = merkle_root(leaves)
+            for old_count in range(1, size + 1):
+                old_root = merkle_root(leaves[:old_count])
+                proof = prove_consistency(leaves, old_count)
+                self.assertIsInstance(proof, MerkleConsistencyProof)
+                self.assertEqual(proof.old_count, old_count)
+                self.assertEqual(proof.new_count, size)
+                self.assertIsInstance(proof.nodes, tuple)
+                self.assertTrue(
+                    verify_consistency(old_root, new_root, proof),
+                    f"split {old_count}->{size} failed",
+                )
+
+    def test_proof_layout_old_peaks_then_appended_leaf_digests(self):
+        # old_count 3 = 2 + 1: peaks are the roots of [alpha, beta] and [gamma]
+        proof = prove_consistency(self.LEAVES, 3)
+        self.assertEqual(proof.new_count, 5)
+        self.assertEqual(
+            proof.nodes,
+            (
+                merkle_root(self.LEAVES[:2]),
+                merkle_root(self.LEAVES[2:3]),
+                merkle_root(self.LEAVES[3:4]),  # appended leaf digests
+                merkle_root(self.LEAVES[4:5]),
+            ),
+        )
+
+    def test_power_of_two_prefix_has_single_peak(self):
+        proof = prove_consistency(self.LEAVES, 4)
+        self.assertEqual(proof.nodes[0], merkle_root(self.LEAVES[:4]))
+        self.assertEqual(len(proof.nodes), 1 + 1)  # one peak, one appended leaf
+
+    def test_no_appends_when_old_count_is_full_size(self):
+        proof = prove_consistency(self.LEAVES, len(self.LEAVES))
+        root = merkle_root(self.LEAVES)
+        self.assertEqual(proof.new_count, len(self.LEAVES))
+        self.assertTrue(verify_consistency(root, root, proof))
+
+    def test_single_leaf_trees(self):
+        proof = prove_consistency([b"only"], 1)
+        self.assertEqual(proof, MerkleConsistencyProof(1, 1, (leaf_digest(b"only"),)))
+        self.assertTrue(verify_consistency(leaf_digest(b"only"), leaf_digest(b"only"), proof))
+
+    def test_proof_is_frozen_and_compares_by_value(self):
+        proof = prove_consistency(self.LEAVES, 2)
+        self.assertEqual(proof, prove_consistency(self.LEAVES, 2))
+        self.assertEqual(proof, MerkleConsistencyProof(2, 5, proof.nodes))
+        with self.assertRaises(AttributeError):
+            proof.old_count = 3
+
+    def test_positional_construction_field_order(self):
+        proof = MerkleConsistencyProof(2, 5, (b"x" * 32,))
+        self.assertEqual((proof.old_count, proof.new_count, proof.nodes), (2, 5, (b"x" * 32,)))
+
+    def test_tampered_nodes_and_roots_fail(self):
+        old_root = merkle_root(self.LEAVES[:3])
+        new_root = merkle_root(self.LEAVES)
+        proof = prove_consistency(self.LEAVES, 3)
+        for position in range(len(proof.nodes)):
+            flipped = MerkleConsistencyProof(
+                3, 5, proof.nodes[:position] + (proof.nodes[position][::-1],) + proof.nodes[position + 1:]
+            )
+            self.assertFalse(verify_consistency(old_root, new_root, flipped))
+        self.assertFalse(verify_consistency(merkle_root(self.LEAVES[:2]), new_root, proof))
+        self.assertFalse(verify_consistency(old_root, merkle_root(self.LEAVES[:4]), proof))
+        # a proof for a different split must not validate this one
+        other = prove_consistency(self.LEAVES, 2)
+        self.assertFalse(verify_consistency(old_root, new_root, other))
+
+    def test_prove_type_errors(self):
+        for bad in (b"not-a-sequence-of-leaves", "text", 42, None):
+            with self.assertRaises(TypeError):
+                prove_consistency(bad, 1)
+        with self.assertRaises(TypeError):
+            prove_consistency([b"ok", 7], 1)
+        with self.assertRaises(TypeError):
+            prove_consistency([b"ok", bytearray(b"x")], 1)
+        for bad_count in (True, 1.0, "1", None):
+            with self.assertRaises(TypeError):
+                prove_consistency(self.LEAVES, bad_count)
+
+    def test_prove_value_errors(self):
+        with self.assertRaises(ValueError):
+            prove_consistency([], 1)
+        for bad_count in (0, -1, len(self.LEAVES) + 1):
+            with self.assertRaises(ValueError):
+                prove_consistency(self.LEAVES, bad_count)
+
+    def test_verify_type_errors(self):
+        old_root = merkle_root(self.LEAVES[:3])
+        new_root = merkle_root(self.LEAVES)
+        proof = prove_consistency(self.LEAVES, 3)
+        with self.assertRaises(TypeError):
+            verify_consistency("root", new_root, proof)
+        with self.assertRaises(TypeError):
+            verify_consistency(old_root, "root", proof)
+        with self.assertRaises(TypeError):
+            verify_consistency(old_root, new_root, (3, 5, proof.nodes))
+        with self.assertRaises(TypeError):
+            verify_consistency(old_root, new_root, MerkleConsistencyProof(True, 5, proof.nodes))
+        with self.assertRaises(TypeError):
+            verify_consistency(old_root, new_root, MerkleConsistencyProof(3, 5.0, proof.nodes))
+        with self.assertRaises(TypeError):
+            verify_consistency(old_root, new_root, MerkleConsistencyProof(3, 5, list(proof.nodes)))
+        with self.assertRaises(TypeError):
+            verify_consistency(
+                old_root, new_root,
+                MerkleConsistencyProof(3, 5, proof.nodes[:1] + ("x",) + proof.nodes[2:]),
+            )
+
+    def test_verify_shape_errors_return_false(self):
+        old_root = merkle_root(self.LEAVES[:3])
+        new_root = merkle_root(self.LEAVES)
+        proof = prove_consistency(self.LEAVES, 3)
+        # root digest lengths
+        self.assertFalse(verify_consistency(old_root[:-1], new_root, proof))
+        self.assertFalse(verify_consistency(old_root, new_root + b"\x00", proof))
+        # counts: zero/negative old_count, new_count below old_count
+        self.assertFalse(verify_consistency(old_root, new_root, MerkleConsistencyProof(0, 5, proof.nodes)))
+        self.assertFalse(verify_consistency(old_root, new_root, MerkleConsistencyProof(-1, 5, proof.nodes)))
+        self.assertFalse(verify_consistency(old_root, new_root, MerkleConsistencyProof(5, 3, proof.nodes)))
+        # node count off in either direction, including a missing append digest
+        self.assertFalse(verify_consistency(old_root, new_root, MerkleConsistencyProof(3, 5, proof.nodes[:-1])))
+        self.assertFalse(verify_consistency(old_root, new_root, MerkleConsistencyProof(3, 5, proof.nodes + (new_root,))))
+        # node digest length
+        short = MerkleConsistencyProof(3, 5, proof.nodes[:1] + (proof.nodes[1][:16],) + proof.nodes[2:])
+        self.assertFalse(verify_consistency(old_root, new_root, short))
+
+    def test_inputs_are_not_mutated(self):
+        leaves = list(self.LEAVES)
+        snapshot = list(leaves)
+        proof = prove_consistency(leaves, 3)
+        verify_consistency(merkle_root(leaves[:3]), merkle_root(leaves), proof)
+        self.assertEqual(leaves, snapshot)
+        self.assertEqual(proof, prove_consistency(snapshot, 3))
+
+    def test_tuple_leaves_accepted(self):
+        proof = prove_consistency(tuple(self.LEAVES), 3)
+        self.assertTrue(
+            verify_consistency(
+                merkle_root(self.LEAVES[:3]), merkle_root(self.LEAVES), proof
+            )
+        )
 
 
 class ReplayBindingTest(unittest.TestCase):

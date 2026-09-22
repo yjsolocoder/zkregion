@@ -17,6 +17,7 @@ from . import (
     MerkleConsistencyReplayGuard,
     MultiSchnorrEntry,
     RangeBatchEntry,
+    RangeBatchReplayGuard,
     RangeProof,
     RangeReplayGuard,
     Region,
@@ -499,6 +500,32 @@ def main() -> int:
           f"{not other_range.check(forged_range_entry, other_range_binding)}")
     print(f"  binding from another guard instance rejected: "
           f"{not other_range.check(range_replay_entry, fresh_binding)}")
+
+    print()
+    print("per-instance replay protection for range batches (bind once, check once):")
+    rbr = RangeBatchReplayGuard()
+    rbr_binding = rbr.bind_once(range_entries, b"range-batch-session-1", expires_at=10**12)
+    print(f"  digest={rbr_binding.digest.hex()[:32]}…  expires_at={rbr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{rbr.check(range_entries, rbr_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not rbr.check(range_entries, rbr_binding, now=101, randbelow=counter_randbelow())}")
+    other_rbr = RangeBatchReplayGuard()
+    other_rbr_binding = other_rbr.bind_once(range_entries, b"range-batch-session-2")
+    print(f"  reordered batch rejected without consuming the id: "
+          f"{not other_rbr.check(range_entries[::-1], other_rbr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_rbr.check(range_entries, other_rbr_binding, now=1, randbelow=counter_randbelow())}")
+    try:
+        rbr.bind_once(range_entries, b"range-batch-session-1")
+    except ValueError:
+        print("  rebind of a consumed id rejected: True")
+    else:
+        print("  rebind of a consumed id rejected: False")
+    foreign_rbr = RangeBatchReplayGuard()
+    foreign_rbr_binding = foreign_rbr.bind_once(range_entries, b"range-batch-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_rbr.check(range_entries, foreign_rbr_binding, now=1)}")
 
     print()
     print("per-instance replay protection for region proofs (bind once, check once):")

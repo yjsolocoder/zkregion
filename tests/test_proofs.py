@@ -29,6 +29,8 @@ from zkregion import (
     MerkleInclusionBatchEntry,
     MerkleInclusionBatchReplayGuard,
     MerkleInclusionReplayGuard,
+    MerkleMultiBatchEntry,
+    MerkleMultiBatchReplayGuard,
     MerkleMultiProof,
     MerkleProof,
     MultiSchnorrEntry,
@@ -73,6 +75,7 @@ from zkregion import (
     verify_inclusion,
     verify_inclusion_batch,
     verify_multi_inclusion,
+    verify_multi_inclusion_batch,
     verify_opening,
     verify_pedersen_opening,
     verify_range,
@@ -4500,6 +4503,217 @@ class MerkleMultiProofTest(unittest.TestCase):
         proof = prove_multi_inclusion(leaves, indices)
         verify_multi_inclusion(entries, proof, merkle_root(leaves))
         self.assertEqual((leaves, indices, entries), snapshot)
+
+
+class MerkleMultiInclusionBatchTest(unittest.TestCase):
+    """Batch verification of independent compact multi-inclusion proofs."""
+
+    def _leaves(self, prefix, count):
+        return [f"{prefix}-{i}".encode() for i in range(count)]
+
+    def _item(self, leaves, indices, *, root=None):
+        return MerkleMultiBatchEntry(
+            tuple((index, leaves[index]) for index in indices),
+            prove_multi_inclusion(leaves, tuple(indices)),
+            merkle_root(leaves) if root is None else root,
+        )
+
+    def _items(self):
+        first = self._leaves("mmib-a", 5)
+        second = self._leaves("mmib-b", 8)
+        return [
+            self._item(first, (0, 2, 4)),
+            self._item(second, (1, 7)),
+        ]
+
+    def test_valid_batches_of_various_sizes(self):
+        for size in range(1, 12):
+            leaves = self._leaves("mmib-size", size)
+            indices = tuple(range(0, size, 2)) or (0,)
+            items = [self._item(leaves, indices)]
+            self.assertTrue(verify_multi_inclusion_batch(items), size)
+
+    def test_lists_tuples_and_duplicates(self):
+        items = self._items()
+        self.assertTrue(verify_multi_inclusion_batch(items))
+        self.assertTrue(verify_multi_inclusion_batch(tuple(items)))
+        self.assertTrue(verify_multi_inclusion_batch(items + items[:1]))
+        self.assertTrue(verify_multi_inclusion_batch((items[0],) * 3))
+
+    def test_single_item_matches_single_verify(self):
+        leaves = self._leaves("mmib-one", 5)
+        item = self._item(leaves, (1, 3))
+        self.assertTrue(verify_multi_inclusion_batch([item]))
+        self.assertEqual(
+            verify_multi_inclusion_batch([item]),
+            verify_multi_inclusion(item.entries, item.proof, item.root),
+        )
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(verify_multi_inclusion_batch(()))
+        self.assertFalse(verify_multi_inclusion_batch([]))
+
+    def test_items_are_independent_unrelated_trees_allowed(self):
+        first = self._leaves("mmib-x", 4)
+        second = self._leaves("mmib-y", 6)
+        items = [
+            self._item(second, (5,)),
+            self._item(first, (0, 3)),
+            self._item(second, (1,)),
+        ]
+        self.assertTrue(verify_multi_inclusion_batch(items))
+
+    def test_one_invalid_item_returns_false(self):
+        leaves = self._leaves("mmib-bad", 7)
+        proof = prove_multi_inclusion(leaves, (1, 3, 5))
+        good = self._item(leaves, (0,))
+        pairs = tuple((i, leaves[i]) for i in (1, 3, 5))
+        bad_items = [
+            MerkleMultiBatchEntry(  # tampered leaf
+                tuple((i, b"other" if i == 3 else leaves[i]) for i in (1, 3, 5)),
+                proof, merkle_root(leaves),
+            ),
+            MerkleMultiBatchEntry(pairs, proof, b"\x00" * 31),       # root length
+            MerkleMultiBatchEntry(  # wrong root
+                pairs, proof, merkle_root(self._leaves("mmib-other", 7))
+            ),
+            MerkleMultiBatchEntry(  # leaf_count too small
+                pairs, MerkleMultiProof(6, proof.indices, proof.siblings),
+                merkle_root(leaves),
+            ),
+            MerkleMultiBatchEntry(  # indices/entries mismatch
+                pairs[:2], proof, merkle_root(leaves),
+            ),
+            MerkleMultiBatchEntry(  # a sibling consumed twice / short
+                pairs, MerkleMultiProof(7, proof.indices, proof.siblings[:-1]),
+                merkle_root(leaves),
+            ),
+        ]
+        for bad in bad_items:
+            self.assertFalse(verify_multi_inclusion_batch([good, bad, good]), bad)
+            self.assertFalse(verify_multi_inclusion_batch([bad]), bad)
+
+    def test_short_circuits_on_first_invalid_item(self):
+        calls = []
+
+        import zkregion
+        original = zkregion.verify_multi_inclusion
+
+        def tracking(entries, proof, root):
+            calls.append(root)
+            return original(entries, proof, root)
+
+        leaves = self._leaves("mmib-sc", 5)
+        good = self._item(leaves, (0,))
+        bad = MerkleMultiBatchEntry(
+            tuple((i, leaves[i]) for i in (1, 3)),
+            prove_multi_inclusion(leaves, (1, 3)),
+            b"\x7f" * 32,
+        )
+        zkregion.verify_multi_inclusion = tracking
+        try:
+            self.assertFalse(verify_multi_inclusion_batch([good, bad, good]))
+        finally:
+            zkregion.verify_multi_inclusion = original
+        self.assertEqual(len(calls), 2)
+
+    def test_type_errors_are_preflighted_for_whole_batch(self):
+        for bad in (b"abc", bytearray(b"abc"), "abc", 123, None, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                verify_multi_inclusion_batch(bad)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch([object()])
+        good = self._items()[0]
+        # a bad type in a *later* item still raises before any verify runs
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch([good, 42, good])
+
+    def test_nested_field_type_errors_propagate(self):
+        leaves = self._leaves("mmib-field", 6)
+        item = self._item(leaves, (1, 4))
+        proof = item.proof
+        bad_items = [
+            MerkleMultiBatchEntry(list(item.entries), proof, item.root),
+            MerkleMultiBatchEntry(([1, b"x"],), proof, item.root),
+            MerkleMultiBatchEntry(((1, "x"),), proof, item.root),
+            MerkleMultiBatchEntry(((1.0, b"x"),), proof, item.root),
+            MerkleMultiBatchEntry(((True, b"x"),), proof, item.root),
+            MerkleMultiBatchEntry(((1, b"x", 0),), proof, item.root),
+            MerkleMultiBatchEntry(item.entries, object(), item.root),
+            MerkleMultiBatchEntry(item.entries, proof, "root"),
+            MerkleMultiBatchEntry(
+                item.entries, MerkleMultiProof(True, proof.indices, proof.siblings),
+                item.root,
+            ),
+            MerkleMultiBatchEntry(
+                item.entries, MerkleMultiProof("6", proof.indices, proof.siblings),
+                item.root,
+            ),
+            MerkleMultiBatchEntry(
+                item.entries, MerkleMultiProof(6, list(proof.indices), proof.siblings),
+                item.root,
+            ),
+            MerkleMultiBatchEntry(
+                item.entries,
+                MerkleMultiProof(6, proof.indices, list(proof.siblings)),
+                item.root,
+            ),
+            MerkleMultiBatchEntry(
+                item.entries,
+                MerkleMultiProof(
+                    6, proof.indices,
+                    proof.siblings[:-1] + (1,) if proof.siblings else (1,),
+                ),
+                item.root,
+            ),
+        ]
+        for bad in bad_items:
+            with self.assertRaises(TypeError, msg=bad):
+                verify_multi_inclusion_batch([bad])
+            with self.assertRaises(TypeError, msg=bad):
+                verify_multi_inclusion_batch([item, bad])
+
+    def test_entry_is_frozen_positional_and_value_equal(self):
+        leaves = self._leaves("mmib-eq", 6)
+        entries = tuple((i, leaves[i]) for i in (2, 5))
+        proof = prove_multi_inclusion(leaves, (2, 5))
+        root = merkle_root(leaves)
+        item = MerkleMultiBatchEntry(entries, proof, root)
+        clone = MerkleMultiBatchEntry(entries, proof, root)
+        keyword = MerkleMultiBatchEntry(entries=entries, proof=proof, root=root)
+        self.assertEqual(item, clone)
+        self.assertEqual(item, keyword)
+        self.assertEqual((item.entries, item.proof, item.root), (entries, proof, root))
+        self.assertTrue(dataclasses.is_dataclass(item))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            item.root = b"\x00" * 32
+        self.assertNotEqual(
+            item,
+            MerkleMultiBatchEntry(((2, leaves[0]), (5, leaves[5])), proof, root),
+        )
+        self.assertEqual(hash(item), hash(clone))
+
+    def test_inputs_not_mutated(self):
+        items = self._items()
+        snapshots = [
+            (item.entries, item.root, item.proof.siblings, item.proof.indices)
+            for item in items
+        ]
+        self.assertTrue(verify_multi_inclusion_batch(items))
+        self.assertEqual(
+            [
+                (i.entries, i.root, i.proof.siblings, i.proof.indices)
+                for i in items
+            ],
+            snapshots,
+        )
+        bad = MerkleMultiBatchEntry(
+            items[0].entries, items[0].proof, b"\x00" * 32
+        )
+        mixed = [items[0], bad]
+        self.assertFalse(verify_multi_inclusion_batch(mixed))
+        self.assertEqual(bad.root, b"\x00" * 32)
+        self.assertEqual(items[0].proof.siblings, snapshots[0][2])
 
 
 class ReplayBindingTest(unittest.TestCase):
@@ -13731,6 +13945,680 @@ class MerkleInclusionBatchReplayGuardTest(unittest.TestCase):
             MerkleInclusionBatchReplayGuard(store=store).check(
                 entries, binding, now=1
             )
+        )
+        store.close()
+
+
+class MerkleMultiBatchReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for batches of multi-inclusion proofs."""
+
+    DOMAIN = b"zr/mmb/v1"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "mmb.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _leaves(self, count, prefix="mmb-leaf"):
+        return [f"{prefix}-{i}".encode() for i in range(count)]
+
+    def _item(self, leaves, indices, *, root=None):
+        return MerkleMultiBatchEntry(
+            tuple((index, leaves[index]) for index in indices),
+            prove_multi_inclusion(leaves, tuple(indices)),
+            merkle_root(leaves) if root is None else root,
+        )
+
+    def _batch(self, size=6, indices=(0, 2, 5)):
+        leaves = self._leaves(size)
+        return [self._item(leaves, indices)]
+
+    def _mixed_batch(self):
+        first = self._leaves(6, "mmb-a")
+        second = self._leaves(8, "mmb-b")
+        return [
+            self._item(first, (0, 2, 5)),
+            self._item(second, (1, 7)),
+        ]
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def expected_digest(batch, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(
+                F(transform(item)) for item in sequence
+            )
+
+        def Qe(pair):
+            return F(U(pair[0])) + F(pair[1])
+
+        def Q(item):
+            proof = item.proof
+            return (
+                F(item.root)
+                + F(U(proof.leaf_count))
+                + S(proof.indices, U)
+                + S(item.entries, Qe)
+                + S(proof.siblings, lambda sibling: sibling)
+            )
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = F(b"zr/mmb/v1") + F(session_id) + S(batch, Q) + F(expiry)
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(batch, b"s1"))
+        binding = guard.bind_once(batch, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(binding.digest, self.expected_digest(batch, b"s2", 1000))
+
+    def test_q_reuses_multi_guard_contiguous_bytes(self):
+        from zkregion import _merkle_multi_proof_framing
+
+        batch = self._mixed_batch()
+
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        for item in batch:
+            q = _merkle_multi_proof_framing(item.entries, item.root, item.proof)
+            material = (
+                F(b"zr/mmb/v1")
+                + F(b"s")
+                + F(U(1))
+                + F(q)
+                + F(b"\x00")
+            )
+            self.assertEqual(
+                self.expected_digest([item], b"s"),
+                hashlib.sha256(material).digest(),
+            )
+
+    def test_tuple_and_list_inputs_frame_identically(self):
+        batch = self._mixed_batch()
+        from_list = MerkleMultiBatchReplayGuard().bind_once(list(batch), b"s")
+        from_tuple = MerkleMultiBatchReplayGuard().bind_once(tuple(batch), b"s")
+        self.assertEqual(from_list.digest, from_tuple.digest)
+        self.assertEqual(from_list, from_tuple)
+
+    def test_batch_order_duplicates_and_siblings_are_preserved(self):
+        batch = self._mixed_batch()
+        base = MerkleMultiBatchReplayGuard().bind_once(batch, b"s")
+
+        def bind(items):
+            return MerkleMultiBatchReplayGuard().bind_once(items, b"s").digest
+
+        self.assertNotEqual(base.digest, bind(batch[::-1]))
+        self.assertNotEqual(base.digest, bind(batch[:-1]))
+        self.assertNotEqual(base.digest, bind([batch[0], batch[0]]))
+        item = batch[0]
+        # entries order binds
+        reordered_entries = tuple((i, l) for i, l in reversed(item.entries))
+        reordered = MerkleMultiBatchEntry(
+            reordered_entries, item.proof, item.root
+        )
+        self.assertNotEqual(base.digest, bind([reordered] + batch[1:]))
+        # sibling order inside a proof binds
+        proof = item.proof
+        if len(proof.siblings) >= 2:
+            flipped = MerkleMultiProof(
+                proof.leaf_count, proof.indices, proof.siblings[::-1]
+            )
+            flipped_item = MerkleMultiBatchEntry(item.entries, flipped, item.root)
+            self.assertNotEqual(base.digest, bind([flipped_item] + batch[1:]))
+
+    def test_domain_separator_is_distinct(self):
+        batch = self._mixed_batch()
+        binding = MerkleMultiBatchReplayGuard().bind_once(batch, b"s")
+
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(
+                F(transform(item)) for item in sequence
+            )
+
+        def Qe(pair):
+            return F(U(pair[0])) + F(pair[1])
+
+        def Q(item):
+            proof = item.proof
+            return (
+                F(item.root)
+                + F(U(proof.leaf_count))
+                + S(proof.indices, U)
+                + S(item.entries, Qe)
+                + S(proof.siblings, lambda sibling: sibling)
+            )
+
+        framing = F(b"s") + S(batch, Q) + F(b"\x00")
+        for other_domain in (
+            b"zr/r/v1",
+            b"zr/mir/v1",
+            b"zr/mibr/v1",
+            b"zr/mmr/v1",
+            b"zr/mcbr/v1",
+        ):
+            foreign_digest = hashlib.sha256(F(other_domain) + framing).digest()
+            self.assertNotEqual(binding.digest, foreign_digest)
+
+    def test_digest_binds_every_component(self):
+        batch = self._mixed_batch()
+
+        def bind(items=batch, s=b"s", **kw):
+            return MerkleMultiBatchReplayGuard().bind_once(items, s, **kw).digest
+
+        base = bind()
+        self.assertNotEqual(base, bind(s=b"other"))
+        self.assertNotEqual(base, bind(expires_at=1))
+        self.assertNotEqual(bind(expires_at=1), bind(expires_at=2))
+        item = batch[0]
+        proof = item.proof
+        changed_entries = (
+            tuple((i, b"\x7f" * 4) for i, _leaf in item.entries)
+        )
+        changed = list(batch)
+        changed[0] = MerkleMultiBatchEntry(changed_entries, proof, item.root)
+        self.assertNotEqual(base, bind(changed))
+        changed[0] = MerkleMultiBatchEntry(item.entries, proof, b"\x7f" * 32)
+        self.assertNotEqual(base, bind(changed))
+        changed[0] = MerkleMultiBatchEntry(
+            item.entries,
+            MerkleMultiProof(proof.leaf_count + 1, proof.indices, proof.siblings),
+            item.root,
+        )
+        self.assertNotEqual(base, bind(changed))
+        shifted = tuple(
+            ((i + 1) % proof.leaf_count, leaf) for i, leaf in item.entries
+        )
+        changed[0] = MerkleMultiBatchEntry(shifted, proof, item.root)
+        self.assertNotEqual(base, bind(changed))
+        if proof.siblings:
+            sibling = proof.siblings[0]
+            tampered_sibling = bytes([sibling[0] ^ 1]) + sibling[1:]
+            changed[0] = MerkleMultiBatchEntry(
+                item.entries,
+                MerkleMultiProof(
+                    proof.leaf_count,
+                    proof.indices,
+                    (tampered_sibling,) + proof.siblings[1:],
+                ),
+                item.root,
+            )
+            self.assertNotEqual(base, bind(changed))
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        batch = self._mixed_batch()
+        none_binding = MerkleMultiBatchReplayGuard().bind_once(batch, b"a")
+        zero_binding = MerkleMultiBatchReplayGuard().bind_once(
+            batch, b"b", expires_at=0
+        )
+        one_binding = MerkleMultiBatchReplayGuard().bind_once(
+            batch, b"c", expires_at=1
+        )
+        digests = {none_binding.digest, zero_binding.digest, one_binding.digest}
+        self.assertEqual(len(digests), 3)
+
+    # ---- bind_once state and validation -------------------------------------
+
+    def test_empty_batch_rejected(self):
+        for empty in ((), []):
+            with self.assertRaises(ValueError):
+                MerkleMultiBatchReplayGuard().bind_once(empty, b"s")
+
+    def test_pending_consumed_or_claimed_id_cannot_be_rebound(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        guard.bind_once(batch, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, b"s")
+        binding = guard.bind_once(batch, b"t")
+        self.assertTrue(guard._registry.claim(b"t", binding))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, b"t")
+        self.assertTrue(guard.check(batch, guard.bind_once(batch, b"u"), now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, b"u")
+
+    def test_distinct_session_ids_are_independent(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        first = guard.bind_once(batch, b"s1")
+        second = guard.bind_once(batch, b"s2")
+        self.assertTrue(guard.check(batch, first, now=1))
+        self.assertFalse(guard.check(batch, first, now=1))
+        self.assertTrue(guard.check(batch, second, now=1))
+
+    def test_bind_type_errors(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(bad, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once([batch[0], 42], b"s")
+        item = batch[0]
+        nested_bad = [
+            MerkleMultiBatchEntry(list(item.entries), item.proof, item.root),
+            MerkleMultiBatchEntry(((1, "x"),), item.proof, item.root),
+            MerkleMultiBatchEntry(((True, b"x"),), item.proof, item.root),
+            MerkleMultiBatchEntry(item.entries, object(), item.root),
+            MerkleMultiBatchEntry(item.entries, item.proof, "root"),
+        ]
+        for bad in nested_bad:
+            with self.assertRaises(TypeError, msg=bad):
+                guard.bind_once([bad], b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, bad)
+        with self.assertRaises(TypeError):
+            guard.bind_once(batch, b"x", expires_at="1000")
+        with self.assertRaises(TypeError):
+            guard.bind_once(batch, b"x", expires_at=True)
+
+    def test_bind_value_errors(self):
+        batch = self._mixed_batch()
+        with self.assertRaises(ValueError):
+            MerkleMultiBatchReplayGuard().bind_once(batch, b"")
+        for bad_expiry in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                MerkleMultiBatchReplayGuard().bind_once(
+                    batch, b"s", expires_at=bad_expiry
+                )
+        item = batch[0]
+        oversized = [
+            MerkleMultiBatchEntry(
+                item.entries,
+                MerkleMultiProof(2**64, item.proof.indices, item.proof.siblings),
+                item.root,
+            ),
+            MerkleMultiBatchEntry(
+                ((-1, b"x"),), item.proof, item.root
+            ),
+        ]
+        for bad in oversized:
+            with self.assertRaises(ValueError):
+                MerkleMultiBatchReplayGuard().bind_once([bad], b"s")
+
+    def test_construction_rejects_non_store(self):
+        for bad in (object(), "path", 1, True, b"ns", {}):
+            with self.assertRaises(TypeError):
+                MerkleMultiBatchReplayGuard(store=bad)
+
+    # ---- check: accept, reject, consume -------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s", expires_at=1000)
+        self.assertTrue(guard.check(batch, binding, now=999))
+        self.assertFalse(guard.check(batch, binding, now=999))
+        self.assertEqual(guard._consumed, {b"s"})
+        self.assertNotIn(b"s", guard._pending)
+
+    def test_check_with_default_now(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        self.assertTrue(guard.check(batch, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        self.assertTrue(guard.check(batch, binding, now=2**64 - 1))
+
+    def test_expiry_boundary_is_inclusive(self):
+        batch = self._mixed_batch()
+        for now in (1000, 1001, 2**64 - 1):
+            guard = MerkleMultiBatchReplayGuard()
+            binding = guard.bind_once(batch, b"s", expires_at=1000)
+            self.assertFalse(guard.check(batch, binding, now=now))
+            self.assertIn(b"s", guard._pending)
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s", expires_at=1000)
+        self.assertTrue(guard.check(batch, binding, now=999))
+
+    def test_wrong_batch_rejected_without_consuming(self):
+        batch = self._mixed_batch()
+        other = self._batch(size=8, indices=(1, 3, 7))
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        self.assertFalse(guard.check(other, binding, now=1))
+        self.assertFalse(guard.check(batch[::-1], binding, now=1))
+        self.assertFalse(guard.check(batch[:-1], binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(batch, binding, now=1))
+
+    def test_bound_but_unverifiable_batch_rejected_and_restored(self):
+        bogus = b"\xcd" * 32
+        proof = MerkleMultiProof(3, (0, 2), (bogus,) * 3)
+        item = MerkleMultiBatchEntry(((0, b"a"), (2, b"c")), proof, b"\x01" * 32)
+        self.assertFalse(verify_multi_inclusion_batch([item]))
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once([item], b"s")
+        self.assertFalse(guard.check([item], binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        with self.assertRaises(ValueError):
+            guard.bind_once([item], b"s")
+
+    def test_one_invalid_item_rejects_whole_batch_without_consuming(self):
+        leaves = self._leaves(7)
+        good = self._item(leaves, (0,))
+        bad = MerkleMultiBatchEntry(
+            tuple((i, b"other") for i in (1, 3)),
+            prove_multi_inclusion(leaves, (1, 3)),
+            merkle_root(leaves),
+        )
+        also_good = self._item(leaves, (5,))
+        batch = [good, bad, also_good]
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        self.assertFalse(guard.check(batch, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        self.assertFalse(
+            guard.check(batch, ReplayBinding(b"never", b"\x00" * 32), now=1)
+        )
+        binding = guard.bind_once(batch, b"s")
+        foreign = MerkleMultiBatchReplayGuard().bind_once(batch, b"s")
+        self.assertEqual(foreign, binding)
+        self.assertFalse(
+            MerkleMultiBatchReplayGuard().check(batch, foreign, now=1)
+        )
+        self.assertTrue(guard.check(batch, binding, now=1))
+
+    def test_empty_batch_check_returns_false(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        self.assertFalse(guard.check((), binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(batch, binding, now=1))
+
+    def test_oversized_value_at_check_returns_false(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        item = batch[0]
+        bad = MerkleMultiBatchEntry(
+            item.entries,
+            MerkleMultiProof(2**64, item.proof.indices, item.proof.siblings),
+            item.root,
+        )
+        self.assertFalse(guard.check([bad], binding, now=1))
+        self.assertIn(b"s", guard._pending)
+
+    def test_instances_are_independent(self):
+        batch = self._mixed_batch()
+        first = MerkleMultiBatchReplayGuard()
+        second = MerkleMultiBatchReplayGuard()
+        binding = first.bind_once(batch, b"s")
+        self.assertFalse(second.check(batch, binding, now=1))
+        self.assertTrue(first.check(batch, binding, now=1))
+
+    def test_delegation_error_propagates_and_restores_pending(self):
+        import zkregion
+
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        original = zkregion.verify_multi_inclusion_batch
+
+        def boom(_batch):
+            raise RuntimeError("boom")
+
+        zkregion.verify_multi_inclusion_batch = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(batch, binding, now=1)
+        finally:
+            zkregion.verify_multi_inclusion_batch = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(batch, binding, now=1))
+
+    def test_check_type_errors(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.check(bad, binding, now=1)
+        for bad in (7, None, True, "binding", (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(batch, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(batch, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(batch, binding, now=bad)
+
+    def test_inputs_are_not_mutated(self):
+        batch = self._mixed_batch()
+        snapshots = [
+            (item.entries, item.root, item.proof.siblings, item.proof.indices)
+            for item in batch
+        ]
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        self.assertTrue(guard.check(batch, binding, now=1))
+        self.assertEqual(
+            [
+                (i.entries, i.root, i.proof.siblings, i.proof.indices)
+                for i in batch
+            ],
+            snapshots,
+        )
+        self.assertEqual(binding, binding_snapshot)
+
+    def test_concurrent_checks_have_one_winner(self):
+        batch = self._mixed_batch()
+        guard = MerkleMultiBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        results = []
+
+        def worker():
+            results.append(guard.check(batch, binding))
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 7)
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        batch = self._mixed_batch()
+        store = self.make_store()
+        binder = MerkleMultiBatchReplayGuard(store=store)
+        binding = binder.bind_once(batch, b"s", expires_at=1000)
+        checker = MerkleMultiBatchReplayGuard(store=store)
+        self.assertTrue(checker.check(batch, binding, now=999))
+        self.assertFalse(binder.check(batch, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        batch = self._mixed_batch()
+        store = self.make_store()
+        binding = MerkleMultiBatchReplayGuard(store=store).bind_once(batch, b"s")
+        store.close()
+        reopened = self.make_store()
+        guard = MerkleMultiBatchReplayGuard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(batch, binding, now=1))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = MerkleMultiBatchReplayGuard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(batch, b"s")
+        reopened_again.close()
+
+    def test_store_domain_isolation_from_single_multi_guard(self):
+        from zkregion import MerkleMultiReplayGuard
+
+        leaves = self._leaves(7)
+        indices = (0, 2, 4)
+        item = self._item(leaves, indices)
+        store = self.make_store()
+        batch_guard = MerkleMultiBatchReplayGuard(store=store)
+        single_guard = MerkleMultiReplayGuard(store=store)
+        batch_binding = batch_guard.bind_once([item], b"same-id")
+        single_binding = single_guard.bind_once(
+            item.entries, item.root, item.proof, b"same-id"
+        )
+        self.assertTrue(batch_guard.check([item], batch_binding, now=1))
+        self.assertTrue(
+            single_guard.check(
+                item.entries, item.root, item.proof, single_binding, now=1
+            )
+        )
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/mmr/v1", domains)
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        batch = self._mixed_batch()
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = MerkleMultiBatchReplayGuard(store=first).bind_once(batch, b"s")
+        self.assertFalse(
+            MerkleMultiBatchReplayGuard(store=second).check(
+                batch, binding_a, now=1
+            )
+        )
+        self.assertTrue(
+            MerkleMultiBatchReplayGuard(store=first).check(batch, binding_a, now=1)
+        )
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        batch = self._mixed_batch()
+        other = self._batch(size=8, indices=(1, 3, 7))
+        store = self.make_store()
+        binder = MerkleMultiBatchReplayGuard(store=store)
+        binding = binder.bind_once(batch, b"s")
+        checker = MerkleMultiBatchReplayGuard(store=store)
+        self.assertFalse(checker.check(other, binding, now=1))
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(
+            MerkleMultiBatchReplayGuard(store=store).check(batch, binding, now=1)
+        )
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        batch = self._mixed_batch()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = MerkleMultiBatchReplayGuard(store=store)
+        binding = guard.bind_once(batch, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        batch = self._mixed_batch()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = MerkleMultiBatchReplayGuard(store=store).bind_once(batch, b"s")
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+    def test_store_delegation_error_restores_pending(self):
+        import zkregion
+
+        batch = self._mixed_batch()
+        store = self.make_store()
+        guard = MerkleMultiBatchReplayGuard(store=store)
+        binding = guard.bind_once(batch, b"s")
+        original = zkregion.verify_multi_inclusion_batch
+
+        def boom(_batch):
+            raise RuntimeError("boom")
+
+        zkregion.verify_multi_inclusion_batch = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(batch, binding, now=1)
+        finally:
+            zkregion.verify_multi_inclusion_batch = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            MerkleMultiBatchReplayGuard(store=store).check(batch, binding, now=1)
         )
         store.close()
 

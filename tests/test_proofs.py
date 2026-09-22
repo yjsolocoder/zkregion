@@ -26,6 +26,8 @@ from zkregion import (
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyProof,
     MerkleConsistencyReplayGuard,
+    MerkleInclusionBatchEntry,
+    MerkleInclusionBatchReplayGuard,
     MerkleInclusionReplayGuard,
     MerkleMultiProof,
     MerkleProof,
@@ -69,6 +71,7 @@ from zkregion import (
     verify_consistency_chain_batch,
     verify_consistency_chain_batch_bound,
     verify_inclusion,
+    verify_inclusion_batch,
     verify_multi_inclusion,
     verify_opening,
     verify_pedersen_opening,
@@ -12888,6 +12891,844 @@ class MerkleConsistencyBatchReplayGuardTest(unittest.TestCase):
         self.assertIn(b"s", guard._pending)
         self.assertTrue(
             MerkleConsistencyBatchReplayGuard(store=store).check(
+                entries, binding, now=1
+            )
+        )
+        store.close()
+
+
+class MerkleInclusionBatchTest(unittest.TestCase):
+    """Batch verification of independent single-leaf inclusion proofs."""
+
+    def _leaves(self, prefix, count):
+        return [f"{prefix}-{i}".encode() for i in range(count)]
+
+    def _entry(self, leaves, index, root=None):
+        return MerkleInclusionBatchEntry(
+            leaves[index], prove_inclusion(leaves, index),
+            merkle_root(leaves) if root is None else root,
+        )
+
+    def _entries(self):
+        first = self._leaves("ibatch-a", 5)
+        second = self._leaves("ibatch-b", 8)
+        return [
+            self._entry(first, 1),
+            self._entry(first, 4),
+            self._entry(second, 2),
+            self._entry(second, 7),
+        ]
+
+    def test_valid_batches_of_various_sizes(self):
+        for size in range(1, 12):
+            leaves = self._leaves("ibatch-size", size)
+            entries = [self._entry(leaves, i) for i in range(size)]
+            self.assertTrue(verify_inclusion_batch(entries), size)
+
+    def test_lists_tuples_and_duplicates(self):
+        entries = self._entries()
+        self.assertTrue(verify_inclusion_batch(entries))
+        self.assertTrue(verify_inclusion_batch(tuple(entries)))
+        self.assertTrue(verify_inclusion_batch(entries + entries[:1]))
+        self.assertTrue(verify_inclusion_batch((entries[0],) * 3))
+
+    def test_single_entry_matches_single_verify(self):
+        leaves = self._leaves("ibatch-one", 5)
+        entry = self._entry(leaves, 2)
+        self.assertTrue(verify_inclusion_batch([entry]))
+        self.assertTrue(
+            verify_inclusion_batch([entry])
+            == verify_inclusion(entry.leaf, entry.proof, entry.root)
+        )
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(verify_inclusion_batch(()))
+        self.assertFalse(verify_inclusion_batch([]))
+
+    def test_entries_are_independent_unrelated_trees_allowed(self):
+        first = self._leaves("ibatch-x", 4)
+        second = self._leaves("ibatch-y", 6)
+        entries = [
+            self._entry(second, 5),
+            self._entry(first, 0),
+            self._entry(second, 1),
+            self._entry(first, 3),
+        ]
+        self.assertTrue(verify_inclusion_batch(entries))
+
+    def test_one_invalid_entry_returns_false(self):
+        leaves = self._leaves("ibatch-bad", 7)
+        good = [self._entry(leaves, 2), self._entry(leaves, 5)]
+        proof = prove_inclusion(leaves, 3)
+        bad_entries = [
+            MerkleInclusionBatchEntry(b"other", proof, merkle_root(leaves)),  # bad leaf
+            MerkleInclusionBatchEntry(leaves[3], proof, b"\x00" * 31),       # bad root length
+            MerkleInclusionBatchEntry(  # wrong root
+                leaves[3], proof, merkle_root(self._leaves("ibatch-other", 7))
+            ),
+            MerkleInclusionBatchEntry(  # index out of the path's reach
+                leaves[3], MerkleProof(8, proof.siblings), merkle_root(leaves)
+            ),
+            MerkleInclusionBatchEntry(  # negative index
+                leaves[3], MerkleProof(-1, proof.siblings), merkle_root(leaves)
+            ),
+            MerkleInclusionBatchEntry(  # sibling digest of wrong length
+                leaves[3],
+                MerkleProof(3, (b"\x00" * 31,) * len(proof.siblings)),
+                merkle_root(leaves),
+            ),
+            MerkleInclusionBatchEntry(  # tampered sibling
+                leaves[3],
+                MerkleProof(
+                    3,
+                    (bytes([proof.siblings[0][0] ^ 1]) + proof.siblings[0][1:],)
+                    + proof.siblings[1:],
+                ),
+                merkle_root(leaves),
+            ),
+        ]
+        for bad in bad_entries:
+            self.assertFalse(verify_inclusion_batch([good[0], bad, good[1]]), bad)
+            self.assertFalse(verify_inclusion_batch([bad]), bad)
+
+    def test_short_circuits_on_first_invalid_entry(self):
+        calls = []
+
+        import zkregion
+        original = zkregion.verify_inclusion
+
+        def tracking(leaf, proof, root):
+            calls.append(leaf)
+            return original(leaf, proof, root)
+
+        leaves = self._leaves("ibatch-sc", 5)
+        good = self._entry(leaves, 2)
+        bad = MerkleInclusionBatchEntry(
+            b"other", prove_inclusion(leaves, 3), merkle_root(leaves)
+        )
+        zkregion.verify_inclusion = tracking
+        try:
+            self.assertFalse(verify_inclusion_batch([good, bad, good]))
+        finally:
+            zkregion.verify_inclusion = original
+        self.assertEqual(len(calls), 2)
+
+    def test_entries_type_errors_are_preflighted_for_whole_batch(self):
+        for bad in (b"abc", bytearray(b"abc"), "abc", 123, None, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                verify_inclusion_batch(bad)
+        with self.assertRaises(TypeError):
+            verify_inclusion_batch([object()])
+        with self.assertRaises(TypeError):
+            verify_inclusion_batch([("a", "b", "c")])
+        leaves = self._leaves("ibatch-type", 4)
+        good = self._entry(leaves, 2)
+        # a bad type in a *later* entry still raises: the whole batch is
+        # checked before any entry is verified
+        with self.assertRaises(TypeError):
+            verify_inclusion_batch([good, 42, good])
+
+    def test_field_type_errors_propagate(self):
+        leaves = self._leaves("ibatch-field", 4)
+        entry = self._entry(leaves, 2)
+        proof = entry.proof
+        bad_entries = [
+            MerkleInclusionBatchEntry(1, proof, entry.root),
+            MerkleInclusionBatchEntry(entry.leaf, proof, "root"),
+            MerkleInclusionBatchEntry(entry.leaf, object(), entry.root),
+            MerkleInclusionBatchEntry(
+                entry.leaf, MerkleProof(True, proof.siblings), entry.root
+            ),
+            MerkleInclusionBatchEntry(
+                entry.leaf, MerkleProof("1", proof.siblings), entry.root
+            ),
+            MerkleInclusionBatchEntry(
+                entry.leaf, MerkleProof(proof.index, list(proof.siblings)), entry.root
+            ),
+            MerkleInclusionBatchEntry(
+                entry.leaf,
+                MerkleProof(proof.index, proof.siblings[:-1] + (1,)),
+                entry.root,
+            ),
+        ]
+        for bad in bad_entries:
+            with self.assertRaises(TypeError, msg=bad):
+                verify_inclusion_batch([bad])
+            with self.assertRaises(TypeError, msg=bad):
+                verify_inclusion_batch([entry, bad])
+
+    def test_entry_is_frozen_positional_and_value_equal(self):
+        leaves = self._leaves("ibatch-eq", 6)
+        proof = prove_inclusion(leaves, 3)
+        root = merkle_root(leaves)
+        entry = MerkleInclusionBatchEntry(leaves[3], proof, root)
+        clone = MerkleInclusionBatchEntry(leaves[3], proof, root)
+        keyword = MerkleInclusionBatchEntry(leaf=leaves[3], proof=proof, root=root)
+        self.assertEqual(entry, clone)
+        self.assertEqual(entry, keyword)
+        self.assertEqual((entry.leaf, entry.proof, entry.root), (leaves[3], proof, root))
+        self.assertTrue(dataclasses.is_dataclass(entry))
+        with self.assertRaises(AttributeError):
+            entry.leaf = b"\x00" * 32
+        self.assertNotEqual(entry, MerkleInclusionBatchEntry(leaves[0], proof, root))
+        self.assertEqual(hash(entry), hash(clone))
+
+    def test_inputs_not_mutated(self):
+        entries = self._entries()
+        snapshots = [(entry.leaf, entry.root, entry.proof.siblings) for entry in entries]
+        self.assertTrue(verify_inclusion_batch(entries))
+        self.assertEqual(
+            [(e.leaf, e.root, e.proof.siblings) for e in entries], snapshots
+        )
+        # a rejected batch leaves its inputs untouched as well
+        bad = MerkleInclusionBatchEntry(
+            b"other", entries[1].proof, entries[1].root
+        )
+        mixed = [entries[0], bad]
+        self.assertFalse(verify_inclusion_batch(mixed))
+        self.assertEqual(bad.leaf, b"other")
+        self.assertEqual(entries[1].proof.siblings, snapshots[1][2])
+
+
+class MerkleInclusionBatchReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for batches of inclusion proofs."""
+
+    DOMAIN = b"zr/mibr/v1"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "mibr.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _leaves(self, count):
+        return [f"mibr-leaf-{i}".encode() for i in range(count)]
+
+    def _entry(self, leaves, index):
+        return MerkleInclusionBatchEntry(
+            leaves[index], prove_inclusion(leaves, index), merkle_root(leaves)
+        )
+
+    def _entries(self, size=6, indices=(0, 2, 5)):
+        leaves = self._leaves(size)
+        return [self._entry(leaves, index) for index in indices]
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def expected_digest(entries, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(F(transform(item)) for item in sequence)
+
+        def Q(entry):
+            proof = entry.proof
+            return (
+                F(entry.leaf)
+                + F(entry.root)
+                + F(U(proof.index))
+                + S(proof.siblings, lambda sibling: sibling)
+            )
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = F(b"zr/mibr/v1") + F(session_id) + S(entries, Q) + F(expiry)
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(entries, b"s1"))
+        binding = guard.bind_once(entries, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(entries, b"s2", 1000)
+        )
+
+    def test_q_reuses_single_leaf_guard_contiguous_bytes(self):
+        # The per-entry Q framing must be the exact continuous run of the
+        # single-leaf guard transcript, from F(leaf) through S(siblings).
+        from zkregion import _merkle_inclusion_proof_framing
+
+        entries = self._entries()
+
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        for entry in entries:
+            q = _merkle_inclusion_proof_framing(entry.leaf, entry.root, entry.proof)
+            material = (
+                F(b"zr/mibr/v1")
+                + F(b"s")
+                + F(U(1))
+                + F(q)
+                + F(b"\x00")
+            )
+            self.assertEqual(
+                self.expected_digest([entry], b"s"),
+                hashlib.sha256(material).digest(),
+            )
+
+    def test_tuple_and_list_inputs_frame_identically(self):
+        entries = self._entries()
+        from_list = MerkleInclusionBatchReplayGuard().bind_once(list(entries), b"s")
+        from_tuple = MerkleInclusionBatchReplayGuard().bind_once(tuple(entries), b"s")
+        self.assertEqual(from_list.digest, from_tuple.digest)
+        self.assertEqual(from_list, from_tuple)
+
+    def test_batch_order_duplicates_and_siblings_are_preserved(self):
+        entries = self._entries()
+        base = MerkleInclusionBatchReplayGuard().bind_once(entries, b"s")
+
+        def bind(batch):
+            return MerkleInclusionBatchReplayGuard().bind_once(batch, b"s").digest
+
+        self.assertNotEqual(base.digest, bind(entries[::-1]))
+        self.assertNotEqual(base.digest, bind(entries[:-1]))
+        self.assertNotEqual(base.digest, bind([entries[0], entries[0]]))
+        # sibling order inside a proof binds
+        proof = entries[0].proof
+        if len(proof.siblings) >= 2:
+            reordered = MerkleProof(proof.index, proof.siblings[::-1])
+            reordered_entry = MerkleInclusionBatchEntry(
+                entries[0].leaf, reordered, entries[0].root
+            )
+            self.assertNotEqual(base.digest, bind([reordered_entry] + entries[1:]))
+
+    def test_domain_separator_is_distinct(self):
+        entries = self._entries()
+        binding = MerkleInclusionBatchReplayGuard().bind_once(entries, b"s")
+
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(
+                F(transform(item)) for item in sequence
+            )
+
+        def Q(entry):
+            proof = entry.proof
+            return (
+                F(entry.leaf)
+                + F(entry.root)
+                + F(U(proof.index))
+                + S(proof.siblings, lambda sibling: sibling)
+            )
+
+        framing = F(b"s") + S(entries, Q) + F(b"\x00")
+        for other_domain in (
+            b"zr/r/v1",
+            b"zr/mir/v1",
+            b"zr/mmr/v1",
+            b"zr/mcbr/v1",
+            b"zr/mcr/v1",
+            b"zr/mccbr/v1",
+        ):
+            foreign_digest = hashlib.sha256(F(other_domain) + framing).digest()
+            self.assertNotEqual(binding.digest, foreign_digest)
+
+    def test_digest_binds_every_component(self):
+        entries = self._entries()
+
+        def bind(batch=entries, s=b"s", **kw):
+            return MerkleInclusionBatchReplayGuard().bind_once(batch, s, **kw).digest
+
+        base = bind()
+        self.assertNotEqual(base, bind(s=b"other"))
+        self.assertNotEqual(base, bind(expires_at=1))
+        self.assertNotEqual(bind(expires_at=1), bind(expires_at=2))
+        entry = entries[1]
+        # the leaf, root, index and a sibling all bind
+        tampered_leaf = MerkleInclusionBatchEntry(b"\x7f" * 5, entry.proof, entry.root)
+        changed = list(entries)
+        changed[1] = tampered_leaf
+        self.assertNotEqual(base, bind(changed))
+        changed[1] = MerkleInclusionBatchEntry(entry.leaf, entry.proof, b"\x7f" * 32)
+        self.assertNotEqual(base, bind(changed))
+        changed[1] = MerkleInclusionBatchEntry(
+            entry.leaf, MerkleProof(entry.proof.index + 1, entry.proof.siblings),
+            entry.root,
+        )
+        self.assertNotEqual(base, bind(changed))
+        if entry.proof.siblings:
+            sibling = entry.proof.siblings[0]
+            tampered_sibling = bytes([sibling[0] ^ 1]) + sibling[1:]
+            changed[1] = MerkleInclusionBatchEntry(
+                entry.leaf,
+                MerkleProof(entry.proof.index, (tampered_sibling,) + entry.proof.siblings[1:]),
+                entry.root,
+            )
+            self.assertNotEqual(base, bind(changed))
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        entries = self._entries()
+        none_binding = MerkleInclusionBatchReplayGuard().bind_once(entries, b"a")
+        zero_binding = MerkleInclusionBatchReplayGuard().bind_once(
+            entries, b"b", expires_at=0
+        )
+        one_binding = MerkleInclusionBatchReplayGuard().bind_once(
+            entries, b"c", expires_at=1
+        )
+        digests = {none_binding.digest, zero_binding.digest, one_binding.digest}
+        self.assertEqual(len(digests), 3)
+
+    # ---- bind_once state and validation -------------------------------------
+
+    def test_empty_batch_rejected(self):
+        for empty in ((), []):
+            with self.assertRaises(ValueError):
+                MerkleInclusionBatchReplayGuard().bind_once(empty, b"s")
+
+    def test_pending_consumed_or_claimed_id_cannot_be_rebound(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        guard.bind_once(entries, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+        binding = guard.bind_once(entries, b"t")
+        self.assertTrue(guard._registry.claim(b"t", binding))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"t")
+        self.assertTrue(guard.check(entries, guard.bind_once(entries, b"u"), now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"u")
+
+    def test_distinct_session_ids_are_independent(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        first = guard.bind_once(entries, b"s1")
+        second = guard.bind_once(entries, b"s2")
+        self.assertTrue(guard.check(entries, first, now=1))
+        self.assertFalse(guard.check(entries, first, now=1))
+        self.assertTrue(guard.check(entries, second, now=1))
+
+    def test_bind_type_errors(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(bad, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once([entries[0], 42], b"s")
+        bad_leaf = MerkleInclusionBatchEntry(1, entries[0].proof, entries[0].root)
+        with self.assertRaises(TypeError):
+            guard.bind_once([bad_leaf], b"s")
+        bad_root = MerkleInclusionBatchEntry(entries[0].leaf, entries[0].proof, "root")
+        with self.assertRaises(TypeError):
+            guard.bind_once([bad_root], b"s")
+        bad_proof = MerkleInclusionBatchEntry(entries[0].leaf, object(), entries[0].root)
+        with self.assertRaises(TypeError):
+            guard.bind_once([bad_proof], b"s")
+        proof = entries[0].proof
+        nested_bad = [
+            MerkleProof(True, proof.siblings),
+            MerkleProof("1", proof.siblings),
+            MerkleProof(proof.index, list(proof.siblings)),
+            MerkleProof(proof.index, proof.siblings[:-1] + (1,)),
+        ]
+        for bad in nested_bad:
+            bad_entry = MerkleInclusionBatchEntry(entries[0].leaf, bad, entries[0].root)
+            with self.assertRaises(TypeError, msg=bad):
+                guard.bind_once([entries[0], bad_entry], b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entries, bad)
+        with self.assertRaises(TypeError):
+            guard.bind_once(entries, b"x", expires_at="1000")
+        with self.assertRaises(TypeError):
+            guard.bind_once(entries, b"x", expires_at=True)
+
+    def test_bind_value_errors(self):
+        entries = self._entries()
+        with self.assertRaises(ValueError):
+            MerkleInclusionBatchReplayGuard().bind_once(entries, b"")
+        for bad_expiry in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                MerkleInclusionBatchReplayGuard().bind_once(
+                    entries, b"s", expires_at=bad_expiry
+                )
+        huge = 2**64
+        entry = entries[0]
+        oversized = [
+            MerkleProof(huge, entry.proof.siblings),
+            MerkleProof(-1, entry.proof.siblings),
+        ]
+        for bad in oversized:
+            bad_entry = MerkleInclusionBatchEntry(entry.leaf, bad, entry.root)
+            with self.assertRaises(ValueError):
+                MerkleInclusionBatchReplayGuard().bind_once([bad_entry], b"s")
+
+    def test_construction_rejects_non_store(self):
+        for bad in (object(), "path", 1, True, b"ns", {}):
+            with self.assertRaises(TypeError):
+                MerkleInclusionBatchReplayGuard(store=bad)
+
+    # ---- check: accept, reject, consume -------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entries, binding, now=999))
+        self.assertFalse(guard.check(entries, binding, now=999))
+        self.assertEqual(guard._consumed, {b"s"})
+        self.assertNotIn(b"s", guard._pending)
+
+    def test_check_with_default_now(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=2**64 - 1))
+
+    def test_expiry_boundary_is_inclusive(self):
+        entries = self._entries()
+        for now in (1000, 1001, 2**64 - 1):
+            guard = MerkleInclusionBatchReplayGuard()
+            binding = guard.bind_once(entries, b"s", expires_at=1000)
+            self.assertFalse(guard.check(entries, binding, now=now))
+            self.assertIn(b"s", guard._pending)
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entries, binding, now=999))
+
+    def test_wrong_batch_rejected_without_consuming(self):
+        entries = self._entries()
+        other = self._entries(size=8, indices=(1, 3, 7))
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertFalse(guard.check(other, binding, now=1))
+        self.assertFalse(guard.check(entries[::-1], binding, now=1))
+        self.assertFalse(guard.check(entries[:-1], binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_bound_but_unverifiable_batch_rejected_and_restored(self):
+        bogus = b"\xcd" * 32
+        proof = MerkleProof(2, (bogus,) * 3)
+        entry = MerkleInclusionBatchEntry(b"leaf", proof, b"\x01" * 32)
+        self.assertFalse(verify_inclusion_batch([entry]))
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once([entry], b"s")
+        self.assertFalse(guard.check([entry], binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        with self.assertRaises(ValueError):
+            guard.bind_once([entry], b"s")
+
+    def test_one_invalid_entry_rejects_whole_batch_without_consuming(self):
+        leaves = self._leaves(7)
+        good = self._entry(leaves, 1)
+        bad = MerkleInclusionBatchEntry(
+            b"other", prove_inclusion(leaves, 3), merkle_root(leaves)
+        )
+        also_good = self._entry(leaves, 5)
+        batch = [good, bad, also_good]
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(batch, b"s")
+        self.assertFalse(guard.check(batch, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        self.assertFalse(
+            guard.check(entries, ReplayBinding(b"never", b"\x00" * 32), now=1)
+        )
+        binding = guard.bind_once(entries, b"s")
+        foreign = MerkleInclusionBatchReplayGuard().bind_once(entries, b"s")
+        self.assertEqual(foreign, binding)
+        self.assertFalse(
+            MerkleInclusionBatchReplayGuard().check(entries, foreign, now=1)
+        )
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_empty_batch_check_returns_false(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertFalse(guard.check((), binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_oversized_index_at_check_returns_false(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        entry = entries[0]
+        huge = MerkleProof(2**64, entry.proof.siblings)
+        bad_entry = MerkleInclusionBatchEntry(entry.leaf, huge, entry.root)
+        self.assertFalse(guard.check([bad_entry], binding, now=1))
+        self.assertIn(b"s", guard._pending)
+
+    def test_instances_are_independent(self):
+        entries = self._entries()
+        first = MerkleInclusionBatchReplayGuard()
+        second = MerkleInclusionBatchReplayGuard()
+        binding = first.bind_once(entries, b"s")
+        self.assertFalse(second.check(entries, binding, now=1))
+        self.assertTrue(first.check(entries, binding, now=1))
+
+    def test_delegation_error_propagates_and_restores_pending(self):
+        import zkregion
+
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        original = zkregion.verify_inclusion_batch
+
+        def boom(_entries):
+            raise RuntimeError("boom")
+
+        zkregion.verify_inclusion_batch = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entries, binding, now=1)
+        finally:
+            zkregion.verify_inclusion_batch = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_check_type_errors(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.check(bad, binding, now=1)
+        for bad in (7, None, True, "binding", (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(entries, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(entries, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(entries, binding, now=bad)
+
+    def test_inputs_are_not_mutated(self):
+        entries = self._entries()
+        snapshots = [
+            (entry.leaf, entry.root, entry.proof.siblings) for entry in entries
+        ]
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        self.assertTrue(guard.check(entries, binding, now=1))
+        self.assertEqual(
+            [(e.leaf, e.root, e.proof.siblings) for e in entries], snapshots
+        )
+        self.assertEqual(binding, binding_snapshot)
+
+    def test_concurrent_checks_have_one_winner(self):
+        entries = self._entries()
+        guard = MerkleInclusionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        results = []
+
+        def worker():
+            results.append(guard.check(entries, binding))
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 7)
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        entries = self._entries()
+        store = self.make_store()
+        binder = MerkleInclusionBatchReplayGuard(store=store)
+        binding = binder.bind_once(entries, b"s", expires_at=1000)
+        checker = MerkleInclusionBatchReplayGuard(store=store)
+        self.assertTrue(checker.check(entries, binding, now=999))
+        self.assertFalse(binder.check(entries, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        entries = self._entries()
+        store = self.make_store()
+        binding = MerkleInclusionBatchReplayGuard(store=store).bind_once(
+            entries, b"s"
+        )
+        store.close()
+        reopened = self.make_store()
+        guard = MerkleInclusionBatchReplayGuard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = MerkleInclusionBatchReplayGuard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(entries, b"s")
+        reopened_again.close()
+
+    def test_store_domain_isolation_from_single_inclusion_guard(self):
+        leaves = self._leaves(7)
+        entries = [self._entry(leaves, i) for i in (1, 4)]
+        store = self.make_store()
+        batch_guard = MerkleInclusionBatchReplayGuard(store=store)
+        single_guard = MerkleInclusionReplayGuard(store=store)
+        batch_binding = batch_guard.bind_once(entries, b"same-id")
+        single = self._entry(leaves, 3)
+        single_binding = single_guard.bind_once(
+            single.leaf, single.root, single.proof, b"same-id"
+        )
+        self.assertTrue(batch_guard.check(entries, batch_binding, now=1))
+        self.assertTrue(
+            single_guard.check(
+                single.leaf, single.root, single.proof, single_binding, now=1
+            )
+        )
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/mir/v1", domains)
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        entries = self._entries()
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = MerkleInclusionBatchReplayGuard(store=first).bind_once(
+            entries, b"s"
+        )
+        self.assertFalse(
+            MerkleInclusionBatchReplayGuard(store=second).check(
+                entries, binding_a, now=1
+            )
+        )
+        self.assertTrue(
+            MerkleInclusionBatchReplayGuard(store=first).check(
+                entries, binding_a, now=1
+            )
+        )
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        entries = self._entries()
+        other = self._entries(size=8, indices=(1, 3, 7))
+        store = self.make_store()
+        binder = MerkleInclusionBatchReplayGuard(store=store)
+        binding = binder.bind_once(entries, b"s")
+        checker = MerkleInclusionBatchReplayGuard(store=store)
+        self.assertFalse(checker.check(other, binding, now=1))
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(
+            MerkleInclusionBatchReplayGuard(store=store).check(
+                entries, binding, now=1
+            )
+        )
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        entries = self._entries()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = MerkleInclusionBatchReplayGuard(store=store)
+        binding = guard.bind_once(entries, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        entries = self._entries()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = MerkleInclusionBatchReplayGuard(store=store).bind_once(
+            entries, b"s"
+        )
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+    def test_store_delegation_error_restores_pending(self):
+        import zkregion
+
+        entries = self._entries()
+        store = self.make_store()
+        guard = MerkleInclusionBatchReplayGuard(store=store)
+        binding = guard.bind_once(entries, b"s")
+        original = zkregion.verify_inclusion_batch
+
+        def boom(_entries):
+            raise RuntimeError("boom")
+
+        zkregion.verify_inclusion_batch = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entries, binding, now=1)
+        finally:
+            zkregion.verify_inclusion_batch = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            MerkleInclusionBatchReplayGuard(store=store).check(
                 entries, binding, now=1
             )
         )

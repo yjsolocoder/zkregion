@@ -21,6 +21,8 @@ from . import (
     MerkleConsistencyChainBatchReplayGuard,
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyReplayGuard,
+    MerkleInclusionBatchEntry,
+    MerkleInclusionBatchReplayGuard,
     MerkleMultiProof,
     MultiSchnorrEntry,
     RangeBatchEntry,
@@ -58,6 +60,7 @@ from . import (
     verify_consistency_chain_batch,
     verify_consistency_chain_batch_bound,
     verify_inclusion,
+    verify_inclusion_batch,
     verify_multi_inclusion,
     verify_opening,
     verify_pedersen_opening,
@@ -438,6 +441,27 @@ def main() -> int:
     full = prove_multi_inclusion(leaves, range(len(leaves)))
     print(f"  full-leaf proof needs no siblings: {full.siblings == ()}")
     print(f"  full-leaf proof accepted: {verify_multi_inclusion(list(enumerate(leaves)), full, root)}")
+
+    print()
+    print("independent single-leaf Merkle inclusion batch verification:")
+    batch_inclusion_leaves = [b"one", b"two", b"three", b"four"]
+    batch_inclusion_root = merkle_root(batch_inclusion_leaves)
+    inclusion_entries = [
+        MerkleInclusionBatchEntry(b"gamma", prove_inclusion(leaves, 2), root),
+        MerkleInclusionBatchEntry(
+            b"four", prove_inclusion(batch_inclusion_leaves, 3), batch_inclusion_root
+        ),
+    ]
+    print(f"  valid batch of {len(inclusion_entries)} independent entries accepted: "
+          f"{verify_inclusion_batch(inclusion_entries)}")
+    print(f"  tuple and duplicate entries accepted: "
+          f"{verify_inclusion_batch(tuple(inclusion_entries) + tuple(inclusion_entries[:1]))}")
+    print(f"  empty batch rejected: {not verify_inclusion_batch(())}")
+    tampered_inclusion = [
+        MerkleInclusionBatchEntry(b"other", inclusion_entries[0].proof, root),
+        inclusion_entries[1],
+    ]
+    print(f"  tampered entry rejected: {not verify_inclusion_batch(tampered_inclusion)}")
 
     print()
     print("independent Merkle consistency batch verification:")
@@ -955,6 +979,30 @@ def main() -> int:
     foreign_mcbr_binding = foreign_mcbr.bind_once(consistency_entries, b"consistency-batch-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_mcbr.check(consistency_entries, foreign_mcbr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for inclusion batches (bind once, check once):")
+    mibr = MerkleInclusionBatchReplayGuard()
+    mibr_binding = mibr.bind_once(inclusion_entries, b"inclusion-batch-session-1", expires_at=10**12)
+    print(f"  digest={mibr_binding.digest.hex()[:32]}…  expires_at={mibr_binding.expires_at}")
+    print(f"  valid first check accepted: {mibr.check(inclusion_entries, mibr_binding, now=100)}")
+    print(f"  replay rejected: {not mibr.check(inclusion_entries, mibr_binding, now=101)}")
+    other_mibr = MerkleInclusionBatchReplayGuard()
+    other_mibr_binding = other_mibr.bind_once(inclusion_entries, b"inclusion-batch-session-2")
+    print(f"  reordered batch rejected without consuming the id: "
+          f"{not other_mibr.check(inclusion_entries[::-1], other_mibr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mibr.check(inclusion_entries, other_mibr_binding, now=1)}")
+    try:
+        mibr.bind_once(inclusion_entries, b"inclusion-batch-session-1")
+    except ValueError:
+        print("  rebind of a consumed id rejected: True")
+    else:
+        print("  rebind of a consumed id rejected: False")
+    foreign_mibr = MerkleInclusionBatchReplayGuard()
+    foreign_mibr_binding = foreign_mibr.bind_once(inclusion_entries, b"inclusion-batch-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mibr.check(inclusion_entries, foreign_mibr_binding, now=1)}")
 
     print()
     print("per-instance replay protection for bound consistency batches (bind once, check once):")

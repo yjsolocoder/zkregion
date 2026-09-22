@@ -71,6 +71,8 @@ __all__ = [
     "MerkleConsistencyChainReplayGuard",
     "MerkleConsistencyProof",
     "MerkleConsistencyReplayGuard",
+    "MerkleInclusionBatchEntry",
+    "MerkleInclusionBatchReplayGuard",
     "MerkleInclusionReplayGuard",
     "MerkleMultiProof",
     "MerkleMultiReplayGuard",
@@ -115,6 +117,7 @@ __all__ = [
     "verify_consistency_chain_batch",
     "verify_consistency_chain_batch_bound",
     "verify_inclusion",
+    "verify_inclusion_batch",
     "verify_multi_inclusion",
     "verify_opening",
     "verify_pedersen_opening",
@@ -1633,6 +1636,92 @@ def verify_inclusion(leaf: bytes, proof: MerkleProof, root: bytes) -> bool:
     return hmac.compare_digest(digest, root)
 
 
+@dataclass(frozen=True)
+class MerkleInclusionBatchEntry:
+    """One independent item of a single-leaf inclusion batch verification.
+
+    Fields, in order: ``leaf`` (``bytes``), ``proof``
+    (:class:`MerkleProof`) and ``root`` (``bytes``) — exactly the
+    arguments of :func:`verify_inclusion`, in the same order. All three
+    are positional construction arguments; entries compare by value and
+    are immutable.
+    """
+
+    leaf: bytes
+    proof: MerkleProof
+    root: bytes
+
+
+def _check_inclusion_batch_entries_types(
+    entries: object,
+) -> list[MerkleInclusionBatchEntry]:
+    """Validate the inclusion-batch ``entries`` argument types.
+
+    Mirrors the type checks of :func:`verify_inclusion` for *every* entry
+    before any verification runs: ``entries`` must be a non-``bytes`` /
+    ``bytearray`` / ``str`` sequence of
+    :class:`MerkleInclusionBatchEntry` objects whose ``leaf`` / ``root``
+    are ``bytes`` and whose ``proof`` is a :class:`MerkleProof` with a
+    non-``bool`` integer ``index`` and a tuple-of-bytes ``siblings``.
+    The whole batch is walked (a bad type in a later entry still raises),
+    and the entries are copied into a fresh list so the inputs are never
+    mutated. An empty batch is left to :func:`verify_inclusion_batch` to
+    reject with ``False``; structural/value problems (digest lengths, a
+    negative index or an index/path structure that cannot match a real
+    tree) are left to :func:`verify_inclusion` during verification.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of MerkleInclusionBatchEntry")
+    items: list[MerkleInclusionBatchEntry] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, MerkleInclusionBatchEntry):
+            raise TypeError(
+                f"entries[{position}] must be a MerkleInclusionBatchEntry"
+            )
+        _check_bytes(entry.leaf, f"entries[{position}] leaf")
+        _check_bytes(entry.root, f"entries[{position}] root")
+        proof = entry.proof
+        if not isinstance(proof, MerkleProof):
+            raise TypeError(f"entries[{position}] proof must be a MerkleProof")
+        if not isinstance(proof.index, int) or isinstance(proof.index, bool):
+            raise TypeError(f"entries[{position}] proof index must be an integer")
+        if not isinstance(proof.siblings, tuple):
+            raise TypeError(
+                f"entries[{position}] proof siblings must be a tuple of bytes"
+            )
+        for sibling in proof.siblings:
+            _check_bytes(sibling, f"entries[{position}] proof sibling")
+        items.append(entry)
+    return items
+
+
+def verify_inclusion_batch(entries: Sequence[MerkleInclusionBatchEntry]) -> bool:
+    """Check several independent single-leaf Merkle inclusion proofs.
+
+    ``entries`` must be a non-``bytes`` / ``bytearray`` / ``str``
+    sequence of :class:`MerkleInclusionBatchEntry`; an empty batch
+    returns ``False`` and lists, tuples and duplicate entries are legal.
+    The nested types of the *whole* batch are preflighted first, so a
+    wrong type in any entry — including a later one — raises
+    :class:`TypeError` rather than being converted into a batch
+    rejection (returning ``False``). Each entry is then checked, in
+    order, with :func:`verify_inclusion` against its ``leaf``,
+    :attr:`MerkleInclusionBatchEntry.proof` and ``root`` fields, reusing
+    its root length, index, sibling length and path-walk rules; the
+    first entry that returns ``False`` short-circuits the batch.
+    Entries are independent of one another: their roots and trees need
+    not relate, and no hash encoding or cryptographic aggregation is
+    added. Inputs are never mutated.
+    """
+    items = _check_inclusion_batch_entries_types(entries)
+    if not items:
+        return False
+    for entry in items:
+        if not verify_inclusion(entry.leaf, entry.proof, entry.root):
+            return False
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Compact Merkle multi-inclusion proofs
 #
@@ -3024,6 +3113,7 @@ _MERKLE_CHAIN_REPLAY_DOMAIN = b"zr/mccr/v1"
 _MERKLE_CHAIN_BATCH_REPLAY_DOMAIN = b"zr/mccbr/v1"
 _MERKLE_CONSISTENCY_REPLAY_DOMAIN = b"zr/mcr/v1"
 _MERKLE_INCLUSION_REPLAY_DOMAIN = b"zr/mir/v1"
+_MERKLE_INCLUSION_BATCH_REPLAY_DOMAIN = b"zr/mibr/v1"
 _MERKLE_MULTI_REPLAY_DOMAIN = b"zr/mmr/v1"
 _MERKLE_CONSISTENCY_BATCH_REPLAY_DOMAIN = b"zr/mcbr/v1"
 _SCHNORR_BATCH_REPLAY_DOMAIN = b"zr/sbr/v1"
@@ -3181,6 +3271,7 @@ class SQLiteReplayStore:
     :class:`MerkleConsistencyChainReplayGuard`,
     :class:`MerkleConsistencyReplayGuard`,
     :class:`MerkleInclusionReplayGuard`,
+    :class:`MerkleInclusionBatchReplayGuard`,
     :class:`MerkleMultiReplayGuard` and
     :class:`SchnorrBatchReplayGuard`)
     keeps its rows in the same table under its own domain segment via
@@ -6625,6 +6716,29 @@ def _merkle_inclusion_replay_encodable(proof: MerkleProof) -> bool:
     return all(0 <= value <= _UINT64_MAX for value in values)
 
 
+def _merkle_inclusion_proof_framing(
+    leaf: bytes,
+    root: bytes,
+    proof: MerkleProof,
+) -> bytes:
+    """The continuous single-leaf segment ``F(leaf) || F(root) ||``
+    ``F(U(proof.index)) || S(proof.siblings, id)``.
+
+    This is the run of the single-inclusion guard transcript from
+    ``F(leaf)`` up to and including the siblings sequence; the batch
+    guard reuses these exact bytes as each entry's ``Q`` framing.
+    """
+    material = bytearray()
+    material += _frame_length_prefixed(leaf)
+    material += _frame_length_prefixed(root)
+    material += _frame_length_prefixed(_uint64_be(proof.index))
+    # S(proof.siblings, id) = F(U(|siblings|)) || Σ F(sibling)
+    material += _frame_length_prefixed(_uint64_be(len(proof.siblings)))
+    for sibling in proof.siblings:
+        material += _frame_length_prefixed(sibling)
+    return bytes(material)
+
+
 def _merkle_inclusion_replay_digest(
     leaf: bytes,
     root: bytes,
@@ -6636,18 +6750,13 @@ def _merkle_inclusion_replay_digest(
 
     Writes, in order: ``F(D)``, ``F(session_id)``, ``F(leaf)``, ``F(root)``,
     ``F(U(proof.index))``, ``S(proof.siblings, id)`` and ``F(E)``; the
-    siblings keep their leaf-to-root proof order.
+    siblings keep their leaf-to-root proof order. The leaf-through-siblings
+    run is :func:`_merkle_inclusion_proof_framing`.
     """
     transcript = hashlib.sha256()
     transcript.update(_frame_length_prefixed(_MERKLE_INCLUSION_REPLAY_DOMAIN))
     transcript.update(_frame_length_prefixed(session_id))
-    transcript.update(_frame_length_prefixed(leaf))
-    transcript.update(_frame_length_prefixed(root))
-    transcript.update(_frame_length_prefixed(_uint64_be(proof.index)))
-    # S(proof.siblings, id) = F(U(|siblings|)) || Σ F(sibling)
-    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.siblings))))
-    for sibling in proof.siblings:
-        transcript.update(_frame_length_prefixed(sibling))
+    transcript.update(_merkle_inclusion_proof_framing(leaf, root, proof))
     expiry = _replay_expiry_bytes(expires_at)
     transcript.update(_frame_length_prefixed(expiry))
     return transcript.digest()
@@ -6880,6 +6989,296 @@ class MerkleInclusionReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_inclusion(leaf, proof, root):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for batches of single-leaf Merkle inclusion proofs
+#
+# A MerkleInclusionBatchReplayGuard binds a whole non-empty batch of
+# MerkleInclusionBatchEntry items — the same sequence shape accepted by
+# verify_inclusion_batch (order and duplicates preserved) — to a
+# caller-chosen session id, reusing the ReplayBinding type and, byte for
+# byte, the F / U / S framing and the E expiry encoding of the other batch
+# guards. Like them the binding is single-use: without a store the state is
+# local to the guard instance, while an SQLiteReplayStore keeps pending,
+# claimed and consumed ids in the store under b"zr/mibr/v1", shared across
+# instances, processes and restarts. bind_once registers a pending binding,
+# check claims the id atomically, recomputes the digest, checks the expiry,
+# delegates the batch verification to verify_inclusion_batch and consumes the
+# id only on full success; every rejection leaves the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || S(entries, Q) || F(E)
+# )
+#   D = b"zr/mibr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   Q(entry) is the continuous run of the single-leaf inclusion guard
+#   transcript, from F(leaf) through S(proof.siblings, id):
+#     F(leaf) || F(root) || F(U(proof.index)) || S(proof.siblings, id)
+#   i.e. the bytes of _merkle_inclusion_proof_framing(leaf, root, proof)
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+
+
+def _merkle_inclusion_batch_replay_encodable(
+    entries: Sequence[MerkleInclusionBatchEntry],
+) -> bool:
+    """Every U-framed count must fit in unsigned 64 bits.
+
+    The batch length written by the outer S sequence, each proof's
+    ``index`` and each ``siblings`` tuple length are encoded with ``U``;
+    the raw leaf, root and sibling bytes need no encodability rule.
+    """
+    values: list[int] = [len(entries)]
+    for entry in entries:
+        values.extend((entry.proof.index, len(entry.proof.siblings)))
+    return all(0 <= value <= _UINT64_MAX for value in values)
+
+
+def _merkle_inclusion_batch_replay_digest(
+    entries: Sequence[MerkleInclusionBatchEntry],
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the Merkle-inclusion-batch replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``S(entries, Q)`` and
+    ``F(E)``; the entries keep their batch order (duplicates included)
+    and each proof's siblings keep their leaf-to-root order.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_MERKLE_INCLUSION_BATCH_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    # S(entries, Q) = F(U(|entries|)) || Σ F(Q(entry))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(entries))))
+    for entry in entries:
+        q = _merkle_inclusion_proof_framing(entry.leaf, entry.root, entry.proof)
+        transcript.update(_frame_length_prefixed(q))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+class MerkleInclusionBatchReplayGuard:
+    """Single-use replay protection for a batch of inclusion proofs.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole non-empty batch of
+    :class:`MerkleInclusionBatchEntry` items — the same sequence shape
+    accepted by :func:`verify_inclusion_batch` — to a session id;
+    :meth:`check` accepts an equal pending binding exactly once,
+    recomputing the binding digest, checking the expiry and delegating to
+    :func:`verify_inclusion_batch`, and then marks the id consumed. The
+    digest frames the batch under
+    ``SHA-256(F(D) || F(session_id) || S(entries, Q) || F(E))`` with
+    domain ``b"zr/mibr/v1"``, where each entry's ``Q`` is the continuous
+    run of the single-leaf :class:`MerkleInclusionReplayGuard` transcript
+    from ``F(leaf)`` through ``S(proof.siblings, id)`` — i.e.
+    ``F(leaf) || F(root) || F(U(proof.index)) || S(proof.siblings, id)``;
+    the F / U / S framing and the E expiry encoding are reused byte for
+    byte from the Bound, consistency and single-inclusion guards. By
+    default both the pending and the consumed state live on this guard
+    instance and are never shared between instances; passing an
+    :class:`SQLiteReplayStore` as ``store`` instead keeps the state in
+    that store under the ``b"zr/mibr/v1"`` key domain, so batch guards
+    attached to the same store namespace share pending, claimed and
+    consumed ids across independent instances, processes and process
+    restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim
+    taken before the digest/expiry work and the delegated batch
+    verification (the in-instance registry lock, or the store's short
+    transaction and unique claim token); the claim is per-id registry
+    state rather than a global lock, so a batch being verified under one
+    id never serializes checks or binds of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None
+            if store is None
+            else store._view(_MERKLE_INCLUSION_BATCH_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        entries: Sequence[MerkleInclusionBatchEntry],
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to the batch.
+
+        Returns the frozen :class:`ReplayBinding`. ``entries`` must be a
+        non-string, non-empty sequence of
+        :class:`MerkleInclusionBatchEntry` objects (``bytes`` leaf / root
+        and a well-typed :class:`MerkleProof` each), kept in the given
+        order with duplicates preserved and no item dropped;
+        ``session_id`` must be non-empty ``bytes`` and ``expires_at``
+        must be either ``None`` or a non-``bool`` unsigned 64-bit
+        Unix-second timestamp. Every U-framed count (the proof
+        ``index`` values and the batch / ``siblings`` tuple lengths)
+        must likewise fit in uint64. A session id that is already
+        pending, being checked or consumed raises :class:`ValueError`.
+        Wrong argument or nested field types (including a ``bool``
+        index) raise :class:`TypeError`; an empty batch or empty id, an
+        out-of-uint64 expiry or framed count, or a rebind raise
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        items = _check_inclusion_batch_entries_types(entries)
+        _check_bytes(session_id, "session_id")
+        if not items:
+            raise ValueError("entries must not be empty")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _merkle_inclusion_batch_replay_encodable(items):
+            raise ValueError("proof index and tuple lengths must be unsigned 64-bit integers")
+        binding = ReplayBinding(
+            session_id,
+            _merkle_inclusion_batch_replay_digest(items, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entries: Sequence[MerkleInclusionBatchEntry],
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id
+        at most one can return ``True``. The digest is recomputed over the
+        presented ``entries`` in their given order; for a binding with an
+        expiry, ``now >= expires_at`` makes the check fail (``now``
+        defaults to the current Unix seconds and must otherwise be a
+        non-``bool`` uint64). Only then is the batch handed to
+        :func:`verify_inclusion_batch`, which preflights every entry's
+        nested types and checks each single-leaf inclusion independently.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, an empty batch
+        or :func:`verify_inclusion_batch` returning ``False``) returns
+        ``False``, releases the claim and leaves the registration
+        pending. An exception escaping the delegated verification
+        likewise releases the claim and then propagates unchanged,
+        leaving the id usable. With a store backend, only the holder of
+        the current claim token can consume the id (an expired claim
+        may be taken over by a later equal ``check``); a stale token
+        neither consumes nor restores anything. Verification runs
+        without any lock or transaction held, so other ids are never
+        serialized. Argument type errors raise :class:`TypeError`; an
+        out-of-range ``now`` raises :class:`ValueError`. Inputs are
+        never mutated.
+        """
+        items = _check_inclusion_batch_entries_types(entries)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not items or not _merkle_inclusion_batch_replay_encodable(items):
+            return False  # an empty batch or a negative/oversized U-framed index
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(items, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _merkle_inclusion_batch_replay_digest(
+                    items, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_inclusion_batch(items):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entries: Sequence[MerkleInclusionBatchEntry],
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _merkle_inclusion_batch_replay_digest(
+                    entries, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_inclusion_batch(entries):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

@@ -40,7 +40,8 @@ verify_consistency_batch_bound / MerkleConsistencyChain /
 prove_consistency_chain / verify_consistency_chain /
 verify_consistency_chain_batch /
 BoundConsistencyChainBatch / verify_consistency_chain_batch_bound /
-BoundConsistencyChainReplayGuard.
+BoundConsistencyChainReplayGuard /
+BoundMerkleMultiBatchReplayGuard.
 """
 
 from __future__ import annotations
@@ -64,6 +65,7 @@ __all__ = [
     "BoundConsistencyChainReplayGuard",
     "BoundConsistencyReplayGuard",
     "BoundMerkleMultiBatch",
+    "BoundMerkleMultiBatchReplayGuard",
     "BoundRangeBatch",
     "BoundRegionBatch",
     "BoundRegionReplayGuard",
@@ -3395,6 +3397,7 @@ _SINGLE_KEY_BATCH_REPLAY_DOMAIN = b"zr/skbr/v1"
 _SINGLE_KEY_BOUND_REPLAY_DOMAIN = b"zr/skbbr/v1"
 _BOUND_CONSISTENCY_REPLAY_DOMAIN = b"zr/bcbr/v1"
 _BOUND_CONSISTENCY_CHAIN_REPLAY_DOMAIN = b"zr/bccbr/v1"
+_BOUND_MERKLE_MULTI_BATCH_REPLAY_DOMAIN = b"zr/bmmbr/v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -10669,5 +10672,338 @@ class BoundConsistencyChainReplayGuard:
             # to pending, but only while the current token still owns it;
             # after commit() (or a takeover) the token is stale and this is a
             # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for a Merkle-committed multi-inclusion batch
+#
+# A BoundMerkleMultiBatchReplayGuard binds a whole
+# BoundMerkleMultiBatch together with the Merkle root it is claimed under
+# to a caller-chosen session id, reusing the ReplayBinding type and, byte
+# for byte, the F / U / S framing and the E expiry encoding of
+# BoundConsistencyReplayGuard; only the domain separator and the per-item
+# leaves differ. Like the other bound guards the binding is single-use:
+# without a store the state is local to the guard instance, while an
+# SQLiteReplayStore keeps pending, claimed and consumed ids in the store
+# under b"zr/bmmbr/v1", shared across instances, processes and restarts.
+# bind_once registers a pending binding, check recomputes the digest,
+# checks the expiry, delegates the batch verification to
+# verify_multi_inclusion_batch_bound and consumes the id only on full
+# success; every rejection leaves the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || F(root) || F(U(batch.leaf_count))
+#     || Σ_i F(L(item_i))
+#     || F(U(proof.leaf_count)) || S(proof.indices, U)
+#     || S(proof.siblings, λx.x) || F(E)
+# )
+#   D = b"zr/bmmbr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   L(item) = the BoundMerkleMultiBatch leaf bytes
+#              (_bound_merkle_multi_leaf), raw under F — the existing
+#              b"zkregion/multi-batch/v1" outer leaf encoding
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+#
+# The items keep their batch order, duplicates included; items are never
+# dropped or reordered, and the outer MerkleMultiProof's three fields are
+# all bound verbatim.
+
+
+def _bound_merkle_multi_batch_replay_encodable(
+    batch: BoundMerkleMultiBatch,
+) -> bool:
+    """Every U-framed integer must fit in unsigned 64 bits.
+
+    ``batch.leaf_count``, ``batch.proof.leaf_count`` and every outer proof
+    index are written with ``U`` (eight-byte unsigned big-endian); a
+    negative or larger-than-uint64 value cannot be framed. The per-item
+    outer leaves ``L(item)`` are framed raw (their own integers are
+    already encoded inside the leaf bytes), so the items' nested counts
+    and indices need no encodability rule here.
+    """
+    proof = batch.proof
+    values = [batch.leaf_count, proof.leaf_count, *proof.indices]
+    return all(0 <= value <= _UINT64_MAX for value in values)
+
+
+def _bound_merkle_multi_batch_replay_digest(
+    batch: BoundMerkleMultiBatch,
+    root: bytes,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the BoundMerkleMultiBatch replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``F(root)``,
+    ``F(U(batch.leaf_count))``, one ``F(L(item))`` per item in batch
+    order, then ``F(U(proof.leaf_count))``, ``S(proof.indices, U)``,
+    ``S(proof.siblings, identity)`` and ``F(E)``.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_BOUND_MERKLE_MULTI_BATCH_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    transcript.update(_frame_length_prefixed(root))
+    transcript.update(_frame_length_prefixed(_uint64_be(batch.leaf_count)))
+    for item in batch.entries:  # items order, each outer leaf under F
+        transcript.update(_frame_length_prefixed(_bound_merkle_multi_leaf(item)))
+    proof = batch.proof
+    transcript.update(_frame_length_prefixed(_uint64_be(proof.leaf_count)))
+    # S(proof.indices, U) = F(U(|indices|)) || Σ F(U(index))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.indices))))
+    for index in proof.indices:
+        transcript.update(_frame_length_prefixed(_uint64_be(index)))
+    # S(proof.siblings, λx.x) = F(U(|siblings|)) || Σ F(sibling)
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.siblings))))
+    for sibling in proof.siblings:
+        transcript.update(_frame_length_prefixed(sibling))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+def _check_bound_merkle_multi_batch_types(batch: object, root: object) -> None:
+    """Validate BoundMerkleMultiBatch argument types for the guard.
+
+    Mirrors the type checks of :func:`verify_multi_inclusion_batch_bound`:
+    the batch must be a :class:`BoundMerkleMultiBatch` whose entries tuple
+    holds nestedly well-typed :class:`MerkleMultiBatchEntry` objects, whose
+    ``leaf_count`` is a non-``bool`` integer and whose proof is a
+    well-typed :class:`MerkleMultiProof`; ``root`` must be ``bytes``.
+    Structural and value problems (coverage, counts, digest lengths) are
+    left to :func:`verify_multi_inclusion_batch_bound` at check time.
+    """
+    if not isinstance(batch, BoundMerkleMultiBatch):
+        raise TypeError("batch must be a BoundMerkleMultiBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(
+            "batch entries must be a tuple of MerkleMultiBatchEntry"
+        )
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    _check_multi_inclusion_batch_entries_types(entries)
+
+
+class BoundMerkleMultiBatchReplayGuard:
+    """Single-use replay protection for a Merkle-committed multi batch.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole
+    :class:`BoundMerkleMultiBatch` together with the Merkle ``root`` it is
+    claimed under; :meth:`check` accepts an equal pending binding exactly
+    once — atomically claiming the id, recomputing the binding digest,
+    checking the expiry and delegating to
+    :func:`verify_multi_inclusion_batch_bound` — and then marks the id
+    consumed. By default both the pending and the consumed state live on
+    this guard instance and are never shared between instances; passing an
+    :class:`SQLiteReplayStore` as ``store`` instead keeps the state in
+    that store under the ``b"zr/bmmbr/v1"`` key domain, so bound-multi-
+    batch guards attached to the same store namespace share pending,
+    claimed and consumed ids across independent instances, processes and
+    process restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the digest/expiry work and the delegated batch verification (the
+    in-instance registry lock, or the store's short transaction and unique
+    claim token); the claim is per-id registry state rather than a global
+    lock, so a batch being verified under one id never serializes checks or
+    binds of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None
+            if store is None
+            else store._view(_BOUND_MERKLE_MULTI_BATCH_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        batch: BoundMerkleMultiBatch,
+        root: bytes,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to a batch/root.
+
+        Only registers the pending binding and returns the frozen
+        :class:`ReplayBinding`; nothing is verified here. ``root`` and
+        ``session_id`` must be ``bytes`` and the id must be non-empty, and
+        ``expires_at`` must be either ``None`` or a non-``bool`` unsigned
+        64-bit Unix-second timestamp; the U-framed integers
+        (``leaf_count`` and the outer proof indices) must likewise fit in
+        uint64. A session id that is already pending, being checked or
+        consumed raises :class:`ValueError`. Wrong argument or nested
+        field types raise :class:`TypeError`; an empty id, an
+        out-of-uint64 expiry or framed integer, or a rebind raise
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_bound_merkle_multi_batch_types(batch, root)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _bound_merkle_multi_batch_replay_encodable(batch):
+            raise ValueError("leaf_count and proof indices must be unsigned 64-bit integers")
+        binding = ReplayBinding(
+            session_id,
+            _bound_merkle_multi_batch_replay_digest(
+                batch, root, session_id, expires_at
+            ),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        batch: BoundMerkleMultiBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Atomically claim, verify and consume the pending binding.
+
+        The id is claimed atomically first, then the binding digest is
+        recomputed over the presented ``batch`` / ``root`` and the expiry
+        is checked; only then is the batch/root handed unchanged to
+        :func:`verify_multi_inclusion_batch_bound`. ``binding`` must be
+        the equal, still-pending :class:`ReplayBinding` previously
+        registered on this guard for ``binding.session_id``. For a
+        binding with an expiry, ``now >= expires_at`` makes the check fail
+        (``now`` defaults to the current Unix seconds and must otherwise
+        be a non-``bool`` uint64).
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, tampering, expiry, or
+        :func:`verify_multi_inclusion_batch_bound` returning ``False``)
+        returns ``False``, releases the claim and leaves the registration
+        pending. An exception escaping the delegated verification
+        likewise releases the claim and then propagates unchanged,
+        leaving the id usable. With a store backend, only the holder of
+        the current claim token can consume the id (an expired claim may
+        be taken over by a later equal ``check``); a stale token neither
+        consumes nor restores anything. Verification runs without any
+        lock or transaction held, so other ids are never serialized.
+        Argument type errors raise :class:`TypeError`; an out-of-range
+        ``now`` raises :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_bound_merkle_multi_batch_types(batch, root)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _bound_merkle_multi_batch_replay_encodable(batch):
+            return False  # negative or oversized U-framed integers
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(batch, root, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_merkle_multi_batch_replay_digest(
+                    batch, root, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_multi_inclusion_batch_bound(batch, root):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        batch: BoundMerkleMultiBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_merkle_multi_batch_replay_digest(
+                    batch, root, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_multi_inclusion_batch_bound(batch, root):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
             if not committed:
                 self._store.release(session_id, token)

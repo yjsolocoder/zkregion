@@ -9,6 +9,7 @@ from . import (
     BoundConsistencyChainBatch,
     BoundConsistencyChainReplayGuard,
     BoundConsistencyReplayGuard,
+    BoundMerkleMultiBatch,
     BoundRangeBatch,
     BoundRegionBatch,
     BoundRegionReplayGuard,
@@ -23,6 +24,7 @@ from . import (
     MerkleConsistencyReplayGuard,
     MerkleInclusionBatchEntry,
     MerkleInclusionBatchReplayGuard,
+    MerkleMultiBatchEntry,
     MerkleMultiProof,
     MultiSchnorrEntry,
     RangeBatchEntry,
@@ -62,6 +64,8 @@ from . import (
     verify_inclusion,
     verify_inclusion_batch,
     verify_multi_inclusion,
+    verify_multi_inclusion_batch,
+    verify_multi_inclusion_batch_bound,
     verify_opening,
     verify_pedersen_opening,
     verify_range,
@@ -441,6 +445,73 @@ def main() -> int:
     full = prove_multi_inclusion(leaves, range(len(leaves)))
     print(f"  full-leaf proof needs no siblings: {full.siblings == ()}")
     print(f"  full-leaf proof accepted: {verify_multi_inclusion(list(enumerate(leaves)), full, root)}")
+
+    print()
+    print("Merkle-committed complete multi-inclusion batch (outer root, then inner batch):")
+    from . import _frame_length_prefixed, _merkle_multi_proof_framing
+
+    def bound_multi_leaf(item: MerkleMultiBatchEntry) -> bytes:
+        return (
+            _frame_length_prefixed(b"zkregion/multi-batch/v1")
+            + _frame_length_prefixed(
+                _merkle_multi_proof_framing(item.entries, item.root, item.proof)
+            )
+        )
+
+    outer_source = [b"one", b"two", b"three", b"four"]
+    outer_root = merkle_root(outer_source)
+    multi_items = [
+        MerkleMultiBatchEntry(
+            tuple((i, leaves[i]) for i in (0, 2, 4)),
+            prove_multi_inclusion(leaves, (0, 2, 4)),
+            root,
+        ),
+        MerkleMultiBatchEntry(
+            tuple((i, outer_source[i]) for i in (1, 3)),
+            prove_multi_inclusion(outer_source, (1, 3)),
+            outer_root,
+        ),
+        MerkleMultiBatchEntry(
+            tuple((i, leaves[i]) for i in (0, 2, 4)),
+            prove_multi_inclusion(leaves, (0, 2, 4)),
+            root,
+        ),
+    ]
+    assert verify_multi_inclusion_batch(multi_items)
+    outer_leaves = [
+        bound_multi_leaf(item) for item in multi_items
+    ]
+    multi_outer_root = merkle_root(outer_leaves)
+    multi_outer_proof = prove_multi_inclusion(
+        outer_leaves, tuple(range(len(outer_leaves)))
+    )
+    multi_bound = BoundMerkleMultiBatch(
+        tuple(multi_items), len(multi_items), multi_outer_proof
+    )
+    print(f"  entries={len(multi_items)}  complete index coverage 0..{len(multi_items) - 1}")
+    print("  valid bound batch accepted: "
+          f"{verify_multi_inclusion_batch_bound(multi_bound, multi_outer_root)}")
+    print("  duplicate items preserved and accepted: "
+          f"{verify_multi_inclusion_batch_bound(multi_bound, multi_outer_root)}")
+    print("  wrong root rejected: "
+          f"{not verify_multi_inclusion_batch_bound(multi_bound, merkle_root(outer_leaves[:1]))}")
+    print("  empty batch rejected: "
+          f"{not verify_multi_inclusion_batch_bound(BoundMerkleMultiBatch((), 0, MerkleMultiProof(0, (), ())), bytes(32))}")
+    gap_proof = MerkleMultiProof(
+        len(multi_items), (0, 1, 3), multi_outer_proof.siblings
+    )
+    print("  incomplete indices rejected: "
+          f"{not verify_multi_inclusion_batch_bound(BoundMerkleMultiBatch(tuple(multi_items), len(multi_items), gap_proof), multi_outer_root)}")
+    forged_item = dataclasses.replace(
+        multi_items[0], root=bytes(32)
+    )
+    forged_outer = [bound_multi_leaf(forged_item)] + outer_leaves[1:]
+    forged_proof = prove_multi_inclusion(forged_outer, tuple(range(len(forged_outer))))
+    forged_bound = BoundMerkleMultiBatch(
+        (forged_item, *multi_items[1:]), len(multi_items), forged_proof
+    )
+    print("  committed-but-invalid inner item rejected: "
+          f"{not verify_multi_inclusion_batch_bound(forged_bound, merkle_root(forged_outer))}")
 
     print()
     print("independent single-leaf Merkle inclusion batch verification:")

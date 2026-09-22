@@ -13,6 +13,7 @@ from zkregion import (
     BoundConsistencyChainBatch,
     BoundConsistencyChainReplayGuard,
     BoundConsistencyReplayGuard,
+    BoundMerkleMultiBatch,
     BoundRangeBatch,
     BoundRegionBatch,
     BoundRegionReplayGuard,
@@ -76,6 +77,7 @@ from zkregion import (
     verify_inclusion_batch,
     verify_multi_inclusion,
     verify_multi_inclusion_batch,
+    verify_multi_inclusion_batch_bound,
     verify_opening,
     verify_pedersen_opening,
     verify_range,
@@ -4714,6 +4716,671 @@ class MerkleMultiInclusionBatchTest(unittest.TestCase):
         self.assertFalse(verify_multi_inclusion_batch(mixed))
         self.assertEqual(bad.root, b"\x00" * 32)
         self.assertEqual(items[0].proof.siblings, snapshots[0][2])
+
+
+class BoundMerkleMultiBatchTest(unittest.TestCase):
+    """Merkle-committed complete batches of compact multi-inclusion proofs."""
+
+    DOMAIN = b"zkregion/multi-batch/v1"
+
+    def _leaves(self, prefix, count):
+        return [f"{prefix}-{i}".encode() for i in range(count)]
+
+    def _item(self, leaves, indices, *, root=None):
+        return MerkleMultiBatchEntry(
+            tuple((index, leaves[index]) for index in indices),
+            prove_multi_inclusion(leaves, tuple(indices)),
+            merkle_root(leaves) if root is None else root,
+        )
+
+    def _honest_items(self):
+        first = self._leaves("bmmb-a", 5)
+        second = self._leaves("bmmb-b", 8)
+        third = self._leaves("bmmb-c", 4)
+        return [
+            self._item(first, (0, 2, 4)),
+            self._item(second, (1, 7)),
+            self._item(third, (0, 3)),
+        ]
+
+    def build(self, items):
+        leaves = [self._leaf(item) for item in items]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(items))))
+        batch = BoundMerkleMultiBatch(tuple(items), len(items), proof)
+        return batch, root, leaves
+
+    def _q(self, item):
+        # Spec: F(root) || F(U(proof.leaf_count)) || S(proof.indices, U)
+        #       || S(entries, Q_e) || S(proof.siblings, id)
+        def f(x):
+            return len(x).to_bytes(4, "big") + x
+
+        def u(n):
+            return n.to_bytes(8, "big")
+
+        material = bytearray()
+        material += f(item.root)
+        material += f(u(item.proof.leaf_count))
+        material += f(u(len(item.proof.indices)))
+        for index in item.proof.indices:
+            material += f(u(index))
+        material += f(u(len(item.entries)))
+        for index, leaf in item.entries:
+            material += f(f(u(index)) + f(leaf))
+        material += f(u(len(item.proof.siblings)))
+        for sibling in item.proof.siblings:
+            material += f(sibling)
+        return bytes(material)
+
+    def _leaf(self, item):
+        def f(x):
+            return len(x).to_bytes(4, "big") + x
+
+        return f(self.DOMAIN) + f(self._q(item))
+
+    # ---- batch object -------------------------------------------------------
+
+    def test_batch_positional_equality_and_immutability(self):
+        batch, root, _ = self.build(self._honest_items())
+        rebuilt = BoundMerkleMultiBatch(batch.entries, 3, batch.proof)
+        self.assertEqual(rebuilt, batch)
+        self.assertEqual(hash(rebuilt), hash(batch))
+        self.assertEqual(
+            tuple(getattr(batch, name) for name in ("entries", "leaf_count", "proof")),
+            (batch.entries, 3, batch.proof),
+        )
+        self.assertIsInstance(batch.entries, tuple)
+        self.assertNotEqual(BoundMerkleMultiBatch(batch.entries, 2, batch.proof), batch)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.leaf_count = 4
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.entries = ()
+
+    def test_field_order_and_types(self):
+        batch, _, _ = self.build(self._honest_items())
+        self.assertEqual(
+            [field.name for field in dataclasses.fields(batch)],
+            ["entries", "leaf_count", "proof"],
+        )
+        self.assertIsInstance(batch.entries, tuple)
+        for item in batch.entries:
+            self.assertIsInstance(item, MerkleMultiBatchEntry)
+        self.assertIsInstance(batch.leaf_count, int)
+        self.assertNotIsInstance(batch.leaf_count, bool)
+        self.assertIsInstance(batch.proof, MerkleMultiProof)
+
+    def test_entries_must_be_tuple(self):
+        batch, root, _ = self.build(self._honest_items())
+        loose = BoundMerkleMultiBatch(list(batch.entries), 3, batch.proof)
+        self.assertNotIsInstance(loose.entries, tuple)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(loose, root)
+
+    # ---- leaf encoding ------------------------------------------------------
+
+    def test_leaf_layout(self):
+        items = self._honest_items()
+        for item in items:
+            leaf = self._leaf(item)
+            framed = frame_items(leaf)
+            self.assertEqual(framed[0], self.DOMAIN)
+            self.assertEqual(framed[1], self._q(item))
+
+    def test_leaf_helper_matches_spec(self):
+        import zkregion
+
+        for item in self._honest_items():
+            self.assertEqual(
+                zkregion._bound_merkle_multi_batch_leaf(item), self._leaf(item)
+            )
+
+    def test_leaf_q_is_replay_transcript_run(self):
+        import zkregion
+
+        for item in self._honest_items():
+            self.assertEqual(
+                self._q(item),
+                zkregion._merkle_multi_proof_framing(
+                    item.entries, item.root, item.proof
+                ),
+            )
+
+    def test_leaf_digest_follows_merkle_rule(self):
+        items = self._honest_items()
+        leaf = self._leaf(items[0])
+        expected = hashlib.sha256(
+            b"\x00" + len(leaf).to_bytes(4, "big") + leaf
+        ).digest()
+        self.assertEqual(merkle_root([leaf]), expected)
+
+    def test_leaf_binds_root_counts_indices_entries_siblings(self):
+        items = self._honest_items()
+        item = items[0]
+        base = self._leaf(item)
+        # root
+        self.assertNotEqual(
+            base,
+            self._leaf(
+                MerkleMultiBatchEntry(item.entries, item.proof, bytes(32))
+            ),
+        )
+        # proof.leaf_count
+        self.assertNotEqual(
+            base,
+            self._leaf(
+                MerkleMultiBatchEntry(
+                    item.entries,
+                    MerkleMultiProof(
+                        item.proof.leaf_count + 1,
+                        item.proof.indices,
+                        item.proof.siblings,
+                    ),
+                    item.root,
+                )
+            ),
+        )
+        # indices
+        self.assertNotEqual(
+            base,
+            self._leaf(
+                MerkleMultiBatchEntry(
+                    item.entries,
+                    MerkleMultiProof(
+                        item.proof.leaf_count,
+                        tuple(reversed(item.proof.indices)),
+                        item.proof.siblings,
+                    ),
+                    item.root,
+                )
+            ),
+        )
+        # entries
+        other_pairs = tuple(
+            (index, b"other" if position == 0 else leaf)
+            for position, (index, leaf) in enumerate(item.entries)
+        )
+        self.assertNotEqual(
+            base,
+            self._leaf(MerkleMultiBatchEntry(other_pairs, item.proof, item.root)),
+        )
+        # siblings
+        if item.proof.siblings:
+            flipped = item.proof.siblings[:-1] + (
+                bytes([item.proof.siblings[-1][0] ^ 1])
+                + item.proof.siblings[-1][1:],
+            )
+            self.assertNotEqual(
+                base,
+                self._leaf(
+                    MerkleMultiBatchEntry(
+                        item.entries,
+                        MerkleMultiProof(
+                            item.proof.leaf_count, item.proof.indices, flipped
+                        ),
+                        item.root,
+                    )
+                ),
+            )
+
+    # ---- honest round trips -------------------------------------------------
+
+    def test_honest_batch_verifies(self):
+        batch, root, _ = self.build(self._honest_items())
+        self.assertTrue(verify_multi_inclusion_batch_bound(batch, root))
+
+    def test_single_item_batch_verifies(self):
+        leaves = self._leaves("bmmb-one", 5)
+        items = [self._item(leaves, (2, 4))]
+        batch, root, _ = self.build(items)
+        self.assertTrue(verify_multi_inclusion_batch_bound(batch, root))
+
+    def test_full_leaf_outer_proof_has_empty_siblings(self):
+        batch, _, _ = self.build(self._honest_items())
+        self.assertEqual(batch.proof.siblings, ())
+
+    def test_various_sizes(self):
+        for size in range(1, 13):
+            leaves = self._leaves(f"bmmb-size-{size}", size + 2)
+            # duplicate items are legal: every item is valid against this tree
+            items = [self._item(leaves, (0,)) for _ in range(size)]
+            batch, root, _ = self.build(items)
+            self.assertTrue(verify_multi_inclusion_batch_bound(batch, root), size)
+
+    def test_independent_unrelated_trees_allowed(self):
+        items = self._honest_items()
+        batch, root, _ = self.build(items)
+        self.assertTrue(verify_multi_inclusion_batch_bound(batch, root))
+
+    def test_duplicate_items_preserved_and_allowed(self):
+        items = self._honest_items()
+        items = [items[0], items[0], items[1], items[0]]
+        batch, root, _ = self.build(items)
+        self.assertEqual(batch.leaf_count, 4)
+        self.assertTrue(verify_multi_inclusion_batch_bound(batch, root))
+
+    # ---- structural rejection ----------------------------------------------
+
+    def test_empty_batch_returns_false(self):
+        proof = MerkleMultiProof(0, (), ())
+        batch = BoundMerkleMultiBatch((), 0, proof)
+        self.assertFalse(verify_multi_inclusion_batch_bound(batch, bytes(32)))
+
+    def test_leaf_count_must_match_entries(self):
+        items = self._honest_items()
+        batch, root, _ = self.build(items)
+        for claimed in (2, 4):
+            bad = BoundMerkleMultiBatch(batch.entries, claimed, batch.proof)
+            self.assertFalse(verify_multi_inclusion_batch_bound(bad, root))
+
+    def test_leaf_count_must_match_proof_leaf_count(self):
+        items = self._honest_items()
+        bad_proof = MerkleMultiProof(2, (0, 1, 2), ())
+        batch, root, _ = self.build(items)
+        bad = BoundMerkleMultiBatch(batch.entries, 3, bad_proof)
+        self.assertFalse(verify_multi_inclusion_batch_bound(bad, root))
+
+    def test_non_positive_leaf_count_returns_false(self):
+        items = self._honest_items()
+        batch, root, _ = self.build(items)
+        for count in (0, -1):
+            bad = BoundMerkleMultiBatch(batch.entries, count, batch.proof)
+            self.assertFalse(verify_multi_inclusion_batch_bound(bad, root))
+
+    def test_indices_must_cover_all_positions(self):
+        items = self._honest_items()
+        batch, root, _ = self.build(items)
+        cases = {
+            "gap": (0, 1, 3),
+            "partial": (0, 1),
+            "reordered": (2, 1, 0),
+            "duplicate": (0, 0, 2),
+            "empty": (),
+            "out_of_range": (0, 1, 5),
+        }
+        for label, indices in cases.items():
+            bad_proof = MerkleMultiProof(3, tuple(indices), batch.proof.siblings)
+            bad = BoundMerkleMultiBatch(batch.entries, 3, bad_proof)
+            self.assertFalse(
+                verify_multi_inclusion_batch_bound(bad, root), label
+            )
+
+    def test_wrong_root_rejected(self):
+        batch, _, _ = self.build(self._honest_items())
+        self.assertFalse(verify_multi_inclusion_batch_bound(batch, bytes(32)))
+        self.assertFalse(verify_multi_inclusion_batch_bound(batch, b""))
+        self.assertFalse(verify_multi_inclusion_batch_bound(batch, bytes(33)))
+
+    def test_tampered_item_fails_outer_root(self):
+        items = self._honest_items()
+        batch, root, _ = self.build(items)
+        # swap item order: the committed root no longer matches the leaves
+        swapped = BoundMerkleMultiBatch(
+            (items[1], items[0], items[2]), 3, batch.proof
+        )
+        self.assertFalse(verify_multi_inclusion_batch_bound(swapped, root))
+        # tamper one item's leaf bytes (a sibling digest)
+        proof0 = items[0].proof
+        self.assertTrue(proof0.siblings)
+        last = proof0.siblings[-1]
+        tampered_sibling = last[:-1] + bytes([last[-1] ^ 1])
+        tampered_proof = MerkleMultiProof(
+            proof0.leaf_count,
+            proof0.indices,
+            proof0.siblings[:-1] + (tampered_sibling,),
+        )
+        tampered = MerkleMultiBatchEntry(
+            items[0].entries, tampered_proof, items[0].root
+        )
+        tampered_batch = BoundMerkleMultiBatch(
+            (tampered,) + tuple(items[1:]), 3, batch.proof
+        )
+        self.assertFalse(verify_multi_inclusion_batch_bound(tampered_batch, root))
+
+    # ---- delegation ---------------------------------------------------------
+
+    def test_root_passes_then_delegates_verbatim(self):
+        import zkregion
+
+        batch, root, _ = self.build(self._honest_items())
+        seen = {}
+        original = zkregion.verify_multi_inclusion_batch
+
+        def tracking(argument):
+            seen["argument"] = argument
+            return original(argument)
+
+        zkregion.verify_multi_inclusion_batch = tracking
+        try:
+            self.assertTrue(verify_multi_inclusion_batch_bound(batch, root))
+        finally:
+            zkregion.verify_multi_inclusion_batch = original
+        self.assertIs(seen["argument"], batch.entries)
+
+    def test_no_delegation_when_outer_root_fails(self):
+        import zkregion
+
+        batch, _, _ = self.build(self._honest_items())
+
+        def boom(_entries):
+            raise AssertionError("verify_multi_inclusion_batch must not be called")
+
+        original = zkregion.verify_multi_inclusion_batch
+        zkregion.verify_multi_inclusion_batch = boom
+        try:
+            self.assertFalse(verify_multi_inclusion_batch_bound(batch, bytes(32)))
+            empty = BoundMerkleMultiBatch((), 0, MerkleMultiProof(0, (), ()))
+            self.assertFalse(
+                verify_multi_inclusion_batch_bound(empty, bytes(32))
+            )
+        finally:
+            zkregion.verify_multi_inclusion_batch = original
+
+    def test_outer_verify_runs_before_inner_delegation(self):
+        # the outer verify_multi_inclusion must run; a bad outer root returns
+        # False without the inner batch ever being consulted
+        import zkregion
+
+        batch, _, _ = self.build(self._honest_items())
+        inner_calls = []
+        outer_calls = []
+        inner_original = zkregion.verify_multi_inclusion_batch
+        outer_original = zkregion.verify_multi_inclusion
+
+        def inner_tracking(argument):
+            inner_calls.append(argument)
+            return inner_original(argument)
+
+        def outer_tracking(entries, proof, given_root):
+            outer_calls.append(given_root)
+            return outer_original(entries, proof, given_root)
+
+        zkregion.verify_multi_inclusion_batch = inner_tracking
+        zkregion.verify_multi_inclusion = outer_tracking
+        try:
+            self.assertFalse(verify_multi_inclusion_batch_bound(batch, bytes(32)))
+        finally:
+            zkregion.verify_multi_inclusion_batch = inner_original
+            zkregion.verify_multi_inclusion = outer_original
+        self.assertEqual(len(outer_calls), 1)
+        self.assertEqual(inner_calls, [])
+
+    def test_delegation_rejection_returns_false(self):
+        # items whose outer leaves commit fine but whose own multi-inclusion
+        # proofs are invalid: the outer root passes, then the inner batch fails
+        leaves = self._leaves("bmmb-bad", 6)
+        good = [
+            self._item(leaves, (0, 2)),
+            self._item(leaves, (1, 4)),
+            self._item(leaves, (3, 5)),
+        ]
+        proof0 = good[0].proof
+        broken_proof = MerkleMultiProof(
+            proof0.leaf_count, proof0.indices, proof0.siblings[:-1]
+        )
+        broken = MerkleMultiBatchEntry(good[0].entries, broken_proof, good[0].root)
+        items = [broken] + good[1:]
+        batch, root, _ = self.build(items)
+        self.assertFalse(verify_multi_inclusion_batch_bound(batch, root))
+        # the same entries fail the plain batch verifier as well
+        self.assertFalse(verify_multi_inclusion_batch(items))
+
+    def test_delegation_result_returned_verbatim(self):
+        import zkregion
+
+        batch, root, _ = self.build(self._honest_items())
+        original = zkregion.verify_multi_inclusion_batch
+        zkregion.verify_multi_inclusion_batch = lambda _entries: False
+        try:
+            # outer root is valid, so the bound's verdict comes straight from
+            # verify_multi_inclusion_batch
+            self.assertFalse(verify_multi_inclusion_batch_bound(batch, root))
+        finally:
+            zkregion.verify_multi_inclusion_batch = original
+        self.assertTrue(verify_multi_inclusion_batch_bound(batch, root))
+
+    # ---- type errors --------------------------------------------------------
+
+    def test_type_errors(self):
+        items = self._honest_items()
+        batch, root, _ = self.build(items)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound("batch", root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(None, root)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(list(items), 3, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(("x",) * 3, 3, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(batch.entries, True, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(batch.entries, 3.0, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(batch.entries, "3", batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(batch.entries, 3, "proof"), root
+            )
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(batch, "root")
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(batch, bytearray(root))
+
+    def test_nested_type_errors(self):
+        items = self._honest_items()
+        batch, root, _ = self.build(items)
+        # item is not a MerkleMultiBatchEntry
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(("x",) + tuple(items[1:]), 3, batch.proof),
+                root,
+            )
+        # item entries is not a tuple
+        list_entries = MerkleMultiBatchEntry(
+            list(items[0].entries), items[0].proof, items[0].root
+        )
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(
+                    (list_entries,) + tuple(items[1:]), 3, batch.proof
+                ),
+                root,
+            )
+        # a pair that is not a 2-tuple
+        bad_pair = MerkleMultiBatchEntry(
+            ((1, b"x", 0),) + items[0].entries[1:],
+            items[0].proof,
+            items[0].root,
+        )
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch((bad_pair,) + tuple(items[1:]), 3, batch.proof),
+                root,
+            )
+        # bool / non-integer pair index and non-bytes leaf
+        bool_index = MerkleMultiBatchEntry(
+            ((True, b"x"),) + items[0].entries[1:],
+            items[0].proof,
+            items[0].root,
+        )
+        str_leaf = MerkleMultiBatchEntry(
+            ((items[0].entries[0][0], "x"),) + items[0].entries[1:],
+            items[0].proof,
+            items[0].root,
+        )
+        for bad in (bool_index, str_leaf):
+            with self.assertRaises(TypeError):
+                verify_multi_inclusion_batch_bound(
+                    BoundMerkleMultiBatch((bad,) + tuple(items[1:]), 3, batch.proof),
+                    root,
+                )
+        # item proof is not a MerkleMultiProof
+        bad_proof_field = MerkleMultiBatchEntry(
+            items[0].entries, "proof", items[0].root
+        )
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(
+                    (bad_proof_field,) + tuple(items[1:]), 3, batch.proof
+                ),
+                root,
+            )
+        # item root is not bytes
+        bad_root_field = MerkleMultiBatchEntry(
+            items[0].entries, items[0].proof, bytearray(items[0].root)
+        )
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(
+                    (bad_root_field,) + tuple(items[1:]), 3, batch.proof
+                ),
+                root,
+            )
+        # bool item-proof leaf_count
+        bool_count = MerkleMultiBatchEntry(
+            items[0].entries,
+            MerkleMultiProof(True, items[0].proof.indices, items[0].proof.siblings),
+            items[0].root,
+        )
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch((bool_count,) + tuple(items[1:]), 3, batch.proof),
+                root,
+            )
+        # item-proof indices not a tuple / a non-integer index
+        bad_indices = MerkleMultiBatchEntry(
+            items[0].entries,
+            MerkleMultiProof(
+                items[0].proof.leaf_count,
+                list(items[0].proof.indices),
+                items[0].proof.siblings,
+            ),
+            items[0].root,
+        )
+        str_index = MerkleMultiBatchEntry(
+            items[0].entries,
+            MerkleMultiProof(
+                items[0].proof.leaf_count,
+                tuple("0" for _ in items[0].proof.indices),
+                items[0].proof.siblings,
+            ),
+            items[0].root,
+        )
+        for bad in (bad_indices, str_index):
+            with self.assertRaises(TypeError):
+                verify_multi_inclusion_batch_bound(
+                    BoundMerkleMultiBatch((bad,) + tuple(items[1:]), 3, batch.proof),
+                    root,
+                )
+        # item-proof siblings not a tuple / a non-bytes sibling
+        list_siblings = MerkleMultiBatchEntry(
+            items[0].entries,
+            MerkleMultiProof(
+                items[0].proof.leaf_count,
+                items[0].proof.indices,
+                list(items[0].proof.siblings),
+            ),
+            items[0].root,
+        )
+        nonbytes_sibling = MerkleMultiBatchEntry(
+            items[0].entries,
+            MerkleMultiProof(
+                items[0].proof.leaf_count, items[0].proof.indices, ("x",)
+            ),
+            items[0].root,
+        )
+        for bad in (list_siblings, nonbytes_sibling):
+            with self.assertRaises(TypeError):
+                verify_multi_inclusion_batch_bound(
+                    BoundMerkleMultiBatch((bad,) + tuple(items[1:]), 3, batch.proof),
+                    root,
+                )
+        # outer proof nested field types
+        bad_outer_index = MerkleMultiProof(3, (0, 1, "2"), batch.proof.siblings)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(batch.entries, 3, bad_outer_index), root
+            )
+        bad_outer_indices = MerkleMultiProof(3, [0, 1, 2], batch.proof.siblings)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(batch.entries, 3, bad_outer_indices), root
+            )
+        bad_outer_siblings = MerkleMultiProof(3, (0, 1, 2), ("x",))
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(batch.entries, 3, bad_outer_siblings), root
+            )
+        bad_outer_count = MerkleMultiProof("3", (0, 1, 2), batch.proof.siblings)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(batch.entries, 3, bad_outer_count), root
+            )
+
+    def test_nested_type_error_in_later_item_still_raises(self):
+        items = self._honest_items()
+        bad_root_field = MerkleMultiBatchEntry(
+            items[2].entries, items[2].proof, bytearray(items[2].root)
+        )
+        batch, root, _ = self.build(items)
+        with self.assertRaises(TypeError):
+            verify_multi_inclusion_batch_bound(
+                BoundMerkleMultiBatch(
+                    tuple(items[:2]) + (bad_root_field,), 3, batch.proof
+                ),
+                root,
+            )
+
+    # ---- input preservation -------------------------------------------------
+
+    def test_inputs_not_mutated(self):
+        items = self._honest_items()
+        batch, root, _ = self.build(items)
+        root_snapshot = bytes(root)
+        items_snapshot = [
+            (item.entries, item.root, item.proof.leaf_count,
+             item.proof.indices, item.proof.siblings)
+            for item in items
+        ]
+        proof_snapshot = (
+            batch.proof.leaf_count, batch.proof.indices, batch.proof.siblings
+        )
+        self.assertTrue(verify_multi_inclusion_batch_bound(batch, root))
+        self.assertEqual(root, root_snapshot)
+        self.assertEqual(
+            [
+                (item.entries, item.root, item.proof.leaf_count,
+                 item.proof.indices, item.proof.siblings)
+                for item in items
+            ],
+            items_snapshot,
+        )
+        self.assertEqual(
+            (batch.proof.leaf_count, batch.proof.indices, batch.proof.siblings),
+            proof_snapshot,
+        )
+        # rejected input is left untouched too
+        self.assertFalse(verify_multi_inclusion_batch_bound(batch, bytes(32)))
+        self.assertEqual(root, root_snapshot)
+        self.assertEqual(
+            [
+                (item.entries, item.root, item.proof.leaf_count,
+                 item.proof.indices, item.proof.siblings)
+                for item in items
+            ],
+            items_snapshot,
+        )
 
 
 class ReplayBindingTest(unittest.TestCase):

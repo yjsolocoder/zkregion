@@ -31,7 +31,8 @@ Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleInclusionBatchEntry / verify_inclusion_batch /
 MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion / MerkleMultiBatchEntry /
-verify_multi_inclusion_batch /
+verify_multi_inclusion_batch / BoundMerkleMultiBatch /
+verify_multi_inclusion_batch_bound /
 MerkleConsistencyProof / prove_consistency /
 verify_consistency / MerkleConsistencyBatchEntry /
 verify_consistency_batch / BoundConsistencyBatch /
@@ -62,6 +63,7 @@ __all__ = [
     "BoundConsistencyChainBatch",
     "BoundConsistencyChainReplayGuard",
     "BoundConsistencyReplayGuard",
+    "BoundMerkleMultiBatch",
     "BoundRangeBatch",
     "BoundRegionBatch",
     "BoundRegionReplayGuard",
@@ -126,6 +128,7 @@ __all__ = [
     "verify_inclusion_batch",
     "verify_multi_inclusion",
     "verify_multi_inclusion_batch",
+    "verify_multi_inclusion_batch_bound",
     "verify_opening",
     "verify_pedersen_opening",
     "verify_range",
@@ -2013,6 +2016,148 @@ def verify_multi_inclusion_batch(batch: Sequence[MerkleMultiBatchEntry]) -> bool
         if not verify_multi_inclusion(item.entries, item.proof, item.root):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed complete multi-inclusion batches
+#
+# A whole batch of MerkleMultiBatchEntry items frozen together with the outer
+# Merkle multi-inclusion proof that commits to every item. Each outer Merkle
+# leaf starts from the domain separator b"zkregion/multi-batch/v1" and then
+# writes F(Q(item)), where Q reuses, byte for byte, the continuous run of the
+# MerkleMultiReplayGuard transcript from F(root) through
+# S(proof.siblings, id): F(root) || F(U(proof.leaf_count)) ||
+# S(proof.indices, U) || S(item.entries, Q_e) || S(proof.siblings, id), i.e.
+# the bytes of _merkle_multi_proof_framing. Items keep their batch order with
+# duplicates retained. Verification first checks every outer leaf against the
+# Merkle root, then runs the unchanged verify_multi_inclusion_batch.
+
+_BOUND_MERKLE_MULTI_BATCH_DOMAIN = b"zkregion/multi-batch/v1"
+
+
+@dataclass(frozen=True)
+class BoundMerkleMultiBatch:
+    """A complete multi-inclusion batch bound to an outer Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a non-empty tuple of
+    :class:`MerkleMultiBatchEntry`; ``leaf_count`` — a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``; ``proof`` — the outer
+    :class:`MerkleMultiProof` whose indices cover
+    ``0 .. leaf_count - 1`` without gaps, duplicates or reordering. All
+    three are positional construction arguments; batches compare by
+    value and are immutable.
+    """
+
+    entries: tuple[MerkleMultiBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_merkle_multi_batch_leaf(item: MerkleMultiBatchEntry) -> bytes:
+    """Build the outer Merkle leaf committed for one :class:`MerkleMultiBatchEntry`.
+
+    The leaf is ``F(D) || F(Q(item))`` with domain
+    ``D = b"zkregion/multi-batch/v1"`` and ``F(x)`` the four-byte
+    unsigned big-endian length prefix of ``x`` followed by ``x``.
+    ``Q(item)`` reuses, byte for byte, the continuous run of the
+    :class:`MerkleMultiReplayGuard` transcript from ``F(root)`` through
+    ``S(proof.siblings, id)`` —
+    ``F(root) || F(U(proof.leaf_count)) || S(proof.indices, U) ||``
+    ``S(item.entries, Q_e) || S(proof.siblings, id)`` — i.e. the bytes
+    produced by :func:`_merkle_multi_proof_framing`, with each
+    ``(index, leaf)`` pair framed as ``Q_e = F(U(index)) || F(leaf)``.
+    The leaf digest then follows the standard Merkle leaf rule.
+    """
+    material = bytearray()
+    material += _frame_length_prefixed(_BOUND_MERKLE_MULTI_BATCH_DOMAIN)
+    material += _frame_length_prefixed(
+        _merkle_multi_proof_framing(item.entries, item.root, item.proof)
+    )
+    return bytes(material)
+
+
+def verify_multi_inclusion_batch_bound(
+    batch: BoundMerkleMultiBatch,
+    root: bytes,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundMerkleMultiBatch`.
+
+    The outer Merkle binding is checked first: every
+    :class:`MerkleMultiBatchEntry` is encoded to its outer leaf exactly
+    as specified by :func:`_bound_merkle_multi_batch_leaf` —
+    ``F(b"zkregion/multi-batch/v1") || F(Q(item))``, where ``Q(item)``
+    is the :class:`MerkleMultiReplayGuard` transcript run from
+    ``F(root)`` through ``S(proof.siblings, id)`` — and the whole batch
+    is checked against ``root`` with :func:`verify_multi_inclusion`,
+    keeping the batch order and duplicate items. ``leaf_count`` must be
+    a positive, non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``, and ``proof.indices`` must equal
+    ``tuple(range(leaf_count))`` — covering ``0 .. leaf_count - 1`` with
+    no gaps, duplicates or reordering; an empty batch, a count mismatch
+    or any index mismatch returns ``False``. Only after the outer root
+    check passes do the unchanged entries go through
+    :func:`verify_multi_inclusion_batch`, handed over exactly as given;
+    a failed outer check never reaches the inner batch verification.
+
+    The nested types of the whole batch are preflighted before any
+    verification runs, so a wrong type in any item — including a later
+    one — raises :class:`TypeError`: a batch that is not a
+    :class:`BoundMerkleMultiBatch`, non-tuple entries,
+    non-:class:`MerkleMultiBatchEntry` items, a non-integer or ``bool``
+    ``leaf_count``, a wrong outer proof, a non-``bytes`` root, or
+    malformed nested field types in any item (non-tuple ``(index,
+    leaf)`` pairs, ``bool`` or non-integer indices, non-``bytes``
+    leaves or roots, a non-:class:`MerkleMultiProof` item proof, or
+    non-tuple / wrongly-typed proof ``indices`` / ``siblings``). Every
+    other invalidity (empty batch, miscount, incomplete indices, wrong
+    root, tampered leaf bytes or any
+    :func:`verify_multi_inclusion_batch` rejection) returns ``False``.
+    Inputs are never mutated.
+    """
+    if not isinstance(batch, BoundMerkleMultiBatch):
+        raise TypeError("batch must be a BoundMerkleMultiBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(
+            "batch entries must be a tuple of MerkleMultiBatchEntry"
+        )
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    # Preflight every item's nested types before anything is verified;
+    # a bad type in a later item still raises TypeError here.
+    _check_multi_inclusion_batch_entries_types(entries)
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_merkle_multi_batch_leaf(item) for item in entries]
+
+    # 1) the outer Merkle root commits to every item leaf, then
+    # 2) the unchanged multi-inclusion batch verification checks each item
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_multi_inclusion_batch(entries)
 
 
 # ---------------------------------------------------------------------------

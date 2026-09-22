@@ -81,6 +81,7 @@ __all__ = [
     "SchnorrProver",
     "SchnorrVerifier",
     "SQLiteReplayStore",
+    "SingleKeyBatchGuard",
     "commit",
     "commit_coordinate",
     "merkle_root",
@@ -2504,6 +2505,7 @@ _MERKLE_INCLUSION_REPLAY_DOMAIN = b"zr/mir/v1"
 _MERKLE_MULTI_REPLAY_DOMAIN = b"zr/mmr/v1"
 _MERKLE_CONSISTENCY_BATCH_REPLAY_DOMAIN = b"zr/mcbr/v1"
 _SCHNORR_BATCH_REPLAY_DOMAIN = b"zr/sbr/v1"
+_SINGLE_KEY_BATCH_REPLAY_DOMAIN = b"zr/skbr/v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -6677,6 +6679,408 @@ class SchnorrBatchReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_schnorr_batch(entries, randbelow=randbelow):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# SingleKeyBatchGuard binds a whole batch of SchnorrBatchEntry items — all
+# made for one fixed public key and group — to one session id. Without a
+# store the pending/claimed/consumed states are local to the guard instance,
+# while an SQLiteReplayStore keeps pending, claimed and consumed ids in the
+# store under b"zr/skbr/v1", shared across instances, processes and restarts.
+# bind_once registers a pending binding, check claims the id atomically,
+# recomputes the digest, checks the expiry, delegates the batch verification
+# to the fixed SchnorrVerifier's verify_batch with randbelow passed through
+# unchanged and consumes the id only on full success; every rejection leaves
+# the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || S(entries, L) || F(E)
+# )
+#   D = b"zr/skbr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   L(e) = the BoundSchnorr leaf raw bytes built for e with this guard's
+#          public key and group parameters (_bound_schnorr_leaf)
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+
+
+def _check_schnorr_batch_entries_types(
+    entries: object,
+) -> list[SchnorrBatchEntry]:
+    """Validate the single-key Schnorr-batch ``entries`` argument types.
+
+    Mirrors the sequence and nested type rules of
+    :meth:`SchnorrVerifier.verify_batch`: ``entries`` must be a
+    non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`SchnorrBatchEntry` objects whose ``message`` / ``context`` are
+    ``bytes`` and whose ``proof`` is a :class:`SchnorrProof` with
+    non-``bool`` integer commitment / response. The entries are copied into
+    a fresh list so the inputs are never mutated; an empty batch is left
+    for :meth:`SingleKeyBatchGuard.bind_once` to reject with
+    :class:`ValueError`, and structural/value problems (out-of-range
+    commitments, negative responses) are left to
+    :meth:`SchnorrVerifier.verify_batch` at check time.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of SchnorrBatchEntry")
+    items: list[SchnorrBatchEntry] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, SchnorrBatchEntry):
+            raise TypeError(f"entries[{position}] must be a SchnorrBatchEntry")
+        _check_bytes(entry.message, f"entries[{position}] message")
+        _check_bytes(entry.context, f"entries[{position}] context")
+        proof = entry.proof
+        if not isinstance(proof, SchnorrProof):
+            raise TypeError(f"entries[{position}] proof must be a SchnorrProof")
+        if (
+            not isinstance(proof.commitment, int)
+            or isinstance(proof.commitment, bool)
+            or not isinstance(proof.response, int)
+            or isinstance(proof.response, bool)
+        ):
+            raise TypeError(
+                f"entries[{position}] proof commitment and response must be integers"
+            )
+        items.append(entry)
+    return items
+
+
+def _single_key_batch_leaf(
+    entry: SchnorrBatchEntry,
+    public_key: int,
+    prime: int,
+    generator: int,
+) -> bytes:
+    """The BoundSchnorr leaf raw bytes for ``entry`` under one fixed key/group.
+
+    The leaf is built byte for byte by :func:`_bound_schnorr_leaf` from a
+    :class:`MultiSchnorrEntry` carrying the guard's ``public_key``,
+    ``prime`` and ``generator`` together with the entry's ``message``,
+    ``proof`` and ``context``.
+    """
+    return _bound_schnorr_leaf(
+        MultiSchnorrEntry(
+            public_key, entry.message, entry.proof, entry.context, prime, generator
+        )
+    )
+
+
+def _single_key_batch_replay_encodable(entries: Sequence[SchnorrBatchEntry]) -> bool:
+    """The batch length must fit in uint64 and every leaf integer be framed.
+
+    The outer ``S`` sequence writes the batch count with ``U`` (eight-byte
+    unsigned big-endian), and each leaf frames the proof commitment /
+    response with the shortest unsigned big-endian encoding; a count
+    outside uint64 or a negative leaf integer cannot be framed. The guard's
+    own ``prime`` / ``generator`` / ``public_key`` are validated positive
+    at construction, so only the proof integers can be negative here.
+    """
+    if not 0 <= len(entries) <= _UINT64_MAX:
+        return False
+    for entry in entries:
+        if min(entry.proof.commitment, entry.proof.response) < 0:
+            return False
+    return True
+
+
+def _single_key_batch_replay_digest(
+    entries: Sequence[SchnorrBatchEntry],
+    session_id: bytes,
+    expires_at: int | None,
+    *,
+    public_key: int,
+    prime: int,
+    generator: int,
+) -> bytes:
+    """Compute the single-key Schnorr batch replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``S(entries, L)`` and
+    ``F(E)``; ``L(entry)`` is the BoundSchnorr leaf raw bytes built with
+    the guard's public key and group parameters, and the entries keep
+    their batch order (duplicates included).
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_SINGLE_KEY_BATCH_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    # S(entries, L) = F(U(|entries|)) || Σ F(L(entry))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(entries))))
+    for entry in entries:
+        leaf = _single_key_batch_leaf(entry, public_key, prime, generator)
+        transcript.update(_frame_length_prefixed(leaf))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+class SingleKeyBatchGuard:
+    """Single-use replay protection for a same-key :class:`SchnorrBatchEntry` batch.
+
+    The guard is bound to one fixed ``public_key`` and group (``prime`` /
+    ``generator``, defaulting to :data:`DEFAULT_PRIME` /
+    :data:`DEFAULT_GENERATOR`); every batch it checks is verified by the
+    :class:`SchnorrVerifier` constructed once from those parameters.
+    :meth:`bind_once` registers a pending :class:`ReplayBinding` that
+    commits a whole non-empty batch of :class:`SchnorrBatchEntry` items —
+    the same sequence shape accepted by
+    :meth:`SchnorrVerifier.verify_batch`, kept in the given order with
+    duplicates preserved — to a session id; :meth:`check` accepts an equal
+    pending binding exactly once, recomputing the binding digest, checking
+    the expiry and delegating to the fixed verifier's
+    :meth:`~SchnorrVerifier.verify_batch` with the random source passed
+    through unchanged, and then marks the id consumed. The digest frames
+    the batch under ``SHA-256(F(D) || F(session_id) || S(entries, L) ||
+    F(E))`` with domain ``b"zr/skbr/v1"``, where ``L(entry)`` is the
+    existing BoundSchnorr leaf raw bytes built with this guard's public
+    key and group parameters (the same bytes :func:`_bound_schnorr_leaf`
+    builds for :func:`verify_bound`); the F / U / S framing and the E
+    expiry encoding are reused byte for byte from the other replay guards.
+    By default both the pending and the consumed state live on this guard
+    instance and are never shared between instances; passing an
+    :class:`SQLiteReplayStore` as ``store`` instead keeps the state in
+    that store under the ``b"zr/skbr/v1"`` key domain, so batch guards
+    attached to the same store namespace share pending, claimed and
+    consumed ids across independent instances, processes and process
+    restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the digest/expiry work and the delegated batch verification
+    (the in-instance registry lock, or the store's short transaction and
+    unique claim token); the claim is per-id registry state rather than a
+    global lock, so a batch being verified under one id never serializes
+    checks or binds of other ids.
+    """
+
+    def __init__(
+        self,
+        public_key: int,
+        *,
+        prime: int = DEFAULT_PRIME,
+        generator: int = DEFAULT_GENERATOR,
+        store: SQLiteReplayStore | None = None,
+    ) -> None:
+        _check_int(public_key, "public_key")
+        _check_int(prime, "prime")
+        _check_int(generator, "generator")
+        # The fixed verifier carries the group-value range checks.
+        self._verifier = SchnorrVerifier(public_key, prime=prime, generator=generator)
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._public_key = public_key
+        self._prime = prime
+        self._generator = generator
+        self._store = (
+            None
+            if store is None
+            else store._view(_SINGLE_KEY_BATCH_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def public_key(self) -> int:
+        return self._public_key
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def _digest(
+        self,
+        entries: Sequence[SchnorrBatchEntry],
+        session_id: bytes,
+        expires_at: int | None,
+    ) -> bytes:
+        """The binding digest over ``entries`` under this guard's key/group."""
+        return _single_key_batch_replay_digest(
+            entries,
+            session_id,
+            expires_at,
+            public_key=self._public_key,
+            prime=self._prime,
+            generator=self._generator,
+        )
+
+    def bind_once(
+        self,
+        entries: Sequence[SchnorrBatchEntry],
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to the batch.
+
+        Returns the frozen :class:`ReplayBinding`. ``entries`` must be a
+        non-string, non-empty sequence of :class:`SchnorrBatchEntry`
+        objects following the same sequence and nested type rules as
+        :meth:`SchnorrVerifier.verify_batch`: every entry's ``message``
+        and ``context`` are ``bytes`` and its ``proof`` is a
+        :class:`SchnorrProof` with non-``bool`` integer commitment /
+        response; entries are kept in the given order with duplicates
+        preserved and no item dropped. ``session_id`` must be non-empty
+        ``bytes`` and ``expires_at`` must be either ``None`` or a
+        non-``bool`` unsigned 64-bit Unix-second timestamp; the
+        ``U``-framed batch length must fit in uint64 and every leaf
+        integer (the proof commitment / response) must be non-negative. A
+        session id that is already pending, being checked or consumed
+        raises :class:`ValueError`. Wrong argument or nested field types
+        (including ``bool`` integers) raise :class:`TypeError`; an empty
+        batch or empty id, an out-of-uint64 expiry or batch length, a
+        negative leaf integer or a rebind raise :class:`ValueError`.
+        Inputs are never mutated.
+        """
+        items = _check_schnorr_batch_entries_types(entries)
+        _check_bytes(session_id, "session_id")
+        if not items:
+            raise ValueError("entries must not be empty")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _single_key_batch_replay_encodable(items):
+            raise ValueError(
+                "batch length and leaf integers must be non-negative unsigned integers"
+            )
+        binding = ReplayBinding(
+            session_id,
+            self._digest(items, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entries: Sequence[SchnorrBatchEntry],
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+        randbelow: Callable[[int], int] = secrets.randbelow,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id
+        at most one can return ``True``. The digest is recomputed over the
+        presented ``entries`` in their given order; for a binding with an
+        expiry, ``now >= expires_at`` makes the check fail (``now``
+        defaults to the current Unix seconds and must otherwise be a
+        non-``bool`` uint64). Only then is the batch handed to the fixed
+        verifier's :meth:`SchnorrVerifier.verify_batch` with ``randbelow``
+        passed through unchanged, under that method's sequence, structure
+        and randomness contract: it is called once per structurally valid
+        entry as ``randbelow(prime - 1)``, a non-callable source or a
+        non-integer result raises :class:`TypeError` and a coefficient
+        outside ``[0, prime - 1)`` raises :class:`ValueError`.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, an empty batch, a
+        negative leaf integer, or the delegated batch verification
+        returning ``False``) returns ``False``, releases the claim and
+        leaves the registration pending. An exception escaping the
+        delegated verification (such as the :class:`TypeError` /
+        :class:`ValueError` raised by a bad ``randbelow``) likewise
+        releases the claim and then propagates unchanged, leaving the id
+        usable. With a store backend, only the holder of the current claim
+        token can consume the id (an expired claim may be taken over by a
+        later equal ``check``); a stale token neither consumes nor
+        restores anything. Verification runs without any lock or
+        transaction held, so other ids are never serialized. Argument type
+        errors (including a non-callable ``randbelow``) raise
+        :class:`TypeError`; an out-of-range ``now`` raises
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        items = _check_schnorr_batch_entries_types(entries)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if not callable(randbelow):
+            raise TypeError("randbelow must be callable")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _single_key_batch_replay_encodable(items):
+            return False  # an oversized batch or negative leaf integers
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(items, binding, session_id, current, randbelow)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                self._digest(items, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not self._verifier.verify_batch(items, randbelow=randbelow):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entries: Sequence[SchnorrBatchEntry],
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+        randbelow: Callable[[int], int],
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                self._digest(entries, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not self._verifier.verify_batch(entries, randbelow=randbelow):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

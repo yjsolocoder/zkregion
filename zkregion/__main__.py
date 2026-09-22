@@ -32,6 +32,7 @@ from . import (
     SchnorrProof,
     SchnorrProver,
     SchnorrVerifier,
+    SingleKeyBatchGuard,
     commit,
     commit_coordinate,
     merkle_root,
@@ -474,6 +475,32 @@ def main() -> int:
     foreign_sbr_binding = foreign_sbr.bind_once(multi_batch, b"schnorr-batch-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_sbr.check(multi_batch, foreign_sbr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for same-key Schnorr batches (bind once, check once):")
+    skbr = SingleKeyBatchGuard(prover.public_key)
+    skbr_binding = skbr.bind_once(batch, b"single-key-batch-session-1", expires_at=10**12)
+    print(f"  digest={skbr_binding.digest.hex()[:32]}…  expires_at={skbr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{skbr.check(batch, skbr_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not skbr.check(batch, skbr_binding, now=101, randbelow=counter_randbelow())}")
+    other_skbr = SingleKeyBatchGuard(prover.public_key)
+    other_skbr_binding = other_skbr.bind_once(batch, b"single-key-batch-session-2")
+    print(f"  reordered batch rejected without consuming the id: "
+          f"{not other_skbr.check(batch[::-1], other_skbr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_skbr.check(batch, other_skbr_binding, now=1, randbelow=counter_randbelow())}")
+    try:
+        skbr.bind_once(batch, b"single-key-batch-session-1")
+    except ValueError:
+        print("  rebind of a consumed id rejected: True")
+    else:
+        print("  rebind of a consumed id rejected: False")
+    wrong_key_skbr = SingleKeyBatchGuard(SchnorrProver(secret=0xC0FFEE).public_key)
+    wrong_key_binding = wrong_key_skbr.bind_once(batch, b"single-key-batch-session-3")
+    print(f"  batch under the wrong key rejected without consuming the id: "
+          f"{not wrong_key_skbr.check(batch, wrong_key_binding, now=1, randbelow=counter_randbelow())}")
 
     print()
     print("per-instance replay protection for range proofs (bind once, check once):")

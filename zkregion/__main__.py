@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 
 from . import (
+    BoundConsistencyBatch,
     BoundRangeBatch,
     BoundRegionBatch,
     BoundRegionReplayGuard,
@@ -15,6 +16,7 @@ from . import (
     MerkleConsistencyBatchReplayGuard,
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyReplayGuard,
+    MerkleMultiProof,
     MultiSchnorrEntry,
     RangeBatchEntry,
     RangeBatchReplayGuard,
@@ -47,6 +49,7 @@ from . import (
     prove_region,
     verify_bound,
     verify_consistency_batch,
+    verify_consistency_batch_bound,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
@@ -457,6 +460,50 @@ def main() -> int:
     # entries are independent: counts need not chain to their neighbours
     unordered = [consistency_entries[2], consistency_entries[0], consistency_entries[1]]
     print(f"  non-adjacent, reordered counts accepted: {verify_consistency_batch(unordered)}")
+
+    print()
+    print("Merkle-committed complete consistency batch verification:")
+
+    def bound_consistency_leaf(entry: MerkleConsistencyBatchEntry) -> bytes:
+        proof = entry.proof
+        items = [
+            b"zkregion/consistency-bound/v1",
+            entry.old_root,
+            entry.new_root,
+            str(proof.old_count).encode("ascii"),
+            str(proof.new_count).encode("ascii"),
+        ]
+        items.extend(proof.nodes)
+        return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+    consistency_bound_leaves = [
+        bound_consistency_leaf(entry) for entry in consistency_entries
+    ]
+    consistency_bound_root = merkle_root(consistency_bound_leaves)
+    consistency_bound_proof = prove_multi_inclusion(
+        consistency_bound_leaves, tuple(range(len(consistency_bound_leaves)))
+    )
+    consistency_bound = BoundConsistencyBatch(
+        tuple(consistency_entries), len(consistency_entries), consistency_bound_proof
+    )
+    print("  valid bound batch accepted: "
+          f"{verify_consistency_batch_bound(consistency_bound, consistency_bound_root)}")
+    print("  wrong root rejected: "
+          f"{not verify_consistency_batch_bound(consistency_bound, merkle_root(consistency_bound_leaves[:1]))}")
+    print("  empty batch rejected: "
+          f"{not verify_consistency_batch_bound(BoundConsistencyBatch((), 0, MerkleMultiProof(0, (), ())), bytes(32))}")
+    gap_proof = MerkleMultiProof(
+        len(consistency_entries), (0, 1, 3), consistency_bound_proof.siblings
+    )
+    print("  incomplete indices rejected: "
+          f"{not verify_consistency_batch_bound(BoundConsistencyBatch(tuple(consistency_entries), 3, gap_proof), consistency_bound_root)}")
+    forged_leaves = [bound_consistency_leaf(entry) for entry in tampered]
+    forged_proof = prove_multi_inclusion(forged_leaves, tuple(range(len(forged_leaves))))
+    forged_bound = BoundConsistencyBatch(
+        tuple(tampered), len(tampered), forged_proof
+    )
+    print("  tampered entry rejected: "
+          f"{not verify_consistency_batch_bound(forged_bound, merkle_root(forged_leaves))}")
 
     print()
     print("per-instance replay protection (bind once, check once):")

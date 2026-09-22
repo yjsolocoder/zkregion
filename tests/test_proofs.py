@@ -10,6 +10,7 @@ from zkregion import (
     DEFAULT_GENERATOR,
     DEFAULT_PRIME,
     BoundConsistencyBatch,
+    BoundConsistencyReplayGuard,
     BoundRangeBatch,
     BoundRegionBatch,
     BoundRegionReplayGuard,
@@ -8279,6 +8280,655 @@ class BoundConsistencyBatchTest(unittest.TestCase):
             ],
             entries_snapshot,
         )
+
+
+class BoundConsistencyReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for Merkle-bound consistency batches."""
+
+    DOMAIN = b"zr/bcbr/v1"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "bcbr.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def guard(self, **kwargs):
+        return BoundConsistencyReplayGuard(**kwargs)
+
+    def _leaves(self, count=6):
+        return [f"bcbr-{i}".encode() for i in range(count)]
+
+    def _entry(self, leaves, old_count):
+        return MerkleConsistencyBatchEntry(
+            merkle_root(leaves[:old_count]),
+            merkle_root(leaves),
+            prove_consistency(leaves, old_count),
+        )
+
+    def build(self, entries):
+        leaves = [bound_consistency_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        batch = BoundConsistencyBatch(tuple(entries), len(entries), proof)
+        return batch, root
+
+    def honest(self):
+        leaves = self._leaves(6)
+        return self.build([self._entry(leaves, old) for old in (1, 3, 5)])
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def expected_digest(batch, root, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        proof = batch.proof
+        material = F(b"zr/bcbr/v1") + F(session_id) + F(root) + F(U(batch.leaf_count))
+        material += b"".join(
+            F(bound_consistency_leaf(entry)) for entry in batch.entries
+        )
+        material += (
+            F(U(proof.leaf_count))
+            + F(U(len(proof.indices)))
+            + b"".join(F(U(index)) for index in proof.indices)
+            + F(U(len(proof.siblings)))
+            + b"".join(F(sibling) for sibling in proof.siblings)
+            + F(expiry)
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(batch, root, b"s1"))
+        binding = guard.bind_once(batch, root, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(batch, root, b"s2", 1000)
+        )
+
+    def test_domain_separator_is_distinct(self):
+        batch, root = self.honest()
+        binding = self.guard().bind_once(batch, root, b"s")
+        self.assertEqual(binding.digest, self.expected_digest(batch, root, b"s"))
+        # identical framing under the bound-region domain must differ
+        proof = batch.proof
+
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        material = F(b"zr/brg/v1") + F(b"s") + F(root) + F(U(3))
+        material += b"".join(
+            F(bound_consistency_leaf(entry)) for entry in batch.entries
+        )
+        material += (
+            F(U(proof.leaf_count))
+            + F(U(len(proof.indices)))
+            + b"".join(F(U(index)) for index in proof.indices)
+            + F(U(len(proof.siblings)))
+            + b"".join(F(sibling) for sibling in proof.siblings)
+            + F(b"\x00")
+        )
+        self.assertNotEqual(binding.digest, hashlib.sha256(material).digest())
+
+    def test_digest_binds_every_component(self):
+        leaves = self._leaves(6)
+        entries = [self._entry(leaves, old) for old in (1, 3, 5)]
+        batch, root = self.build(entries)
+        guard = self.guard()
+        base = guard.bind_once(batch, root, b"s")
+        self.assertNotEqual(base.digest, self.expected_digest(batch, root, b"other"))
+        self.assertNotEqual(base.digest, self.expected_digest(batch, root, b"s", 1))
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(batch, hashlib.sha256(root).digest(), b"s"),
+        )
+        bleaves = [bound_consistency_leaf(entry) for entry in entries]
+        single, single_root = self.build(entries[:1])
+        self.assertNotEqual(
+            base.digest, self.expected_digest(single, single_root, b"s")
+        )
+        reordered, reordered_root = self.build(
+            [entries[1], entries[0], entries[2]]
+        )
+        self.assertNotEqual(
+            base.digest, self.expected_digest(reordered, reordered_root, b"s")
+        )
+        # proof siblings participate: a partial multi proof carries siblings
+        partial = prove_multi_inclusion(bleaves, (0, 1))
+        partial_batch = BoundConsistencyBatch(
+            tuple(entries[:2]), 2, partial
+        )
+        self.assertNotEqual(
+            base.digest, self.expected_digest(partial_batch, root, b"s")
+        )
+        # the proof indices participate: reordered indices are structurally
+        # invalid for check, but still change the bound digest
+        reordered_indices = MerkleMultiProof(
+            batch.proof.leaf_count, (2, 1, 0), batch.proof.siblings
+        )
+        retagged = BoundConsistencyBatch(batch.entries, 3, reordered_indices)
+        self.assertNotEqual(
+            self.guard().bind_once(retagged, root, b"s").digest,
+            base.digest,
+        )
+        guard_after = self.guard()
+        retag_binding = guard_after.bind_once(retagged, root, b"r")
+        self.assertFalse(guard_after.check(retagged, root, retag_binding, now=1))
+        # the rejection above never consumed the id, and digest recomputation
+        # with the same object matches an independent guard's binding
+        other = self.guard()
+        other_binding = other.bind_once(retagged, root, b"r")
+        self.assertEqual(retag_binding, other_binding)
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        batch, root = self.honest()
+        none = self.guard().bind_once(batch, root, b"s")
+        zero = self.guard().bind_once(batch, root, b"s", expires_at=0)
+        one = self.guard().bind_once(batch, root, b"s", expires_at=1)
+        self.assertNotEqual(none.digest, zero.digest)
+        self.assertNotEqual(zero.digest, one.digest)
+
+    def test_pending_id_cannot_be_rebound(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        guard.bind_once(batch, root, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        first = guard.bind_once(batch, root, b"s1")
+        second = guard.bind_once(batch, root, b"s2")
+        self.assertNotEqual(first, second)
+        self.assertTrue(guard.check(batch, root, first, now=1))
+        self.assertTrue(guard.check(batch, root, second, now=1))
+
+    # ---- bind argument validation -------------------------------------------
+
+    def test_bind_type_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        for bad in ("batch", 7, None, batch.entries, batch.proof):
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, root, b"s")
+        for bad in (bytearray(root), None, 7, "root"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, bad, b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, root, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, root, b"s", expires_at=bad)
+        with self.assertRaises(TypeError):
+            BoundConsistencyReplayGuard(store=object())
+
+    def test_bind_nested_type_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        entries = batch.entries
+        proof = batch.proof
+        with self.assertRaises(TypeError):
+            guard.bind_once(BoundConsistencyBatch(list(entries), 3, proof), root, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConsistencyBatch(("x",) * 3, 3, proof), root, b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(BoundConsistencyBatch(entries, True, proof), root, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(BoundConsistencyBatch(entries, 3.0, proof), root, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(BoundConsistencyBatch(entries, 3, "proof"), root, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConsistencyBatch(
+                    entries, 3, MerkleMultiProof(3, [0, 1, 2], ())
+                ),
+                root, b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConsistencyBatch(
+                    entries, 3, MerkleMultiProof(3, (0, 1, True), ())
+                ),
+                root, b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConsistencyBatch(
+                    entries, 3, MerkleMultiProof(3, (0, 1, 2), (b"ok", 7))
+                ),
+                root, b"s",
+            )
+        entry = entries[0]
+        bad_entry_cases = [
+            dataclasses.replace(entry, old_root="old"),
+            dataclasses.replace(entry, new_root=7),
+            dataclasses.replace(entry, proof="p"),
+            dataclasses.replace(
+                entry,
+                proof=MerkleConsistencyProof(True, entry.proof.new_count, entry.proof.nodes),
+            ),
+            dataclasses.replace(
+                entry,
+                proof=MerkleConsistencyProof(
+                    entry.proof.old_count, entry.proof.new_count, (b"node", 7)
+                ),
+            ),
+        ]
+        for bad_entry in bad_entry_cases:
+            with self.assertRaises(TypeError):
+                guard.bind_once(
+                    BoundConsistencyBatch((bad_entry,) + entries[1:], 3, proof),
+                    root, b"s",
+                )
+
+    def test_bind_value_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"")
+        for bad in (-1, 2**64):
+            with self.assertRaises(ValueError):
+                guard.bind_once(batch, root, b"s", expires_at=bad)
+        with self.assertRaises(ValueError):
+            guard.bind_once(
+                BoundConsistencyBatch(batch.entries, 2**64, batch.proof), root, b"t"
+            )
+        negative_index = MerkleMultiProof(1, (-1,), ())
+        with self.assertRaises(ValueError):
+            guard.bind_once(
+                BoundConsistencyBatch(batch.entries[:1], 1, negative_index),
+                root, b"t",
+            )
+
+    # ---- honest check and single use ----------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s", expires_at=1000)
+        self.assertTrue(guard.check(batch, root, binding, now=999))
+        self.assertFalse(guard.check(batch, root, binding, now=999))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_check_with_default_now(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        batch, root = self.honest()
+        for now in (0, 2**64 - 1):
+            guard = self.guard()
+            binding = guard.bind_once(batch, root, b"s")
+            self.assertTrue(guard.check(batch, root, binding, now=now))
+
+    def test_expiry_boundary_is_inclusive(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s1", expires_at=1000)
+        self.assertTrue(guard.check(batch, root, binding, now=999))
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s2", expires_at=1000)
+        self.assertFalse(guard.check(batch, root, binding, now=1000))
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s3", expires_at=1000)
+        self.assertFalse(guard.check(batch, root, binding, now=1001))
+
+    # ---- rejection never consumes -------------------------------------------
+
+    def test_expired_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s", expires_at=1000)
+        self.assertFalse(guard.check(batch, root, binding, now=2000))
+        self.assertTrue(guard.check(batch, root, binding, now=999))
+        self.assertFalse(guard.check(batch, root, binding, now=999))
+
+    def test_wrong_root_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertFalse(guard.check(batch, bytes(32), binding, now=1))
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+
+    def test_delegated_batch_rejection_does_not_consume(self):
+        # leaves commit under the multi-inclusion root, but the entry's own
+        # consistency proof is truncated: the root passes and the batch fails
+        leaves = self._leaves(6)
+        good = [self._entry(leaves, old) for old in (1, 3, 5)]
+        proof0 = good[0].proof
+        broken_proof = MerkleConsistencyProof(
+            proof0.old_count, proof0.new_count, proof0.nodes[:-1]
+        )
+        broken = MerkleConsistencyBatchEntry(
+            good[0].old_root, good[0].new_root, broken_proof
+        )
+        batch, root = self.build([broken] + good[1:])
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertFalse(guard.check(batch, root, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_short_sibling_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        bogus_proof = MerkleMultiProof(
+            batch.proof.leaf_count, batch.proof.indices, (b"short",)
+        )
+        bogus_batch = BoundConsistencyBatch(batch.entries, 3, bogus_proof)
+        guard = self.guard()
+        binding = guard.bind_once(bogus_batch, root, b"s")
+        self.assertFalse(guard.check(bogus_batch, root, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(bogus_batch, root, b"s")
+
+    def test_short_root_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        short_root = root[:-1]
+        guard = self.guard()
+        binding = guard.bind_once(batch, short_root, b"s")
+        self.assertFalse(guard.check(batch, short_root, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, short_root, b"s")
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        guard.bind_once(batch, root, b"local")
+        foreign = self.guard().bind_once(batch, root, b"elsewhere")
+        self.assertFalse(guard.check(batch, root, foreign, now=1))
+        equal = self.guard().bind_once(batch, root, b"local")
+        self.assertTrue(guard.check(batch, root, equal, now=1))
+        unknown = ReplayBinding(b"never-bound", b"\x00" * 32)
+        self.assertFalse(guard.check(batch, root, unknown, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        guard.bind_once(batch, root, b"s")
+        forged_digest = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(guard.check(batch, root, forged_digest, now=1))
+        forged_expiry = ReplayBinding(
+            b"s", self.expected_digest(batch, root, b"s", 1), 1
+        )
+        self.assertFalse(guard.check(batch, root, forged_expiry, now=0))
+
+    def test_replaced_proof_mismatches_digest_without_consuming(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        replaced = BoundConsistencyBatch(
+            batch.entries, batch.leaf_count,
+            MerkleMultiProof(3, (0, 1, 2), (b"\x00" * 32,)),
+        )
+        self.assertFalse(guard.check(replaced, root, binding, now=1))
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+
+    def test_instances_are_independent(self):
+        batch, root = self.honest()
+        first = self.guard()
+        second = self.guard()
+        binding = first.bind_once(batch, root, b"s")
+        self.assertFalse(second.check(batch, root, binding, now=1))
+        self.assertTrue(first.check(batch, root, binding, now=1))
+
+    # ---- check argument validation ------------------------------------------
+
+    def test_check_type_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        for bad in ("batch", 7, None, batch.entries):
+            with self.assertRaises(TypeError):
+                guard.check(bad, root, binding, now=1)
+        for bad in (None, 7, "root", bytearray(root)):
+            with self.assertRaises(TypeError):
+                guard.check(batch, bad, binding, now=1)
+        for bad in ("binding", 7, None, (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(batch, root, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(batch, root, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(batch, root, binding, now=bad)
+
+    def test_oversized_framed_integer_check_returns_false(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        oversized = BoundConsistencyBatch(batch.entries, 2**64, batch.proof)
+        self.assertFalse(guard.check(oversized, root, binding, now=1))
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+
+    def test_inputs_are_not_mutated(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        batch_snapshot = BoundConsistencyBatch(
+            batch.entries, batch.leaf_count, batch.proof
+        )
+        binding = guard.bind_once(batch, root, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        held_root = bytes(root)
+        guard.check(batch, root, binding, now=1)
+        self.assertEqual(batch, batch_snapshot)
+        self.assertEqual(binding, binding_snapshot)
+        self.assertEqual(root, held_root)
+
+    def test_delegation_error_restores_pending_in_memory(self):
+        import zkregion
+
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        original = zkregion.verify_consistency_batch_bound
+
+        def boom(_batch, _root):
+            raise RuntimeError("boom")
+
+        zkregion.verify_consistency_batch_bound = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(batch, root, binding, now=1)
+        finally:
+            zkregion.verify_consistency_batch_bound = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        binder = self.guard(store=store)
+        binding = binder.bind_once(batch, root, b"s", expires_at=1000)
+        checker = self.guard(store=store)
+        self.assertTrue(checker.check(batch, root, binding, now=999))
+        self.assertFalse(binder.check(batch, root, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(batch, root, b"s")
+        store.close()
+        reopened = self.make_store()
+        guard = self.guard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = self.guard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(batch, root, b"s")
+        reopened_again.close()
+
+    def test_store_domain_isolation_from_other_guards(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        brg_guard = BoundRegionReplayGuard(store=store)
+        binding = guard.bind_once(batch, root, b"same-id")
+        region_batch = BoundRegionBatch((), 0, batch.proof)
+        brg_binding = brg_guard.bind_once(region_batch, root, b"same-id")
+        self.assertNotEqual(binding.digest, brg_binding.digest)
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/brg/v1", domains)
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        batch, root = self.honest()
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = self.guard(store=first).bind_once(batch, root, b"s")
+        self.assertFalse(
+            self.guard(store=second).check(batch, root, binding_a, now=1)
+        )
+        self.assertTrue(
+            self.guard(store=first).check(batch, root, binding_a, now=1)
+        )
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        binder = self.guard(store=store)
+        binding = binder.bind_once(batch, root, b"s")
+        checker = self.guard(store=store)
+        self.assertFalse(checker.check(batch, bytes(32), binding, now=1))
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(
+            self.guard(store=store).check(batch, root, binding, now=1)
+        )
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        batch, root = self.honest()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = self.guard(store=store)
+        binding = guard.bind_once(batch, root, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):  # live claim cannot be rebound
+            guard.bind_once(batch, root, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):  # expired claim still cannot be rebound
+            guard.bind_once(batch, root, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):  # consumed id can never be rebound
+            guard.bind_once(batch, root, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        batch, root = self.honest()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = self.guard(store=store).bind_once(batch, root, b"s")
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+    def test_store_delegation_error_restores_pending(self):
+        import zkregion
+
+        batch, root = self.honest()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        binding = guard.bind_once(batch, root, b"s")
+        original = zkregion.verify_consistency_batch_bound
+
+        def boom(_batch, _root):
+            raise RuntimeError("boom")
+
+        zkregion.verify_consistency_batch_bound = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(batch, root, binding, now=1)
+        finally:
+            zkregion.verify_consistency_batch_bound = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            self.guard(store=store).check(batch, root, binding, now=1)
+        )
+        store.close()
+
+    def test_store_sqlite_errors_propagate(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        guard.bind_once(batch, root, b"s")
+        store._connection.execute("DROP TABLE replay_sessions_v1")
+        with self.assertRaises(sqlite3.Error):
+            guard.check(batch, root, ReplayBinding(b"s", b"\x00" * 32), now=1)
+        store.close()
 
 
 class MerkleConsistencyChainTest(unittest.TestCase):

@@ -155,6 +155,40 @@ bound_cb = BoundConsistencyBatch(
 )
 assert verify_consistency_batch_bound(bound_cb, bound_cb_root)
 
+# Merkle 承诺的一致性链完整批验：整批一致性链先提交到一棵 Merkle 树
+from zkregion import BoundConsistencyChainBatch, verify_consistency_chain_batch_bound
+
+def bound_chain_leaf(chain):
+    def frame(item):
+        return len(item).to_bytes(4, "big") + item
+    leaf = bytearray(frame(b"zkregion/consistency-chains/v1"))
+    leaf += frame(str(len(chain.roots)).encode("ascii"))
+    for chain_root in chain.roots:
+        leaf += frame(chain_root)
+    leaf += frame(str(len(chain.proofs)).encode("ascii"))
+    for seg in chain.proofs:
+        leaf += frame(str(seg.old_count).encode("ascii"))
+        leaf += frame(str(seg.new_count).encode("ascii"))
+        leaf += frame(str(len(seg.nodes)).encode("ascii"))
+        for node in seg.nodes:
+            leaf += frame(node)
+    return bytes(leaf)
+
+chain_leaves = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon"]
+chains = [
+    prove_consistency_chain(chain_leaves, (1, 3, 5)),
+    prove_consistency_chain(chain_leaves, (2, 5)),
+]
+bound_cc_leaves = [bound_chain_leaf(chain) for chain in chains]
+bound_cc_root = merkle_root(bound_cc_leaves)
+bound_cc_proof = prove_multi_inclusion(
+    bound_cc_leaves, tuple(range(len(bound_cc_leaves)))
+)
+bound_cc = BoundConsistencyChainBatch(
+    tuple(chains), len(chains), bound_cc_proof
+)
+assert verify_consistency_chain_batch_bound(bound_cc, bound_cc_root)
+
 # Pedersen 陷门承诺：对区间 [lower, upper] 内的量化整数值做承诺
 from zkregion import pedersen_commit, verify_pedersen_opening
 

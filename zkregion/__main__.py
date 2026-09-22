@@ -6,6 +6,7 @@ import dataclasses
 
 from . import (
     BoundConsistencyBatch,
+    BoundConsistencyChainBatch,
     BoundConsistencyReplayGuard,
     BoundRangeBatch,
     BoundRegionBatch,
@@ -15,6 +16,7 @@ from . import (
     BoundSchnorrReplayGuard,
     MerkleConsistencyBatchEntry,
     MerkleConsistencyBatchReplayGuard,
+    MerkleConsistencyChain,
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyReplayGuard,
     MerkleMultiProof,
@@ -51,6 +53,7 @@ from . import (
     verify_bound,
     verify_consistency_batch,
     verify_consistency_batch_bound,
+    verify_consistency_chain_batch_bound,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
@@ -505,6 +508,67 @@ def main() -> int:
     )
     print("  tampered entry rejected: "
           f"{not verify_consistency_batch_bound(forged_bound, merkle_root(forged_leaves))}")
+
+    print()
+    print("Merkle-committed complete consistency chain batch verification:")
+
+    def bound_consistency_chain_leaf(chain: MerkleConsistencyChain) -> bytes:
+        def frame(item: bytes) -> bytes:
+            return len(item).to_bytes(4, "big") + item
+
+        leaf = bytearray(frame(b"zkregion/consistency-chains/v1"))
+        leaf += frame(str(len(chain.roots)).encode("ascii"))
+        for chain_root in chain.roots:
+            leaf += frame(chain_root)
+        leaf += frame(str(len(chain.proofs)).encode("ascii"))
+        for segment in chain.proofs:
+            leaf += frame(str(segment.old_count).encode("ascii"))
+            leaf += frame(str(segment.new_count).encode("ascii"))
+            leaf += frame(str(len(segment.nodes)).encode("ascii"))
+            for node in segment.nodes:
+                leaf += frame(node)
+        return bytes(leaf)
+
+    consistency_chains = [
+        prove_consistency_chain(leaves, (1, 2, 4)),
+        prove_consistency_chain(leaves, (2, 4)),
+    ]
+    chain_bound_leaves = [
+        bound_consistency_chain_leaf(chain) for chain in consistency_chains
+    ]
+    chain_bound_root = merkle_root(chain_bound_leaves)
+    chain_bound_proof = prove_multi_inclusion(
+        chain_bound_leaves, tuple(range(len(chain_bound_leaves)))
+    )
+    chain_bound = BoundConsistencyChainBatch(
+        tuple(consistency_chains), len(consistency_chains), chain_bound_proof
+    )
+    print("  valid bound chain batch accepted: "
+          f"{verify_consistency_chain_batch_bound(chain_bound, chain_bound_root)}")
+    print("  wrong root rejected: "
+          f"{not verify_consistency_chain_batch_bound(chain_bound, bytes(32))}")
+    print("  empty batch rejected: "
+          f"{not verify_consistency_chain_batch_bound(BoundConsistencyChainBatch((), 0, MerkleMultiProof(0, (), ())), bytes(32))}")
+    chain_gap_proof = MerkleMultiProof(
+        len(consistency_chains), (0, 2), chain_bound_proof.siblings
+    )
+    print("  incomplete indices rejected: "
+          f"{not verify_consistency_chain_batch_bound(BoundConsistencyChainBatch(tuple(consistency_chains), 2, chain_gap_proof), chain_bound_root)}")
+    forged_chains = [
+        MerkleConsistencyChain(tuple(bytes(32) for _ in chain.roots), chain.proofs)
+        for chain in consistency_chains
+    ]
+    forged_chain_leaves = [
+        bound_consistency_chain_leaf(chain) for chain in forged_chains
+    ]
+    forged_chain_proof = prove_multi_inclusion(
+        forged_chain_leaves, tuple(range(len(forged_chain_leaves)))
+    )
+    forged_chain_bound = BoundConsistencyChainBatch(
+        tuple(forged_chains), len(forged_chains), forged_chain_proof
+    )
+    print("  invalid chain rejected: "
+          f"{not verify_consistency_chain_batch_bound(forged_chain_bound, merkle_root(forged_chain_leaves))}")
 
     print()
     print("per-instance replay protection (bind once, check once):")

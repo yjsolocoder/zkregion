@@ -10,6 +10,7 @@ from zkregion import (
     DEFAULT_GENERATOR,
     DEFAULT_PRIME,
     BoundConsistencyBatch,
+    BoundConsistencyChainBatch,
     BoundConsistencyReplayGuard,
     BoundRangeBatch,
     BoundRegionBatch,
@@ -63,6 +64,7 @@ from zkregion import (
     verify_consistency_batch,
     verify_consistency_batch_bound,
     verify_consistency_chain,
+    verify_consistency_chain_batch_bound,
     verify_inclusion,
     verify_multi_inclusion,
     verify_opening,
@@ -9089,6 +9091,566 @@ class MerkleConsistencyChainTest(unittest.TestCase):
         self.assertEqual(leaves, snapshot)
         self.assertEqual(chain.roots, roots_snapshot)
         self.assertEqual(chain.proofs, proofs_snapshot)
+
+
+def bound_consistency_chain_leaf(chain: MerkleConsistencyChain) -> bytes:
+    def frame(item: bytes) -> bytes:
+        return len(item).to_bytes(4, "big") + item
+
+    leaf = bytearray(frame(b"zkregion/consistency-chains/v1"))
+    leaf += frame(str(len(chain.roots)).encode("ascii"))
+    for root in chain.roots:
+        leaf += frame(root)
+    leaf += frame(str(len(chain.proofs)).encode("ascii"))
+    for proof in chain.proofs:
+        leaf += frame(str(proof.old_count).encode("ascii"))
+        leaf += frame(str(proof.new_count).encode("ascii"))
+        leaf += frame(str(len(proof.nodes)).encode("ascii"))
+        for node in proof.nodes:
+            leaf += frame(node)
+    return bytes(leaf)
+
+
+class BoundConsistencyChainBatchTest(unittest.TestCase):
+    """Merkle-committed complete batches of consistency chains."""
+
+    def _leaves(self, count):
+        return [f"ccbound-{i}".encode() for i in range(count)]
+
+    def _chains(self):
+        leaves = self._leaves(9)
+        return [
+            prove_consistency_chain(leaves, (1, 3, 5)),
+            prove_consistency_chain(leaves, (2, 4, 9)),
+            prove_consistency_chain(leaves, (1, 9)),
+        ]
+
+    def build(self, chains):
+        leaves = [bound_consistency_chain_leaf(chain) for chain in chains]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(chains))))
+        batch = BoundConsistencyChainBatch(tuple(chains), len(chains), proof)
+        return batch, root, leaves
+
+    # ---- batch object -------------------------------------------------------
+
+    def test_batch_positional_equality_and_immutability(self):
+        batch, root, _ = self.build(self._chains())
+        rebuilt = BoundConsistencyChainBatch(batch.chains, 3, batch.proof)
+        self.assertEqual(rebuilt, batch)
+        self.assertEqual(hash(rebuilt), hash(batch))
+        self.assertEqual(
+            tuple(getattr(batch, name) for name in ("chains", "leaf_count", "proof")),
+            (batch.chains, 3, batch.proof),
+        )
+        self.assertIsInstance(batch.chains, tuple)
+        self.assertNotEqual(
+            BoundConsistencyChainBatch(batch.chains, 4, batch.proof), batch
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.leaf_count = 4
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.chains = ()
+
+    def test_field_order_and_types(self):
+        batch, _, _ = self.build(self._chains())
+        self.assertEqual(
+            [field.name for field in dataclasses.fields(batch)],
+            ["chains", "leaf_count", "proof"],
+        )
+        self.assertIsInstance(batch.chains, tuple)
+        for chain in batch.chains:
+            self.assertIsInstance(chain, MerkleConsistencyChain)
+        self.assertIsInstance(batch.leaf_count, int)
+        self.assertNotIsInstance(batch.leaf_count, bool)
+        self.assertIsInstance(batch.proof, MerkleMultiProof)
+
+    def test_chains_must_be_tuple(self):
+        batch, root, _ = self.build(self._chains())
+        loose = BoundConsistencyChainBatch(list(batch.chains), 3, batch.proof)
+        self.assertNotIsInstance(loose.chains, tuple)
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(loose, root)
+
+    # ---- leaf encoding ------------------------------------------------------
+
+    def test_leaf_layout(self):
+        chain = self._chains()[0]
+        items = frame_items(bound_consistency_chain_leaf(chain))
+        cursor = 0
+        self.assertEqual(items[cursor], b"zkregion/consistency-chains/v1")
+        cursor += 1
+        # roots section: count then one raw root each
+        self.assertEqual(items[cursor], str(len(chain.roots)).encode("ascii"))
+        cursor += 1
+        root_items = items[cursor:cursor + len(chain.roots)]
+        self.assertEqual(root_items, list(chain.roots))
+        cursor += len(chain.roots)
+        # proofs section: count, then per segment old/new/nodes-count/nodes
+        self.assertEqual(items[cursor], str(len(chain.proofs)).encode("ascii"))
+        cursor += 1
+        for proof in chain.proofs:
+            self.assertEqual(items[cursor], str(proof.old_count).encode("ascii"))
+            self.assertEqual(items[cursor + 1], str(proof.new_count).encode("ascii"))
+            self.assertEqual(
+                items[cursor + 2], str(len(proof.nodes)).encode("ascii")
+            )
+            self.assertEqual(items[cursor + 3:cursor + 3 + len(proof.nodes)],
+                             list(proof.nodes))
+            cursor += 3 + len(proof.nodes)
+        self.assertEqual(cursor, len(items))
+
+    def test_leaf_order_and_duplicates_preserved(self):
+        leaves = self._leaves(6)
+        chain = prove_consistency_chain(leaves, (1, 2, 4, 6))
+        items = frame_items(bound_consistency_chain_leaf(chain))
+        # roots appear in checkpoint order, including any equal-length framing
+        roots = chain.roots
+        self.assertEqual(
+            items[2:2 + len(roots)], list(roots)
+        )
+
+    def test_leaf_uses_raw_root_and_node_bytes(self):
+        for chain in self._chains():
+            leaf = bound_consistency_chain_leaf(chain)
+            for root in chain.roots:
+                self.assertIn(root, leaf)
+            for proof in chain.proofs:
+                for node in proof.nodes:
+                    self.assertIn(node, leaf)
+
+    def test_counts_are_decimal_ascii(self):
+        chain = self._chains()[1]
+        items = frame_items(bound_consistency_chain_leaf(chain))
+        # section headers and segment counts must be plain decimal ASCII
+        self.assertEqual(items[1], b"3")
+        self.assertEqual(items[5], b"2")
+        offset = 6
+        for proof in chain.proofs:
+            self.assertEqual(items[offset], str(proof.old_count).encode("ascii"))
+            self.assertTrue(items[offset].isascii())
+            self.assertEqual(items[offset + 1], str(proof.new_count).encode("ascii"))
+            self.assertEqual(items[offset + 2], str(len(proof.nodes)).encode("ascii"))
+            offset += 3 + len(proof.nodes)
+
+    def test_internal_leaf_helper_matches_spec(self):
+        import zkregion
+
+        for chain in self._chains():
+            self.assertEqual(
+                zkregion._bound_consistency_chain_leaf(chain),
+                bound_consistency_chain_leaf(chain),
+            )
+
+    def test_leaf_digest_follows_merkle_rule(self):
+        chain = self._chains()[0]
+        leaf = bound_consistency_chain_leaf(chain)
+        expected = hashlib.sha256(
+            b"\x00" + len(leaf).to_bytes(4, "big") + leaf
+        ).digest()
+        self.assertEqual(merkle_root([leaf]), expected)
+
+    # ---- honest round trips -------------------------------------------------
+
+    def test_honest_batch_verifies(self):
+        batch, root, _ = self.build(self._chains())
+        self.assertTrue(verify_consistency_chain_batch_bound(batch, root))
+
+    def test_single_chain_batch_verifies(self):
+        batch, root, _ = self.build([self._chains()[0]])
+        self.assertTrue(verify_consistency_chain_batch_bound(batch, root))
+        self.assertEqual(batch.proof.siblings, ())
+
+    def test_various_sizes(self):
+        leaves = self._leaves(12)
+        for size in range(1, 9):
+            chains = [
+                prove_consistency_chain(leaves, (1, 2 + offset, 12))
+                for offset in range(size)
+            ]
+            batch, root, _ = self.build(chains)
+            self.assertTrue(verify_consistency_chain_batch_bound(batch, root), size)
+
+    def test_duplicate_chains_allowed(self):
+        chains = self._chains()
+        batch, root, _ = self.build([chains[0], chains[0]])
+        self.assertTrue(verify_consistency_chain_batch_bound(batch, root))
+
+    def test_independent_chains_need_not_relate(self):
+        leaves_a = self._leaves(9)
+        leaves_b = [b"other" + bytes([i]) for i in range(5)]
+        chains = [
+            prove_consistency_chain(leaves_a, (1, 9)),
+            prove_consistency_chain(leaves_b, (2, 5)),
+        ]
+        batch, root, _ = self.build(chains)
+        self.assertTrue(verify_consistency_chain_batch_bound(batch, root))
+
+    # ---- structural rejection ----------------------------------------------
+
+    def test_empty_batch_returns_false(self):
+        batch = BoundConsistencyChainBatch((), 0, MerkleMultiProof(0, (), ()))
+        self.assertFalse(
+            verify_consistency_chain_batch_bound(batch, bytes(32))
+        )
+
+    def test_leaf_count_must_match_chains(self):
+        batch, root, _ = self.build(self._chains())
+        for claimed in (2, 4):
+            bad = BoundConsistencyChainBatch(batch.chains, claimed, batch.proof)
+            self.assertFalse(verify_consistency_chain_batch_bound(bad, root))
+
+    def test_leaf_count_must_match_proof_leaf_count(self):
+        batch, root, _ = self.build(self._chains())
+        bad_proof = MerkleMultiProof(2, (0, 1, 2), ())
+        bad = BoundConsistencyChainBatch(batch.chains, 3, bad_proof)
+        self.assertFalse(verify_consistency_chain_batch_bound(bad, root))
+
+    def test_non_positive_leaf_count_returns_false(self):
+        batch, root, _ = self.build(self._chains())
+        for count in (0, -1):
+            bad = BoundConsistencyChainBatch(batch.chains, count, batch.proof)
+            self.assertFalse(verify_consistency_chain_batch_bound(bad, root))
+
+    def test_indices_must_equal_range(self):
+        batch, root, _ = self.build(self._chains())
+        cases = {
+            "gap": (0, 1, 3),
+            "partial": (0, 1),
+            "reordered": (2, 1, 0),
+            "duplicate": (0, 0, 2),
+            "empty": (),
+            "out_of_range": (0, 1, 5),
+        }
+        for label, indices in cases.items():
+            bad_proof = MerkleMultiProof(
+                3, tuple(indices), batch.proof.siblings
+            )
+            bad = BoundConsistencyChainBatch(batch.chains, 3, bad_proof)
+            self.assertFalse(
+                verify_consistency_chain_batch_bound(bad, root), label
+            )
+
+    def test_wrong_root_rejected(self):
+        batch, _, _ = self.build(self._chains())
+        self.assertFalse(verify_consistency_chain_batch_bound(batch, bytes(32)))
+        self.assertFalse(verify_consistency_chain_batch_bound(batch, b""))
+        self.assertFalse(verify_consistency_chain_batch_bound(batch, bytes(33)))
+
+    def test_tampered_chain_fails_root(self):
+        chains = self._chains()
+        batch, root, _ = self.build(chains)
+        # swap chain order: the committed root no longer matches the leaves
+        swapped = BoundConsistencyChainBatch(
+            (chains[1], chains[0], chains[2]), 3, batch.proof
+        )
+        self.assertFalse(verify_consistency_chain_batch_bound(swapped, root))
+        # tamper with one root inside a chain -> leaf bytes change
+        tampered_roots = list(chains[0].roots)
+        tampered_roots[0] = bytes(32)
+        tampered = MerkleConsistencyChain(
+            tuple(tampered_roots), chains[0].proofs
+        )
+        tampered_batch = BoundConsistencyChainBatch(
+            (tampered,) + tuple(chains[1:]), 3, batch.proof
+        )
+        self.assertFalse(
+            verify_consistency_chain_batch_bound(tampered_batch, root)
+        )
+
+    def test_wrong_domain_separator_rejected(self):
+        import zkregion
+
+        chains = self._chains()
+        original = zkregion._CONSISTENCY_CHAINS_BOUND_DOMAIN
+        zkregion._CONSISTENCY_CHAINS_BOUND_DOMAIN = b"zkregion/other/v1"
+        try:
+            batch, root, _ = self.build(chains)
+            # leaves committed under the spec domain, helper now uses another
+            self.assertFalse(
+                verify_consistency_chain_batch_bound(batch, root)
+            )
+        finally:
+            zkregion._CONSISTENCY_CHAINS_BOUND_DOMAIN = original
+
+    # ---- delegation ---------------------------------------------------------
+
+    def test_root_passes_then_verifies_each_chain(self):
+        import zkregion
+
+        batch, root, _ = self.build(self._chains())
+        seen = []
+        original = zkregion.verify_consistency_chain
+
+        def tracking(argument):
+            seen.append(argument)
+            return original(argument)
+
+        zkregion.verify_consistency_chain = tracking
+        try:
+            self.assertTrue(verify_consistency_chain_batch_bound(batch, root))
+        finally:
+            zkregion.verify_consistency_chain = original
+        self.assertEqual(tuple(seen), batch.chains)
+
+    def test_no_chain_check_when_root_fails(self):
+        import zkregion
+
+        batch, _, _ = self.build(self._chains())
+
+        def boom(_chain):
+            raise AssertionError("verify_consistency_chain must not be called")
+
+        original = zkregion.verify_consistency_chain
+        zkregion.verify_consistency_chain = boom
+        try:
+            self.assertFalse(
+                verify_consistency_chain_batch_bound(batch, bytes(32))
+            )
+            empty = BoundConsistencyChainBatch(
+                (), 0, MerkleMultiProof(0, (), ())
+            )
+            self.assertFalse(
+                verify_consistency_chain_batch_bound(empty, bytes(32))
+            )
+        finally:
+            zkregion.verify_consistency_chain = original
+
+    def test_chain_rejection_returns_false(self):
+        chains = self._chains()
+        # a chain whose leaves commit fine but which verify_consistency_chain
+        # rejects: all-zero 32-byte roots with real proofs
+        broken = MerkleConsistencyChain(
+            tuple(bytes(32) for _ in range(3)), chains[0].proofs
+        )
+        self.assertFalse(verify_consistency_chain(broken))
+        batch, root, _ = self.build([broken] + chains[1:])
+        self.assertFalse(verify_consistency_chain_batch_bound(batch, root))
+
+    def test_chain_checks_short_circuit_in_order(self):
+        import zkregion
+
+        chains = self._chains()
+        broken = MerkleConsistencyChain(
+            tuple(bytes(32) for _ in range(3)), chains[0].proofs
+        )
+        batch, root, _ = self.build([broken] + chains[1:])
+        calls = []
+        original = zkregion.verify_consistency_chain
+
+        def tracking(argument):
+            calls.append(argument)
+            return original(argument)
+
+        zkregion.verify_consistency_chain = tracking
+        try:
+            self.assertFalse(verify_consistency_chain_batch_bound(batch, root))
+        finally:
+            zkregion.verify_consistency_chain = original
+        self.assertEqual(calls, [broken])
+
+    # ---- type errors --------------------------------------------------------
+
+    def test_type_errors(self):
+        batch, root, _ = self.build(self._chains())
+        chains = batch.chains
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound("batch", root)
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(None, root)
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(list(chains), 3, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(("x",) * 3, 3, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(chains, True, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(chains, 3.0, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(chains, "3", batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(chains, 3, "proof"), root
+            )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(batch, "root")
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(batch, bytearray(root))
+
+    def test_nested_type_errors(self):
+        batch, root, _ = self.build(self._chains())
+        chains = batch.chains
+        # roots is not a tuple
+        list_roots = MerkleConsistencyChain(
+            list(chains[0].roots), chains[0].proofs
+        )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(
+                    (list_roots,) + chains[1:], 3, batch.proof
+                ),
+                root,
+            )
+        # a root that is not bytes
+        nonbytes_root = MerkleConsistencyChain(
+            ("root",) + chains[0].roots[1:], chains[0].proofs
+        )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(
+                    (nonbytes_root,) + chains[1:], 3, batch.proof
+                ),
+                root,
+            )
+        # proofs is not a tuple
+        list_proofs = MerkleConsistencyChain(
+            chains[0].roots, list(chains[0].proofs)
+        )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(
+                    (list_proofs,) + chains[1:], 3, batch.proof
+                ),
+                root,
+            )
+        # a segment that is not a MerkleConsistencyProof
+        bad_segment = MerkleConsistencyChain(
+            chains[0].roots, ("proof",)
+        )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(
+                    (bad_segment,) + chains[1:], 3, batch.proof
+                ),
+                root,
+            )
+        # bool segment count
+        bool_count = MerkleConsistencyChain(
+            chains[0].roots[:2],
+            (MerkleConsistencyProof(True, 5, chains[0].proofs[0].nodes),),
+        )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(
+                    (bool_count,) + chains[1:], 3, batch.proof
+                ),
+                root,
+            )
+        # nodes is not a tuple
+        list_nodes = MerkleConsistencyChain(
+            chains[0].roots[:2],
+            (
+                MerkleConsistencyProof(
+                    1, 3, list(chains[0].proofs[0].nodes)
+                ),
+            ),
+        )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(
+                    (list_nodes,) + chains[1:], 3, batch.proof
+                ),
+                root,
+            )
+        # a node that is not bytes
+        nonbytes_node = MerkleConsistencyChain(
+            chains[0].roots[:2],
+            (MerkleConsistencyProof(1, 3, ("node",)),),
+        )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(
+                    (nonbytes_node,) + chains[1:], 3, batch.proof
+                ),
+                root,
+            )
+        # proof index that is not an integer
+        bad_index = MerkleMultiProof(
+            3, (0, 1, "2"), batch.proof.siblings
+        )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(chains, 3, bad_index), root
+            )
+        # proof.indices is not a tuple
+        bad_indices = MerkleMultiProof(
+            3, [0, 1, 2], batch.proof.siblings
+        )
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(chains, 3, bad_indices), root
+            )
+        # a sibling that is not bytes
+        bad_siblings = MerkleMultiProof(3, (0, 1, 2), ("x",))
+        with self.assertRaises(TypeError):
+            verify_consistency_chain_batch_bound(
+                BoundConsistencyChainBatch(chains, 3, bad_siblings), root
+            )
+
+    # ---- input preservation -------------------------------------------------
+
+    def test_inputs_not_mutated(self):
+        chains = self._chains()
+        batch, root, _ = self.build(chains)
+        root_snapshot = bytes(root)
+        chains_snapshot = [
+            (
+                chain.roots,
+                tuple(
+                    (p.old_count, p.new_count, p.nodes)
+                    for p in chain.proofs
+                ),
+            )
+            for chain in chains
+        ]
+        proof_snapshot = (
+            batch.proof.leaf_count, batch.proof.indices, batch.proof.siblings
+        )
+        self.assertTrue(verify_consistency_chain_batch_bound(batch, root))
+        self.assertEqual(root, root_snapshot)
+        self.assertEqual(
+            [
+                (
+                    chain.roots,
+                    tuple(
+                        (p.old_count, p.new_count, p.nodes)
+                        for p in chain.proofs
+                    ),
+                )
+                for chain in chains
+            ],
+            chains_snapshot,
+        )
+        self.assertEqual(
+            (batch.proof.leaf_count, batch.proof.indices, batch.proof.siblings),
+            proof_snapshot,
+        )
+        # a rejected input is left untouched too
+        self.assertFalse(verify_consistency_chain_batch_bound(batch, bytes(32)))
+        self.assertEqual(root, root_snapshot)
+        self.assertEqual(
+            [
+                (
+                    chain.roots,
+                    tuple(
+                        (p.old_count, p.new_count, p.nodes)
+                        for p in chain.proofs
+                    ),
+                )
+                for chain in chains
+            ],
+            chains_snapshot,
+        )
 
 
 class MerkleConsistencyChainReplayGuardTest(unittest.TestCase):

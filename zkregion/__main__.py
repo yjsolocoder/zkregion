@@ -7,6 +7,7 @@ import dataclasses
 from . import (
     BoundConsistencyBatch,
     BoundConsistencyChainBatch,
+    BoundConsistencyChainReplayGuard,
     BoundConsistencyReplayGuard,
     BoundRangeBatch,
     BoundRegionBatch,
@@ -930,6 +931,26 @@ def main() -> int:
     foreign_bcbr_binding = foreign_bcbr.bind_once(consistency_bound, consistency_bound_root, b"bound-consistency-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_bcbr.check(consistency_bound, consistency_bound_root, foreign_bcbr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for bound consistency chain batches (bind once, check once):")
+    bccbr = BoundConsistencyChainReplayGuard()
+    bccbr_binding = bccbr.bind_once(chain_bound, chain_bound_root, b"bound-consistency-chain-session-1", expires_at=10**12)
+    print(f"  digest={bccbr_binding.digest.hex()[:32]}…  expires_at={bccbr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{bccbr.check(chain_bound, chain_bound_root, bccbr_binding, now=100)}")
+    print(f"  replay rejected: "
+          f"{not bccbr.check(chain_bound, chain_bound_root, bccbr_binding, now=101)}")
+    other_bccbr = BoundConsistencyChainReplayGuard()
+    other_bccbr_binding = other_bccbr.bind_once(chain_bound, chain_bound_root, b"bound-consistency-chain-session-2")
+    print(f"  wrong root rejected without consuming the id: "
+          f"{not other_bccbr.check(chain_bound, bytes(32), other_bccbr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_bccbr.check(chain_bound, chain_bound_root, other_bccbr_binding, now=1)}")
+    foreign_bccbr = BoundConsistencyChainReplayGuard()
+    foreign_bccbr_binding = foreign_bccbr.bind_once(chain_bound, chain_bound_root, b"bound-consistency-chain-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_bccbr.check(chain_bound, chain_bound_root, foreign_bccbr_binding, now=1)}")
 
     print()
     print("region membership:")

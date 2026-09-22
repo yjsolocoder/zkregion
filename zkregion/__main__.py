@@ -26,6 +26,7 @@ from . import (
     ReplayBinding,
     ReplayGuard,
     SchnorrBatchEntry,
+    SchnorrBatchReplayGuard,
     SchnorrProof,
     SchnorrProver,
     SchnorrVerifier,
@@ -624,6 +625,32 @@ def main() -> int:
     foreign_mcbr_binding = foreign_mcbr.bind_once(consistency_entries, b"consistency-batch-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_mcbr.check(consistency_entries, foreign_mcbr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for multi-key Schnorr batches (bind once, check once):")
+    sbr = SchnorrBatchReplayGuard()
+    sbr_binding = sbr.bind_once(multi_batch, b"schnorr-batch-session-1", expires_at=10**12)
+    print(f"  digest={sbr_binding.digest.hex()[:32]}…  expires_at={sbr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{sbr.check(multi_batch, sbr_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not sbr.check(multi_batch, sbr_binding, now=101, randbelow=counter_randbelow())}")
+    other_sbr = SchnorrBatchReplayGuard()
+    other_sbr_binding = other_sbr.bind_once(multi_batch, b"schnorr-batch-session-2")
+    print(f"  shortened batch rejected without consuming the id: "
+          f"{not other_sbr.check(multi_batch[:-1], other_sbr_binding, now=1, randbelow=counter_randbelow())}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_sbr.check(multi_batch, other_sbr_binding, now=1, randbelow=counter_randbelow())}")
+    try:
+        sbr.bind_once(multi_batch, b"schnorr-batch-session-1")
+    except ValueError:
+        print("  rebind of a consumed id rejected: True")
+    else:
+        print("  rebind of a consumed id rejected: False")
+    foreign_sbr = SchnorrBatchReplayGuard()
+    foreign_sbr_binding = foreign_sbr.bind_once(multi_batch, b"schnorr-batch-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_sbr.check(multi_batch, foreign_sbr_binding, now=1, randbelow=counter_randbelow())}")
 
     print()
     print("region membership:")

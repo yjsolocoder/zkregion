@@ -18,6 +18,7 @@ from . import (
     MerkleConsistencyBatchEntry,
     MerkleConsistencyBatchReplayGuard,
     MerkleConsistencyChain,
+    MerkleConsistencyChainBatchReplayGuard,
     MerkleConsistencyChainReplayGuard,
     MerkleConsistencyReplayGuard,
     MerkleMultiProof,
@@ -54,6 +55,7 @@ from . import (
     verify_bound,
     verify_consistency_batch,
     verify_consistency_batch_bound,
+    verify_consistency_chain_batch,
     verify_consistency_chain_batch_bound,
     verify_inclusion,
     verify_multi_inclusion,
@@ -572,6 +574,24 @@ def main() -> int:
           f"{not verify_consistency_chain_batch_bound(forged_chain_bound, merkle_root(forged_chain_leaves))}")
 
     print()
+    print("independent consistency chain batch verification:")
+    chain_batch = [
+        prove_consistency_chain(leaves, (1, 2, 4)),
+        prove_consistency_chain(leaves, (2, 4)),
+    ]
+    print("  valid chain batch accepted: "
+          f"{verify_consistency_chain_batch(chain_batch)}")
+    print("  tuple and duplicate chains accepted: "
+          f"{verify_consistency_chain_batch((chain_batch[0],) * 3)}")
+    print("  empty batch rejected: "
+          f"{not verify_consistency_chain_batch(())}")
+    invalid_chain = MerkleConsistencyChain(
+        tuple(bytes(32) for _ in chain_batch[0].roots), chain_batch[0].proofs
+    )
+    print("  invalid chain rejected: "
+          f"{not verify_consistency_chain_batch([chain_batch[0], invalid_chain])}")
+
+    print()
     print("per-instance replay protection (bind once, check once):")
     guard = ReplayGuard()
     replay_entry = MultiSchnorrEntry(
@@ -865,6 +885,30 @@ def main() -> int:
     foreign_mccr_binding = foreign_mccr.bind_once(chain, b"chain-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_mccr.check(chain, foreign_mccr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for consistency chain batches (bind once, check once):")
+    mccbr = MerkleConsistencyChainBatchReplayGuard()
+    mccbr_binding = mccbr.bind_once(chain_batch, b"chain-batch-session-1", expires_at=10**12)
+    print(f"  digest={mccbr_binding.digest.hex()[:32]}…  expires_at={mccbr_binding.expires_at}")
+    print(f"  valid first check accepted: {mccbr.check(chain_batch, mccbr_binding, now=100)}")
+    print(f"  replay rejected: {not mccbr.check(chain_batch, mccbr_binding, now=101)}")
+    other_mccbr = MerkleConsistencyChainBatchReplayGuard()
+    other_mccbr_binding = other_mccbr.bind_once(chain_batch, b"chain-batch-session-2")
+    print(f"  shortened batch rejected without consuming the id: "
+          f"{not other_mccbr.check(chain_batch[:-1], other_mccbr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mccbr.check(chain_batch, other_mccbr_binding, now=1)}")
+    try:
+        mccbr.bind_once(chain_batch, b"chain-batch-session-1")
+    except ValueError:
+        print("  rebind of a consumed id rejected: True")
+    else:
+        print("  rebind of a consumed id rejected: False")
+    foreign_mccbr = MerkleConsistencyChainBatchReplayGuard()
+    foreign_mccbr_binding = foreign_mccbr.bind_once(chain_batch, b"chain-batch-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mccbr.check(chain_batch, foreign_mccbr_binding, now=1)}")
 
     print()
     print("per-instance replay protection for single consistency proofs (bind once, check once):")

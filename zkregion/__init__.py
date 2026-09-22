@@ -7,7 +7,7 @@ prove_region / verify_region / RegionBatchEntry / verify_region_batch /
 RegionBatchReplayGuard /
 SchnorrProof / SchnorrBatchEntry / SchnorrProver /
 SchnorrVerifier / MultiSchnorrEntry / verify_schnorr_batch /
-SchnorrBatchReplayGuard /
+SchnorrBatchReplayGuard / SingleKeyBoundBatch /
 RangeBatchReplayGuard /
 BoundSchnorrBatch / verify_bound /
 BoundRegionBatch / verify_region_bound /
@@ -82,6 +82,7 @@ __all__ = [
     "SchnorrVerifier",
     "SQLiteReplayStore",
     "SingleKeyBatchGuard",
+    "SingleKeyBoundBatch",
     "commit",
     "commit_coordinate",
     "merkle_root",
@@ -757,6 +758,23 @@ class SchnorrProver:
         return SchnorrProof(commitment=commitment, response=k + challenge * self._secret)
 
 
+@dataclass(frozen=True)
+class SingleKeyBoundBatch:
+    """A complete single-key Schnorr batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of :class:`SchnorrBatchEntry`;
+    ``leaf_count`` — a positive, non-``bool`` integer equal to both
+    ``len(entries)`` and ``proof.leaf_count``; ``proof`` — the
+    :class:`MerkleMultiProof` whose indices cover ``0 .. leaf_count - 1``
+    without gaps or duplicates. All three are positional construction
+    arguments; batches compare by value and are immutable.
+    """
+
+    entries: tuple[SchnorrBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
 class SchnorrVerifier:
     """Checks the Schnorr response against a published commitment."""
 
@@ -871,6 +889,116 @@ class SchnorrVerifier:
                 % self._prime
             )
         return pow(self._generator, exponent_sum, self._prime) == product
+
+    def verify_bound_batch(
+        self,
+        batch: SingleKeyBoundBatch,
+        root: bytes,
+        *,
+        randbelow: Callable[[int], int] = secrets.randbelow,
+    ) -> bool:
+        """Verify a Merkle-committed complete :class:`SingleKeyBoundBatch`.
+
+        The Merkle binding is checked first: every entry is encoded to its
+        leaf exactly as specified by :func:`_bound_schnorr_leaf`, from a
+        :class:`MultiSchnorrEntry` carrying this verifier's fixed
+        ``public_key`` and group parameters together with the entry's
+        ``message``, ``proof`` and ``context``, and the whole batch is
+        checked against ``root`` with :func:`verify_multi_inclusion`.
+        ``leaf_count`` must be a positive, non-``bool`` integer equal to
+        both ``len(entries)`` and ``proof.leaf_count``, and
+        ``proof.indices`` must cover ``0 .. leaf_count - 1`` with no gaps,
+        duplicates or reordering; an empty batch, a missing entry or any
+        index mismatch returns ``False``. No randomness is drawn unless the
+        root checks out; only then does the batch go through
+        :meth:`verify_batch` with the same ``randbelow``, under its
+        unchanged randomness contract: it is called once per structurally
+        valid entry as ``randbelow(prime - 1)``.
+
+        Type errors — a batch that is not a :class:`SingleKeyBoundBatch`,
+        non-tuple entries, non-:class:`SchnorrBatchEntry` items, a
+        non-integer or ``bool`` ``leaf_count``, a wrong proof/root object,
+        malformed nested field types, or a non-callable ``randbelow`` —
+        raise :class:`TypeError`; a coefficient outside
+        ``[0, prime - 1)`` raises :class:`ValueError`; every other
+        invalidity returns ``False``. Inputs are never mutated.
+        """
+        if not isinstance(batch, SingleKeyBoundBatch):
+            raise TypeError("batch must be a SingleKeyBoundBatch")
+        _check_bytes(root, "root")
+        if not callable(randbelow):
+            raise TypeError("randbelow must be callable")
+        entries = batch.entries
+        if not isinstance(entries, tuple):
+            raise TypeError("batch entries must be a tuple of SchnorrBatchEntry")
+        leaf_count = batch.leaf_count
+        if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+            raise TypeError("batch leaf_count must be an integer")
+        proof = batch.proof
+        if not isinstance(proof, MerkleMultiProof):
+            raise TypeError("batch proof must be a MerkleMultiProof")
+        if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+            raise TypeError("proof leaf_count must be an integer")
+        if not isinstance(proof.indices, tuple):
+            raise TypeError("proof indices must be a tuple of integers")
+        for index in proof.indices:
+            if not isinstance(index, int) or isinstance(index, bool):
+                raise TypeError("proof indices must be a tuple of integers")
+        if not isinstance(proof.siblings, tuple):
+            raise TypeError("proof siblings must be a tuple of bytes")
+        for sibling in proof.siblings:
+            _check_bytes(sibling, "proof sibling")
+        for position, entry in enumerate(entries):
+            if not isinstance(entry, SchnorrBatchEntry):
+                raise TypeError(f"entries[{position}] must be a SchnorrBatchEntry")
+            _check_bytes(entry.message, f"entries[{position}] message")
+            _check_bytes(entry.context, f"entries[{position}] context")
+            entry_proof = entry.proof
+            if not isinstance(entry_proof, SchnorrProof):
+                raise TypeError(f"entries[{position}] proof must be a SchnorrProof")
+            if (
+                not isinstance(entry_proof.commitment, int)
+                or isinstance(entry_proof.commitment, bool)
+                or not isinstance(entry_proof.response, int)
+                or isinstance(entry_proof.response, bool)
+            ):
+                raise TypeError(
+                    f"entries[{position}] proof commitment and response must be integers"
+                )
+
+        if leaf_count < 1:
+            return False
+        if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+            return False
+        if proof.indices != tuple(range(leaf_count)):
+            return False  # empty coverage, gaps, duplicates or reordering
+
+        # The leaf encoding is unsigned, so a negative integer cannot be
+        # framed; every other structural check (ranges) is left to
+        # verify_batch so the Merkle root is always examined first.
+        for entry in entries:
+            if min(entry.proof.commitment, entry.proof.response) < 0:
+                return False
+
+        leaves = [
+            _bound_schnorr_leaf(
+                MultiSchnorrEntry(
+                    self._public_key,
+                    entry.message,
+                    entry.proof,
+                    entry.context,
+                    self._prime,
+                    self._generator,
+                )
+            )
+            for entry in entries
+        ]
+
+        # 1) the Merkle root commits to every entry leaf, then
+        # 2) the unchanged single-key batch verification checks the proofs
+        if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+            return False
+        return self.verify_batch(entries, randbelow=randbelow)
 
 
 def verify_schnorr_batch(

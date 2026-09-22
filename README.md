@@ -155,6 +155,35 @@ bound_cb = BoundConsistencyBatch(
 )
 assert verify_consistency_batch_bound(bound_cb, bound_cb_root)
 
+# Merkle 承诺的一致性链完整批验：整批一致性链先提交到一棵 Merkle 树
+from zkregion import BoundConsistencyChainBatch, verify_consistency_chain_batch_bound
+
+def bound_chain_leaf(chain):
+    items = [b"zkregion/consistency-chains/v1"]
+    items.append(str(len(chain.roots)).encode("ascii"))
+    items += list(chain.roots)
+    items.append(str(len(chain.proofs)).encode("ascii"))
+    for proof in chain.proofs:
+        items.append(str(proof.old_count).encode("ascii"))
+        items.append(str(proof.new_count).encode("ascii"))
+        items.append(str(len(proof.nodes)).encode("ascii"))
+        items += list(proof.nodes)
+    return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+chain_batch = [
+    prove_consistency_chain(more_leaves, counts)
+    for counts in ((1, 3, 5), (2, 4, 6), (1, 6))
+]
+bound_cc_leaves = [bound_chain_leaf(chain) for chain in chain_batch]
+bound_cc_root = merkle_root(bound_cc_leaves)
+bound_cc_proof = prove_multi_inclusion(
+    bound_cc_leaves, tuple(range(len(bound_cc_leaves)))
+)
+bound_cc = BoundConsistencyChainBatch(
+    tuple(chain_batch), len(chain_batch), bound_cc_proof
+)
+assert verify_consistency_chain_batch_bound(bound_cc, bound_cc_root)
+
 # Pedersen 陷门承诺：对区间 [lower, upper] 内的量化整数值做承诺
 from zkregion import pedersen_commit, verify_pedersen_opening
 
@@ -695,6 +724,8 @@ python3 -m zkregion
 - `prove_consistency_chain(leaves, counts) -> MerkleConsistencyChain` — 生成多检查点一致性链，`roots` 按 `counts` 取前缀根，`proofs` 为相邻段的一致性证明
 - `verify_consistency_chain(chain) -> bool` — 一次确认链上每个检查点均由前一棵树连续追加所得
 - `MerkleConsistencyChain(roots, proofs)` — 冻结的一致性链对象，`roots` 为 `tuple[bytes, ...]`，`proofs` 为 `tuple[MerkleConsistencyProof, ...]`，可位置构造、按值相等且不可变
+- `BoundConsistencyChainBatch(chains, leaf_count, proof)` — 冻结的一致性链完整批对象；字段依次为非空 `tuple[MerkleConsistencyChain, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变；`leaf_count` 须等于链数及 `proof.leaf_count`，`proof.indices` 须为 `tuple(range(leaf_count))`，空批、缺链、计数不符或索引不完整均返回 `False`
+- `verify_consistency_chain_batch_bound(batch, root) -> bool` — Merkle 承诺的一致性链完整批验：先以域 `b"zkregion/consistency-chains/v1"` 的叶编码与 `verify_multi_inclusion` 验根（结构/根失败即返回，不委托核链），根通过后逐条原样调用 `verify_consistency_chain`；错型抛 `TypeError`，其余无效返回 `False`，输入不变
 - `Region(min_x, max_x, min_y, max_y)` — 闭区间矩形；`contains(x, y)`
 
 ### Merkle 树构造
@@ -749,6 +780,25 @@ python3 -m zkregion
 2. 根通过后，**原样委托** `verify_consistency_batch(batch.entries)`，逐项沿用其根长度、计数、节点数量与长度、缺余节点及追加关系规则，不做包装或改动。
 
 类型错误——`batch` 不是 `BoundConsistencyBatch`、`entries` 不是元组或含非 `MerkleConsistencyBatchEntry`、条目嵌套字段类型错误（根非 `bytes`、`proof` 非 `MerkleConsistencyProof`、`bool` 计数、`nodes` 非元组或节点非 `bytes`）、`leaf_count` 不是非 `bool` 整数、外层 `proof`/`root` 类型错误——抛 `TypeError`；其余一切无效情形（空批、缺项、计数不符、索引不完整、错误根、叶字节篡改、根非 32 字节，以及委托 `verify_consistency_batch` 返回的任何 `False`）均返回 `False`。入口不改写任何输入。
+
+### Merkle 承诺的一致性链完整批验
+
+`BoundConsistencyChainBatch(chains, leaf_count, proof)` 把一批**完整**的多检查点一致性链与一棵 Merkle 树的多包含证明冻结在一起，三个字段依次为：
+
+1. `chains: tuple[MerkleConsistencyChain, ...]` —— 必须是非空元组（不是列表），每项是 `MerkleConsistencyChain`；
+2. `leaf_count: int` —— 正的非 `bool` 整数，且必须同时等于 `len(chains)` 与 `proof.leaf_count`；
+3. `proof: MerkleMultiProof` —— 其 `indices` 必须无缺口、无重复、无乱序地恰好覆盖 `0 .. leaf_count - 1`（即等于 `tuple(range(leaf_count))`）。
+
+三字段均可位置构造，对象按值相等且不可变（冻结 dataclass）。空批（`leaf_count < 1` 或 `chains` 为空）、缺链（数量不符）、`leaf_count` 与链数或 `proof.leaf_count` 不一致、`proof.indices` 不等于 `tuple(range(leaf_count))`（含索引缺口、重复、乱序）均返回 `False`。
+
+每条链的 Merkle 叶字节以域 `b"zkregion/consistency-chains/v1"` 开始，随后依次写入 `roots`、`proofs` 两段：`roots` 段先写根元素数，再按链上原序写入每个根的原始 `bytes`；`proofs` 段先写段证明元素数，再对每个段证明依次写入 `old_count`、`new_count` 的十进制 ASCII 与该段的 `nodes`——`nodes` 同样先写元素数，再按原序写入每片节点的原始 `bytes`。每个原子项前置四字节无符号大端长度，计数（含各段元素数）一律用十进制 ASCII，根与节点不经任何编码、原样成帧并保持原序（含重复）。叶摘要仍按 Merkle 树构造一节的 `SHA-256(b"\x00" + len4 + leaf)` 计算。
+
+`verify_consistency_chain_batch_bound(batch, root) -> bool` 的验证分两步、次序固定：
+
+1. 先校验批结构（`chains` 非空元组、`leaf_count` 正数且与链数及 `proof.leaf_count` 相等、`proof.indices == tuple(range(leaf_count))`），再以全部 `(index, leaf)`（`index` 即 0 起的链位置）调用 `verify_multi_inclusion` 校验 Merkle 根；任一叶字节、proof 或根不符即返回 `False`，且根校验通过前不核任何链；
+2. 根通过后，按原序对每条链**逐链调用** `verify_consistency_chain`，逐条沿用其根数/证明数、段间接续与严格递增、根长度及各段 `verify_consistency` 规则，不做包装或改动；任一链无效即返回 `False`。
+
+类型错误——`batch` 不是 `BoundConsistencyChainBatch`、`chains` 不是元组或含非 `MerkleConsistencyChain`、链嵌套字段类型错误（根非 `bytes`、段证明非 `MerkleConsistencyProof`、`bool` 计数、`nodes` 非元组或节点非 `bytes`）、`leaf_count` 不是非 `bool` 整数、外层 `proof`/`root` 类型错误——抛 `TypeError`；其余一切无效情形（空批、缺链、计数不符、索引不完整、错误根、叶字节篡改、根非 32 字节，以及任一 `verify_consistency_chain` 返回的 `False`）均返回 `False`。入口不改写任何输入。
 
 ### Pedersen 量化坐标陷门承诺
 

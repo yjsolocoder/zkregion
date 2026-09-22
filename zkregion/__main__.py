@@ -9,6 +9,7 @@ from . import (
     BoundConsistencyChainBatch,
     BoundConsistencyChainReplayGuard,
     BoundConsistencyReplayGuard,
+    BoundMerkleInclusionBatch,
     BoundMerkleMultiBatch,
     BoundMerkleMultiBatchReplayGuard,
     BoundRangeBatch,
@@ -64,6 +65,7 @@ from . import (
     verify_consistency_chain_batch_bound,
     verify_inclusion,
     verify_inclusion_batch,
+    verify_inclusion_batch_bound,
     verify_multi_inclusion,
     verify_multi_inclusion_batch_bound,
     verify_opening,
@@ -466,6 +468,59 @@ def main() -> int:
         inclusion_entries[1],
     ]
     print(f"  tampered entry rejected: {not verify_inclusion_batch(tampered_inclusion)}")
+
+    print()
+    print("Merkle-committed complete single-leaf inclusion batch verification:")
+
+    def bound_inclusion_leaf(entry: MerkleInclusionBatchEntry) -> bytes:
+        def frame(item: bytes) -> bytes:
+            return len(item).to_bytes(4, "big") + item
+
+        def u64(value: int) -> bytes:
+            return value.to_bytes(8, "big")
+
+        proof = entry.proof
+        q = bytearray()
+        q += frame(entry.leaf)
+        q += frame(entry.root)
+        q += frame(u64(proof.index))
+        q += frame(u64(len(proof.siblings)))
+        for sibling in proof.siblings:
+            q += frame(sibling)
+        return frame(b"zkregion/inclusion-batch/v1") + frame(bytes(q))
+
+    inclusion_bound_leaves = [
+        bound_inclusion_leaf(entry) for entry in inclusion_entries
+    ]
+    inclusion_bound_root = merkle_root(inclusion_bound_leaves)
+    inclusion_bound_proof = prove_multi_inclusion(
+        inclusion_bound_leaves, tuple(range(len(inclusion_bound_leaves)))
+    )
+    inclusion_bound = BoundMerkleInclusionBatch(
+        tuple(inclusion_entries), len(inclusion_entries), inclusion_bound_proof
+    )
+    print("  valid bound batch accepted: "
+          f"{verify_inclusion_batch_bound(inclusion_bound, inclusion_bound_root)}")
+    print("  wrong root rejected: "
+          f"{not verify_inclusion_batch_bound(inclusion_bound, merkle_root(inclusion_bound_leaves[:1]))}")
+    print("  empty batch rejected: "
+          f"{not verify_inclusion_batch_bound(BoundMerkleInclusionBatch((), 0, MerkleMultiProof(0, (), ())), bytes(32))}")
+    gap_proof = MerkleMultiProof(
+        len(inclusion_entries), (1,), inclusion_bound_proof.siblings
+    )
+    print("  incomplete indices rejected: "
+          f"{not verify_inclusion_batch_bound(BoundMerkleInclusionBatch(tuple(inclusion_entries), len(inclusion_entries), gap_proof), inclusion_bound_root)}")
+    forged_inclusion_leaves = [
+        bound_inclusion_leaf(entry) for entry in tampered_inclusion
+    ]
+    forged_inclusion_proof = prove_multi_inclusion(
+        forged_inclusion_leaves, tuple(range(len(forged_inclusion_leaves)))
+    )
+    forged_inclusion_bound = BoundMerkleInclusionBatch(
+        tuple(tampered_inclusion), len(tampered_inclusion), forged_inclusion_proof
+    )
+    print("  tampered entry rejected: "
+          f"{not verify_inclusion_batch_bound(forged_inclusion_bound, merkle_root(forged_inclusion_leaves))}")
 
     print()
     print("independent Merkle consistency batch verification:")

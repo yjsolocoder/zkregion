@@ -9,6 +9,8 @@ from . import (
     BoundConsistencyChainBatch,
     BoundConsistencyChainReplayGuard,
     BoundConsistencyReplayGuard,
+    BoundMerkleMultiBatch,
+    BoundMerkleMultiBatchReplayGuard,
     BoundRangeBatch,
     BoundRegionBatch,
     BoundRegionReplayGuard,
@@ -23,6 +25,7 @@ from . import (
     MerkleConsistencyReplayGuard,
     MerkleInclusionBatchEntry,
     MerkleInclusionBatchReplayGuard,
+    MerkleMultiBatchEntry,
     MerkleMultiProof,
     MultiSchnorrEntry,
     RangeBatchEntry,
@@ -62,6 +65,7 @@ from . import (
     verify_inclusion,
     verify_inclusion_batch,
     verify_multi_inclusion,
+    verify_multi_inclusion_batch_bound,
     verify_opening,
     verify_pedersen_opening,
     verify_range,
@@ -1023,6 +1027,69 @@ def main() -> int:
     foreign_bcbr_binding = foreign_bcbr.bind_once(consistency_bound, consistency_bound_root, b"bound-consistency-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_bcbr.check(consistency_bound, consistency_bound_root, foreign_bcbr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for bound Merkle multi-inclusion batches (bind once, check once):")
+
+    def bound_multi_batch_leaf(item: MerkleMultiBatchEntry) -> bytes:
+        def frame(value: bytes) -> bytes:
+            return len(value).to_bytes(4, "big") + value
+
+        def u64(value: int) -> bytes:
+            return value.to_bytes(8, "big")
+
+        q = bytearray()
+        q += frame(item.root)
+        q += frame(u64(item.proof.leaf_count))
+        q += frame(u64(len(item.proof.indices)))
+        for index in item.proof.indices:
+            q += frame(u64(index))
+        q += frame(u64(len(item.entries)))
+        for index, leaf in item.entries:
+            q += frame(frame(u64(index)) + frame(leaf))
+        q += frame(u64(len(item.proof.siblings)))
+        for sibling in item.proof.siblings:
+            q += frame(sibling)
+        return frame(b"zkregion/multi-batch/v1") + frame(bytes(q))
+
+    bmmbr_tree_leaves = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon"]
+    bmmbr_tree_root = merkle_root(bmmbr_tree_leaves)
+    bmmbr_items = [
+        MerkleMultiBatchEntry(
+            tuple((i, bmmbr_tree_leaves[i]) for i in (0, 2, 4)),
+            prove_multi_inclusion(bmmbr_tree_leaves, (0, 2, 4)),
+            bmmbr_tree_root,
+        ),
+        MerkleMultiBatchEntry(
+            ((1, bmmbr_tree_leaves[1]),),
+            prove_multi_inclusion(bmmbr_tree_leaves, (1,)),
+            bmmbr_tree_root,
+        ),
+    ]
+    bmmbr_leaves = [bound_multi_batch_leaf(item) for item in bmmbr_items]
+    bmmbr_root = merkle_root(bmmbr_leaves)
+    bmmbr_bound = BoundMerkleMultiBatch(
+        tuple(bmmbr_items),
+        len(bmmbr_items),
+        prove_multi_inclusion(bmmbr_leaves, tuple(range(len(bmmbr_items)))),
+    )
+    bmmbr = BoundMerkleMultiBatchReplayGuard()
+    bmmbr_binding = bmmbr.bind_once(bmmbr_bound, bmmbr_root, b"bound-multi-batch-session-1", expires_at=10**12)
+    print(f"  digest={bmmbr_binding.digest.hex()[:32]}…  expires_at={bmmbr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{bmmbr.check(bmmbr_bound, bmmbr_root, bmmbr_binding, now=100)}")
+    print(f"  replay rejected: "
+          f"{not bmmbr.check(bmmbr_bound, bmmbr_root, bmmbr_binding, now=101)}")
+    other_bmmbr = BoundMerkleMultiBatchReplayGuard()
+    other_bmmbr_binding = other_bmmbr.bind_once(bmmbr_bound, bmmbr_root, b"bound-multi-batch-session-2")
+    print(f"  wrong root rejected without consuming the id: "
+          f"{not other_bmmbr.check(bmmbr_bound, bytes(32), other_bmmbr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_bmmbr.check(bmmbr_bound, bmmbr_root, other_bmmbr_binding, now=1)}")
+    foreign_bmmbr = BoundMerkleMultiBatchReplayGuard()
+    foreign_bmmbr_binding = foreign_bmmbr.bind_once(bmmbr_bound, bmmbr_root, b"bound-multi-batch-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_bmmbr.check(bmmbr_bound, bmmbr_root, foreign_bmmbr_binding, now=1)}")
 
     print()
     print("per-instance replay protection for bound consistency chain batches (bind once, check once):")

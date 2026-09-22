@@ -33,6 +33,7 @@ from . import (
     SchnorrProver,
     SchnorrVerifier,
     SingleKeyBatchGuard,
+    SingleKeyBoundBatch,
     commit,
     commit_coordinate,
     merkle_root,
@@ -354,6 +355,50 @@ def main() -> int:
     print(
         "  committed-but-forged response rejected: "
         f"{not verify_bound(forged_batch, merkle_root(forged_leaves), randbelow=counter_randbelow())}"
+    )
+
+    print()
+    print("Merkle-committed same-key Schnorr batch (verifier fixes the key/group):")
+    single_batch = [
+        SchnorrBatchEntry(b"alpha", prover.prove(b"alpha", context=b"same"), context=b"same"),
+        SchnorrBatchEntry(b"beta", prover.prove(b"beta", context=b"same"), context=b"same"),
+    ]
+    single_leaves = [
+        bound_leaf(
+            MultiSchnorrEntry(
+                verifier.public_key, entry.message, entry.proof, entry.context
+            )
+        )
+        for entry in single_batch
+    ]
+    single_root = merkle_root(single_leaves)
+    single_proof = prove_multi_inclusion(single_leaves, tuple(range(len(single_batch))))
+    single_bound = SingleKeyBoundBatch(
+        tuple(single_batch), len(single_batch), single_proof
+    )
+    print(f"  entries={len(single_batch)}  complete index coverage 0..{len(single_batch) - 1}")
+    print(
+        "  valid bound batch accepted: "
+        f"{verifier.verify_bound_batch(single_bound, single_root, randbelow=counter_randbelow())}"
+    )
+    print(
+        "  wrong root rejected: "
+        f"{not verifier.verify_bound_batch(single_bound, merkle_root(single_leaves[:1]))}"
+    )
+    committed = dataclasses.replace(
+        single_batch[0],
+        proof=SchnorrProof(single_batch[0].proof.commitment, single_batch[0].proof.response + 1),
+    )
+    forged_leaves = [
+        bound_leaf(MultiSchnorrEntry(verifier.public_key, committed.message, committed.proof, committed.context))
+    ] + single_leaves[1:]
+    forged_proof = prove_multi_inclusion(forged_leaves, tuple(range(len(single_batch))))
+    forged_single = SingleKeyBoundBatch(
+        (committed, *single_batch[1:]), len(single_batch), forged_proof
+    )
+    print(
+        "  committed-but-forged response rejected: "
+        f"{not verifier.verify_bound_batch(forged_single, merkle_root(forged_leaves), randbelow=counter_randbelow())}"
     )
 
     print()

@@ -65,6 +65,26 @@ proof = prove_multi_inclusion(leaves, tuple(range(len(leaves))))
 batch = BoundSchnorrBatch(tuple(multi), len(multi), proof)
 assert verify_bound(batch, root)
 
+# 同一公钥 Schnorr 完整批验：整批 SchnorrBatchEntry 先提交到一棵 Merkle 树
+from zkregion import SingleKeyBoundBatch
+
+single = [
+    SchnorrBatchEntry(b"alpha", prover.prove(b"alpha", context=b"s1"), context=b"s1"),
+    SchnorrBatchEntry(b"beta", prover.prove(b"beta", context=b"s1"), context=b"s1"),
+]
+
+def single_leaf(entry):
+    multi_entry = MultiSchnorrEntry(
+        verifier.public_key, entry.message, entry.proof, entry.context
+    )
+    return bound_leaf(multi_entry)
+
+single_leaves = [single_leaf(entry) for entry in single]
+single_root = merkle_root(single_leaves)
+single_proof = prove_multi_inclusion(single_leaves, tuple(range(len(single))))
+single_bound = SingleKeyBoundBatch(tuple(single), len(single), single_proof)
+assert verifier.verify_bound_batch(single_bound, single_root)
+
 # Merkle 包含证明
 from zkregion import prove_inclusion, verify_inclusion
 
@@ -531,12 +551,14 @@ python3 -m zkregion
   - `verify(commitment, challenge, response)` — 交互式验证
   - `verify_proof(message, proof, *, context=b"") -> bool` — 非交互证明验证
   - `verify_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 同一公钥的批量验证
+  - `verify_bound_batch(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的同一公钥 Schnorr 完整批验：每项以本验证器固定公钥与群参数及条目的 `message`、`proof`、`context` 构造 `MultiSchnorrEntry`，叶字节逐字节复用既有 BoundSchnorr 编码；先 `verify_multi_inclusion` 验根（失败不取随机），根通过后才把 `randbelow` 透传给 `verify_batch`
 - `SchnorrProof(commitment, response)` — 不可变证明对象（`t = g**k mod prime`，`s = k + c * secret`）
 - `SchnorrBatchEntry(message, proof, context=b"")` — 不可变批量验证条目，字段类型依次为 `bytes`、`SchnorrProof`、`bytes`
 - `verify_schnorr_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 多公钥批量验证，按 `(prime, generator)` 分组做一次随机线性组合
 - `MultiSchnorrEntry(public_key, message, proof, context=b"", prime=DEFAULT_PRIME, generator=DEFAULT_GENERATOR)` — 不可变多公钥批量验证条目；前三字段依次为 `int`、`bytes`、`SchnorrProof`，均为必填且可位置构造，值相等即相等
 - `verify_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的 Schnorr 完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_schnorr_batch` 验签
 - `BoundSchnorrBatch(entries, leaf_count, proof)` — 冻结的完整批对象；字段依次为 `tuple[MultiSchnorrEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变
+- `SingleKeyBoundBatch(entries, leaf_count, proof)` — 冻结的同一公钥完整批对象；字段依次为 `tuple[SchnorrBatchEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变；公钥与群参数由验证它的 `SchnorrVerifier` 固定，`leaf_count` 须等于条目数及 `proof.leaf_count`，`proof.indices` 须为 `tuple(range(leaf_count))`，空批、缺项、乱序或索引缺口均返回 `False`
 - `verify_region_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的区域证明完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_region_batch` 验子证明
 - `BoundRegionBatch(entries, leaf_count, proof)` — 冻结的完整批对象；字段依次为 `tuple[RegionBatchEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变
 - `ReplayBinding(session_id, digest, expires_at=None)` — 冻结的一次性防重放绑定；字段依次为非空 `bytes`、`bytes` 摘要（不限定长度；各守卫登记的均为 32 字节 SHA-256 摘要）、`None` 或非 `bool` 的 uint64 Unix 秒过期时间；可位置构造、按值相等且不可变

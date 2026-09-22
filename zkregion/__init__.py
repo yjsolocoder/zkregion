@@ -27,7 +27,8 @@ Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion / MerkleConsistencyProof / prove_consistency /
 verify_consistency / MerkleConsistencyBatchEntry /
-verify_consistency_batch / MerkleConsistencyChain /
+verify_consistency_batch / BoundConsistencyBatch /
+verify_consistency_batch_bound / MerkleConsistencyChain /
 prove_consistency_chain / verify_consistency_chain.
 """
 
@@ -47,6 +48,7 @@ from typing import Callable
 __all__ = [
     "DEFAULT_GENERATOR",
     "DEFAULT_PRIME",
+    "BoundConsistencyBatch",
     "BoundRangeBatch",
     "BoundRegionBatch",
     "BoundRegionReplayGuard",
@@ -98,6 +100,7 @@ __all__ = [
     "verify_bound",
     "verify_consistency",
     "verify_consistency_batch",
+    "verify_consistency_batch_bound",
     "verify_consistency_chain",
     "verify_inclusion",
     "verify_multi_inclusion",
@@ -1973,6 +1976,153 @@ def verify_consistency_batch(entries: Sequence[MerkleConsistencyBatchEntry]) -> 
         if not verify_consistency(entry.old_root, entry.new_root, entry.proof):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed consistency batches
+#
+# A complete consistency batch frozen together with the Merkle proof that
+# commits to every entry. Each Merkle leaf starts from the domain separator
+# b"zkregion/consistency-bound/v1" and frames, in order, the entry's
+# old_root, new_root, old_count, new_count and every node of the proof in
+# order. Verification first checks every leaf against the Merkle root, then
+# runs the unchanged consistency batch verification.
+
+_CONSISTENCY_BOUND_DOMAIN = b"zkregion/consistency-bound/v1"
+
+
+@dataclass(frozen=True)
+class BoundConsistencyBatch:
+    """A complete consistency batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of
+    :class:`MerkleConsistencyBatchEntry`; ``leaf_count`` — a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``; ``proof`` — the :class:`MerkleMultiProof` whose
+    indices cover ``0 .. leaf_count - 1`` without gaps or duplicates. All
+    three are positional construction arguments; batches compare by value
+    and are immutable.
+    """
+
+    entries: tuple[MerkleConsistencyBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_consistency_leaf(entry: MerkleConsistencyBatchEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`MerkleConsistencyBatchEntry`.
+
+    Items, in order: the domain separator, ``old_root``, ``new_root``,
+    ``old_count``, ``new_count`` and every node of the proof in order.
+    Every item is prefixed with its four-byte unsigned big-endian length;
+    counts are encoded as decimal ASCII while roots and nodes keep their
+    raw bytes and their given order.
+    """
+    proof = entry.proof
+    items = [
+        _CONSISTENCY_BOUND_DOMAIN,
+        entry.old_root,
+        entry.new_root,
+        str(proof.old_count).encode("ascii"),
+        str(proof.new_count).encode("ascii"),
+    ]
+    items.extend(proof.nodes)
+    leaf = bytearray()
+    for item in items:
+        leaf += len(item).to_bytes(4, "big")
+        leaf += item
+    return bytes(leaf)
+
+
+def verify_consistency_batch_bound(
+    batch: BoundConsistencyBatch,
+    root: bytes,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundConsistencyBatch`.
+
+    The Merkle binding is checked first: every entry is encoded to its
+    leaf exactly as specified by :func:`_bound_consistency_leaf` and the
+    whole batch is checked against ``root`` with
+    :func:`verify_multi_inclusion`. ``leaf_count`` must be a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``, and ``proof.indices`` must cover
+    ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering; an
+    empty batch, a missing entry or any index mismatch returns ``False``.
+    Only after the root checks does the batch go through
+    :func:`verify_consistency_batch`, which applies its own unchanged
+    root, count, node and append rules to every entry.
+
+    Type errors — a batch that is not a :class:`BoundConsistencyBatch`,
+    non-tuple entries, non-:class:`MerkleConsistencyBatchEntry` items, a
+    non-integer or ``bool`` ``leaf_count``, a wrong proof/root object or
+    malformed nested field types — raise :class:`TypeError`; every other
+    invalidity behaves exactly as the delegated calls do. Inputs are
+    never mutated.
+    """
+    if not isinstance(batch, BoundConsistencyBatch):
+        raise TypeError("batch must be a BoundConsistencyBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(
+            "batch entries must be a tuple of MerkleConsistencyBatchEntry"
+        )
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, MerkleConsistencyBatchEntry):
+            raise TypeError(
+                f"entries[{position}] must be a MerkleConsistencyBatchEntry"
+            )
+        _check_bytes(entry.old_root, f"entries[{position}] old_root")
+        _check_bytes(entry.new_root, f"entries[{position}] new_root")
+        entry_proof = entry.proof
+        if not isinstance(entry_proof, MerkleConsistencyProof):
+            raise TypeError(
+                f"entries[{position}] proof must be a MerkleConsistencyProof"
+            )
+        for name in ("old_count", "new_count"):
+            value = getattr(entry_proof, name)
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise TypeError(
+                    f"entries[{position}] proof {name} must be an integer"
+                )
+        if not isinstance(entry_proof.nodes, tuple):
+            raise TypeError(
+                f"entries[{position}] proof nodes must be a tuple of bytes"
+            )
+        for node in entry_proof.nodes:
+            _check_bytes(node, f"entries[{position}] proof node")
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_consistency_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf, then
+    # 2) the unchanged consistency batch verification checks the pairs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_consistency_batch(entries)
 
 
 # ---------------------------------------------------------------------------

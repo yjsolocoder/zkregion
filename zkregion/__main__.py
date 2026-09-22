@@ -34,6 +34,7 @@ from . import (
     SchnorrVerifier,
     SingleKeyBatchGuard,
     SingleKeyBoundBatch,
+    SingleKeyBoundReplayGuard,
     commit,
     commit_coordinate,
     merkle_root,
@@ -711,6 +712,26 @@ def main() -> int:
     foreign_bsr_binding = foreign_bsr.bind_once(bound_batch, bound_root, b"bound-schnorr-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_bsr.check(bound_batch, bound_root, foreign_bsr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for same-key bound Schnorr batches:")
+    skbbr = SingleKeyBoundReplayGuard(verifier.public_key)
+    skbbr_binding = skbbr.bind_once(single_bound, single_root, b"single-key-bound-session-1", expires_at=10**12)
+    print(f"  digest={skbbr_binding.digest.hex()[:32]}…  expires_at={skbbr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{skbbr.check(single_bound, single_root, skbbr_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not skbbr.check(single_bound, single_root, skbbr_binding, now=101, randbelow=counter_randbelow())}")
+    other_skbbr = SingleKeyBoundReplayGuard(verifier.public_key)
+    other_skbbr_binding = other_skbbr.bind_once(single_bound, single_root, b"single-key-bound-session-2")
+    print(f"  wrong root rejected without consuming the id: "
+          f"{not other_skbbr.check(single_bound, merkle_root(single_leaves[:1]), other_skbbr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_skbbr.check(single_bound, single_root, other_skbbr_binding, now=1, randbelow=counter_randbelow())}")
+    foreign_skbbr = SingleKeyBoundReplayGuard(verifier.public_key)
+    foreign_skbbr_binding = foreign_skbbr.bind_once(single_bound, single_root, b"single-key-bound-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_skbbr.check(single_bound, single_root, foreign_skbbr_binding, now=1)}")
 
     print()
     print("per-instance replay protection for consistency chains (bind once, check once):")

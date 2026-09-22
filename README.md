@@ -105,6 +105,36 @@ inclusion_batch = [
 assert verify_inclusion_batch(inclusion_batch)
 assert not verify_inclusion_batch(())
 
+# Merkle 承诺的单叶包含证明完整批验：整批包含条目先提交到一棵 Merkle 树
+from zkregion import BoundMerkleInclusionBatch, verify_inclusion_batch_bound
+
+def bound_inclusion_batch_leaf(item):
+    # Q(item) 复用 MerkleInclusionReplayGuard 摘要从 F(leaf) 到 S(proof.siblings, id)
+    # 的连续字节；外层叶为 F(b"zkregion/inclusion-batch/v1") || F(Q(item))
+    def frame(value):
+        return len(value).to_bytes(4, "big") + value
+    def u64(value):
+        return value.to_bytes(8, "big")
+    proof = item.proof
+    q = bytearray()
+    q += frame(item.leaf)
+    q += frame(item.root)
+    q += frame(u64(proof.index))
+    q += frame(u64(len(proof.siblings)))
+    for sibling in proof.siblings:
+        q += frame(sibling)
+    return frame(b"zkregion/inclusion-batch/v1") + frame(bytes(q))
+
+bound_ib_leaves = [bound_inclusion_batch_leaf(item) for item in inclusion_batch]
+bound_ib_root = merkle_root(bound_ib_leaves)
+bound_ib_proof = prove_multi_inclusion(
+    bound_ib_leaves, tuple(range(len(bound_ib_leaves)))
+)
+bound_ib = BoundMerkleInclusionBatch(
+    tuple(inclusion_batch), len(inclusion_batch), bound_ib_proof
+)
+assert verify_inclusion_batch_bound(bound_ib, bound_ib_root)
+
 # Merkle 多包含证明（一次证明多片叶子，无需完整叶集即可验证）
 from zkregion import verify_multi_inclusion
 
@@ -903,6 +933,8 @@ python3 -m zkregion
 - `verify_inclusion(leaf, proof, root) -> bool` — 验证包含证明
 - `MerkleInclusionBatchEntry(leaf, proof, root)` — 不可变包含批验条目，字段依次为 `bytes`、`MerkleProof`、`bytes`，次序与 `verify_inclusion` 入参一致；三字段均可位置构造、按值相等且不可变
 - `verify_inclusion_batch(entries) -> bool` — 独立单叶包含证明的批量验证：先预检整批嵌套类型（任一条目错型——含 `bool` 索引、非元组 `siblings` 或节点非 `bytes`——均抛 `TypeError`，后项错型同样抛出），空批返回 `False`，再逐项以 `leaf`、`proof`、`root` 调 `verify_inclusion`，首拒短路；条目彼此独立、可乱序重复，不做密码学聚合，输入不变
+- `BoundMerkleInclusionBatch(entries, leaf_count, proof)` — 冻结的单叶包含证明完整批对象；字段依次为非空 `tuple[MerkleInclusionBatchEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变；`leaf_count` 须等于条目数及 `proof.leaf_count`，`proof.indices` 须为 `tuple(range(leaf_count))`，空批、缺项、计数不符或索引不完整均返回 `False`
+- `verify_inclusion_batch_bound(batch, root) -> bool` — Merkle 承诺的单叶包含证明完整批验：每项外层叶为 `F(b"zkregion/inclusion-batch/v1") || F(Q(item))`，其中 `Q(item)` 逐字节复用 `MerkleInclusionReplayGuard` 摘要从 `F(leaf)` 到 `S(proof.siblings, id)` 的连续段（即 `F(leaf) || F(root) || F(U(proof.index)) || S(proof.siblings, id)`，入参不变的 `_merkle_inclusion_proof_framing`），按批序成叶、留重，叶摘要沿用 Merkle 规则；先以 `verify_multi_inclusion` 验根（结构/根失败即返回 `False` 且不进内层），根通过后原样调用 `verify_inclusion_batch(batch.entries)`；全批预检类型与 U 成帧 uint64 边界，`root` 须为 `bytes`，错型抛 `TypeError`，其余无效返回 `False`，输入不变
 - `MerkleProof(index, siblings)` — 不可变证明对象，`siblings` 为按叶到根排列的 `tuple[bytes, ...]`
 - `prove_multi_inclusion(leaves, indices) -> MerkleMultiProof` — 为多片叶子生成紧凑的合并包含证明
 - `verify_multi_inclusion(entries, proof, root) -> bool` — 无需完整叶集验证多包含证明；`entries` 按 `proof.indices` 顺序给出 `(index, leaf)`
@@ -944,6 +976,31 @@ python3 -m zkregion
 2. 预检通过后，空批返回 `False`；否则逐项按 `leaf`、`proof`、`root` 顺序委托既有 `verify_inclusion`，完全沿用其根长度、索引、兄弟长度与路径恢复规则；任一条目无效即返回 `False`，首拒短路。
 
 各条目彼此独立：可来自互不相干的树，可以乱序、可以重复；批验不新增任何哈希编码，也不做密码学聚合。`entries` 本身不是序列或是 `bytes`/`bytearray`/`str`、条目不是 `MerkleInclusionBatchEntry`、任一字段错型——含嵌套证明的 `bool` 索引、`siblings` 非元组或兄弟非 `bytes`——均抛 `TypeError`，即类型错误不会被转换为批量拒绝（返回 `False`）。除空批外，根或兄弟非 32 字节、负索引、索引深于路径允许、路径结构非法或任一根不符均返回 `False`。入口不改写任何输入。
+
+### Merkle 承诺的单叶包含证明完整批验
+
+`BoundMerkleInclusionBatch(entries, leaf_count, proof)` 把一批**完整**的单叶包含证明批验条目与一棵 Merkle 树的多包含证明冻结在一起，三个字段依次为：
+
+1. `entries: tuple[MerkleInclusionBatchEntry, ...]` —— 必须是非空元组（不是列表），每项是 `MerkleInclusionBatchEntry`；
+2. `leaf_count: int` —— 正的非 `bool` 整数，且必须同时等于 `len(entries)` 与 `proof.leaf_count`；
+3. `proof: MerkleMultiProof` —— 其 `indices` 必须无缺口、无重复、无乱序地恰好覆盖 `0 .. leaf_count - 1`（即等于 `tuple(range(leaf_count))`）。
+
+三字段均可位置构造，对象按值相等且不可变（冻结 dataclass）。空批（`leaf_count < 1` 或 `entries` 为空）、缺项（数量不符）、`leaf_count` 与条目数或 `proof.leaf_count` 不一致、`proof.indices` 不等于 `tuple(range(leaf_count))`（含索引缺口、重复、乱序）均返回 `False`。
+
+每个条目的外层 Merkle 叶字节为
+
+```
+leaf(item) = F(b"zkregion/inclusion-batch/v1") || F(Q(item))
+```
+
+其中 `F(x)` 为 `x` 的四字节无符号大端长度前缀加 `x`；`Q(item)` **逐字节复用** `MerkleInclusionReplayGuard` 绑定摘要中从 `F(leaf)` 到 `S(proof.siblings, id)` 的连续段（即入参不变的内部成帧函数 `_merkle_inclusion_proof_framing`），按序为 `F(leaf) || F(root) || F(U(proof.index)) || S(proof.siblings, id)`，其中 `U(n)` 为八字节无符号大端编码、`S(a,f) = F(U(|a|)) || Σ F(f(a_i))`、恒等映射下兄弟摘要原样置于 `F` 之下。条目按批序成叶并保留重复项（不删项、不乱序）；叶摘要仍按 Merkle 树构造一节的 `SHA-256(b"\x00" + len4 + leaf)` 计算。任何由 `Q` 以 `U` 成帧的整数（各 `proof.index` 及 `siblings` 元组长度）超出 uint64 均返回 `False`。
+
+`verify_inclusion_batch_bound(batch, root) -> bool` 的验证分两步、次序固定：
+
+1. 先预检**整批**嵌套类型并校验批结构（`entries` 非空元组、`leaf_count` 正数且与条目数及 `proof.leaf_count` 相等、`proof.indices == tuple(range(leaf_count))`、U 值可成帧），再按全部 `(index, leaf)`（`index` 即 0 起的条目位置）调用 `verify_multi_inclusion` 校验 Merkle 根；任一叶字节、proof 或根不符即返回 `False`，且根校验通过前不进入内层批验；
+2. 根通过后，**输入不变地**调用 `verify_inclusion_batch(batch.entries)`，逐项沿用其根长度、索引、兄弟长度与路径恢复规则，不做包装或改动。
+
+类型错误——`batch` 不是 `BoundMerkleInclusionBatch`、`entries` 不是元组、`leaf_count` 不是非 `bool` 整数、外层 `proof`/`root` 类型错误，或任一 `MerkleInclusionBatchEntry` 的嵌套字段类型错误（叶/根/兄弟非 `bytes`、内层 proof 非 `MerkleProof`、`bool` 索引、`siblings` 非元组）——抛 `TypeError`，预检会走完整批，后项错型同样抛出；其余一切无效情形（空批、缺项、计数不符、索引不完整、U 值越界、错误根、叶字节篡改，以及委托 `verify_inclusion_batch` 返回的任何 `False`）均返回 `False`。`root` 必须为 `bytes`（`bytearray` 不算）。入口不改写任何输入。
 
 ### Merkle 追加一致性证明
 

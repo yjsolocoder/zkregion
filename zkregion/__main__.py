@@ -22,6 +22,7 @@ from . import (
     RangeReplayGuard,
     Region,
     RegionBatchEntry,
+    RegionBatchReplayGuard,
     RegionProof,
     RegionReplayGuard,
     ReplayBinding,
@@ -526,6 +527,32 @@ def main() -> int:
     foreign_rbr_binding = foreign_rbr.bind_once(range_entries, b"range-batch-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_rbr.check(range_entries, foreign_rbr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for region batches (bind once, check once):")
+    rgbr = RegionBatchReplayGuard()
+    rgbr_binding = rgbr.bind_once(batch_entries, b"region-batch-session-1", expires_at=10**12)
+    print(f"  digest={rgbr_binding.digest.hex()[:32]}…  expires_at={rgbr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{rgbr.check(batch_entries, rgbr_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not rgbr.check(batch_entries, rgbr_binding, now=101, randbelow=counter_randbelow())}")
+    other_rgbr = RegionBatchReplayGuard()
+    other_rgbr_binding = other_rgbr.bind_once(batch_entries, b"region-batch-session-2")
+    print(f"  reordered batch rejected without consuming the id: "
+          f"{not other_rgbr.check(batch_entries[::-1], other_rgbr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_rgbr.check(batch_entries, other_rgbr_binding, now=1, randbelow=counter_randbelow())}")
+    try:
+        rgbr.bind_once(batch_entries, b"region-batch-session-1")
+    except ValueError:
+        print("  rebind of a consumed id rejected: True")
+    else:
+        print("  rebind of a consumed id rejected: False")
+    foreign_rgbr = RegionBatchReplayGuard()
+    foreign_rgbr_binding = foreign_rgbr.bind_once(batch_entries, b"region-batch-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_rgbr.check(batch_entries, foreign_rgbr_binding, now=1)}")
 
     print()
     print("per-instance replay protection for region proofs (bind once, check once):")

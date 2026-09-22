@@ -32,6 +32,7 @@ from zkregion import (
     RangeReplayGuard,
     Region,
     RegionBatchEntry,
+    RegionBatchReplayGuard,
     RegionProof,
     RegionReplayGuard,
     ReplayBinding,
@@ -11307,6 +11308,762 @@ class RangeBatchReplayGuardTest(unittest.TestCase):
         self.assertIn(b"s", guard._pending)
         self.assertTrue(
             RangeBatchReplayGuard(store=store).check(
+                entries, binding, now=1, randbelow=counter_randbelow()
+            )
+        )
+        store.close()
+
+
+class RegionBatchReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for region-proof batches."""
+
+    DOMAIN = b"zr/rgbr/v1"
+    PRIME_A = SMALL_PRIME
+    PRIME_B = 104723
+    REGION = Region(0, 10, 20, 30)
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "rgbr.db")
+        self.entries = self.make_entries()
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def make_entry(self, x, y, *, prime, blinding, region=None, context=b"batch"):
+        if region is None:
+            region = self.REGION
+        x_commitment, x_r = pedersen_commit(
+            x, region.min_x, region.max_x, prime=prime, generator=3,
+            blinding=blinding,
+        )
+        y_commitment, y_r = pedersen_commit(
+            y, region.min_y, region.max_y, prime=prime, generator=3,
+            blinding=blinding + 1,
+        )
+        proof = prove_region(
+            x_commitment, y_commitment, x, y, x_r, y_r, region,
+            context=context, randbelow=counter_randbelow(),
+        )
+        return RegionBatchEntry(x_commitment, y_commitment, region, proof, context)
+
+    def make_entries(self):
+        return [
+            self.make_entry(4, 22, prime=self.PRIME_A, blinding=1001),
+            self.make_entry(7, 28, prime=self.PRIME_A, blinding=1003),
+            self.make_entry(3, 25, prime=self.PRIME_B, blinding=2001),
+        ]
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def bound_region_leaf(entry):
+        items = [b"zkregion/region-bound/v1"]
+        for c in (entry.x_commitment, entry.y_commitment):
+            items += [str(v).encode("ascii")
+                      for v in (c.element, c.lower, c.upper, c.prime, c.generator, c.h)]
+        r = entry.region
+        items += [str(v).encode("ascii") for v in (r.min_x, r.max_x, r.min_y, r.max_y)]
+        items.append(entry.context)
+        for sub in (entry.proof.x_proof, entry.proof.y_proof):
+            for seq in (sub.t, sub.e, sub.s):
+                items.append(str(len(seq)).encode("ascii"))
+                items += [str(v).encode("ascii") for v in seq]
+        return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+    def expected_digest(self, entries, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(
+                F(transform(item)) for item in sequence
+            )
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = (
+            F(b"zr/rgbr/v1") + F(session_id)
+            + S(entries, self.bound_region_leaf) + F(expiry)
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(entries, b"s1"))
+        binding = guard.bind_once(entries, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(entries, b"s2", 1000)
+        )
+
+    def test_tuple_and_list_inputs_frame_identically(self):
+        entries = self.entries
+        from_list = RegionBatchReplayGuard().bind_once(list(entries), b"s")
+        from_tuple = RegionBatchReplayGuard().bind_once(tuple(entries), b"s")
+        self.assertEqual(from_list.digest, from_tuple.digest)
+        self.assertEqual(from_list, from_tuple)
+
+    def test_batch_order_and_duplicates_are_preserved(self):
+        entries = self.entries
+        base = RegionBatchReplayGuard().bind_once(entries, b"s")
+
+        def bind(batch):
+            return RegionBatchReplayGuard().bind_once(batch, b"s").digest
+
+        self.assertNotEqual(base.digest, bind(entries[::-1]))
+        self.assertNotEqual(base.digest, bind(entries[:-1]))
+        self.assertNotEqual(base.digest, bind([entries[0], entries[0]]))
+        self.assertEqual(base.digest, bind(list(entries)))
+
+    def test_domain_separator_is_distinct(self):
+        entries = self.entries
+        binding = RegionBatchReplayGuard().bind_once(entries, b"s")
+
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(
+                F(transform(item)) for item in sequence
+            )
+
+        framing = F(b"s") + S(entries, self.bound_region_leaf) + F(b"\x00")
+        for other_domain in (
+            b"zr/r/v1",
+            b"zr/rr/v1",
+            b"zr/rg/v1",
+            b"zr/brg/v1",
+            b"zr/brr/v1",
+            b"zr/bsr/v1",
+            b"zr/sbr/v1",
+            b"zr/rbr/v1",
+            b"zr/mccr/v1",
+            b"zr/mcr/v1",
+            b"zr/mir/v1",
+            b"zr/mmr/v1",
+            b"zr/mcbr/v1",
+        ):
+            foreign_digest = hashlib.sha256(F(other_domain) + framing).digest()
+            self.assertNotEqual(binding.digest, foreign_digest)
+
+    def test_digest_binds_every_component(self):
+        entries = self.entries
+
+        def bind(batch=entries, s=b"s", **kw):
+            return RegionBatchReplayGuard().bind_once(batch, s, **kw).digest
+
+        base = bind()
+        self.assertNotEqual(base, bind(s=b"other"))
+        self.assertNotEqual(base, bind(expires_at=1))
+        self.assertNotEqual(bind(expires_at=1), bind(expires_at=2))
+        entry = entries[1]
+        tampered_context = dataclasses.replace(entry, context=b"elsewhere")
+        self.assertNotEqual(base, bind([entries[0], tampered_context, entries[2]]))
+        tampered_commitment = dataclasses.replace(
+            entry.x_commitment, element=entry.x_commitment.element + 1
+        )
+        self.assertNotEqual(
+            base,
+            bind([
+                entries[0],
+                dataclasses.replace(entry, x_commitment=tampered_commitment),
+                entries[2],
+            ]),
+        )
+        tampered_region = dataclasses.replace(entry, region=Region(0, 10, 20, 31))
+        self.assertNotEqual(base, bind([entries[0], tampered_region, entries[2]]))
+        x_proof = entry.proof.x_proof
+        tampered_proof = dataclasses.replace(
+            entry.proof,
+            x_proof=RangeProof(
+                x_proof.t, x_proof.e, x_proof.s[:-1] + (x_proof.s[-1] + 1,),
+            ),
+        )
+        self.assertNotEqual(
+            base,
+            bind([
+                entries[0],
+                dataclasses.replace(entry, proof=tampered_proof),
+                entries[2],
+            ]),
+        )
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        entries = self.entries
+        none_binding = RegionBatchReplayGuard().bind_once(entries, b"a")
+        zero_binding = RegionBatchReplayGuard().bind_once(entries, b"b", expires_at=0)
+        one_binding = RegionBatchReplayGuard().bind_once(entries, b"c", expires_at=1)
+        digests = {none_binding.digest, zero_binding.digest, one_binding.digest}
+        self.assertEqual(len(digests), 3)
+
+    def test_negative_fields_still_bind(self):
+        # BoundRegion leaves encode integers as decimal ASCII with the sign
+        # kept, so negative region bounds frame without an encodability
+        # rejection (mirroring RegionReplayGuard).
+        region = Region(-5, 10, 20, 30)
+        entry = self.make_entry(-2, 25, prime=self.PRIME_A, blinding=3001,
+                                region=region)
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once([entry], b"s")
+        self.assertEqual(binding.digest, self.expected_digest([entry], b"s"))
+        self.assertTrue(
+            guard.check([entry], binding, now=1, randbelow=counter_randbelow())
+        )
+
+    # ---- bind_once state and validation -------------------------------------
+
+    def test_empty_batch_rejected(self):
+        for empty in ((), []):
+            with self.assertRaises(ValueError):
+                RegionBatchReplayGuard().bind_once(empty, b"s")
+
+    def test_pending_id_cannot_be_rebound(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        guard.bind_once(entries, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=counter_randbelow()))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_claimed_id_cannot_be_rebound(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard._registry.claim(b"s", binding))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        first = guard.bind_once(entries, b"s1")
+        second = guard.bind_once(entries, b"s2")
+        self.assertTrue(guard.check(entries, first, now=1, randbelow=counter_randbelow()))
+        self.assertFalse(guard.check(entries, first, now=1, randbelow=counter_randbelow()))
+        self.assertTrue(guard.check(entries, second, now=1, randbelow=counter_randbelow()))
+
+    def test_bind_type_errors(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(bad, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once([entries[0], 42], b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once([("a", "b")], b"s")
+        entry = entries[0]
+        bad_fields = [
+            dataclasses.replace(entry, x_commitment="c"),
+            dataclasses.replace(entry, y_commitment=object()),
+            dataclasses.replace(
+                entry,
+                x_commitment=dataclasses.replace(entry.x_commitment, h=True),
+            ),
+            dataclasses.replace(entry, region="r"),
+            dataclasses.replace(entry, region=Region(0, True, 20, 30)),
+            dataclasses.replace(entry, proof="p"),
+            dataclasses.replace(entry, proof=object()),
+            dataclasses.replace(
+                entry,
+                proof=dataclasses.replace(entry.proof, x_proof="xp"),
+            ),
+            dataclasses.replace(
+                entry,
+                proof=dataclasses.replace(
+                    entry.proof,
+                    y_proof=RangeProof(
+                        (True,) + entry.proof.y_proof.t[1:],
+                        entry.proof.y_proof.e,
+                        entry.proof.y_proof.s,
+                    ),
+                ),
+            ),
+            dataclasses.replace(
+                entry,
+                proof=dataclasses.replace(
+                    entry.proof,
+                    x_proof=RangeProof(
+                        list(entry.proof.x_proof.t),
+                        entry.proof.x_proof.e,
+                        entry.proof.x_proof.s,
+                    ),
+                ),
+            ),
+            dataclasses.replace(entry, context=bytearray(b"batch")),
+        ]
+        for bad in bad_fields:
+            with self.assertRaises(TypeError, msg=bad):
+                guard.bind_once([entries[1], bad], b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entries, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entries, b"x", expires_at=bad)
+
+    def test_bind_value_errors(self):
+        entries = self.entries
+        with self.assertRaises(ValueError):
+            RegionBatchReplayGuard().bind_once(entries, b"")
+        for bad_expiry in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                RegionBatchReplayGuard().bind_once(
+                    entries, b"s", expires_at=bad_expiry
+                )
+
+    def test_construction_rejects_non_store(self):
+        for bad in (object(), "path", 1, True, b"ns", {}):
+            with self.assertRaises(TypeError):
+                RegionBatchReplayGuard(store=bad)
+
+    # ---- check: accept, reject, consume -------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertTrue(
+            guard.check(entries, binding, now=999, randbelow=counter_randbelow())
+        )
+        self.assertFalse(
+            guard.check(entries, binding, now=999, randbelow=counter_randbelow())
+        )
+        self.assertEqual(guard._consumed, {b"s"})
+        self.assertNotIn(b"s", guard._pending)
+
+    def test_check_with_default_now_and_randbelow(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(
+            guard.check(entries, binding, now=2**64 - 1, randbelow=counter_randbelow())
+        )
+
+    def test_expiry_boundary_is_inclusive(self):
+        entries = self.entries
+        for now in (1000, 1001, 2**64 - 1):
+            guard = RegionBatchReplayGuard()
+            binding = guard.bind_once(entries, b"s", expires_at=1000)
+            self.assertFalse(
+                guard.check(entries, binding, now=now, randbelow=counter_randbelow())
+            )
+            self.assertIn(b"s", guard._pending)
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertTrue(
+            guard.check(entries, binding, now=999, randbelow=counter_randbelow())
+        )
+
+    def test_wrong_batch_rejected_without_consuming(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertFalse(
+            guard.check(entries[::-1], binding, now=1, randbelow=counter_randbelow())
+        )
+        self.assertFalse(
+            guard.check(entries[:-1], binding, now=1, randbelow=counter_randbelow())
+        )
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            guard.check(entries, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_bound_but_unverifiable_batch_rejected_and_restored(self):
+        entries = self.entries
+        x_proof = entries[0].proof.x_proof
+        forged_proof = dataclasses.replace(
+            entries[0].proof,
+            x_proof=RangeProof(
+                x_proof.t, x_proof.e, x_proof.s[:-1] + (x_proof.s[-1] + 1,),
+            ),
+        )
+        bad = [dataclasses.replace(entries[0], proof=forged_proof)] + entries[1:]
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(bad, b"s")
+        self.assertFalse(
+            guard.check(bad, binding, now=1, randbelow=counter_randbelow())
+        )
+        self.assertIn(b"s", guard._pending)
+        with self.assertRaises(ValueError):
+            guard.bind_once(bad, b"s")
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        self.assertFalse(
+            guard.check(
+                entries, ReplayBinding(b"never", b"\x00" * 32),
+                now=1, randbelow=counter_randbelow(),
+            )
+        )
+        binding = guard.bind_once(entries, b"s")
+        foreign = RegionBatchReplayGuard().bind_once(entries, b"s")
+        self.assertEqual(foreign, binding)
+        self.assertFalse(
+            RegionBatchReplayGuard().check(
+                entries, foreign, now=1, randbelow=counter_randbelow()
+            )
+        )
+        self.assertTrue(
+            guard.check(entries, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        guard.bind_once(entries, b"s")
+        forged = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(guard._registry.claim(b"s", forged))
+        self.assertIn(b"s", guard._pending)
+
+    def test_empty_batch_check_returns_false(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertFalse(
+            guard.check((), binding, now=1, randbelow=counter_randbelow())
+        )
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            guard.check(entries, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_instances_are_independent(self):
+        entries = self.entries
+        first = RegionBatchReplayGuard()
+        second = RegionBatchReplayGuard()
+        binding = first.bind_once(entries, b"s")
+        self.assertFalse(
+            second.check(entries, binding, now=1, randbelow=counter_randbelow())
+        )
+        self.assertTrue(
+            first.check(entries, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    # ---- random source passthrough ------------------------------------------
+
+    def test_randbelow_is_passed_through_to_delegation(self):
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=recording))
+        # Each entry has two [0, 10]-sized range proofs of 11 branches each;
+        # entries are visited in order (two entries on PRIME_A, then one on
+        # PRIME_B).
+        self.assertEqual(
+            calls,
+            [self.PRIME_A - 1] * 44 + [self.PRIME_B - 1] * 22,
+        )
+
+    def test_no_randomness_drawn_for_a_replayed_id(self):
+        entries = self.entries
+
+        def boom(upper):
+            raise AssertionError("randbelow must not be called")
+
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(
+            guard.check(entries, binding, now=1, randbelow=counter_randbelow())
+        )
+        self.assertFalse(guard.check(entries, binding, now=1, randbelow=boom))
+
+    def test_no_randomness_drawn_for_a_digest_mismatch(self):
+        entries = self.entries
+
+        def boom(upper):
+            raise AssertionError("randbelow must not be called")
+
+        guard = RegionBatchReplayGuard()
+        guard.bind_once(entries, b"s")
+        self.assertFalse(
+            guard.check(entries[::-1], ReplayBinding(b"s", b"\x01" * 32),
+                        now=1, randbelow=boom)
+        )
+
+    def test_delegated_randomness_errors_propagate_and_restore(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        with self.assertRaises(TypeError):
+            guard.check(entries, binding, now=1, randbelow=lambda upper: True)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            guard.check(entries, binding, now=1, randbelow=counter_randbelow())
+        )
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s2")
+        with self.assertRaises(ValueError):
+            guard.check(entries, binding, now=1, randbelow=lambda upper: -1)
+        self.assertIn(b"s2", guard._pending)
+
+    def test_delegation_error_propagates_and_restores_pending(self):
+        import zkregion
+
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        original = zkregion.verify_region_batch
+
+        def boom(_entries, **_kwargs):
+            raise RuntimeError("boom")
+
+        zkregion.verify_region_batch = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entries, binding, now=1)
+        finally:
+            zkregion.verify_region_batch = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            guard.check(entries, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    # ---- check argument validation ------------------------------------------
+
+    def test_check_type_errors(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.check(bad, binding, now=1)
+        for bad in (7, None, True, "binding", (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(entries, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(entries, binding, now=bad)
+        with self.assertRaises(TypeError):
+            guard.check(entries, binding, now=1, randbelow=7)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(entries, binding, now=bad)
+
+    def test_inputs_are_not_mutated(self):
+        entries = self.entries
+        guard = RegionBatchReplayGuard()
+        snapshots = [
+            (entry.x_commitment, entry.y_commitment, entry.region,
+             entry.proof, entry.context)
+            for entry in entries
+        ]
+        sequence_snapshot = list(entries)
+        binding = guard.bind_once(entries, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        self.assertTrue(
+            guard.check(entries, binding, now=1, randbelow=counter_randbelow())
+        )
+        self.assertEqual(
+            [(entry.x_commitment, entry.y_commitment, entry.region,
+              entry.proof, entry.context) for entry in entries],
+            snapshots,
+        )
+        self.assertEqual(list(entries), sequence_snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        entries = self.entries
+        store = self.make_store()
+        binder = RegionBatchReplayGuard(store=store)
+        binding = binder.bind_once(entries, b"s", expires_at=1000)
+        checker = RegionBatchReplayGuard(store=store)
+        self.assertTrue(
+            checker.check(entries, binding, now=999, randbelow=counter_randbelow())
+        )
+        self.assertFalse(
+            binder.check(entries, binding, now=999, randbelow=counter_randbelow())
+        )
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        entries = self.entries
+        store = self.make_store()
+        binding = RegionBatchReplayGuard(store=store).bind_once(entries, b"s")
+        store.close()
+        reopened = self.make_store()
+        guard = RegionBatchReplayGuard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            guard.check(entries, binding, now=1, randbelow=counter_randbelow())
+        )
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = RegionBatchReplayGuard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(entries, b"s")
+        reopened_again.close()
+
+    def test_store_domain_isolation_from_single_entry_guard(self):
+        entries = self.entries
+        store = self.make_store()
+        batch_guard = RegionBatchReplayGuard(store=store)
+        single_guard = RegionReplayGuard(store=store)
+        batch_binding = batch_guard.bind_once(entries, b"same-id")
+        single_binding = single_guard.bind_once(entries[0], b"same-id")
+        self.assertTrue(
+            batch_guard.check(
+                entries, batch_binding, now=1, randbelow=counter_randbelow()
+            )
+        )
+        self.assertTrue(single_guard.check(entries[0], single_binding, now=1))
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/rg/v1", domains)
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        entries = self.entries
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = RegionBatchReplayGuard(store=first).bind_once(entries, b"s")
+        self.assertFalse(
+            RegionBatchReplayGuard(store=second).check(
+                entries, binding_a, now=1, randbelow=counter_randbelow()
+            )
+        )
+        self.assertTrue(
+            RegionBatchReplayGuard(store=first).check(
+                entries, binding_a, now=1, randbelow=counter_randbelow()
+            )
+        )
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        entries = self.entries
+        store = self.make_store()
+        binder = RegionBatchReplayGuard(store=store)
+        binding = binder.bind_once(entries, b"s")
+        checker = RegionBatchReplayGuard(store=store)
+        self.assertFalse(
+            checker.check(entries[::-1], binding, now=1,
+                          randbelow=counter_randbelow())
+        )
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(
+            RegionBatchReplayGuard(store=store).check(
+                entries, binding, now=1, randbelow=counter_randbelow()
+            )
+        )
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        entries = self.entries
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = RegionBatchReplayGuard(store=store)
+        binding = guard.bind_once(entries, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):  # live claim cannot be rebound
+            guard.bind_once(entries, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):  # expired claim still cannot be rebound
+            guard.bind_once(entries, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):  # consumed id can never be rebound
+            guard.bind_once(entries, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        entries = self.entries
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = RegionBatchReplayGuard(store=store).bind_once(entries, b"s")
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+    def test_store_delegation_error_restores_pending(self):
+        import zkregion
+
+        entries = self.entries
+        store = self.make_store()
+        guard = RegionBatchReplayGuard(store=store)
+        binding = guard.bind_once(entries, b"s")
+        original = zkregion.verify_region_batch
+
+        def boom(_entries, **_kwargs):
+            raise RuntimeError("boom")
+
+        zkregion.verify_region_batch = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entries, binding, now=1)
+        finally:
+            zkregion.verify_region_batch = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            RegionBatchReplayGuard(store=store).check(
                 entries, binding, now=1, randbelow=counter_randbelow()
             )
         )

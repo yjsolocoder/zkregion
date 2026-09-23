@@ -40,10 +40,13 @@ verify_multi_inclusion_batch_bound /
 MerkleConsistencyProof / prove_consistency /
 verify_consistency / MerkleConsistencyBatchEntry /
 verify_consistency_batch / BoundConsistencyBatch /
+prove_consistency_batch_bound /
 verify_consistency_batch_bound / MerkleConsistencyChain /
 prove_consistency_chain / verify_consistency_chain /
 verify_consistency_chain_batch /
-BoundConsistencyChainBatch / verify_consistency_chain_batch_bound /
+BoundConsistencyChainBatch /
+prove_consistency_chain_batch_bound /
+verify_consistency_chain_batch_bound /
 BoundConsistencyChainReplayGuard.
 """
 
@@ -119,7 +122,9 @@ __all__ = [
     "merkle_root",
     "pedersen_commit",
     "prove_consistency",
+    "prove_consistency_batch_bound",
     "prove_consistency_chain",
+    "prove_consistency_chain_batch_bound",
     "prove_inclusion",
     "prove_inclusion_batch_bound",
     "prove_multi_inclusion",
@@ -2746,6 +2751,53 @@ def verify_consistency_batch_bound(
     return verify_consistency_batch(entries)
 
 
+def prove_consistency_batch_bound(
+    entries: Sequence[MerkleConsistencyBatchEntry],
+) -> tuple[BoundConsistencyBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundConsistencyBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`MerkleConsistencyBatchEntry` rules as
+    :func:`verify_consistency_batch` and must be non-empty; every entry is
+    copied into a tuple in its original order with duplicates preserved,
+    and the inputs are never mutated. Each entry is encoded to its outer
+    leaf byte for byte with :func:`_bound_consistency_leaf`; the domain
+    separator, length framing, field order and the leaf/internal Merkle
+    hashing all stay unchanged. With ``n = len(entries)``, the complete
+    multi-inclusion proof is built with :func:`prove_multi_inclusion`
+    over the encoded leaves and the full indices ``tuple(range(n))`` — so
+    its ``indices`` cover every leaf and its ``siblings`` are empty — and
+    the returned batch carries ``leaf_count = n`` alongside that proof.
+    The second return value is the outer tree's :func:`merkle_root` of
+    the encoded leaves, which is exactly the root the batch verifies
+    under: ``verify_consistency_batch_bound(batch, root)`` returns
+    ``True``. Single-item, odd- and even-sized batches and duplicate
+    entries are all deterministic and byte for byte compatible with the
+    previous manual construction.
+
+    A type preflight over the whole batch — every entry and every nested
+    field, including ``bool`` counts and later entries — raises
+    :class:`TypeError` before anything is built; an empty batch or
+    :func:`verify_consistency_batch` returning ``False`` raises
+    :class:`ValueError`.
+    """
+    items = _check_merkle_consistency_batch_entries_types(entries)
+    if not items:
+        raise ValueError("entries must not be empty")
+    if not verify_consistency_batch(items):
+        raise ValueError("entries must pass verify_consistency_batch")
+    ordered = tuple(items)
+    leaves = [_bound_consistency_leaf(entry) for entry in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundConsistencyBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
+
+
 # ---------------------------------------------------------------------------
 # Multi-checkpoint Merkle consistency chains
 #
@@ -3074,6 +3126,54 @@ def verify_consistency_chain_batch(
         if not verify_consistency_chain(chain):
             return False
     return True
+
+
+def prove_consistency_chain_batch_bound(
+    chains: Sequence[MerkleConsistencyChain],
+) -> tuple[BoundConsistencyChainBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundConsistencyChainBatch`.
+
+    ``chains`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`MerkleConsistencyChain` rules as
+    :func:`verify_consistency_chain_batch` and must be non-empty; every
+    chain is copied into a tuple in its original order with duplicates
+    preserved, and the inputs are never mutated. Each chain is encoded to
+    its outer leaf byte for byte with :func:`_bound_consistency_chain_leaf`;
+    the domain separator, sequence and length framing, field order and the
+    leaf/internal Merkle hashing all stay unchanged. With
+    ``n = len(chains)``, the complete multi-inclusion proof is built with
+    :func:`prove_multi_inclusion` over the encoded leaves and the full
+    indices ``tuple(range(n))`` — so its ``indices`` cover every leaf and
+    its ``siblings`` are empty — and the returned batch carries
+    ``leaf_count = n`` alongside that proof. The second return value is
+    the outer tree's :func:`merkle_root` of the encoded leaves, which is
+    exactly the root the batch verifies under:
+    ``verify_consistency_chain_batch_bound(batch, root)`` returns ``True``.
+    Single-item, odd- and even-sized batches and duplicate chains are all
+    deterministic and byte for byte compatible with the previous manual
+    construction.
+
+    A type preflight over the whole batch — every chain and every nested
+    field, including ``bool`` counts, non-tuple ``roots`` / ``proofs`` /
+    ``nodes`` and later chains — raises :class:`TypeError` before anything
+    is built; an empty batch or :func:`verify_consistency_chain_batch`
+    returning ``False`` raises :class:`ValueError`.
+    """
+    items = _check_merkle_consistency_chains_types(chains)
+    if not items:
+        raise ValueError("chains must not be empty")
+    if not verify_consistency_chain_batch(items):
+        raise ValueError("chains must pass verify_consistency_chain_batch")
+    ordered = tuple(items)
+    leaves = [_bound_consistency_chain_leaf(chain) for chain in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundConsistencyChainBatch(
+        chains=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
 
 
 # ---------------------------------------------------------------------------

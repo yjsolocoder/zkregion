@@ -29,7 +29,8 @@ ReplayBinding / ReplayGuard / SQLiteReplayStore /
 RangeReplayGuard / RegionReplayGuard /
 Region / MerkleProof / merkle_root / prove_inclusion /
 verify_inclusion / MerkleInclusionBatchEntry / verify_inclusion_batch /
-BoundMerkleInclusionBatch / verify_inclusion_batch_bound /
+BoundMerkleInclusionBatch / prove_inclusion_batch_bound /
+verify_inclusion_batch_bound /
 BoundMerkleInclusionBatchReplayGuard /
 MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion / MerkleMultiBatchEntry /
@@ -119,6 +120,7 @@ __all__ = [
     "prove_consistency",
     "prove_consistency_chain",
     "prove_inclusion",
+    "prove_inclusion_batch_bound",
     "prove_multi_inclusion",
     "prove_range",
     "prove_region",
@@ -1873,6 +1875,52 @@ def verify_inclusion_batch_bound(
     if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
         return False
     return verify_inclusion_batch(entries)
+
+
+def prove_inclusion_batch_bound(
+    entries: Sequence[MerkleInclusionBatchEntry],
+) -> tuple[BoundMerkleInclusionBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundMerkleInclusionBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`MerkleInclusionBatchEntry` rules as
+    :func:`verify_inclusion_batch` and must be non-empty; every item is
+    copied into a tuple in its original order with duplicates preserved,
+    and the inputs are never mutated. Each item is encoded to its outer
+    leaf byte for byte with :func:`_bound_merkle_inclusion_leaf`; the leaf
+    digests and internal nodes follow the existing SHA-256 Merkle rules.
+    With ``n = len(entries)``, the complete multi-inclusion proof is built
+    with :func:`prove_multi_inclusion` over
+    ``tuple(range(n))`` — so its ``indices`` cover every leaf and its
+    ``siblings`` are empty — and the returned batch carries
+    ``leaf_count = n`` alongside that proof. The second return value is
+    the outer tree's :func:`merkle_root` of the encoded leaves, which is
+    exactly the root the batch verifies under:
+    ``verify_inclusion_batch_bound(batch, root)`` returns ``True``.
+
+    A type preflight over the whole batch raises :class:`TypeError` before
+    anything is built; an empty batch, any ``U``-framed integer outside
+    uint64 (a proof ``index`` or ``siblings`` length), or
+    :func:`verify_inclusion_batch` returning ``False`` raises
+    :class:`ValueError`.
+    """
+    items = _check_inclusion_batch_entries_types(entries)
+    if not items:
+        raise ValueError("entries must not be empty")
+    if not _merkle_inclusion_batch_replay_encodable(items):
+        raise ValueError("entries contain an integer that cannot be U-framed")
+    if not verify_inclusion_batch(items):
+        raise ValueError("entries must pass verify_inclusion_batch")
+    ordered = tuple(items)
+    leaves = [_bound_merkle_inclusion_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundMerkleInclusionBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
 
 
 # ---------------------------------------------------------------------------

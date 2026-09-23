@@ -10,6 +10,7 @@ from . import (
     BoundConsistencyChainReplayGuard,
     BoundConsistencyReplayGuard,
     BoundMerkleInclusionBatch,
+    BoundMerkleInclusionBatchReplayGuard,
     BoundMerkleMultiBatch,
     BoundMerkleMultiBatchReplayGuard,
     BoundRangeBatch,
@@ -1145,6 +1146,26 @@ def main() -> int:
     foreign_bmmbr_binding = foreign_bmmbr.bind_once(bmmbr_bound, bmmbr_root, b"bound-multi-batch-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_bmmbr.check(bmmbr_bound, bmmbr_root, foreign_bmmbr_binding, now=1)}")
+
+    print()
+    print("per-instance replay protection for bound Merkle inclusion batches (bind once, check once):")
+    bmibr = BoundMerkleInclusionBatchReplayGuard()
+    bmibr_binding = bmibr.bind_once(inclusion_bound, inclusion_bound_root, b"bound-inclusion-batch-session-1", expires_at=10**12)
+    print(f"  digest={bmibr_binding.digest.hex()[:32]}…  expires_at={bmibr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{bmibr.check(inclusion_bound, inclusion_bound_root, bmibr_binding, now=100)}")
+    print(f"  replay rejected: "
+          f"{not bmibr.check(inclusion_bound, inclusion_bound_root, bmibr_binding, now=101)}")
+    other_bmibr = BoundMerkleInclusionBatchReplayGuard()
+    other_bmibr_binding = other_bmibr.bind_once(inclusion_bound, inclusion_bound_root, b"bound-inclusion-batch-session-2")
+    print(f"  wrong root rejected without consuming the id: "
+          f"{not other_bmibr.check(inclusion_bound, bytes(32), other_bmibr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_bmibr.check(inclusion_bound, inclusion_bound_root, other_bmibr_binding, now=1)}")
+    foreign_bmibr = BoundMerkleInclusionBatchReplayGuard()
+    foreign_bmibr_binding = foreign_bmibr.bind_once(inclusion_bound, inclusion_bound_root, b"bound-inclusion-batch-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_bmibr.check(inclusion_bound, inclusion_bound_root, foreign_bmibr_binding, now=1)}")
 
     print()
     print("per-instance replay protection for bound consistency chain batches (bind once, check once):")

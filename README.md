@@ -422,6 +422,26 @@ assert not region_contains_committed(
     region, x_commitment, y_commitment, 40, 101, x_blinding, y_blinding
 )
 
+# 与承诺绑定的区域判定批量验证：整批先预检嵌套类型，再逐项委托区域判定
+from zkregion import RegionContainsEntry, verify_region_contains_batch
+
+contains_entries = [
+    RegionContainsEntry(region, x_commitment, y_commitment, 40, 60, x_blinding, y_blinding),
+    RegionContainsEntry(region, x_commitment, y_commitment, 40, 60, x_blinding, y_blinding),
+]
+assert verify_region_contains_batch(contains_entries)
+assert not verify_region_contains_batch(())
+
+# Merkle 承诺的区域判定完整批验：整批判定条目先提交到一棵 Merkle 树
+from zkregion import (
+    BoundRegionContainsBatch,
+    prove_region_contains_bound,
+    verify_region_contains_bound,
+)
+
+contains_batch, contains_root = prove_region_contains_bound(contains_entries)
+assert verify_region_contains_bound(contains_batch, contains_root)
+
 # 实例内防重放：session id 一次性绑定到一条 Schnorr 条目
 from zkregion import ReplayGuard, ReplayBinding
 
@@ -921,6 +941,11 @@ python3 -m zkregion
 - `prove_region(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionProof` — 生成二维矩形区域成员非交互证明
 - `verify_region(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证区域成员证明，无需坐标或盲因子
 - `region_contains_committed(region, x_commitment, y_commitment, x, y, x_blinding, y_blinding) -> bool` — 与承诺绑定的矩形区域判定：先按 x 后 y 的固定次序逐轴校验声明区间与开合——承诺声明区间须恰为区域对应轴的两个边界（x 承诺为 `(region.min_x, region.max_x)`、y 承诺为 `(region.min_y, region.max_y)`），值与盲因子按 `verify_pedersen_opening` 同一套口径以承诺对象内的群参数（含非默认参数与显式 `h`）重算比对——两轴都通过后才判定坐标是否落在闭区间矩形内（四边算在矩形内）；任一层字段错型（含用 `bool` 冒充整数）或传入非 `Region` / 非 `PedersenCommitment` 对象一律抛 `TypeError`，开合不符、盲因子或承诺内参数越界、声明区间与区域边界不一致、声明非法（`lower > upper` 或值越出声明区间）、换绑任一承诺或盲因子、坐标落在矩形外一律返回 `False`；纯函数、结果确定、次序固定、不改写任何输入、不引入落盘或持久化
+- `verify_region_contains_batch(entries) -> bool` — 与承诺绑定的区域判定批量验证：`entries` 须为非 `bytes`/`bytearray`/`str` 的 `RegionContainsEntry` 序列，先整批预检嵌套类型（区域、两轴承诺、坐标与盲因子错型，含用 `bool` 冒充整数与后项错型，一律抛 `TypeError`），再逐项委托 `region_contains_committed`；空批返回 `False`，首条不通过即短路返回 `False`；条目相互独立、可乱序可重复，不聚合、不新增编码、不改写输入
+- `RegionContainsEntry(region, x_commitment, y_commitment, x, y, x_blinding, y_blinding)` — 不可变区域判定批验条目，字段次序与 `region_contains_committed` 入参一致（x 轴先于 y 轴）；可位置构造、按值相等
+- `BoundRegionContainsBatch(entries, leaf_count, proof)` — 冻结的区域判定完整批对象；字段依次为 `tuple[RegionContainsEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变；`leaf_count` 须等于条目数及 `proof.leaf_count`，`proof.indices` 须为 `tuple(range(leaf_count))`，空批、缺项、计数不符或索引不完整均返回 `False`
+- `verify_region_contains_bound(batch, root) -> bool` — Merkle 承诺的区域判定完整批验：每项外层叶先写域标签 `b"zkregion/rcb/v1"`，再按条目字段顺序展开——区域四边界、x 后 y 两承诺各六字段（数据类字段顺序）、两坐标与两盲因子，整数以十进制 ASCII（负号保留）编码，每个原子项前置四字节无符号大端长度；按批序成叶、留重，叶摘要沿用 Merkle 规则；先以 `verify_multi_inclusion` 验根（结构/根失败即返回 `False` 且不进内层），根通过后原样调用 `verify_region_contains_batch(batch.entries)`；`root` 须为 `bytes`，全批类型预检，错型（含用 `bool` 冒充整数）抛 `TypeError`，其余无效（空批、计数或索引不符、错根、篡改或内层批验拒绝）返回 `False`，输入不变
+- `prove_region_contains_bound(entries) -> tuple[BoundRegionContainsBatch, bytes]` — 顶层构造 Merkle 承诺的规范区域判定完整批：`entries` 沿用 `verify_region_contains_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，输入不变；每项外层叶逐字节复用 `_bound_region_contains_leaf` 编码，域标签、长度帧、十进制 ASCII 整数约定、字段顺序及 Merkle 哈希规则不变；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖从零开始的全部位置、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_region_contains_bound(batch, root) is True`，单项、奇偶批与重复项均确定，重复构造逐字节一致；全批或任一嵌套字段错型（含用 `bool` 冒充整数与后项错型）抛 `TypeError`，空批、批次数越出 uint64 或 `verify_region_contains_batch` 返回 `False`（开合不符、声明区间不一致或坐标越界）抛 `ValueError`
 - `RegionProof(x_proof, y_proof)` — 不可变区域证明对象，两字段均为 `RangeProof`
 - `verify_region_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 区域证明的批量验证，按 `(prime, generator, h)` 分组做一次随机线性组合
 - `RegionBatchEntry(x_commitment, y_commitment, region, proof, context=b"")` — 不可变批量验证条目，字段次序与 `verify_region` 入参一致

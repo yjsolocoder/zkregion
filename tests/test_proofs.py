@@ -23,6 +23,7 @@ from zkregion import (
     BoundPedersenOpeningReplayGuard,
     BoundRangeBatch,
     BoundRegionBatch,
+    BoundRegionContainsBatch,
     BoundRegionReplayGuard,
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
@@ -54,6 +55,7 @@ from zkregion import (
     Region,
     RegionBatchEntry,
     RegionBatchReplayGuard,
+    RegionContainsEntry,
     RegionProof,
     RegionReplayGuard,
     ReplayBinding,
@@ -79,6 +81,7 @@ from zkregion import (
     prove_pedersen_opening_batch_bound,
     prove_range,
     prove_region,
+    prove_region_contains_bound,
     prove_schnorr_batch_bound,
     region_contains_committed,
     verify_bound,
@@ -106,6 +109,8 @@ from zkregion import (
     verify_region,
     verify_region_batch,
     verify_region_bound,
+    verify_region_contains_batch,
+    verify_region_contains_bound,
     verify_schnorr_batch,
 )
 
@@ -5396,6 +5401,379 @@ class RegionContainsCommittedTest(unittest.TestCase):
         self.assertEqual(dataclasses.asdict(xc), snapshots[1])
         self.assertEqual(dataclasses.asdict(yc), snapshots[2])
         self.assertEqual((x, y, xr, yr), snapshots[3])
+
+
+class RegionContainsBatchTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def entry(self, x=40, y=60, region=None, x_blinding=1234, y_blinding=4321):
+        region = Region(0, 100, 0, 100) if region is None else region
+        x_commitment, x_r = pedersen_commit(
+            x, region.min_x, region.max_x,
+            prime=self.PRIME, generator=self.G, h=self.H, blinding=x_blinding,
+        )
+        y_commitment, y_r = pedersen_commit(
+            y, region.min_y, region.max_y,
+            prime=self.PRIME, generator=self.G, h=self.H, blinding=y_blinding,
+        )
+        return RegionContainsEntry(
+            region, x_commitment, y_commitment, x, y, x_r, y_r
+        )
+
+    # ---- entry value semantics ---------------------------------------------
+
+    def test_entry_is_positional_value_based_and_immutable(self):
+        built = self.entry()
+        entry = RegionContainsEntry(
+            built.region, built.x_commitment, built.y_commitment,
+            built.x, built.y, built.x_blinding, built.y_blinding,
+        )
+        again = RegionContainsEntry(
+            region=built.region, x_commitment=built.x_commitment,
+            y_commitment=built.y_commitment, x=built.x, y=built.y,
+            x_blinding=built.x_blinding, y_blinding=built.y_blinding,
+        )
+        self.assertEqual(entry, again)
+        self.assertEqual(
+            tuple(RegionContainsEntry.__dataclass_fields__),
+            ("region", "x_commitment", "y_commitment", "x", "y",
+             "x_blinding", "y_blinding"),
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            entry.x = 1
+
+    # ---- honest batches -----------------------------------------------------
+
+    def test_honest_batch_verifies(self):
+        entries = [self.entry(), self.entry(x=1, y=2, x_blinding=7, y_blinding=9)]
+        self.assertTrue(verify_region_contains_batch(entries))
+
+    def test_tuple_reordered_and_duplicate_entries_are_legal(self):
+        first = self.entry(x=10, y=20)
+        second = self.entry(x=30, y=40, x_blinding=77, y_blinding=88)
+        self.assertTrue(verify_region_contains_batch((second, first, first)))
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(verify_region_contains_batch(()))
+        self.assertFalse(verify_region_contains_batch([]))
+
+    # ---- failing entries ----------------------------------------------------
+
+    def test_any_failing_entry_short_circuits_to_false(self):
+        good = self.entry()
+        bad_point = self.entry()
+        bad_point = RegionContainsEntry(
+            bad_point.region, bad_point.x_commitment, bad_point.y_commitment,
+            40, 101, bad_point.x_blinding, bad_point.y_blinding,
+        )
+        self.assertFalse(verify_region_contains_batch([good, bad_point]))
+        self.assertFalse(verify_region_contains_batch([bad_point, good]))
+
+    def test_rebound_commitment_or_blinding_returns_false(self):
+        entry = self.entry()
+        swapped = RegionContainsEntry(
+            entry.region, entry.x_commitment, entry.y_commitment,
+            entry.x, entry.y, entry.y_blinding, entry.x_blinding,
+        )
+        self.assertFalse(verify_region_contains_batch([swapped]))
+        other = self.entry(x=41, y=60)
+        rebound = RegionContainsEntry(
+            entry.region, other.x_commitment, entry.y_commitment,
+            entry.x, entry.y, entry.x_blinding, entry.y_blinding,
+        )
+        self.assertFalse(verify_region_contains_batch([rebound]))
+
+    def test_declared_range_mismatch_returns_false(self):
+        region = Region(0, 100, 0, 100)
+        x_commitment, x_r = pedersen_commit(
+            40, 0, 99, prime=self.PRIME, generator=self.G, h=self.H, blinding=1234
+        )
+        y_commitment, y_r = pedersen_commit(
+            60, 0, 100, prime=self.PRIME, generator=self.G, h=self.H, blinding=4321
+        )
+        entry = RegionContainsEntry(region, x_commitment, y_commitment, 40, 60, x_r, y_r)
+        self.assertFalse(verify_region_contains_batch([entry]))
+
+    # ---- type preflight -----------------------------------------------------
+
+    def test_non_sequence_and_string_batches_raise_typeerror(self):
+        for bad in (b"x", bytearray(b"x"), "entries", 7, None):
+            with self.assertRaises(TypeError):
+                verify_region_contains_batch(bad)
+
+    def test_late_entry_type_errors_still_raise(self):
+        failing = dataclasses.replace(self.entry(), y=101)
+        # The first entry would fail verification; the type error in the
+        # second entry must still raise instead of returning False.
+        with self.assertRaises(TypeError):
+            verify_region_contains_batch([failing, "entry"])
+        with self.assertRaises(TypeError):
+            verify_region_contains_batch([failing, self.entry(), None])
+
+    def test_nested_wrong_types_raise_typeerror(self):
+        entry = self.entry()
+        good = [self.entry()]
+        cases = [
+            dataclasses.replace(entry, region="region"),
+            dataclasses.replace(entry, x_commitment="x"),
+            dataclasses.replace(entry, y_commitment=None),
+            dataclasses.replace(entry, x=1.5),
+            dataclasses.replace(entry, y="60"),
+            dataclasses.replace(entry, x_blinding=None),
+            dataclasses.replace(entry, y_blinding=(1,)),
+            dataclasses.replace(
+                entry, x_commitment=dataclasses.replace(entry.x_commitment, h="h")
+            ),
+        ]
+        for position, bad in enumerate(cases):
+            with self.assertRaises(TypeError, msg=f"case {position}"):
+                verify_region_contains_batch(good + [bad])
+
+    def test_bool_fields_raise_exactly_typeerror(self):
+        entry = self.entry()
+        for field in ("x", "y", "x_blinding", "y_blinding"):
+            for bad in (True, False):
+                broken = dataclasses.replace(entry, **{field: bad})
+                with self.assertRaises(Exception) as ctx:
+                    verify_region_contains_batch([broken])
+                self.assertIs(type(ctx.exception), TypeError)
+        broken_region = Region.__new__(Region)
+        for name, value in (("min_x", True), ("max_x", 100),
+                            ("min_y", 0), ("max_y", 100)):
+            object.__setattr__(broken_region, name, value)
+        with self.assertRaises(Exception) as ctx:
+            verify_region_contains_batch(
+                [dataclasses.replace(entry, region=broken_region)]
+            )
+        self.assertIs(type(ctx.exception), TypeError)
+
+    # ---- determinism and purity ---------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        entries = [self.entry(), self.entry(x=5, y=6)]
+        snapshot = [dataclasses.asdict(e) for e in entries]
+        self.assertTrue(verify_region_contains_batch(entries))
+        self.assertEqual([dataclasses.asdict(e) for e in entries], snapshot)
+
+
+class BoundRegionContainsBatchTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def entry(self, x=40, y=60, region=None, x_blinding=1234, y_blinding=4321):
+        region = Region(0, 100, 0, 100) if region is None else region
+        x_commitment, x_r = pedersen_commit(
+            x, region.min_x, region.max_x,
+            prime=self.PRIME, generator=self.G, h=self.H, blinding=x_blinding,
+        )
+        y_commitment, y_r = pedersen_commit(
+            y, region.min_y, region.max_y,
+            prime=self.PRIME, generator=self.G, h=self.H, blinding=y_blinding,
+        )
+        return RegionContainsEntry(
+            region, x_commitment, y_commitment, x, y, x_r, y_r
+        )
+
+    def entries(self, count=3):
+        return [self.entry(x=10 + i, y=20 + i, x_blinding=100 + i,
+                           y_blinding=200 + i)
+                for i in range(count)]
+
+    def manual_batch(self, entries):
+        import zkregion
+
+        leaves = [zkregion._bound_region_contains_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(leaves))))
+        return BoundRegionContainsBatch(tuple(entries), len(entries), proof), root
+
+    # ---- construction and verification round-trip ---------------------------
+
+    def test_round_trip_single_odd_even_and_duplicates(self):
+        for count in (1, 2, 3, 4, 5):
+            batch, root = prove_region_contains_bound(self.entries(count))
+            self.assertEqual(batch.leaf_count, count)
+            self.assertEqual(batch.proof.leaf_count, count)
+            self.assertEqual(batch.proof.indices, tuple(range(count)))
+            self.assertTrue(verify_region_contains_bound(batch, root))
+        entry = self.entry()
+        batch, root = prove_region_contains_bound([entry, entry, entry])
+        self.assertTrue(verify_region_contains_bound(batch, root))
+
+    def test_batch_is_value_based_and_immutable(self):
+        first, root = prove_region_contains_bound(self.entries(2))
+        second, _ = prove_region_contains_bound(self.entries(2))
+        self.assertEqual(first, second)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            first.leaf_count = 9
+
+    def test_repeated_construction_is_byte_identical(self):
+        entries = self.entries(3)
+        first_batch, first_root = prove_region_contains_bound(entries)
+        second_batch, second_root = prove_region_contains_bound(list(entries))
+        self.assertEqual(first_batch, second_batch)
+        self.assertEqual(first_root, second_root)
+
+    def test_leaf_framing_matches_the_specification(self):
+        entry = self.entry(x=-30, y=-12, region=Region(-50, -10, -40, -5))
+        (region, xc, yc, x, y, xr, yr) = (
+            entry.region, entry.x_commitment, entry.y_commitment,
+            entry.x, entry.y, entry.x_blinding, entry.y_blinding,
+        )
+        items = [b"zkregion/rcb/v1"]
+        items += [
+            str(v).encode("ascii")
+            for v in (region.min_x, region.max_x, region.min_y, region.max_y)
+        ]
+        for commitment in (xc, yc):
+            items += [
+                str(v).encode("ascii")
+                for v in (commitment.element, commitment.lower, commitment.upper,
+                          commitment.prime, commitment.generator, commitment.h)
+            ]
+        items += [str(v).encode("ascii") for v in (x, y, xr, yr)]
+        leaf = b"".join(
+            len(item).to_bytes(4, "big") + item for item in items
+        )
+        batch, root = prove_region_contains_bound([entry])
+        self.assertEqual(root, merkle_root([leaf]))
+        self.assertTrue(verify_region_contains_bound(batch, root))
+
+    def test_input_sequence_is_not_mutated(self):
+        entries = self.entries(3)
+        snapshot = [dataclasses.asdict(e) for e in entries]
+        prove_region_contains_bound(entries)
+        self.assertEqual([dataclasses.asdict(e) for e in entries], snapshot)
+
+    # ---- prove-time rejections ----------------------------------------------
+
+    def test_prove_empty_batch_raises_valueerror(self):
+        with self.assertRaises(ValueError):
+            prove_region_contains_bound(())
+        with self.assertRaises(ValueError):
+            prove_region_contains_bound([])
+
+    def test_prove_type_preflight_raises_typeerror(self):
+        entry = self.entry()
+        with self.assertRaises(TypeError):
+            prove_region_contains_bound("entries")
+        with self.assertRaises(TypeError):
+            prove_region_contains_bound([entry, "x"])
+        with self.assertRaises(TypeError):
+            prove_region_contains_bound([dataclasses.replace(entry, x=True)])
+        with self.assertRaises(TypeError):
+            prove_region_contains_bound([dataclasses.replace(entry, region=None)])
+
+    def test_prove_inner_failure_raises_valueerror(self):
+        entry = self.entry()
+        outside = dataclasses.replace(entry, y=101)
+        with self.assertRaises(ValueError):
+            prove_region_contains_bound([outside])
+        swapped = dataclasses.replace(
+            entry, x_blinding=entry.y_blinding, y_blinding=entry.x_blinding
+        )
+        with self.assertRaises(ValueError):
+            prove_region_contains_bound([self.entry(), swapped])
+
+    # ---- verify-time rejections ---------------------------------------------
+
+    def test_wrong_root_returns_false(self):
+        batch, root = prove_region_contains_bound(self.entries(2))
+        self.assertFalse(verify_region_contains_bound(batch, bytes(32)))
+        self.assertFalse(verify_region_contains_bound(batch, root + b"\x00"))
+
+    def test_count_and_index_mismatches_return_false(self):
+        batch, root = prove_region_contains_bound(self.entries(3))
+        for claimed in (0, 1, 2, 4):
+            bad = dataclasses.replace(batch, leaf_count=claimed)
+            self.assertFalse(verify_region_contains_bound(bad, root))
+        bad_proof = dataclasses.replace(batch.proof, leaf_count=2)
+        self.assertFalse(
+            verify_region_contains_bound(
+                dataclasses.replace(batch, proof=bad_proof), root
+            )
+        )
+        reordered = dataclasses.replace(batch.proof, indices=(2, 1, 0))
+        self.assertFalse(
+            verify_region_contains_bound(
+                dataclasses.replace(batch, proof=reordered), root
+            )
+        )
+        gapped = dataclasses.replace(batch.proof, indices=(0, 1, 1))
+        self.assertFalse(
+            verify_region_contains_bound(
+                dataclasses.replace(batch, proof=gapped), root
+            )
+        )
+
+    def test_inner_failure_returns_false(self):
+        entry = self.entry()
+        outside = dataclasses.replace(entry, y=101)
+        batch, root = self.manual_batch([entry, outside])
+        self.assertFalse(verify_region_contains_bound(batch, root))
+
+    def test_tampered_entry_returns_false(self):
+        entries = self.entries(2)
+        batch, root = prove_region_contains_bound(entries)
+        tampered = dataclasses.replace(entries[0], x=entries[0].x + 1)
+        bad = dataclasses.replace(batch, entries=(tampered, entries[1]))
+        self.assertFalse(verify_region_contains_bound(bad, root))
+
+    # ---- verify-time type errors --------------------------------------------
+
+    def test_wrong_batch_and_root_types_raise_typeerror(self):
+        batch, root = prove_region_contains_bound(self.entries(2))
+        with self.assertRaises(TypeError):
+            verify_region_contains_bound("batch", root)
+        with self.assertRaises(TypeError):
+            verify_region_contains_bound(None, root)
+        with self.assertRaises(TypeError):
+            verify_region_contains_bound(batch, "root")
+        with self.assertRaises(TypeError):
+            verify_region_contains_bound(batch, bytearray(root))
+
+    def test_malformed_batch_fields_raise_typeerror(self):
+        batch, root = prove_region_contains_bound(self.entries(2))
+        with self.assertRaises(TypeError):
+            verify_region_contains_bound(
+                dataclasses.replace(batch, entries=list(batch.entries)), root
+            )
+        with self.assertRaises(TypeError):
+            verify_region_contains_bound(
+                dataclasses.replace(batch, entries=("x",) * 2), root
+            )
+        for bad_count in (True, False, 2.0, "2", None):
+            with self.assertRaises(TypeError):
+                verify_region_contains_bound(
+                    dataclasses.replace(batch, leaf_count=bad_count), root
+                )
+        with self.assertRaises(TypeError):
+            verify_region_contains_bound(
+                dataclasses.replace(batch, proof="proof"), root
+            )
+        for bad_proof in (
+            dataclasses.replace(batch.proof, leaf_count=True),
+            dataclasses.replace(batch.proof, indices=[0, 1]),
+            dataclasses.replace(batch.proof, indices=(0, True)),
+            dataclasses.replace(batch.proof, siblings=[b"x"]),
+            dataclasses.replace(batch.proof, siblings=(1,)),
+        ):
+            with self.assertRaises(TypeError):
+                verify_region_contains_bound(
+                    dataclasses.replace(batch, proof=bad_proof), root
+                )
+
+    def test_nested_entry_type_errors_raise_typeerror(self):
+        entries = self.entries(2)
+        batch, root = prove_region_contains_bound(entries)
+        broken = dataclasses.replace(entries[1], y_blinding=False)
+        bad = dataclasses.replace(batch, entries=(entries[0], broken))
+        with self.assertRaises(Exception) as ctx:
+            verify_region_contains_bound(bad, root)
+        self.assertIs(type(ctx.exception), TypeError)
 
 
 class MerkleMultiProofTest(unittest.TestCase):

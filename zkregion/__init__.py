@@ -1,9 +1,16 @@
 """zkregion - commitments and interactive proofs for region membership.
 
 Public API: commit / verify_opening / OpeningBatchEntry /
-verify_opening_batch / commit_coordinate / PedersenCommitment /
+verify_opening_batch / BoundOpeningBatch /
+prove_opening_batch_bound / verify_opening_batch_bound /
+OpeningBatchReplayGuard /
+commit_coordinate / PedersenCommitment /
 pedersen_commit / verify_pedersen_opening / PedersenOpeningBatchEntry /
-verify_pedersen_opening_batch / RangeProof / prove_range /
+verify_pedersen_opening_batch / BoundPedersenOpeningBatch /
+prove_pedersen_opening_batch_bound /
+verify_pedersen_opening_batch_bound /
+PedersenOpeningBatchReplayGuard /
+RangeProof / prove_range /
 verify_range / RangeBatchEntry / verify_range_batch / RegionProof /
 prove_region / verify_region / region_contains_committed /
 RegionBatchEntry / verify_region_batch /
@@ -77,6 +84,8 @@ __all__ = [
     "BoundMerkleInclusionBatchReplayGuard",
     "BoundMerkleMultiBatch",
     "BoundMerkleMultiBatchReplayGuard",
+    "BoundOpeningBatch",
+    "BoundPedersenOpeningBatch",
     "BoundRangeBatch",
     "BoundRegionBatch",
     "BoundRegionReplayGuard",
@@ -136,6 +145,8 @@ __all__ = [
     "prove_inclusion_batch_bound",
     "prove_multi_inclusion",
     "prove_multi_inclusion_batch_bound",
+    "prove_opening_batch_bound",
+    "prove_pedersen_opening_batch_bound",
     "prove_range",
     "prove_range_batch_bound",
     "prove_region",
@@ -157,8 +168,10 @@ __all__ = [
     "verify_multi_inclusion_batch_bound",
     "verify_opening",
     "verify_opening_batch",
+    "verify_opening_batch_bound",
     "verify_pedersen_opening",
     "verify_pedersen_opening_batch",
+    "verify_pedersen_opening_batch_bound",
     "verify_range",
     "verify_range_batch",
     "verify_range_bound",
@@ -4155,6 +4168,333 @@ def prove_range_batch_bound(
     root = merkle_root(leaves)
     proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
     batch = BoundRangeBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed opening batches
+#
+# A complete hash-opening batch (BoundOpeningBatch) or Pedersen-opening
+# batch (BoundPedersenOpeningBatch) frozen together with the Merkle
+# multi-inclusion proof that commits to every entry. Each outer leaf writes
+# the entry's opening fields item by item — commitment, value and nonce for
+# hash openings; the six commitment fields, value and blinding for Pedersen
+# openings — every item prefixed with its four-byte unsigned big-endian
+# length and the domain separator written first; integers are decimal ASCII
+# with the sign kept. The field run behind the framed domain separator is
+# byte for byte the replay guards' Q(entry) framing, and the leaf digests
+# and internal nodes follow the existing SHA-256 Merkle rules. Verification
+# checks the outer root first and only then delegates to the unchanged bare
+# batch verification.
+
+_OPENING_BOUND_DOMAIN = b"zkregion/ob/v1"
+_PEDERSEN_OPENING_BOUND_DOMAIN = b"zkregion/pob/v1"
+
+
+@dataclass(frozen=True)
+class BoundOpeningBatch:
+    """A complete hash-opening batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of :class:`OpeningBatchEntry`;
+    ``leaf_count`` — a positive, non-``bool`` integer equal to both
+    ``len(entries)`` and ``proof.leaf_count``; ``proof`` — the
+    :class:`MerkleMultiProof` whose indices cover ``0 .. leaf_count - 1``
+    without gaps or duplicates. All three are positional construction
+    arguments; batches compare by value and are immutable.
+    """
+
+    entries: tuple[OpeningBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_opening_leaf(entry: OpeningBatchEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`OpeningBatchEntry`.
+
+    The leaf is the framed domain separator ``b"zkregion/ob/v1"`` followed
+    by the entry's ``commitment``, ``value`` and ``nonce`` — the arguments
+    of :func:`verify_opening`, in the same order — each prefixed with its
+    four-byte unsigned big-endian length. The field run is byte for byte
+    the :class:`OpeningBatchReplayGuard` transcript's ``Q(entry)``.
+    """
+    return _frame_length_prefixed(_OPENING_BOUND_DOMAIN) + _opening_batch_leaf(entry)
+
+
+def verify_opening_batch_bound(batch: BoundOpeningBatch, root: bytes) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundOpeningBatch`.
+
+    The Merkle binding is checked first: every entry is encoded to its leaf
+    exactly as specified by :func:`_bound_opening_leaf` and the whole batch
+    is checked against ``root`` with :func:`verify_multi_inclusion`.
+    ``leaf_count`` must be a positive, non-``bool`` integer equal to both
+    ``len(entries)`` and ``proof.leaf_count``, and ``proof.indices`` must
+    cover ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering; an
+    empty batch, a missing entry, a count mismatch or any index mismatch
+    returns ``False``. Only after the root checks does the batch go through
+    :func:`verify_opening_batch` unchanged, which rechecks every opening in
+    order.
+
+    Type errors — a batch that is not a :class:`BoundOpeningBatch`,
+    non-tuple entries, non-:class:`OpeningBatchEntry` items, a non-integer
+    or ``bool`` ``leaf_count``, a wrong proof/root object, or malformed
+    nested field types (including ``bool`` indices, a non-tuple
+    ``indices`` / ``siblings`` or non-``bytes`` commitment, value, nonce or
+    sibling) — raise :class:`TypeError`; every other invalidity (empty
+    batch, miscount, incomplete indices, wrong root, tampered leaf bytes or
+    any :func:`verify_opening_batch` rejection) returns ``False``. Inputs
+    are never mutated.
+    """
+    if not isinstance(batch, BoundOpeningBatch):
+        raise TypeError("batch must be a BoundOpeningBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError("batch entries must be a tuple of OpeningBatchEntry")
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    _check_opening_batch_entries_types(entries)
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_opening_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf, then
+    # 2) the unchanged opening batch verification checks each opening
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_opening_batch(entries)
+
+
+def prove_opening_batch_bound(
+    entries: Sequence[OpeningBatchEntry],
+) -> tuple[BoundOpeningBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundOpeningBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`OpeningBatchEntry` rules as
+    :func:`verify_opening_batch` and must be non-empty; every item is
+    copied into a tuple in its original order with duplicates preserved,
+    and the inputs are never mutated. Each item is encoded to its outer
+    leaf byte for byte with :func:`_bound_opening_leaf`; the domain
+    separator, length framing and field order stay unchanged, and the
+    leaf digests and internal nodes follow the existing SHA-256 Merkle
+    rules. With ``n = len(entries)``, the complete multi-inclusion proof
+    is built with :func:`prove_multi_inclusion` over the encoded leaves
+    and the full indices ``tuple(range(n))`` — so its ``indices`` cover
+    every leaf from zero and its ``siblings`` are empty — and the
+    returned batch carries ``leaf_count = n`` alongside that proof. The
+    second return value is the outer tree's :func:`merkle_root` of the
+    encoded leaves, which is exactly the root the batch verifies under:
+    ``verify_opening_batch_bound(batch, root)`` returns ``True``.
+    Single-item, odd- and even-sized batches and duplicate items are all
+    deterministic, and repeated constructions are byte for byte
+    identical.
+
+    A type preflight over the whole batch — every item and every nested
+    field, including later items — raises :class:`TypeError` before
+    anything is built; an empty batch, a batch count outside uint64, or
+    :func:`verify_opening_batch` returning ``False`` (a mismatching
+    commitment, value or nonce) raises :class:`ValueError`.
+    """
+    items = _check_opening_batch_entries_types(entries)
+    if not items:
+        raise ValueError("entries must not be empty")
+    if not _opening_batch_replay_encodable(items):
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    if not verify_opening_batch(items):
+        raise ValueError("entries must pass verify_opening_batch")
+    ordered = tuple(items)
+    leaves = [_bound_opening_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundOpeningBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
+
+
+@dataclass(frozen=True)
+class BoundPedersenOpeningBatch:
+    """A complete Pedersen-opening batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of
+    :class:`PedersenOpeningBatchEntry`; ``leaf_count`` — a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``; ``proof`` — the :class:`MerkleMultiProof` whose
+    indices cover ``0 .. leaf_count - 1`` without gaps or duplicates. All
+    three are positional construction arguments; batches compare by value
+    and are immutable.
+    """
+
+    entries: tuple[PedersenOpeningBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_pedersen_opening_leaf(entry: PedersenOpeningBatchEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`PedersenOpeningBatchEntry`.
+
+    The leaf is the framed domain separator ``b"zkregion/pob/v1"``
+    followed by the commitment's ``element`` / ``lower`` / ``upper`` /
+    ``prime`` / ``generator`` / ``h`` fields and the entry's ``value`` and
+    ``blinding`` — together the arguments of
+    :func:`verify_pedersen_opening`, in the same order. Every integer is
+    encoded as decimal ASCII with the sign kept and prefixed with its
+    four-byte unsigned big-endian length. The field run is byte for byte
+    the :class:`PedersenOpeningBatchReplayGuard` transcript's
+    ``Q(entry)``.
+    """
+    return (
+        _frame_length_prefixed(_PEDERSEN_OPENING_BOUND_DOMAIN)
+        + _pedersen_opening_batch_leaf(entry)
+    )
+
+
+def verify_pedersen_opening_batch_bound(
+    batch: BoundPedersenOpeningBatch,
+    root: bytes,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundPedersenOpeningBatch`.
+
+    The Merkle binding is checked first: every entry is encoded to its
+    leaf exactly as specified by :func:`_bound_pedersen_opening_leaf` and
+    the whole batch is checked against ``root`` with
+    :func:`verify_multi_inclusion`. ``leaf_count`` must be a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``, and ``proof.indices`` must cover
+    ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering; an
+    empty batch, a missing entry, a count mismatch or any index mismatch
+    returns ``False``. Only after the root checks does the batch go
+    through :func:`verify_pedersen_opening_batch` unchanged, which
+    rechecks every opening in order under each commitment's own group
+    parameters and declared range.
+
+    Type errors — a batch that is not a
+    :class:`BoundPedersenOpeningBatch`, non-tuple entries,
+    non-:class:`PedersenOpeningBatchEntry` items, a non-integer or
+    ``bool`` ``leaf_count``, a wrong proof/root object, or malformed
+    nested field types (including a ``bool`` passed as an integer, a
+    non-tuple ``indices`` / ``siblings`` or a non-``bytes`` sibling) —
+    raise :class:`TypeError`; every other invalidity (empty batch,
+    miscount, incomplete indices, wrong root, tampered leaf bytes or any
+    :func:`verify_pedersen_opening_batch` rejection) returns ``False``.
+    Inputs are never mutated.
+    """
+    if not isinstance(batch, BoundPedersenOpeningBatch):
+        raise TypeError("batch must be a BoundPedersenOpeningBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(
+            "batch entries must be a tuple of PedersenOpeningBatchEntry"
+        )
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    _check_pedersen_opening_batch_entries_types(entries)
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_pedersen_opening_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf, then
+    # 2) the unchanged Pedersen opening batch verification runs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_pedersen_opening_batch(entries)
+
+
+def prove_pedersen_opening_batch_bound(
+    entries: Sequence[PedersenOpeningBatchEntry],
+) -> tuple[BoundPedersenOpeningBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundPedersenOpeningBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`PedersenOpeningBatchEntry` rules as
+    :func:`verify_pedersen_opening_batch` and must be non-empty; every
+    item is copied into a tuple in its original order with duplicates
+    preserved, and the inputs are never mutated. Each item is encoded to
+    its outer leaf byte for byte with
+    :func:`_bound_pedersen_opening_leaf`; the domain separator, length
+    framing, decimal ASCII integer convention and field order stay
+    unchanged, and the leaf digests and internal nodes follow the
+    existing SHA-256 Merkle rules. With ``n = len(entries)``, the
+    complete multi-inclusion proof is built with
+    :func:`prove_multi_inclusion` over the encoded leaves and the full
+    indices ``tuple(range(n))`` — so its ``indices`` cover every leaf
+    from zero and its ``siblings`` are empty — and the returned batch
+    carries ``leaf_count = n`` alongside that proof. The second return
+    value is the outer tree's :func:`merkle_root` of the encoded leaves,
+    which is exactly the root the batch verifies under:
+    ``verify_pedersen_opening_batch_bound(batch, root)`` returns
+    ``True``. Single-item, odd- and even-sized batches and duplicate
+    items are all deterministic, and repeated constructions are byte for
+    byte identical.
+
+    A type preflight over the whole batch — every item and every nested
+    field, including ``bool`` integers and later items — raises
+    :class:`TypeError` before anything is built; an empty batch, a batch
+    count outside uint64, or :func:`verify_pedersen_opening_batch`
+    returning ``False`` (an out-of-range parameter, a value outside the
+    declared range or an incorrect opening) raises :class:`ValueError`.
+    """
+    items = _check_pedersen_opening_batch_entries_types(entries)
+    if not items:
+        raise ValueError("entries must not be empty")
+    if not _pedersen_opening_batch_replay_encodable(items):
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    if not verify_pedersen_opening_batch(items):
+        raise ValueError("entries must pass verify_pedersen_opening_batch")
+    ordered = tuple(items)
+    leaves = [_bound_pedersen_opening_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundPedersenOpeningBatch(
         entries=ordered,
         leaf_count=len(ordered),
         proof=proof,

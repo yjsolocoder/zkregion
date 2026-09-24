@@ -1,7 +1,9 @@
 """zkregion - commitments and interactive proofs for region membership.
 
-Public API: commit / verify_opening / commit_coordinate / PedersenCommitment /
-pedersen_commit / verify_pedersen_opening / RangeProof / prove_range /
+Public API: commit / verify_opening / OpeningBatchEntry /
+verify_opening_batch / commit_coordinate / PedersenCommitment /
+pedersen_commit / verify_pedersen_opening / PedersenOpeningBatchEntry /
+verify_pedersen_opening_batch / RangeProof / prove_range /
 verify_range / RangeBatchEntry / verify_range_batch / RegionProof /
 prove_region / verify_region / region_contains_committed /
 RegionBatchEntry / verify_region_batch /
@@ -97,7 +99,9 @@ __all__ = [
     "MerkleMultiReplayGuard",
     "MerkleProof",
     "MultiSchnorrEntry",
+    "OpeningBatchEntry",
     "PedersenCommitment",
+    "PedersenOpeningBatchEntry",
     "RangeBatchEntry",
     "RangeBatchReplayGuard",
     "RangeProof",
@@ -150,7 +154,9 @@ __all__ = [
     "verify_multi_inclusion_batch",
     "verify_multi_inclusion_batch_bound",
     "verify_opening",
+    "verify_opening_batch",
     "verify_pedersen_opening",
+    "verify_pedersen_opening_batch",
     "verify_range",
     "verify_range_batch",
     "verify_range_bound",
@@ -262,6 +268,75 @@ def commit_coordinate(x: int, y: int, *, nonce: bytes | None = None) -> tuple[by
     if not isinstance(x, int) or not isinstance(y, int):
         raise TypeError("coordinates must be integers")
     return commit(f"{x}:{y}".encode("utf-8"), nonce=nonce)
+
+
+@dataclass(frozen=True)
+class OpeningBatchEntry:
+    """One item of a hash-commitment opening batch verification.
+
+    Fields, in order: ``commitment``, ``value`` and ``nonce`` (all
+    ``bytes``) — exactly the arguments of :func:`verify_opening`, in the
+    same order. All three are positional construction arguments; entries
+    compare by value and are immutable.
+    """
+
+    commitment: bytes
+    value: bytes
+    nonce: bytes
+
+
+def _check_opening_batch_entries_types(
+    entries: object,
+) -> list[OpeningBatchEntry]:
+    """Validate the opening-batch ``entries`` argument types.
+
+    Mirrors the type expectations of :func:`verify_opening` for *every*
+    entry before any verification runs: ``entries`` must be a
+    non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`OpeningBatchEntry` objects whose ``commitment`` / ``value``
+    / ``nonce`` are ``bytes``. The whole batch is walked (a bad type in
+    a later entry still raises), and the entries are copied into a
+    fresh list so the inputs are never mutated. An empty batch is left
+    to :func:`verify_opening_batch` to reject with ``False``; a wrong
+    opening is left to :func:`verify_opening` during verification.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of OpeningBatchEntry")
+    items: list[OpeningBatchEntry] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, OpeningBatchEntry):
+            raise TypeError(f"entries[{position}] must be an OpeningBatchEntry")
+        _check_bytes(entry.commitment, f"entries[{position}] commitment")
+        _check_bytes(entry.value, f"entries[{position}] value")
+        _check_bytes(entry.nonce, f"entries[{position}] nonce")
+        items.append(entry)
+    return items
+
+
+def verify_opening_batch(entries: Sequence[OpeningBatchEntry]) -> bool:
+    """Check several independent hash-commitment openings.
+
+    ``entries`` must be a non-``bytes`` / ``bytearray`` / ``str``
+    sequence of :class:`OpeningBatchEntry`; an empty batch returns
+    ``False`` and lists, tuples and duplicate entries are legal. The
+    nested types of the *whole* batch are preflighted first, so a wrong
+    type in any entry — including a later one — raises
+    :class:`TypeError` rather than being converted into a batch
+    rejection (returning ``False``). Each entry is then checked, in
+    order, with :func:`verify_opening` against its ``commitment``,
+    ``value`` and ``nonce`` fields, reusing its constant-time digest
+    comparison; the first entry that returns ``False`` short-circuits
+    the batch. Entries are independent of one another: their values and
+    nonces need not relate, and no encoding or cryptographic
+    aggregation is added. Inputs are never mutated.
+    """
+    items = _check_opening_batch_entries_types(entries)
+    if not items:
+        return False
+    for entry in items:
+        if not verify_opening(entry.commitment, entry.value, entry.nonce):
+            return False
+    return True
 
 
 @dataclass(frozen=True)
@@ -417,6 +492,96 @@ def verify_pedersen_opening(
         % prime
     )
     return expected == commitment.element
+
+
+@dataclass(frozen=True)
+class PedersenOpeningBatchEntry:
+    """One item of a Pedersen opening batch verification.
+
+    Fields, in order: the :class:`PedersenCommitment`, the ``value`` and
+    the ``blinding`` factor — exactly the arguments of
+    :func:`verify_pedersen_opening`, in the same order. All three are
+    positional construction arguments; entries compare by value and are
+    immutable.
+    """
+
+    commitment: PedersenCommitment
+    value: int
+    blinding: int
+
+
+def _check_pedersen_opening_batch_entries_types(
+    entries: object,
+) -> list[PedersenOpeningBatchEntry]:
+    """Validate the Pedersen-opening-batch ``entries`` argument types.
+
+    Mirrors the type checks of :func:`verify_pedersen_opening` for
+    *every* entry before any verification runs: ``entries`` must be a
+    non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`PedersenOpeningBatchEntry` objects whose ``commitment`` is a
+    :class:`PedersenCommitment` with non-``bool`` integer fields and
+    whose ``value`` / ``blinding`` are non-``bool`` integers. The whole
+    batch is walked (a bad type in a later entry still raises), and the
+    entries are copied into a fresh list so the inputs are never
+    mutated. An empty batch is left to
+    :func:`verify_pedersen_opening_batch` to reject with ``False``;
+    out-of-range values, blindings or commitment fields and wrong
+    openings are left to :func:`verify_pedersen_opening` during
+    verification.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of PedersenOpeningBatchEntry")
+    items: list[PedersenOpeningBatchEntry] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, PedersenOpeningBatchEntry):
+            raise TypeError(
+                f"entries[{position}] must be a PedersenOpeningBatchEntry"
+            )
+        commitment = entry.commitment
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(
+                f"entries[{position}] commitment must be a PedersenCommitment"
+            )
+        for name in ("element", "lower", "upper", "prime", "generator", "h"):
+            _check_int(
+                getattr(commitment, name),
+                f"entries[{position}] commitment {name}",
+            )
+        _check_int(entry.value, f"entries[{position}] value")
+        _check_int(entry.blinding, f"entries[{position}] blinding")
+        items.append(entry)
+    return items
+
+
+def verify_pedersen_opening_batch(
+    entries: Sequence[PedersenOpeningBatchEntry],
+) -> bool:
+    """Check several independent Pedersen commitment openings.
+
+    ``entries`` must be a non-``bytes`` / ``bytearray`` / ``str``
+    sequence of :class:`PedersenOpeningBatchEntry`; an empty batch
+    returns ``False`` and lists, tuples and duplicate entries are legal.
+    The nested types of the *whole* batch are preflighted first, so a
+    wrong type in any entry — including a later one, and including a
+    ``bool`` standing in for an integer — raises :class:`TypeError`
+    rather than being converted into a batch rejection (returning
+    ``False``). Each entry is then checked, in order, with
+    :func:`verify_pedersen_opening` against its ``commitment``,
+    ``value`` and ``blinding`` fields, reusing its range, group and
+    recomputation rules: an out-of-range value or blinding, a rebound
+    commitment or blinding, or any other mismatch returns ``False`` for
+    that entry, and the first such entry short-circuits the batch.
+    Entries are independent of one another: their commitments, ranges
+    and group parameters need not relate, and no encoding or
+    cryptographic aggregation is added. Inputs are never mutated.
+    """
+    items = _check_pedersen_opening_batch_entries_types(entries)
+    if not items:
+        return False
+    for entry in items:
+        if not verify_pedersen_opening(entry.commitment, entry.value, entry.blinding):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------

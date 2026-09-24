@@ -836,9 +836,13 @@ python3 -m zkregion
 - `DEFAULT_PRIME` / `DEFAULT_GENERATOR` — 默认群参数（`2**127 - 1` 与 `3`）
 - `commit(value, *, nonce=None) -> (commitment, nonce)` — 哈希承诺，`nonce` 缺省随机 16 字节
 - `verify_opening(commitment, value, nonce) -> bool` — 常量时间比对
+- `OpeningBatchEntry(commitment, value, nonce)` — 不可变哈希开合批验条目，字段类型依次为 `bytes`、`bytes`、`bytes`，次序与 `verify_opening` 入参一致；三字段均可位置构造、按值相等且不可变
+- `verify_opening_batch(entries) -> bool` — 独立哈希开合的批量验证：先预检整批嵌套类型（批次非序列或为 `bytes`/`bytearray`/`str`、条目非 `OpeningBatchEntry`、任一字段非 `bytes` 均抛 `TypeError`，后项错型同样抛出），空批返回 `False`，再逐项以 `commitment`、`value`、`nonce` 调 `verify_opening`，首拒短路；条目彼此独立、可乱序重复，不做密码学聚合，输入不变
 - `commit_coordinate(x, y, *, nonce=None)` — 对整数坐标对做承诺
 - `pedersen_commit(value, lower, upper, *, prime=DEFAULT_PRIME, generator=DEFAULT_GENERATOR, h=None, blinding=None, randbelow=secrets.randbelow) -> (PedersenCommitment, blinding)` — 区间量化值的 Pedersen 承诺
 - `verify_pedersen_opening(commitment, value, blinding) -> bool` — 复用承诺对象内参数验证开合
+- `PedersenOpeningBatchEntry(commitment, value, blinding)` — 不可变陷门开合批验条目，字段依次为 `PedersenCommitment`、值与盲因子（均为非 `bool` 整数），次序与 `verify_pedersen_opening` 入参一致；三字段均可位置构造、按值相等且不可变
+- `verify_pedersen_opening_batch(entries) -> bool` — 独立 Pedersen 开合的批量验证：先预检整批嵌套类型（批次非序列或为 `bytes`/`bytearray`/`str`、条目非 `PedersenOpeningBatchEntry`、承诺非 `PedersenCommitment` 或其字段错型、值或盲因子错型——含 `bool` 冒充整数——均抛 `TypeError`，后项错型同样抛出），空批返回 `False`，再逐项以 `commitment`、`value`、`blinding` 调 `verify_pedersen_opening`，首拒短路；开合不符、盲因子或值越出声明区间、换绑承诺或盲因子均返回 `False`；条目彼此独立、可乱序重复，不做密码学聚合，输入不变
 - `PedersenCommitment(element, lower, upper, prime, generator, h)` — 不可变承诺对象；承诺值为 `element = g**(value-lower) * h**blinding mod prime`
 - `prove_range(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> RangeProof` — 生成 Pedersen 承诺的非交互区间证明（Schnorr OR）
 - `verify_range(commitment, proof, context=b"") -> bool` — 验证区间证明
@@ -1493,7 +1497,7 @@ digest = SHA-256(
 
 ## 限制
 
-`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。区域判定只是朴素的坐标比较，不检查坐标是否经过承诺绑定；批量验证所用的随机线性组合与默认群一样仅供演示。Pedersen 承诺默认的 `h = g**2 mod prime` 带有公开陷门、破坏绑定性；其上的 Schnorr OR 区间证明与二维区域成员证明同样是演示级构造——区间上限 256 个整数、挑战来自 SHA-256 Fiat-Shamir 转录、群参数与默认 `h` 均未做生产级安全分析，不能用于真实部署。
+`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。`Region.contains` 只是朴素的坐标比较，本身不检查承诺绑定；与承诺绑定的区域判定由 `region_contains_committed` 提供——它先按固定次序逐轴校验声明区间与开合（承诺声明区间须恰为区域对应轴边界），两轴都通过后才判定坐标是否落在闭区间矩形内。批量验证所用的随机线性组合与默认群一样仅供演示。Pedersen 承诺默认的 `h = g**2 mod prime` 带有公开陷门、破坏绑定性；其上的 Schnorr OR 区间证明与二维区域成员证明同样是演示级构造——区间上限 256 个整数、挑战来自 SHA-256 Fiat-Shamir 转录、群参数与默认 `h` 均未做生产级安全分析，不能用于真实部署。
 
 ## 测试
 

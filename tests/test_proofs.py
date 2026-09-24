@@ -39,8 +39,10 @@ from zkregion import (
     MerkleProof,
     MultiSchnorrEntry,
     OpeningBatchEntry,
+    OpeningBatchReplayGuard,
     PedersenCommitment,
     PedersenOpeningBatchEntry,
+    PedersenOpeningBatchReplayGuard,
     RangeBatchEntry,
     RangeBatchReplayGuard,
     RangeProof,
@@ -22597,4 +22599,929 @@ class BoundMerkleInclusionBatchReplayGuardTest(unittest.TestCase):
         store._connection.execute("DROP TABLE replay_sessions_v1")
         with self.assertRaises(sqlite3.Error):
             guard.check(batch, root, ReplayBinding(b"s", b"\x00" * 32), now=1)
+        store.close()
+
+
+class OpeningBatchReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for hash-commitment opening batches."""
+
+    DOMAIN = b"zr/obr/v1"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "obr.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _entries(self, values=(b"alpha", b"beta", b"gamma")):
+        entries = []
+        for value in values:
+            commitment, nonce = commit(value)
+            entries.append(OpeningBatchEntry(commitment, value, nonce))
+        return entries
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def expected_digest(entries, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(
+                F(transform(item)) for item in sequence
+            )
+
+        def Q(entry):
+            return F(entry.commitment) + F(entry.value) + F(entry.nonce)
+
+        expiry = (
+            b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        )
+        material = F(b"zr/obr/v1") + F(session_id) + S(entries, Q) + F(expiry)
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(entries, b"s1"))
+        binding = guard.bind_once(entries, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(binding.digest, self.expected_digest(entries, b"s2", 1000))
+
+    def test_tuple_and_list_inputs_frame_identically(self):
+        entries = self._entries()
+        from_list = OpeningBatchReplayGuard().bind_once(list(entries), b"s")
+        from_tuple = OpeningBatchReplayGuard().bind_once(tuple(entries), b"s")
+        self.assertEqual(from_list.digest, from_tuple.digest)
+        self.assertEqual(from_list, from_tuple)
+
+    def test_batch_order_and_duplicates_change_digest(self):
+        entries = self._entries()
+
+        def bind(batch):
+            return OpeningBatchReplayGuard().bind_once(batch, b"s").digest
+
+        base = bind(entries)
+        self.assertNotEqual(base, bind(entries[::-1]))
+        self.assertNotEqual(base, bind(entries[:-1]))
+        self.assertNotEqual(base, bind(entries + [entries[0]]))
+        self.assertEqual(bind(entries), bind(list(entries)))
+
+    def test_digest_binds_every_field(self):
+        entries = self._entries()
+        base = OpeningBatchReplayGuard().bind_once(entries, b"s").digest
+        entry = entries[0]
+        variants = [
+            OpeningBatchEntry(bytes(32), entry.value, entry.nonce),
+            OpeningBatchEntry(entry.commitment, b"other", entry.nonce),
+            OpeningBatchEntry(entry.commitment, entry.value, b"\x00" * 16),
+        ]
+        for variant in variants:
+            digest = OpeningBatchReplayGuard().bind_once(
+                [variant] + entries[1:], b"s"
+            ).digest
+            self.assertNotEqual(base, digest)
+
+    # ---- bind argument boundaries -------------------------------------------
+
+    def test_bind_type_errors(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(bad, b"s")
+        for bad in (7, None, True, "entry", b"entry"):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once([bad], b"s")
+        entry = entries[0]
+        for bad_entry in (
+            OpeningBatchEntry(bytearray(entry.commitment), entry.value, entry.nonce),
+            OpeningBatchEntry(entry.commitment, "alpha", entry.nonce),
+            OpeningBatchEntry(entry.commitment, entry.value, True),
+        ):
+            with self.assertRaises(TypeError):
+                guard.bind_once([bad_entry], b"s")
+        for bad in (7, None, True, "s", bytearray(b"s")):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(entries, bad)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(entries, b"s", expires_at=bad)
+        with self.assertRaises(TypeError):
+            OpeningBatchReplayGuard(store=object())
+
+    def test_bind_value_errors(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        with self.assertRaises(ValueError):
+            guard.bind_once([], b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once((), b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.bind_once(entries, b"s", expires_at=bad)
+
+    def test_pending_id_cannot_be_rebound(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        guard.bind_once(entries, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        first = guard.bind_once(entries, b"s1")
+        second = guard.bind_once(entries, b"s2")
+        self.assertNotEqual(first.digest, second.digest)
+        self.assertTrue(guard.check(entries, first, now=1))
+        self.assertTrue(guard.check(entries, second, now=1))
+
+    # ---- check semantics ----------------------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1))
+        self.assertNotIn(b"s", guard._pending)
+        self.assertIn(b"s", guard._consumed)
+        self.assertFalse(guard.check(entries, binding, now=1))
+
+    def test_check_with_default_now(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding))
+
+    def test_expiry_boundary_is_inclusive(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entries, binding, now=999))
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertFalse(guard.check(entries, binding, now=1000))
+        self.assertIn(b"s", guard._pending)
+
+    def test_expired_rejection_does_not_consume(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertFalse(guard.check(entries, binding, now=1000))
+        self.assertIn(b"s", guard._pending)
+        self.assertNotIn(b"s", guard._consumed)
+        self.assertTrue(guard.check(entries, binding, now=999))
+
+    def test_reordered_batch_is_rejected_then_original_succeeds(self):
+        # 哈希批顺序重排专例：同一批条目重排后摘要不同，拒绝且不消费。
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        reordered = [entries[1], entries[2], entries[0]]
+        self.assertFalse(guard.check(reordered, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertNotIn(b"s", guard._consumed)
+        self.assertTrue(guard.check(entries, binding, now=1))
+        self.assertFalse(guard.check(reordered, binding, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        entries = self._entries()
+        other = self._entries((b"one", b"two", b"three"))
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        foreign = ReplayBinding(b"s", b"\x00" * 32)
+        self.assertFalse(guard.check(entries, foreign, now=1))
+        self.assertIn(b"s", guard._pending)
+        # 换绑判假：为另一批登记的绑定不能用于本批，反之亦然。
+        other_binding = guard.bind_once(other, b"t")
+        self.assertFalse(guard.check(entries, other_binding, now=1))
+        self.assertFalse(guard.check(other, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertIn(b"t", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+        self.assertTrue(guard.check(other, other_binding, now=1))
+
+    def test_foreign_guard_binding_rejected(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        foreign = OpeningBatchReplayGuard().bind_once(entries, b"s")
+        self.assertEqual(foreign, binding)
+        self.assertFalse(OpeningBatchReplayGuard().check(entries, foreign, now=1))
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_empty_batch_check_returns_false(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertFalse(guard.check((), binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_delegated_batch_rejection_does_not_consume(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        entry = entries[0]
+        bad = OpeningBatchEntry(entry.commitment, b"wrong", entry.nonce)
+        self.assertFalse(guard.check([bad] + entries[1:], binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertNotIn(b"s", guard._consumed)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_instances_are_independent(self):
+        entries = self._entries()
+        first = OpeningBatchReplayGuard()
+        second = OpeningBatchReplayGuard()
+        binding = first.bind_once(entries, b"s")
+        self.assertFalse(second.check(entries, binding, now=1))
+        self.assertTrue(first.check(entries, binding, now=1))
+
+    def test_delegation_error_propagates_and_restores_pending(self):
+        import zkregion
+
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        original = zkregion.verify_opening_batch
+
+        def boom(_entries):
+            raise RuntimeError("boom")
+
+        zkregion.verify_opening_batch = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entries, binding, now=1)
+        finally:
+            zkregion.verify_opening_batch = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_check_type_errors(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.check(bad, binding, now=1)
+        for bad in (7, None, True, "binding", (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(entries, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(entries, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(entries, binding, now=bad)
+
+    def test_inputs_are_not_mutated(self):
+        entries = self._entries()
+        snapshots = [(e.commitment, e.value, e.nonce) for e in entries]
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        self.assertTrue(guard.check(entries, binding, now=1))
+        self.assertEqual(
+            [(e.commitment, e.value, e.nonce) for e in entries], snapshots
+        )
+        self.assertEqual(binding, binding_snapshot)
+
+    def test_concurrent_checks_have_one_winner(self):
+        entries = self._entries()
+        guard = OpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        results = []
+
+        def worker():
+            results.append(guard.check(entries, binding))
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 7)
+
+    # ---- SQLite backend -----------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        entries = self._entries()
+        store = self.make_store()
+        binder = OpeningBatchReplayGuard(store=store)
+        binding = binder.bind_once(entries, b"s", expires_at=1000)
+        checker = OpeningBatchReplayGuard(store=store)
+        self.assertTrue(checker.check(entries, binding, now=999))
+        self.assertFalse(binder.check(entries, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        entries = self._entries()
+        store = self.make_store()
+        binder = OpeningBatchReplayGuard(store=store)
+        binding = binder.bind_once(entries, b"s")
+        binder.bind_once(entries, b"t")
+        checker = OpeningBatchReplayGuard(store=store)
+        self.assertTrue(checker.check(entries, binding, now=1))
+        store.close()
+        reopened = self.make_store()
+        guard = OpeningBatchReplayGuard(store=reopened)
+        self.assertNotIn(b"s", guard._pending)
+        self.assertIn(b"s", guard._consumed)
+        self.assertIn(b"t", guard._pending)
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+        reopened.close()
+
+    def test_store_domain_isolation_from_other_guards(self):
+        entries = self._entries()
+        pedersen_entries = []
+        for value in (10, 20):
+            commitment, blinding = pedersen_commit(value, 0, 100)
+            pedersen_entries.append(
+                PedersenOpeningBatchEntry(commitment, value, blinding)
+            )
+        store = self.make_store()
+        hash_guard = OpeningBatchReplayGuard(store=store)
+        pedersen_guard = PedersenOpeningBatchReplayGuard(store=store)
+        hash_binding = hash_guard.bind_once(entries, b"s")
+        pedersen_binding = pedersen_guard.bind_once(pedersen_entries, b"s")
+        self.assertTrue(
+            pedersen_guard.check(pedersen_entries, pedersen_binding, now=1)
+        )
+        self.assertTrue(hash_guard.check(entries, hash_binding, now=1))
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertEqual(domains, {b"zr/obr/v1", b"zr/pobr/v1"})
+        store.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        entries = self._entries()
+        store = self.make_store()
+        guard = OpeningBatchReplayGuard(store=store)
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        checker = OpeningBatchReplayGuard(store=store)
+        self.assertFalse(checker.check(entries, binding, now=1000))
+        self.assertTrue(checker.check(entries, binding, now=999))
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        entries = self._entries()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = OpeningBatchReplayGuard(store=store).bind_once(entries, b"s")
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+    def test_store_delegation_error_restores_pending(self):
+        import zkregion
+
+        entries = self._entries()
+        store = self.make_store()
+        guard = OpeningBatchReplayGuard(store=store)
+        binding = guard.bind_once(entries, b"s")
+        original = zkregion.verify_opening_batch
+
+        def boom(_entries):
+            raise RuntimeError("boom")
+
+        zkregion.verify_opening_batch = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entries, binding, now=1)
+        finally:
+            zkregion.verify_opening_batch = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            OpeningBatchReplayGuard(store=store).check(entries, binding, now=1)
+        )
+        store.close()
+
+
+class PedersenOpeningBatchReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for Pedersen trapdoor opening batches."""
+
+    DOMAIN = b"zr/pobr/v1"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "pobr.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _entries(self, values=(10, 20, 30)):
+        entries = []
+        for value in values:
+            commitment, blinding = pedersen_commit(value, 0, 100)
+            entries.append(PedersenOpeningBatchEntry(commitment, value, blinding))
+        return entries
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def expected_digest(entries, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def I(value):
+            return str(value).encode("ascii")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(
+                F(transform(item)) for item in sequence
+            )
+
+        def Q(entry):
+            commitment = entry.commitment
+            q = bytearray()
+            for name in ("element", "lower", "upper", "prime", "generator", "h"):
+                q += F(I(getattr(commitment, name)))
+            q += F(I(entry.value))
+            q += F(I(entry.blinding))
+            return bytes(q)
+
+        expiry = (
+            b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        )
+        material = F(b"zr/pobr/v1") + F(session_id) + S(entries, Q) + F(expiry)
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(entries, b"s1"))
+        binding = guard.bind_once(entries, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(binding.digest, self.expected_digest(entries, b"s2", 1000))
+
+    def test_tuple_and_list_inputs_frame_identically(self):
+        entries = self._entries()
+        from_list = PedersenOpeningBatchReplayGuard().bind_once(list(entries), b"s")
+        from_tuple = PedersenOpeningBatchReplayGuard().bind_once(tuple(entries), b"s")
+        self.assertEqual(from_list.digest, from_tuple.digest)
+        self.assertEqual(from_list, from_tuple)
+
+    def test_batch_order_and_duplicates_change_digest(self):
+        entries = self._entries()
+
+        def bind(batch):
+            return PedersenOpeningBatchReplayGuard().bind_once(batch, b"s").digest
+
+        base = bind(entries)
+        self.assertNotEqual(base, bind(entries[::-1]))
+        self.assertNotEqual(base, bind(entries[:-1]))
+        self.assertNotEqual(base, bind(entries + [entries[0]]))
+        self.assertEqual(bind(entries), bind(list(entries)))
+
+    def test_digest_binds_every_field(self):
+        entries = self._entries()
+        base = PedersenOpeningBatchReplayGuard().bind_once(entries, b"s").digest
+        entry = entries[0]
+        commitment = entry.commitment
+        fields = {
+            name: getattr(commitment, name)
+            for name in ("element", "lower", "upper", "prime", "generator", "h")
+        }
+        variants = []
+        for name in fields:
+            changed = dict(fields)
+            changed[name] = fields[name] + 1
+            variants.append(
+                PedersenOpeningBatchEntry(
+                    PedersenCommitment(**changed), entry.value, entry.blinding
+                )
+            )
+        variants.append(
+            PedersenOpeningBatchEntry(commitment, entry.value + 1, entry.blinding)
+        )
+        variants.append(
+            PedersenOpeningBatchEntry(commitment, entry.value, entry.blinding + 1)
+        )
+        for variant in variants:
+            digest = PedersenOpeningBatchReplayGuard().bind_once(
+                [variant] + entries[1:], b"s"
+            ).digest
+            self.assertNotEqual(base, digest)
+
+    def test_negative_integers_are_framed(self):
+        commitment, blinding = pedersen_commit(10, 0, 100)
+        negative = PedersenCommitment(
+            commitment.element, -5, 100, commitment.prime,
+            commitment.generator, commitment.h,
+        )
+        entry = PedersenOpeningBatchEntry(negative, 10, blinding)
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once([entry], b"s")
+        self.assertEqual(binding.digest, self.expected_digest([entry], b"s"))
+
+    # ---- bind argument boundaries -------------------------------------------
+
+    def test_bind_type_errors(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(bad, b"s")
+        for bad in (7, None, True, "entry", b"entry"):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once([bad], b"s")
+        entry = entries[0]
+        commitment = entry.commitment
+        fields = {
+            name: getattr(commitment, name)
+            for name in ("element", "lower", "upper", "prime", "generator", "h")
+        }
+        for name in fields:
+            for bad in (True, 1.5, "1"):
+                changed = dict(fields)
+                changed[name] = bad
+                bad_entry = PedersenOpeningBatchEntry(
+                    PedersenCommitment(**changed), entry.value, entry.blinding
+                )
+                with self.assertRaises(TypeError, msg=f"{name}={bad!r}"):
+                    guard.bind_once([bad_entry], b"s")
+        for bad_entry in (
+            PedersenOpeningBatchEntry(commitment, True, entry.blinding),
+            PedersenOpeningBatchEntry(commitment, entry.value, False),
+            PedersenOpeningBatchEntry(commitment, 1.5, entry.blinding),
+            PedersenOpeningBatchEntry("commitment", entry.value, entry.blinding),
+        ):
+            with self.assertRaises(TypeError):
+                guard.bind_once([bad_entry], b"s")
+        for bad in (7, None, True, "s", bytearray(b"s")):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(entries, bad)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(entries, b"s", expires_at=bad)
+        with self.assertRaises(TypeError):
+            PedersenOpeningBatchReplayGuard(store=object())
+
+    def test_bind_value_errors(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        with self.assertRaises(ValueError):
+            guard.bind_once([], b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once((), b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.bind_once(entries, b"s", expires_at=bad)
+
+    def test_pending_id_cannot_be_rebound(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        guard.bind_once(entries, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        first = guard.bind_once(entries, b"s1")
+        second = guard.bind_once(entries, b"s2")
+        self.assertNotEqual(first.digest, second.digest)
+        self.assertTrue(guard.check(entries, first, now=1))
+        self.assertTrue(guard.check(entries, second, now=1))
+
+    # ---- check semantics ----------------------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1))
+        self.assertNotIn(b"s", guard._pending)
+        self.assertIn(b"s", guard._consumed)
+        self.assertFalse(guard.check(entries, binding, now=1))
+
+    def test_check_with_default_now(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding))
+
+    def test_expiry_boundary_is_inclusive(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entries, binding, now=999))
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertFalse(guard.check(entries, binding, now=1000))
+        self.assertIn(b"s", guard._pending)
+
+    def test_expired_rejection_does_not_consume(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertFalse(guard.check(entries, binding, now=1000))
+        self.assertIn(b"s", guard._pending)
+        self.assertNotIn(b"s", guard._consumed)
+        self.assertTrue(guard.check(entries, binding, now=999))
+
+    def test_reordered_batch_is_rejected_then_original_succeeds(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        reordered = [entries[1], entries[2], entries[0]]
+        self.assertFalse(guard.check(reordered, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertNotIn(b"s", guard._consumed)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        entries = self._entries()
+        other = self._entries((40, 50, 60))
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        foreign = ReplayBinding(b"s", b"\x00" * 32)
+        self.assertFalse(guard.check(entries, foreign, now=1))
+        self.assertIn(b"s", guard._pending)
+        # 换绑判假：为另一批登记的绑定不能用于本批，反之亦然。
+        other_binding = guard.bind_once(other, b"t")
+        self.assertFalse(guard.check(entries, other_binding, now=1))
+        self.assertFalse(guard.check(other, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertIn(b"t", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+        self.assertTrue(guard.check(other, other_binding, now=1))
+
+    def test_foreign_guard_binding_rejected(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        foreign = PedersenOpeningBatchReplayGuard().bind_once(entries, b"s")
+        self.assertEqual(foreign, binding)
+        self.assertFalse(
+            PedersenOpeningBatchReplayGuard().check(entries, foreign, now=1)
+        )
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_empty_batch_check_returns_false(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertFalse(guard.check((), binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_delegated_batch_rejection_does_not_consume(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        entry = entries[0]
+        bad = PedersenOpeningBatchEntry(
+            entry.commitment, entry.value + 1, entry.blinding
+        )
+        self.assertFalse(guard.check([bad] + entries[1:], binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertNotIn(b"s", guard._consumed)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_instances_are_independent(self):
+        entries = self._entries()
+        first = PedersenOpeningBatchReplayGuard()
+        second = PedersenOpeningBatchReplayGuard()
+        binding = first.bind_once(entries, b"s")
+        self.assertFalse(second.check(entries, binding, now=1))
+        self.assertTrue(first.check(entries, binding, now=1))
+
+    def test_delegation_error_propagates_and_restores_pending(self):
+        import zkregion
+
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        original = zkregion.verify_pedersen_opening_batch
+
+        def boom(_entries):
+            raise RuntimeError("boom")
+
+        zkregion.verify_pedersen_opening_batch = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entries, binding, now=1)
+        finally:
+            zkregion.verify_pedersen_opening_batch = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1))
+
+    def test_check_type_errors(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.check(bad, binding, now=1)
+        for bad in (7, None, True, "binding", (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(entries, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(entries, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(entries, binding, now=bad)
+
+    def test_inputs_are_not_mutated(self):
+        entries = self._entries()
+        snapshots = [(e.commitment, e.value, e.blinding) for e in entries]
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        self.assertTrue(guard.check(entries, binding, now=1))
+        self.assertEqual(
+            [(e.commitment, e.value, e.blinding) for e in entries], snapshots
+        )
+        self.assertEqual(binding, binding_snapshot)
+
+    def test_concurrent_checks_have_one_winner(self):
+        entries = self._entries()
+        guard = PedersenOpeningBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        results = []
+
+        def worker():
+            results.append(guard.check(entries, binding))
+
+        threads = [threading.Thread(target=worker) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 7)
+
+    # ---- SQLite backend -----------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        entries = self._entries()
+        store = self.make_store()
+        binder = PedersenOpeningBatchReplayGuard(store=store)
+        binding = binder.bind_once(entries, b"s", expires_at=1000)
+        checker = PedersenOpeningBatchReplayGuard(store=store)
+        self.assertTrue(checker.check(entries, binding, now=999))
+        self.assertFalse(binder.check(entries, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        entries = self._entries()
+        store = self.make_store()
+        binder = PedersenOpeningBatchReplayGuard(store=store)
+        binding = binder.bind_once(entries, b"s")
+        binder.bind_once(entries, b"t")
+        checker = PedersenOpeningBatchReplayGuard(store=store)
+        self.assertTrue(checker.check(entries, binding, now=1))
+        store.close()
+        reopened = self.make_store()
+        guard = PedersenOpeningBatchReplayGuard(store=reopened)
+        self.assertNotIn(b"s", guard._pending)
+        self.assertIn(b"s", guard._consumed)
+        self.assertIn(b"t", guard._pending)
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+        reopened.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        entries = self._entries()
+        store = self.make_store()
+        guard = PedersenOpeningBatchReplayGuard(store=store)
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        checker = PedersenOpeningBatchReplayGuard(store=store)
+        self.assertFalse(checker.check(entries, binding, now=1000))
+        self.assertTrue(checker.check(entries, binding, now=999))
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        entries = self._entries()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = PedersenOpeningBatchReplayGuard(store=store).bind_once(entries, b"s")
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+    def test_store_delegation_error_restores_pending(self):
+        import zkregion
+
+        entries = self._entries()
+        store = self.make_store()
+        guard = PedersenOpeningBatchReplayGuard(store=store)
+        binding = guard.bind_once(entries, b"s")
+        original = zkregion.verify_pedersen_opening_batch
+
+        def boom(_entries):
+            raise RuntimeError("boom")
+
+        zkregion.verify_pedersen_opening_batch = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entries, binding, now=1)
+        finally:
+            zkregion.verify_pedersen_opening_batch = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            PedersenOpeningBatchReplayGuard(store=store).check(
+                entries, binding, now=1
+            )
+        )
         store.close()

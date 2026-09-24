@@ -840,6 +840,7 @@ python3 -m zkregion
 - `prove_range_batch_bound(entries, *, randbelow=secrets.randbelow) -> tuple[BoundRangeBatch, bytes]` — 顶层构造 Merkle 承诺的规范区间证明完整批：`entries` 沿用 `verify_range_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，输入不变；每项外层叶逐字节复用 `_bound_range_leaf` 编码，既有域、长度帧、字段顺序及 Merkle 哈希规则不变；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖每片叶、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_range_bound(batch, root) is True`，单项、奇偶批与重复项均确定，与旧手工构造逐字节兼容；`randbelow` 原样透传给 `verify_range_batch`；全批或任一嵌套字段错型（含后项错型与 `bool` 计数）抛 `TypeError`，空批、U 成帧批次数越出 uint64 或 `verify_range_batch` 返回 `False`（内层证明无效）抛 `ValueError`
 - `prove_region(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionProof` — 生成二维矩形区域成员非交互证明
 - `verify_region(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证区域成员证明，无需坐标或盲因子
+- `region_contains_committed(region, x_commitment, y_commitment, x, y, x_blinding, y_blinding) -> bool` — 坐标判定与两个陷门承诺绑定的公开入口：逐轴（先 x 后 y）校验承诺声明区间等于区域对应轴边界并按 `verify_pedersen_opening` 同一口径重算开合，两轴通过后再做闭区间矩形判定
 - `RegionProof(x_proof, y_proof)` — 不可变区域证明对象，两字段均为 `RangeProof`
 - `verify_region_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 区域证明的批量验证，按 `(prime, generator, h)` 分组做一次随机线性组合
 - `RegionBatchEntry(x_commitment, y_commitment, region, proof, context=b"")` — 不可变批量验证条目，字段次序与 `verify_region` 入参一致
@@ -1154,6 +1155,19 @@ h**Σ(a*s) == Π(t**a * D_i**(a*e))   (mod prime)
 每条轴的子证明在派生 context 下进行，派生 context 按以下项目逐项前置四字节无符号大端长度拼接：域 `b"zkregion/region/v1"`、轴标签 `b"x"` 或 `b"y"`、外部 `context`、Region 四边界（`min_x`、`max_x`、`min_y`、`max_y`）、x 承诺六字段、y 承诺六字段（均按数据类字段顺序）；整数编码为十进制 ASCII。因此证明同时绑定区域、外部 context、两个承诺与轴分配——更换区域、context、承诺或交换两轴（含交换子证明、交换承诺）都验证失败。
 
 `context` 只接受 `bytes`，所有整数拒绝 `bool`；承诺、区域、证明对象或其字段、数值类型错误抛 `TypeError`。生成时区间不匹配、开合无效或轴区间超过 256 个整数抛 `ValueError`；验证时上述非类型错误、结构非法、篡改或绑定不符一律返回 `False`。入口均不改写输入。
+
+### 与承诺绑定的区域判定
+
+`region_contains_committed(region, x_commitment, y_commitment, x, y, x_blinding, y_blinding)` 是把朴素坐标比较（`Region.contains`）与两个坐标的陷门承诺绑定在一起的公开布尔入口，依次接收矩形区域、x 与 y 两个 `PedersenCommitment`、坐标值及对应盲因子。它是纯函数：不落盘、不读写任何持久化状态，也不改写任一传入对象。
+
+校验次序固定，逐轴进行（先 x 后 y），每轴两步：
+
+1. 承诺的声明区间必须恰好等于区域对应轴的两个边界——x 承诺为 `(region.min_x, region.max_x)`，y 承诺为 `(region.min_y, region.max_y)`；
+2. 以承诺对象内的群参数与声明区间，按 `verify_pedersen_opening` 的同一套口径重算并比对开合：`prime > 3`、`1 < generator < prime`、`1 < h < prime`、`0 < element < prime`、`lower <= upper`、区间宽度 `< prime - 1`、`lower <= value <= upper`、`1 <= blinding < prime - 1`，且 `g**(value-lower) * h**blinding mod prime == element`。
+
+两轴都通过后，才判定 `min_x <= x <= max_x and min_y <= y <= max_y`——闭区间边界上算在矩形内。非默认群参数与显式 `h` 的承诺一律按各承诺对象内参数校验，无需带外参数；换绑任一承诺（换对象或篡改字段）或任一盲因子同样判假。
+
+任一层字段给错类型——非 `Region` / 非 `PedersenCommitment` 对象、承诺对象或区域的字段错型、坐标或盲因子不是非 `bool` 整数（`True`/`False` 不冒充整数）——一律抛 `TypeError`，且异常类型唯一为 `TypeError`。开合不符、盲因子或承诺内参数（`element`、群参数）越界、声明区间与区域边界不一致、声明非法（`lower > upper` 或值越出声明区间）、坐标落在矩形外，一律返回 `False` 而不抛异常。重复调用同一组参数结果始终一致。
 
 ### 二维区域证明批量验证
 

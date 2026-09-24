@@ -38,7 +38,9 @@ from zkregion import (
     MerkleMultiProof,
     MerkleProof,
     MultiSchnorrEntry,
+    OpeningBatchEntry,
     PedersenCommitment,
+    PedersenOpeningBatchEntry,
     RangeBatchEntry,
     RangeBatchReplayGuard,
     RangeProof,
@@ -85,7 +87,9 @@ from zkregion import (
     verify_multi_inclusion_batch,
     verify_multi_inclusion_batch_bound,
     verify_opening,
+    verify_opening_batch,
     verify_pedersen_opening,
+    verify_pedersen_opening_batch,
     verify_range,
     verify_range_batch,
     verify_range_bound,
@@ -140,6 +144,142 @@ class CommitmentTest(unittest.TestCase):
     def test_coordinate_requires_integers(self):
         with self.assertRaises(TypeError):
             commit_coordinate(1.5, 2)
+
+
+class OpeningBatchTest(unittest.TestCase):
+    """Batch verification of independent hash-commitment openings."""
+
+    def _entry(self, value):
+        commitment, nonce = commit(value)
+        return OpeningBatchEntry(commitment, value, nonce)
+
+    def _entries(self):
+        return [self._entry(b"alpha"), self._entry(b"beta"), self._entry(b"gamma")]
+
+    def test_valid_batches_of_various_sizes(self):
+        for size in range(1, 8):
+            entries = [self._entry(f"v{i}".encode()) for i in range(size)]
+            self.assertTrue(verify_opening_batch(entries), size)
+
+    def test_lists_tuples_and_duplicates(self):
+        entries = self._entries()
+        self.assertTrue(verify_opening_batch(entries))
+        self.assertTrue(verify_opening_batch(tuple(entries)))
+        self.assertTrue(verify_opening_batch(entries + entries[:1]))
+        self.assertTrue(verify_opening_batch((entries[0],) * 3))
+
+    def test_single_entry_matches_single_verify(self):
+        entry = self._entry(b"one")
+        self.assertTrue(verify_opening_batch([entry]))
+        self.assertTrue(
+            verify_opening_batch([entry])
+            == verify_opening(entry.commitment, entry.value, entry.nonce)
+        )
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(verify_opening_batch(()))
+        self.assertFalse(verify_opening_batch([]))
+
+    def test_one_invalid_entry_returns_false(self):
+        good = self._entries()
+        other_commitment, other_nonce = commit(b"other")
+        bad_entries = [
+            OpeningBatchEntry(good[0].commitment, b"other", good[0].nonce),  # bad value
+            OpeningBatchEntry(good[0].commitment, good[0].value, other_nonce),  # bad nonce
+            OpeningBatchEntry(other_commitment, good[0].value, good[0].nonce),  # bad commitment
+            OpeningBatchEntry(b"\x00" * 32, good[0].value, good[0].nonce),  # wrong digest
+        ]
+        for bad in bad_entries:
+            self.assertFalse(verify_opening_batch([good[0], bad, good[1]]), bad)
+            self.assertFalse(verify_opening_batch([bad]), bad)
+
+    def test_rebound_nonce_returns_false(self):
+        first = self._entry(b"first")
+        second = self._entry(b"second")
+        # swapping the nonce between two honest openings invalidates both
+        swapped = OpeningBatchEntry(first.commitment, first.value, second.nonce)
+        self.assertFalse(verify_opening_batch([swapped]))
+        self.assertFalse(verify_opening_batch([first, swapped, second]))
+
+    def test_short_circuits_on_first_invalid_entry(self):
+        calls = []
+
+        import zkregion
+        original = zkregion.verify_opening
+
+        def tracking(commitment, value, nonce):
+            calls.append(value)
+            return original(commitment, value, nonce)
+
+        good = self._entry(b"good")
+        bad = OpeningBatchEntry(good.commitment, b"other", good.nonce)
+        zkregion.verify_opening = tracking
+        try:
+            self.assertFalse(verify_opening_batch([good, bad, good]))
+        finally:
+            zkregion.verify_opening = original
+        self.assertEqual(len(calls), 2)
+
+    def test_entries_type_errors_are_preflighted_for_whole_batch(self):
+        for bad in (b"abc", bytearray(b"abc"), "abc", 123, None, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                verify_opening_batch(bad)
+        with self.assertRaises(TypeError):
+            verify_opening_batch([object()])
+        with self.assertRaises(TypeError):
+            verify_opening_batch([("a", "b", "c")])
+        good = self._entry(b"good")
+        # a bad type in a *later* entry still raises: the whole batch is
+        # checked before any entry is verified
+        with self.assertRaises(TypeError):
+            verify_opening_batch([good, 42, good])
+        with self.assertRaises(TypeError):
+            verify_opening_batch([good, good, object()])
+
+    def test_field_type_errors_raise_type_error_only(self):
+        entry = self._entry(b"value")
+        bad_entries = [
+            OpeningBatchEntry("c", entry.value, entry.nonce),
+            OpeningBatchEntry(bytearray(entry.commitment), entry.value, entry.nonce),
+            OpeningBatchEntry(entry.commitment, 1, entry.nonce),
+            OpeningBatchEntry(entry.commitment, entry.value, None),
+            OpeningBatchEntry(True, entry.value, entry.nonce),
+            OpeningBatchEntry(entry.commitment, entry.value, 1.5),
+        ]
+        for bad in bad_entries:
+            with self.assertRaises(TypeError, msg=bad):
+                verify_opening_batch([bad])
+            with self.assertRaises(TypeError, msg=bad):
+                verify_opening_batch([entry, bad])
+
+    def test_entry_is_frozen_positional_and_value_equal(self):
+        commitment, nonce = commit(b"value")
+        entry = OpeningBatchEntry(commitment, b"value", nonce)
+        clone = OpeningBatchEntry(commitment, b"value", nonce)
+        keyword = OpeningBatchEntry(commitment=commitment, value=b"value", nonce=nonce)
+        self.assertEqual(entry, clone)
+        self.assertEqual(entry, keyword)
+        self.assertEqual(
+            (entry.commitment, entry.value, entry.nonce), (commitment, b"value", nonce)
+        )
+        self.assertTrue(dataclasses.is_dataclass(entry))
+        with self.assertRaises(AttributeError):
+            entry.value = b"other"
+        self.assertNotEqual(entry, OpeningBatchEntry(commitment, b"other", nonce))
+        self.assertEqual(hash(entry), hash(clone))
+
+    def test_inputs_not_mutated(self):
+        entries = self._entries()
+        snapshots = [(e.commitment, e.value, e.nonce) for e in entries]
+        self.assertTrue(verify_opening_batch(entries))
+        self.assertEqual(
+            [(e.commitment, e.value, e.nonce) for e in entries], snapshots
+        )
+        bad = OpeningBatchEntry(entries[1].commitment, b"other", entries[1].nonce)
+        mixed = [entries[0], bad]
+        self.assertFalse(verify_opening_batch(mixed))
+        self.assertEqual(bad.value, b"other")
+        self.assertEqual(entries[1].nonce, snapshots[1][2])
 
 
 class PedersenCommitmentTest(unittest.TestCase):
@@ -426,6 +566,188 @@ class PedersenCommitmentTest(unittest.TestCase):
         self.assertEqual(commitment, snapshot)
         self.assertEqual(value, 50)
         self.assertEqual(blinding, 1234)
+
+
+class PedersenOpeningBatchTest(unittest.TestCase):
+    """Batch verification of independent Pedersen commitment openings."""
+
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def _entry(self, value=50, lower=0, upper=100, blinding=1234, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        commitment, r = pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+        return PedersenOpeningBatchEntry(commitment, value, r)
+
+    def _entries(self):
+        return [
+            self._entry(50, 0, 100, blinding=1234),
+            self._entry(7, 5, 9, blinding=4321),
+            self._entry(-3, -10, 10, blinding=77),
+        ]
+
+    def test_valid_batches_of_various_sizes(self):
+        for size in range(1, 6):
+            entries = [
+                self._entry(i, 0, 10, blinding=1000 + i) for i in range(size)
+            ]
+            self.assertTrue(verify_pedersen_opening_batch(entries), size)
+
+    def test_lists_tuples_and_duplicates(self):
+        entries = self._entries()
+        self.assertTrue(verify_pedersen_opening_batch(entries))
+        self.assertTrue(verify_pedersen_opening_batch(tuple(entries)))
+        self.assertTrue(verify_pedersen_opening_batch(entries + entries[:1]))
+        self.assertTrue(verify_pedersen_opening_batch((entries[0],) * 3))
+
+    def test_single_entry_matches_single_verify(self):
+        entry = self._entry()
+        self.assertTrue(verify_pedersen_opening_batch([entry]))
+        self.assertTrue(
+            verify_pedersen_opening_batch([entry])
+            == verify_pedersen_opening(entry.commitment, entry.value, entry.blinding)
+        )
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(verify_pedersen_opening_batch(()))
+        self.assertFalse(verify_pedersen_opening_batch([]))
+
+    def test_entries_are_independent_unrelated_ranges_allowed(self):
+        entries = [
+            self._entry(7, 5, 9, blinding=4321),
+            self._entry(50, 0, 100, blinding=1234),
+            self._entry(-3, -10, 10, blinding=77),
+        ]
+        self.assertTrue(verify_pedersen_opening_batch(entries))
+
+    def test_one_invalid_entry_returns_false(self):
+        good = self._entries()
+        bad_entries = [
+            PedersenOpeningBatchEntry(good[0].commitment, 51, good[0].blinding),
+            PedersenOpeningBatchEntry(good[0].commitment, 50, good[0].blinding + 1),
+            PedersenOpeningBatchEntry(good[1].commitment, 50, good[1].blinding),
+        ]
+        for bad in bad_entries:
+            self.assertFalse(verify_pedersen_opening_batch([good[0], bad, good[1]]), bad)
+            self.assertFalse(verify_pedersen_opening_batch([bad]), bad)
+
+    def test_value_outside_declared_range_returns_false(self):
+        entry = self._entry(50, 0, 100)
+        out_of_range = PedersenOpeningBatchEntry(entry.commitment, 101, entry.blinding)
+        self.assertFalse(verify_pedersen_opening_batch([out_of_range]))
+        below = PedersenOpeningBatchEntry(entry.commitment, -1, entry.blinding)
+        self.assertFalse(verify_pedersen_opening_batch([below]))
+
+    def test_blinding_out_of_range_returns_false(self):
+        entry = self._entry()
+        for bad_blinding in (0, self.PRIME - 1, self.PRIME, -5):
+            bad = PedersenOpeningBatchEntry(entry.commitment, 50, bad_blinding)
+            self.assertFalse(verify_pedersen_opening_batch([bad]), bad_blinding)
+
+    def test_rebound_commitment_or_blinding_returns_false(self):
+        first = self._entry(50, 0, 100, blinding=1234)
+        second = self._entry(60, 0, 100, blinding=5678)
+        # swapping the blinding between two honest openings invalidates both
+        swapped = PedersenOpeningBatchEntry(first.commitment, 50, second.blinding)
+        self.assertFalse(verify_pedersen_opening_batch([swapped]))
+        self.assertFalse(verify_pedersen_opening_batch([first, swapped, second]))
+        # rebinding a foreign commitment to the opening fails as well
+        crossed = PedersenOpeningBatchEntry(second.commitment, 50, first.blinding)
+        self.assertFalse(verify_pedersen_opening_batch([crossed]))
+
+    def test_short_circuits_on_first_invalid_entry(self):
+        calls = []
+
+        import zkregion
+        original = zkregion.verify_pedersen_opening
+
+        def tracking(commitment, value, blinding):
+            calls.append(value)
+            return original(commitment, value, blinding)
+
+        good = self._entry()
+        bad = PedersenOpeningBatchEntry(good.commitment, 51, good.blinding)
+        zkregion.verify_pedersen_opening = tracking
+        try:
+            self.assertFalse(verify_pedersen_opening_batch([good, bad, good]))
+        finally:
+            zkregion.verify_pedersen_opening = original
+        self.assertEqual(len(calls), 2)
+
+    def test_entries_type_errors_are_preflighted_for_whole_batch(self):
+        for bad in (b"abc", bytearray(b"abc"), "abc", 123, None, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                verify_pedersen_opening_batch(bad)
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch([object()])
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch([("c", 1, 2)])
+        good = self._entry()
+        # a bad type in a *later* entry still raises: the whole batch is
+        # checked before any entry is verified
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch([good, 42, good])
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch([good, good, object()])
+
+    def test_field_type_errors_raise_type_error_only(self):
+        entry = self._entry()
+        c = entry.commitment
+        bad_entries = [
+            PedersenOpeningBatchEntry("c", 50, entry.blinding),
+            PedersenOpeningBatchEntry(None, 50, entry.blinding),
+            PedersenOpeningBatchEntry(c, "50", entry.blinding),
+            PedersenOpeningBatchEntry(c, 50, 1.5),
+            PedersenOpeningBatchEntry(c, True, entry.blinding),  # bool is not an int
+            PedersenOpeningBatchEntry(c, 50, False),
+            PedersenOpeningBatchEntry(dataclasses.replace(c, element=True), 50, entry.blinding),
+            PedersenOpeningBatchEntry(dataclasses.replace(c, lower="0"), 50, entry.blinding),
+            PedersenOpeningBatchEntry(dataclasses.replace(c, upper=1.5), 50, entry.blinding),
+            PedersenOpeningBatchEntry(dataclasses.replace(c, prime=None), 50, entry.blinding),
+            PedersenOpeningBatchEntry(dataclasses.replace(c, generator=True), 50, entry.blinding),
+            PedersenOpeningBatchEntry(dataclasses.replace(c, h=b"5"), 50, entry.blinding),
+        ]
+        for bad in bad_entries:
+            with self.assertRaises(TypeError, msg=bad):
+                verify_pedersen_opening_batch([bad])
+            with self.assertRaises(TypeError, msg=bad):
+                verify_pedersen_opening_batch([entry, bad])
+
+    def test_entry_is_frozen_positional_and_value_equal(self):
+        commitment, blinding = pedersen_commit(
+            50, 0, 100, prime=self.PRIME, generator=self.G, h=self.H, blinding=1234
+        )
+        entry = PedersenOpeningBatchEntry(commitment, 50, blinding)
+        clone = PedersenOpeningBatchEntry(commitment, 50, blinding)
+        keyword = PedersenOpeningBatchEntry(
+            commitment=commitment, value=50, blinding=blinding
+        )
+        self.assertEqual(entry, clone)
+        self.assertEqual(entry, keyword)
+        self.assertEqual(
+            (entry.commitment, entry.value, entry.blinding), (commitment, 50, blinding)
+        )
+        self.assertTrue(dataclasses.is_dataclass(entry))
+        with self.assertRaises(AttributeError):
+            entry.value = 51
+        self.assertNotEqual(entry, PedersenOpeningBatchEntry(commitment, 51, blinding))
+        self.assertEqual(hash(entry), hash(clone))
+
+    def test_inputs_not_mutated(self):
+        entries = self._entries()
+        snapshots = [(e.commitment, e.value, e.blinding) for e in entries]
+        self.assertTrue(verify_pedersen_opening_batch(entries))
+        self.assertEqual(
+            [(e.commitment, e.value, e.blinding) for e in entries], snapshots
+        )
+        bad = PedersenOpeningBatchEntry(entries[1].commitment, 8, entries[1].blinding + 1)
+        mixed = [entries[0], bad]
+        self.assertFalse(verify_pedersen_opening_batch(mixed))
+        self.assertEqual(bad.value, 8)
+        self.assertEqual(entries[1].blinding, snapshots[1][2])
 
 
 class RangeProofTest(unittest.TestCase):

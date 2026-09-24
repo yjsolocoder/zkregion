@@ -9,8 +9,9 @@ SchnorrProof / SchnorrBatchEntry / SchnorrProver /
 SchnorrVerifier / MultiSchnorrEntry / verify_schnorr_batch /
 SchnorrBatchReplayGuard /
 RangeBatchReplayGuard /
-BoundSchnorrBatch / verify_bound /
+BoundSchnorrBatch / verify_bound / prove_schnorr_batch_bound /
 SingleKeyBoundBatch / SchnorrVerifier.verify_bound_batch /
+SchnorrVerifier.prove_bound_batch /
 BoundRegionBatch / verify_region_bound /
 BoundRangeBatch / verify_range_bound /
 BoundSchnorrReplayGuard /
@@ -133,6 +134,7 @@ __all__ = [
     "prove_range_batch_bound",
     "prove_region",
     "prove_region_batch_bound",
+    "prove_schnorr_batch_bound",
     "verify_bound",
     "verify_consistency",
     "verify_consistency_batch",
@@ -1029,6 +1031,86 @@ class SchnorrVerifier:
         if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
             return False
         return self.verify_batch(entries, randbelow=randbelow)
+
+    def prove_bound_batch(
+        self,
+        entries: Sequence[SchnorrBatchEntry],
+        *,
+        randbelow: Callable[[int], int] = secrets.randbelow,
+    ) -> tuple["SingleKeyBoundBatch", bytes]:
+        """Build a complete, Merkle-committed :class:`SingleKeyBoundBatch`.
+
+        The public key and group parameters (``prime`` / ``generator``)
+        are the fixed ones of this verifier, and ``entries`` follows the
+        same non-``bytes`` / ``bytearray`` / ``str``
+        sequence-of-:class:`SchnorrBatchEntry` rules as
+        :meth:`verify_batch` and must be non-empty; every entry is copied
+        into a tuple in its original order with duplicates preserved, and
+        the inputs are never mutated. Each entry is lifted into a
+        :class:`MultiSchnorrEntry` carrying this verifier's
+        ``public_key`` / ``prime`` / ``generator`` exactly as
+        :meth:`verify_bound_batch` does, and encoded to its outer leaf
+        byte for byte with :func:`_bound_schnorr_leaf`; the domain
+        separator, length framing and field order stay unchanged, and the
+        leaf digests and internal nodes follow the existing SHA-256
+        Merkle rules. With ``n = len(entries)``, the complete
+        multi-inclusion proof is built with
+        :func:`prove_multi_inclusion` over the encoded leaves and the
+        full indices ``tuple(range(n))`` — so its ``indices`` cover
+        every leaf from zero and its ``siblings`` are empty — and the
+        returned batch carries ``leaf_count = n`` alongside that proof.
+        The second return value is the outer tree's
+        :func:`merkle_root` of the encoded leaves, which is exactly the
+        root the batch verifies under:
+        ``verifier.verify_bound_batch(batch, root)`` returns ``True``.
+        Single-item, odd- and even-sized batches and duplicate entries
+        are all deterministic and byte for byte compatible with the
+        previous manual construction.
+
+        A type preflight over the whole batch — every entry and every
+        nested field, including ``bool`` integers and later entries —
+        raises :class:`TypeError` before anything is built; an empty
+        batch, a ``U``-framed batch count outside uint64, a proof
+        integer that cannot be unsignedly framed, or
+        :meth:`verify_batch` returning ``False`` (an invalid inner
+        same-key Schnorr batch) raises :class:`ValueError`. The
+        ``randbelow`` argument is passed through to
+        :meth:`verify_batch` unchanged under its randomness contract, so
+        the source's own boundary exceptions propagate unchanged.
+        """
+        items = _check_schnorr_batch_entries_types(entries)
+        if not callable(randbelow):
+            raise TypeError("randbelow must be callable")
+        if not items:
+            raise ValueError("entries must not be empty")
+        if not _single_key_batch_replay_encodable(items):
+            raise ValueError(
+                "batch length and leaf integers must be non-negative unsigned integers"
+            )
+        if not self.verify_batch(items, randbelow=randbelow):
+            raise ValueError("entries must pass verify_batch")
+        ordered = tuple(items)
+        leaves = [
+            _bound_schnorr_leaf(
+                MultiSchnorrEntry(
+                    self._public_key,
+                    entry.message,
+                    entry.proof,
+                    entry.context,
+                    self._prime,
+                    self._generator,
+                )
+            )
+            for entry in ordered
+        ]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+        batch = SingleKeyBoundBatch(
+            entries=ordered,
+            leaf_count=len(ordered),
+            proof=proof,
+        )
+        return batch, root
 
 
 def verify_schnorr_batch(
@@ -3333,6 +3415,66 @@ def verify_bound(
     if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
         return False
     return verify_schnorr_batch(entries, randbelow=randbelow)
+
+
+def prove_schnorr_batch_bound(
+    entries: Sequence[MultiSchnorrEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> tuple[BoundSchnorrBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundSchnorrBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`MultiSchnorrEntry` rules as
+    :func:`verify_schnorr_batch` and must be non-empty; every entry is
+    copied into a tuple in its original order with duplicates preserved,
+    and the inputs are never mutated. Each entry is encoded to its outer
+    leaf byte for byte with :func:`_bound_schnorr_leaf`; the domain
+    separator, length framing and field order stay unchanged, and the
+    leaf digests and internal nodes follow the existing SHA-256 Merkle
+    rules. With ``n = len(entries)``, the complete multi-inclusion proof
+    is built with :func:`prove_multi_inclusion` over the encoded leaves
+    and the full indices ``tuple(range(n))`` — so its ``indices`` cover
+    every leaf from zero and its ``siblings`` are empty — and the
+    returned batch carries ``leaf_count = n`` alongside that proof. The
+    second return value is the outer tree's :func:`merkle_root` of the
+    encoded leaves, which is exactly the root the batch verifies under:
+    ``verify_bound(batch, root)`` returns ``True``. Single-item, odd- and
+    even-sized batches and duplicate entries are all deterministic and
+    byte for byte compatible with the previous manual construction.
+
+    A type preflight over the whole batch — every entry and every nested
+    field, including ``bool`` counts and later entries — raises
+    :class:`TypeError` before anything is built; an empty batch, a
+    ``U``-framed batch count outside uint64, a leaf integer that cannot
+    be unsignedly framed, or :func:`verify_schnorr_batch` returning
+    ``False`` (an invalid inner Schnorr batch) raises
+    :class:`ValueError`. The ``randbelow`` argument is passed through to
+    :func:`verify_schnorr_batch` unchanged under its randomness contract,
+    so a non-callable source raises :class:`TypeError` and the source's
+    own boundary exceptions propagate unchanged.
+    """
+    items = _check_multi_schnorr_entries_types(entries)
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not items:
+        raise ValueError("entries must not be empty")
+    if not _schnorr_batch_replay_encodable(items):
+        raise ValueError(
+            "batch length and leaf integers must be non-negative unsigned integers"
+        )
+    if not verify_schnorr_batch(items, randbelow=randbelow):
+        raise ValueError("entries must pass verify_schnorr_batch")
+    ordered = tuple(items)
+    leaves = [_bound_schnorr_leaf(entry) for entry in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundSchnorrBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
 
 
 # ---------------------------------------------------------------------------

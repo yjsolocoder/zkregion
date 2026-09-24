@@ -17,6 +17,8 @@ from zkregion import (
     BoundMerkleInclusionBatchReplayGuard,
     BoundMerkleMultiBatch,
     BoundMerkleMultiBatchReplayGuard,
+    BoundOpeningBatch,
+    BoundPedersenOpeningBatch,
     BoundRangeBatch,
     BoundRegionBatch,
     BoundRegionReplayGuard,
@@ -71,6 +73,8 @@ from zkregion import (
     prove_consistency_chain,
     prove_inclusion,
     prove_multi_inclusion,
+    prove_opening_batch_bound,
+    prove_pedersen_opening_batch_bound,
     prove_range,
     prove_region,
     prove_schnorr_batch_bound,
@@ -90,8 +94,10 @@ from zkregion import (
     verify_multi_inclusion_batch_bound,
     verify_opening,
     verify_opening_batch,
+    verify_opening_batch_bound,
     verify_pedersen_opening,
     verify_pedersen_opening_batch,
+    verify_pedersen_opening_batch_bound,
     verify_range,
     verify_range_batch,
     verify_range_bound,
@@ -6316,6 +6322,814 @@ class BoundMerkleMultiBatchTest(unittest.TestCase):
                 ),
                 root,
             )
+
+
+def bound_opening_leaf(entry: OpeningBatchEntry) -> bytes:
+    items = (
+        b"zkregion/ob/v1",
+        entry.commitment,
+        entry.value,
+        entry.nonce,
+    )
+    return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+
+def bound_pedersen_opening_leaf(entry: PedersenOpeningBatchEntry) -> bytes:
+    commitment = entry.commitment
+    items = [b"zkregion/pob/v1"]
+    items += [
+        str(getattr(commitment, name)).encode("ascii")
+        for name in ("element", "lower", "upper", "prime", "generator", "h")
+    ]
+    items.append(str(entry.value).encode("ascii"))
+    items.append(str(entry.blinding).encode("ascii"))
+    return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+
+class BoundOpeningBatchTest(unittest.TestCase):
+    """Merkle-committed complete batches of hash-commitment openings."""
+
+    def _entry(self, value):
+        commitment, nonce = commit(value)
+        return OpeningBatchEntry(commitment, value, nonce)
+
+    def _entries(self):
+        return [self._entry(b"alpha"), self._entry(b"beta"), self._entry(b"gamma")]
+
+    def build(self, entries):
+        return prove_opening_batch_bound(entries)
+
+    def manual_build(self, entries):
+        leaves = [bound_opening_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        batch = BoundOpeningBatch(tuple(entries), len(entries), proof)
+        return batch, root, leaves
+
+    # ---- batch object -------------------------------------------------------
+
+    def test_batch_positional_equality_and_immutability(self):
+        batch, root = self.build(self._entries())
+        rebuilt = BoundOpeningBatch(batch.entries, 3, batch.proof)
+        self.assertEqual(rebuilt, batch)
+        self.assertEqual(hash(rebuilt), hash(batch))
+        self.assertEqual(
+            tuple(getattr(batch, name) for name in ("entries", "leaf_count", "proof")),
+            (batch.entries, 3, batch.proof),
+        )
+        self.assertIsInstance(batch.entries, tuple)
+        self.assertNotEqual(BoundOpeningBatch(batch.entries, 2, batch.proof), batch)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.leaf_count = 4
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.entries = ()
+
+    def test_field_order_and_types(self):
+        batch, _ = self.build(self._entries())
+        self.assertEqual(
+            [field.name for field in dataclasses.fields(batch)],
+            ["entries", "leaf_count", "proof"],
+        )
+        self.assertIsInstance(batch.entries, tuple)
+        for entry in batch.entries:
+            self.assertIsInstance(entry, OpeningBatchEntry)
+        self.assertIsInstance(batch.leaf_count, int)
+        self.assertNotIsInstance(batch.leaf_count, bool)
+        self.assertIsInstance(batch.proof, MerkleMultiProof)
+
+    # ---- leaf encoding ------------------------------------------------------
+
+    def test_leaf_layout(self):
+        entry = self._entries()[0]
+        leaf = bound_opening_leaf(entry)
+        framed = frame_items(leaf)
+        self.assertEqual(
+            framed,
+            [b"zkregion/ob/v1", entry.commitment, entry.value, entry.nonce],
+        )
+
+    def test_internal_leaf_helper_matches_manual_spec(self):
+        import zkregion
+
+        for entry in self._entries():
+            self.assertEqual(
+                zkregion._bound_opening_leaf(entry),
+                bound_opening_leaf(entry),
+            )
+
+    def test_leaf_digest_follows_merkle_rule(self):
+        entry = self._entries()[0]
+        leaf = bound_opening_leaf(entry)
+        expected = hashlib.sha256(
+            b"\x00" + len(leaf).to_bytes(4, "big") + leaf
+        ).digest()
+        self.assertEqual(merkle_root([leaf]), expected)
+
+    def test_negative_or_empty_byte_fields_frame_fine(self):
+        # every entry field is raw bytes: any length, including zero, frames
+        entry = OpeningBatchEntry(b"", b"", b"nonempty")
+        leaf = bound_opening_leaf(entry)
+        self.assertEqual(
+            frame_items(leaf), [b"zkregion/ob/v1", b"", b"", b"nonempty"]
+        )
+
+    # ---- honest round trips -------------------------------------------------
+
+    def test_honest_batch_verifies_once(self):
+        entries = self._entries()
+        batch, root = self.build(entries)
+        self.assertTrue(verify_opening_batch_bound(batch, root))
+        self.assertEqual(batch.leaf_count, len(entries))
+        self.assertEqual(batch.proof.indices, tuple(range(len(entries))))
+        self.assertEqual(batch.proof.siblings, ())
+
+    def test_manual_and_prove_constructions_byte_identical(self):
+        entries = self._entries()
+        batch, root = self.build(entries)
+        manual, manual_root, _ = self.manual_build(entries)
+        self.assertEqual(batch, manual)
+        self.assertEqual(root, manual_root)
+        self.assertTrue(verify_opening_batch_bound(manual, manual_root))
+
+    def test_repeated_prove_is_byte_for_byte_deterministic(self):
+        entries = self._entries()
+        first, first_root = self.build(entries)
+        second, second_root = self.build(list(entries))
+        self.assertEqual(first, second)
+        self.assertEqual(first_root, second_root)
+
+    def test_various_sizes_single_odd_and_even(self):
+        for size in range(1, 9):
+            entries = [self._entry(f"v{i}".encode()) for i in range(size)]
+            batch, root = self.build(entries)
+            self.assertTrue(verify_opening_batch_bound(batch, root), size)
+
+    def test_duplicate_entries_preserved_in_order(self):
+        entry = self._entries()[0]
+        entries = [entry, entry]
+        batch, root = self.build(entries)
+        self.assertEqual(batch.entries, (entry, entry))
+        self.assertTrue(verify_opening_batch_bound(batch, root))
+        # dropping the duplicate changes the tree and fails the bound
+        single, single_root = self.build([entry])
+        self.assertNotEqual(root, single_root)
+        self.assertFalse(verify_opening_batch_bound(single, root))
+
+    def test_inputs_not_mutated(self):
+        entries = self._entries()
+        snapshot = [
+            (entry.commitment, entry.value, entry.nonce) for entry in entries
+        ]
+        self.build(entries)
+        self.assertEqual(
+            [(entry.commitment, entry.value, entry.nonce) for entry in entries],
+            snapshot,
+        )
+
+    # ---- structural rejection ----------------------------------------------
+
+    def test_empty_batch_returns_false(self):
+        proof = MerkleMultiProof(0, (), ())
+        batch = BoundOpeningBatch((), 0, proof)
+        self.assertFalse(verify_opening_batch_bound(batch, bytes(32)))
+
+    def test_leaf_count_must_match_entries_and_proof(self):
+        entries = self._entries()
+        batch, root = self.build(entries)
+        for claimed in (1, 2, 4):
+            bad = BoundOpeningBatch(batch.entries, claimed, batch.proof)
+            self.assertFalse(verify_opening_batch_bound(bad, root))
+        bad_proof = MerkleMultiProof(2, (0, 1, 2), batch.proof.siblings)
+        bad = BoundOpeningBatch(batch.entries, 3, bad_proof)
+        self.assertFalse(verify_opening_batch_bound(bad, root))
+
+    def test_non_positive_leaf_count_returns_false(self):
+        batch, root = self.build(self._entries())
+        for count in (0, -1):
+            bad = BoundOpeningBatch(batch.entries, count, batch.proof)
+            self.assertFalse(verify_opening_batch_bound(bad, root))
+
+    def test_indices_must_cover_all_positions(self):
+        batch, root = self.build(self._entries())
+        cases = {
+            "gap": (0, 2),
+            "partial": (0, 1),
+            "reordered": (2, 1, 0),
+            "duplicate": (0, 1, 1),
+            "empty": (),
+            "out_of_range": (0, 1, 3),
+        }
+        for label, indices in cases.items():
+            bad_proof = MerkleMultiProof(3, tuple(indices), batch.proof.siblings)
+            bad = BoundOpeningBatch(batch.entries, 3, bad_proof)
+            self.assertFalse(verify_opening_batch_bound(bad, root), label)
+
+    def test_entries_must_be_tuple(self):
+        batch, root = self.build(self._entries())
+        loose = BoundOpeningBatch(list(batch.entries), 3, batch.proof)
+        with self.assertRaises(TypeError):
+            verify_opening_batch_bound(loose, root)
+
+    def test_wrong_root_rejected(self):
+        batch, _ = self.build(self._entries())
+        self.assertFalse(verify_opening_batch_bound(batch, bytes(32)))
+        self.assertFalse(verify_opening_batch_bound(batch, b""))
+        self.assertFalse(verify_opening_batch_bound(batch, bytes(33)))
+
+    def test_tampered_entry_changes_leaf_and_fails_root(self):
+        entries = self._entries()
+        batch, root = self.build(entries)
+        # reordering entries: committed outer leaves no longer match
+        swapped = BoundOpeningBatch(
+            (entries[2], entries[1], entries[0]), 3, batch.proof
+        )
+        self.assertFalse(verify_opening_batch_bound(swapped, root))
+        # tamper one field: bound fails before the inner opening is checked
+        tampered_entry = OpeningBatchEntry(
+            entries[0].commitment, b"other", entries[0].nonce
+        )
+        tampered = BoundOpeningBatch(
+            (tampered_entry, entries[1], entries[2]), 3, batch.proof
+        )
+        self.assertFalse(verify_opening_batch_bound(tampered, root))
+
+    def test_wrong_domain_separator_rejected(self):
+        import zkregion
+
+        entries = self._entries()
+        original = zkregion._OPENING_BOUND_DOMAIN
+        batch, root, _ = self.manual_build(entries)  # leaves keep the real domain
+        zkregion._OPENING_BOUND_DOMAIN = b"zkregion/ob/v2"
+        try:
+            self.assertFalse(verify_opening_batch_bound(batch, root))
+        finally:
+            zkregion._OPENING_BOUND_DOMAIN = original
+
+    # ---- delegation ---------------------------------------------------------
+
+    def test_root_passes_then_delegates_unchanged(self):
+        import zkregion
+
+        batch, root = self.build(self._entries())
+        seen = {}
+        original = zkregion.verify_opening_batch
+
+        def tracking(argument):
+            seen["argument"] = argument
+            return original(argument)
+
+        zkregion.verify_opening_batch = tracking
+        try:
+            self.assertTrue(verify_opening_batch_bound(batch, root))
+        finally:
+            zkregion.verify_opening_batch = original
+        self.assertIs(seen["argument"], batch.entries)
+
+    def test_no_inner_delegation_when_root_fails(self):
+        import zkregion
+
+        batch, _ = self.build(self._entries())
+
+        def boom(_entries):
+            raise AssertionError("verify_opening_batch must not be called")
+
+        original = zkregion.verify_opening_batch
+        zkregion.verify_opening_batch = boom
+        try:
+            self.assertFalse(verify_opening_batch_bound(batch, bytes(32)))
+            empty = BoundOpeningBatch((), 0, MerkleMultiProof(0, (), ()))
+            self.assertFalse(verify_opening_batch_bound(empty, bytes(32)))
+        finally:
+            zkregion.verify_opening_batch = original
+
+    def test_inner_batch_rejection_returns_false_after_root_passes(self):
+        # a tampered entry built into its own tree passes the root, then the
+        # unchanged inner verify_opening_batch rejects the bad opening
+        entries = self._entries()
+        tampered_entry = OpeningBatchEntry(
+            entries[0].commitment, b"other", entries[0].nonce
+        )
+        mixed = [tampered_entry, entries[1]]
+        batch, root, _ = self.manual_build(mixed)
+        self.assertFalse(verify_opening_batch(mixed))
+        self.assertFalse(verify_opening_batch_bound(batch, root))
+
+    # ---- type errors --------------------------------------------------------
+
+    def test_type_errors(self):
+        batch, root = self.build(self._entries())
+        with self.assertRaises(TypeError):
+            verify_opening_batch_bound("batch", root)
+        with self.assertRaises(TypeError):
+            verify_opening_batch_bound(None, root)
+        with self.assertRaises(TypeError):
+            verify_opening_batch_bound(
+                BoundOpeningBatch(("x",) * 3, 3, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_opening_batch_bound(
+                BoundOpeningBatch(batch.entries, True, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_opening_batch_bound(
+                BoundOpeningBatch(batch.entries, 3.0, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_opening_batch_bound(
+                BoundOpeningBatch(batch.entries, "3", batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_opening_batch_bound(
+                BoundOpeningBatch(batch.entries, 3, "proof"), root
+            )
+        with self.assertRaises(TypeError):
+            verify_opening_batch_bound(batch, "root")
+        with self.assertRaises(TypeError):
+            verify_opening_batch_bound(batch, bytearray(root))
+
+    def test_nested_type_errors(self):
+        entry = self._entries()[0]
+        proof = prove_multi_inclusion([bound_opening_leaf(entry)], (0,))
+        root = merkle_root([bound_opening_leaf(entry)])
+        bad_entries = [
+            OpeningBatchEntry("c", entry.value, entry.nonce),
+            OpeningBatchEntry(bytearray(entry.commitment), entry.value, entry.nonce),
+            OpeningBatchEntry(entry.commitment, 1, entry.nonce),
+            OpeningBatchEntry(entry.commitment, entry.value, None),
+            OpeningBatchEntry(True, entry.value, entry.nonce),
+        ]
+        for bad in bad_entries:
+            batch = BoundOpeningBatch((bad,), 1, proof)
+            with self.assertRaises(TypeError, msg=bad):
+                verify_opening_batch_bound(batch, root)
+        bad_proofs = [
+            MerkleMultiProof(True, (0,), ()),
+            MerkleMultiProof(1, (True,), ()),
+            MerkleMultiProof(1, (0.0,), ()),
+            MerkleMultiProof(1, (0,), ("x",)),
+            MerkleMultiProof(1, list((0,)), ()),
+        ]
+        for bad_proof in bad_proofs:
+            batch = BoundOpeningBatch((entry,), 1, bad_proof)
+            with self.assertRaises(TypeError, msg=bad_proof):
+                verify_opening_batch_bound(batch, root)
+        # a bad type in a *later* entry still raises before verification
+        good = self._entries()
+        batch, good_root = self.build(good)
+        with self.assertRaises(TypeError):
+            verify_opening_batch_bound(
+                BoundOpeningBatch(tuple(good) + (42,), 4, batch.proof),
+                good_root,
+            )
+
+    # ---- prove entry --------------------------------------------------------
+
+    def test_prove_type_errors(self):
+        entry = self._entries()[0]
+        for bad in (b"abc", bytearray(b"abc"), "abc", 123, None, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                prove_opening_batch_bound(bad)
+        with self.assertRaises(TypeError):
+            prove_opening_batch_bound([object()])
+        with self.assertRaises(TypeError):
+            prove_opening_batch_bound([entry, 42])
+        with self.assertRaises(TypeError):
+            prove_opening_batch_bound(
+                [OpeningBatchEntry(1, entry.value, entry.nonce)]
+            )
+
+    def test_prove_value_errors(self):
+        with self.assertRaises(ValueError):
+            prove_opening_batch_bound(())
+        with self.assertRaises(ValueError):
+            prove_opening_batch_bound([])
+        good = self._entries()
+        bad = OpeningBatchEntry(good[0].commitment, b"other", good[0].nonce)
+        with self.assertRaises(ValueError):
+            prove_opening_batch_bound([good[0], bad])
+
+
+class BoundPedersenOpeningBatchTest(unittest.TestCase):
+    """Merkle-committed complete batches of Pedersen openings."""
+
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def _entry(self, value=50, lower=0, upper=100, blinding=1234, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        commitment, r = pedersen_commit(
+            value, lower, upper, blinding=blinding, **kwargs
+        )
+        return PedersenOpeningBatchEntry(commitment, value, r)
+
+    def _entries(self):
+        return [
+            self._entry(50, 0, 100, blinding=1234),
+            self._entry(7, 5, 9, blinding=4321),
+            self._entry(-3, -10, 10, blinding=77),
+        ]
+
+    def build(self, entries):
+        return prove_pedersen_opening_batch_bound(entries)
+
+    def manual_build(self, entries):
+        leaves = [bound_pedersen_opening_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        batch = BoundPedersenOpeningBatch(tuple(entries), len(entries), proof)
+        return batch, root, leaves
+
+    # ---- batch object -------------------------------------------------------
+
+    def test_batch_positional_equality_and_immutability(self):
+        batch, root = self.build(self._entries())
+        rebuilt = BoundPedersenOpeningBatch(batch.entries, 3, batch.proof)
+        self.assertEqual(rebuilt, batch)
+        self.assertEqual(hash(rebuilt), hash(batch))
+        self.assertEqual(
+            tuple(getattr(batch, name) for name in ("entries", "leaf_count", "proof")),
+            (batch.entries, 3, batch.proof),
+        )
+        self.assertIsInstance(batch.entries, tuple)
+        self.assertNotEqual(
+            BoundPedersenOpeningBatch(batch.entries, 2, batch.proof), batch
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.leaf_count = 4
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.entries = ()
+
+    def test_field_order_and_types(self):
+        batch, _ = self.build(self._entries())
+        self.assertEqual(
+            [field.name for field in dataclasses.fields(batch)],
+            ["entries", "leaf_count", "proof"],
+        )
+        self.assertIsInstance(batch.entries, tuple)
+        for entry in batch.entries:
+            self.assertIsInstance(entry, PedersenOpeningBatchEntry)
+        self.assertIsInstance(batch.leaf_count, int)
+        self.assertNotIsInstance(batch.leaf_count, bool)
+        self.assertIsInstance(batch.proof, MerkleMultiProof)
+
+    # ---- leaf encoding ------------------------------------------------------
+
+    def test_leaf_layout(self):
+        entry = self._entries()[0]
+        framed = frame_items(bound_pedersen_opening_leaf(entry))
+        commitment = entry.commitment
+        self.assertEqual(
+            framed,
+            [
+                b"zkregion/pob/v1",
+                str(commitment.element).encode("ascii"),
+                str(commitment.lower).encode("ascii"),
+                str(commitment.upper).encode("ascii"),
+                str(commitment.prime).encode("ascii"),
+                str(commitment.generator).encode("ascii"),
+                str(commitment.h).encode("ascii"),
+                str(entry.value).encode("ascii"),
+                str(entry.blinding).encode("ascii"),
+            ],
+        )
+
+    def test_negative_integers_keep_their_sign(self):
+        entry = self._entry(-3, -10, 10, blinding=77)
+        framed = frame_items(bound_pedersen_opening_leaf(entry))
+        self.assertEqual(framed[2], b"-10")  # lower
+        self.assertEqual(framed[7], b"-3")   # value
+
+    def test_internal_leaf_helper_matches_manual_spec(self):
+        import zkregion
+
+        for entry in self._entries():
+            self.assertEqual(
+                zkregion._bound_pedersen_opening_leaf(entry),
+                bound_pedersen_opening_leaf(entry),
+            )
+
+    def test_leaf_digest_follows_merkle_rule(self):
+        entry = self._entries()[0]
+        leaf = bound_pedersen_opening_leaf(entry)
+        expected = hashlib.sha256(
+            b"\x00" + len(leaf).to_bytes(4, "big") + leaf
+        ).digest()
+        self.assertEqual(merkle_root([leaf]), expected)
+
+    # ---- honest round trips -------------------------------------------------
+
+    def test_honest_batch_verifies_once(self):
+        entries = self._entries()
+        batch, root = self.build(entries)
+        self.assertTrue(verify_pedersen_opening_batch_bound(batch, root))
+        self.assertEqual(batch.leaf_count, len(entries))
+        self.assertEqual(batch.proof.indices, tuple(range(len(entries))))
+        self.assertEqual(batch.proof.siblings, ())
+
+    def test_manual_and_prove_constructions_byte_identical(self):
+        entries = self._entries()
+        batch, root = self.build(entries)
+        manual, manual_root, _ = self.manual_build(entries)
+        self.assertEqual(batch, manual)
+        self.assertEqual(root, manual_root)
+        self.assertTrue(
+            verify_pedersen_opening_batch_bound(manual, manual_root)
+        )
+
+    def test_repeated_prove_is_byte_for_byte_deterministic(self):
+        entries = self._entries()
+        first, first_root = self.build(entries)
+        second, second_root = self.build(list(entries))
+        self.assertEqual(first, second)
+        self.assertEqual(first_root, second_root)
+
+    def test_various_sizes_single_odd_and_even(self):
+        for size in range(1, 9):
+            entries = [
+                self._entry(i, 0, max(10, size + 1), blinding=1000 + i)
+                for i in range(size)
+            ]
+            batch, root = self.build(entries)
+            self.assertTrue(
+                verify_pedersen_opening_batch_bound(batch, root), size
+            )
+
+    def test_duplicate_entries_preserved_in_order(self):
+        entry = self._entries()[0]
+        entries = [entry, entry]
+        batch, root = self.build(entries)
+        self.assertEqual(batch.entries, (entry, entry))
+        self.assertTrue(verify_pedersen_opening_batch_bound(batch, root))
+        single, single_root = self.build([entry])
+        self.assertNotEqual(root, single_root)
+        self.assertFalse(verify_pedersen_opening_batch_bound(single, root))
+
+    def test_inputs_not_mutated(self):
+        entries = self._entries()
+        snapshot = [
+            (entry.commitment, entry.value, entry.blinding) for entry in entries
+        ]
+        self.build(entries)
+        self.assertEqual(
+            [(entry.commitment, entry.value, entry.blinding) for entry in entries],
+            snapshot,
+        )
+
+    # ---- structural rejection ----------------------------------------------
+
+    def test_empty_batch_returns_false(self):
+        proof = MerkleMultiProof(0, (), ())
+        batch = BoundPedersenOpeningBatch((), 0, proof)
+        self.assertFalse(verify_pedersen_opening_batch_bound(batch, bytes(32)))
+
+    def test_leaf_count_must_match_entries_and_proof(self):
+        entries = self._entries()
+        batch, root = self.build(entries)
+        for claimed in (1, 2, 4):
+            bad = BoundPedersenOpeningBatch(batch.entries, claimed, batch.proof)
+            self.assertFalse(verify_pedersen_opening_batch_bound(bad, root))
+        bad_proof = MerkleMultiProof(2, (0, 1, 2), batch.proof.siblings)
+        bad = BoundPedersenOpeningBatch(batch.entries, 3, bad_proof)
+        self.assertFalse(verify_pedersen_opening_batch_bound(bad, root))
+
+    def test_non_positive_leaf_count_returns_false(self):
+        batch, root = self.build(self._entries())
+        for count in (0, -1):
+            bad = BoundPedersenOpeningBatch(batch.entries, count, batch.proof)
+            self.assertFalse(verify_pedersen_opening_batch_bound(bad, root))
+
+    def test_indices_must_cover_all_positions(self):
+        batch, root = self.build(self._entries())
+        cases = {
+            "gap": (0, 2),
+            "partial": (0, 1),
+            "reordered": (2, 1, 0),
+            "duplicate": (0, 1, 1),
+            "empty": (),
+            "out_of_range": (0, 1, 3),
+        }
+        for label, indices in cases.items():
+            bad_proof = MerkleMultiProof(3, tuple(indices), batch.proof.siblings)
+            bad = BoundPedersenOpeningBatch(batch.entries, 3, bad_proof)
+            self.assertFalse(
+                verify_pedersen_opening_batch_bound(bad, root), label
+            )
+
+    def test_entries_must_be_tuple(self):
+        batch, root = self.build(self._entries())
+        loose = BoundPedersenOpeningBatch(list(batch.entries), 3, batch.proof)
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch_bound(loose, root)
+
+    def test_wrong_root_rejected(self):
+        batch, _ = self.build(self._entries())
+        self.assertFalse(verify_pedersen_opening_batch_bound(batch, bytes(32)))
+        self.assertFalse(verify_pedersen_opening_batch_bound(batch, b""))
+        self.assertFalse(verify_pedersen_opening_batch_bound(batch, bytes(33)))
+
+    def test_tampered_entry_changes_leaf_and_fails_root(self):
+        entries = self._entries()
+        batch, root = self.build(entries)
+        swapped = BoundPedersenOpeningBatch(
+            (entries[2], entries[1], entries[0]), 3, batch.proof
+        )
+        self.assertFalse(verify_pedersen_opening_batch_bound(swapped, root))
+        tampered_entry = PedersenOpeningBatchEntry(
+            entries[0].commitment, 51, entries[0].blinding
+        )
+        tampered = BoundPedersenOpeningBatch(
+            (tampered_entry, entries[1], entries[2]), 3, batch.proof
+        )
+        self.assertFalse(verify_pedersen_opening_batch_bound(tampered, root))
+
+    def test_wrong_domain_separator_rejected(self):
+        import zkregion
+
+        entries = self._entries()
+        original = zkregion._PEDERSEN_OPENING_BOUND_DOMAIN
+        batch, root, _ = self.manual_build(entries)  # leaves keep the real domain
+        zkregion._PEDERSEN_OPENING_BOUND_DOMAIN = b"zkregion/pob/v2"
+        try:
+            self.assertFalse(verify_pedersen_opening_batch_bound(batch, root))
+        finally:
+            zkregion._PEDERSEN_OPENING_BOUND_DOMAIN = original
+
+    # ---- delegation ---------------------------------------------------------
+
+    def test_root_passes_then_delegates_unchanged(self):
+        import zkregion
+
+        batch, root = self.build(self._entries())
+        seen = {}
+        original = zkregion.verify_pedersen_opening_batch
+
+        def tracking(argument):
+            seen["argument"] = argument
+            return original(argument)
+
+        zkregion.verify_pedersen_opening_batch = tracking
+        try:
+            self.assertTrue(verify_pedersen_opening_batch_bound(batch, root))
+        finally:
+            zkregion.verify_pedersen_opening_batch = original
+        self.assertIs(seen["argument"], batch.entries)
+
+    def test_no_inner_delegation_when_root_fails(self):
+        import zkregion
+
+        batch, _ = self.build(self._entries())
+
+        def boom(_entries):
+            raise AssertionError(
+                "verify_pedersen_opening_batch must not be called"
+            )
+
+        original = zkregion.verify_pedersen_opening_batch
+        zkregion.verify_pedersen_opening_batch = boom
+        try:
+            self.assertFalse(
+                verify_pedersen_opening_batch_bound(batch, bytes(32))
+            )
+            empty = BoundPedersenOpeningBatch(
+                (), 0, MerkleMultiProof(0, (), ())
+            )
+            self.assertFalse(
+                verify_pedersen_opening_batch_bound(empty, bytes(32))
+            )
+        finally:
+            zkregion.verify_pedersen_opening_batch = original
+
+    def test_inner_batch_rejection_returns_false_after_root_passes(self):
+        entries = self._entries()
+        tampered_entry = PedersenOpeningBatchEntry(
+            entries[0].commitment, 51, entries[0].blinding
+        )
+        mixed = [tampered_entry, entries[1]]
+        batch, root, _ = self.manual_build(mixed)
+        self.assertFalse(verify_pedersen_opening_batch(mixed))
+        self.assertFalse(verify_pedersen_opening_batch_bound(batch, root))
+
+    # ---- type errors --------------------------------------------------------
+
+    def test_type_errors(self):
+        batch, root = self.build(self._entries())
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch_bound("batch", root)
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch_bound(None, root)
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch_bound(
+                BoundPedersenOpeningBatch(("x",) * 3, 3, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch_bound(
+                BoundPedersenOpeningBatch(batch.entries, True, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch_bound(
+                BoundPedersenOpeningBatch(batch.entries, 3.0, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch_bound(
+                BoundPedersenOpeningBatch(batch.entries, "3", batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch_bound(
+                BoundPedersenOpeningBatch(batch.entries, 3, "proof"), root
+            )
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch_bound(batch, "root")
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch_bound(batch, bytearray(root))
+
+    def test_nested_type_errors(self):
+        entry = self._entries()[0]
+        proof = prove_multi_inclusion(
+            [bound_pedersen_opening_leaf(entry)], (0,)
+        )
+        root = merkle_root([bound_pedersen_opening_leaf(entry)])
+        bad_commitment = PedersenCommitment(
+            "1",
+            entry.commitment.lower,
+            entry.commitment.upper,
+            entry.commitment.prime,
+            entry.commitment.generator,
+            entry.commitment.h,
+        )
+        bad_entries = [
+            PedersenOpeningBatchEntry(object(), entry.value, entry.blinding),
+            PedersenOpeningBatchEntry(bad_commitment, entry.value, entry.blinding),
+            PedersenOpeningBatchEntry(entry.commitment, True, entry.blinding),
+            PedersenOpeningBatchEntry(entry.commitment, 1.0, entry.blinding),
+            PedersenOpeningBatchEntry(entry.commitment, entry.value, False),
+            PedersenOpeningBatchEntry(entry.commitment, entry.value, "1"),
+        ]
+        for bad in bad_entries:
+            batch = BoundPedersenOpeningBatch((bad,), 1, proof)
+            with self.assertRaises(TypeError, msg=bad):
+                verify_pedersen_opening_batch_bound(batch, root)
+        bad_proofs = [
+            MerkleMultiProof(True, (0,), ()),
+            MerkleMultiProof(1, (True,), ()),
+            MerkleMultiProof(1, (0.0,), ()),
+            MerkleMultiProof(1, (0,), ("x",)),
+            MerkleMultiProof(1, list((0,)), ()),
+        ]
+        for bad_proof in bad_proofs:
+            batch = BoundPedersenOpeningBatch((entry,), 1, bad_proof)
+            with self.assertRaises(TypeError, msg=bad_proof):
+                verify_pedersen_opening_batch_bound(batch, root)
+        # a bad type in a *later* entry still raises before verification
+        good = self._entries()
+        batch, good_root = self.build(good)
+        with self.assertRaises(TypeError):
+            verify_pedersen_opening_batch_bound(
+                BoundPedersenOpeningBatch(tuple(good) + (42,), 4, batch.proof),
+                good_root,
+            )
+
+    # ---- prove entry --------------------------------------------------------
+
+    def test_prove_type_errors(self):
+        entry = self._entries()[0]
+        for bad in (
+            b"abc",
+            bytearray(b"abc"),
+            "abc",
+            123,
+            None,
+            object(),
+            1.5,
+        ):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                prove_pedersen_opening_batch_bound(bad)
+        with self.assertRaises(TypeError):
+            prove_pedersen_opening_batch_bound([object()])
+        with self.assertRaises(TypeError):
+            prove_pedersen_opening_batch_bound([entry, 42])
+        with self.assertRaises(TypeError):
+            prove_pedersen_opening_batch_bound(
+                [PedersenOpeningBatchEntry(entry.commitment, True, entry.blinding)]
+            )
+        with self.assertRaises(TypeError):
+            prove_pedersen_opening_batch_bound(
+                [PedersenOpeningBatchEntry(entry.commitment, entry.value, b"1")]
+            )
+
+    def test_prove_value_errors(self):
+        with self.assertRaises(ValueError):
+            prove_pedersen_opening_batch_bound(())
+        with self.assertRaises(ValueError):
+            prove_pedersen_opening_batch_bound([])
+        good = self._entries()
+        bad = PedersenOpeningBatchEntry(
+            good[0].commitment, 51, good[0].blinding
+        )
+        with self.assertRaises(ValueError):
+            prove_pedersen_opening_batch_bound([good[0], bad])
 
 
 class ReplayBindingTest(unittest.TestCase):

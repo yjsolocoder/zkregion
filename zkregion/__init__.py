@@ -130,7 +130,9 @@ __all__ = [
     "prove_multi_inclusion",
     "prove_multi_inclusion_batch_bound",
     "prove_range",
+    "prove_range_batch_bound",
     "prove_region",
+    "prove_region_batch_bound",
     "verify_bound",
     "verify_consistency",
     "verify_consistency_batch",
@@ -3539,6 +3541,63 @@ def verify_region_bound(
     return verify_region_batch(entries, randbelow=randbelow)
 
 
+def prove_region_batch_bound(
+    entries: Sequence[RegionBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> tuple[BoundRegionBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundRegionBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`RegionBatchEntry` rules as
+    :func:`verify_region_batch` and must be non-empty; every entry is
+    copied into a tuple in its original order with duplicates preserved,
+    and the inputs are never mutated. Each entry is encoded to its outer
+    leaf byte for byte with :func:`_bound_region_leaf`; the domain
+    separator, length framing and field order stay unchanged, and the
+    leaf digests and internal nodes follow the existing SHA-256 Merkle
+    rules. With ``n = len(entries)``, the complete multi-inclusion proof
+    is built with :func:`prove_multi_inclusion` over the encoded leaves
+    and the full indices ``tuple(range(n))`` — so its ``indices`` cover
+    every leaf from zero and its ``siblings`` are empty — and the
+    returned batch carries ``leaf_count = n`` alongside that proof. The
+    second return value is the outer tree's :func:`merkle_root` of the
+    encoded leaves, which is exactly the root the batch verifies under:
+    ``verify_region_bound(batch, root)`` returns ``True``. Single-item,
+    odd- and even-sized batches and duplicate entries are all
+    deterministic and byte for byte compatible with the previous manual
+    construction.
+
+    A type preflight over the whole batch — every entry and every nested
+    field, including ``bool`` counts and later entries — raises
+    :class:`TypeError` before anything is built; an empty batch, a
+    ``U``-framed batch count outside uint64, or
+    :func:`verify_region_batch` returning ``False`` (an invalid inner
+    region proof) raises :class:`ValueError`. The ``randbelow``
+    argument is passed through to :func:`verify_region_batch` unchanged
+    under its randomness contract.
+    """
+    items = _check_region_batch_entries_types(entries)
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not items:
+        raise ValueError("entries must not be empty")
+    if not _region_batch_replay_encodable(items):
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    if not verify_region_batch(items, randbelow=randbelow):
+        raise ValueError("entries must pass verify_region_batch")
+    ordered = tuple(items)
+    leaves = [_bound_region_leaf(entry) for entry in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundRegionBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
+
+
 # ---------------------------------------------------------------------------
 # Merkle-committed range batches
 #
@@ -3689,6 +3748,63 @@ def verify_range_bound(
     if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
         return False
     return verify_range_batch(entries, randbelow=randbelow)
+
+
+def prove_range_batch_bound(
+    entries: Sequence[RangeBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> tuple[BoundRangeBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundRangeBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`RangeBatchEntry` rules as
+    :func:`verify_range_batch` and must be non-empty; every item is
+    copied into a tuple in its original order with duplicates preserved,
+    and the inputs are never mutated. Each item is encoded to its outer
+    leaf byte for byte with :func:`_bound_range_leaf`; the domain
+    separator, length framing and field order stay unchanged, and the
+    leaf digests and internal nodes follow the existing SHA-256 Merkle
+    rules. With ``n = len(entries)``, the complete multi-inclusion proof
+    is built with :func:`prove_multi_inclusion` over the encoded leaves
+    and the full indices ``tuple(range(n))`` — so its ``indices`` cover
+    every leaf from zero and its ``siblings`` are empty — and the
+    returned batch carries ``leaf_count = n`` alongside that proof. The
+    second return value is the outer tree's :func:`merkle_root` of the
+    encoded leaves, which is exactly the root the batch verifies under:
+    ``verify_range_bound(batch, root)`` returns ``True``. Single-item,
+    odd- and even-sized batches and duplicate items are all
+    deterministic and byte for byte compatible with the previous manual
+    construction.
+
+    A type preflight over the whole batch — every item and every nested
+    field, including ``bool`` counts and later items — raises
+    :class:`TypeError` before anything is built; an empty batch, a
+    ``U``-framed batch count outside uint64, or
+    :func:`verify_range_batch` returning ``False`` (an invalid inner
+    range proof) raises :class:`ValueError`. The ``randbelow``
+    argument is passed through to :func:`verify_range_batch` unchanged
+    under its randomness contract.
+    """
+    items = _check_range_batch_entries_types(entries)
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not items:
+        raise ValueError("entries must not be empty")
+    if not _range_batch_replay_encodable(items):
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    if not verify_range_batch(items, randbelow=randbelow):
+        raise ValueError("entries must pass verify_range_batch")
+    ordered = tuple(items)
+    leaves = [_bound_range_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundRangeBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
 
 
 # ---------------------------------------------------------------------------

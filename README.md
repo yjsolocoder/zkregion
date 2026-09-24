@@ -384,6 +384,16 @@ assert verify_region_bound(bound_region, region_root)
 
 Region(0, 100, 0, 100).contains(50, 50)     # True
 
+# 与承诺绑定的区域判定：先逐轴校验开合与声明区间，再判定坐标是否落在矩形内
+from zkregion import region_contains_committed
+
+assert region_contains_committed(
+    region, x_commitment, y_commitment, 40, 60, x_blinding, y_blinding
+)
+assert not region_contains_committed(
+    region, x_commitment, y_commitment, 40, 101, x_blinding, y_blinding
+)
+
 # 实例内防重放：session id 一次性绑定到一条 Schnorr 条目
 from zkregion import ReplayGuard, ReplayBinding
 
@@ -840,6 +850,7 @@ python3 -m zkregion
 - `prove_range_batch_bound(entries, *, randbelow=secrets.randbelow) -> tuple[BoundRangeBatch, bytes]` — 顶层构造 Merkle 承诺的规范区间证明完整批：`entries` 沿用 `verify_range_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，输入不变；每项外层叶逐字节复用 `_bound_range_leaf` 编码，既有域、长度帧、字段顺序及 Merkle 哈希规则不变；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖每片叶、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_range_bound(batch, root) is True`，单项、奇偶批与重复项均确定，与旧手工构造逐字节兼容；`randbelow` 原样透传给 `verify_range_batch`；全批或任一嵌套字段错型（含后项错型与 `bool` 计数）抛 `TypeError`，空批、U 成帧批次数越出 uint64 或 `verify_range_batch` 返回 `False`（内层证明无效）抛 `ValueError`
 - `prove_region(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionProof` — 生成二维矩形区域成员非交互证明
 - `verify_region(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证区域成员证明，无需坐标或盲因子
+- `region_contains_committed(region, x_commitment, y_commitment, x, y, x_blinding, y_blinding) -> bool` — 与承诺绑定的矩形区域判定：先按 x 后 y 的固定次序逐轴校验声明区间与开合——承诺声明区间须恰为区域对应轴的两个边界（x 承诺为 `(region.min_x, region.max_x)`、y 承诺为 `(region.min_y, region.max_y)`），值与盲因子按 `verify_pedersen_opening` 同一套口径以承诺对象内的群参数（含非默认参数与显式 `h`）重算比对——两轴都通过后才判定坐标是否落在闭区间矩形内（四边算在矩形内）；任一层字段错型（含用 `bool` 冒充整数）或传入非 `Region` / 非 `PedersenCommitment` 对象一律抛 `TypeError`，开合不符、盲因子或承诺内参数越界、声明区间与区域边界不一致、声明非法（`lower > upper` 或值越出声明区间）、换绑任一承诺或盲因子、坐标落在矩形外一律返回 `False`；纯函数、结果确定、次序固定、不改写任何输入、不引入落盘或持久化
 - `RegionProof(x_proof, y_proof)` — 不可变区域证明对象，两字段均为 `RangeProof`
 - `verify_region_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 区域证明的批量验证，按 `(prime, generator, h)` 分组做一次随机线性组合
 - `RegionBatchEntry(x_commitment, y_commitment, region, proof, context=b"")` — 不可变批量验证条目，字段次序与 `verify_region` 入参一致

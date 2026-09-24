@@ -3,7 +3,8 @@
 Public API: commit / verify_opening / commit_coordinate / PedersenCommitment /
 pedersen_commit / verify_pedersen_opening / RangeProof / prove_range /
 verify_range / RangeBatchEntry / verify_range_batch / RegionProof /
-prove_region / verify_region / RegionBatchEntry / verify_region_batch /
+prove_region / verify_region / region_contains_committed /
+RegionBatchEntry / verify_region_batch /
 RegionBatchReplayGuard /
 SchnorrProof / SchnorrBatchEntry / SchnorrProver /
 SchnorrVerifier / MultiSchnorrEntry / verify_schnorr_batch /
@@ -134,6 +135,7 @@ __all__ = [
     "prove_region",
     "prove_region_batch_bound",
     "prove_schnorr_batch_bound",
+    "region_contains_committed",
     "verify_bound",
     "verify_consistency",
     "verify_consistency_batch",
@@ -1401,6 +1403,67 @@ def verify_region(
         proof.y_proof,
         _region_sub_context(b"y", context, region, x_commitment, y_commitment),
     )
+
+
+def region_contains_committed(
+    region: Region,
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    x: int,
+    y: int,
+    x_blinding: int,
+    y_blinding: int,
+) -> bool:
+    """Decide rectangle membership of a point bound to two Pedersen commitments.
+
+    Unlike :meth:`Region.contains`, this binds the plain coordinate test to
+    commitment openings. Each axis is checked first, in fixed order x then y:
+
+    1. the commitment's declared range must equal the region's two bounds on
+       that axis — ``(x_commitment.lower, x_commitment.upper)`` must equal
+       ``(region.min_x, region.max_x)`` and likewise for y / ``min_y``,
+       ``max_y``;
+    2. ``value`` and ``blinding`` must open the commitment, recomputed and
+       compared with :func:`verify_pedersen_opening` (group parameters, the
+       element, the declared range, the value and the blinding all come from
+       / are checked against the commitment object itself, so non-default
+       group parameters and an explicit ``h`` are honoured).
+
+    Only after both axes pass is ``(x, y)`` tested against the closed
+    rectangle, so the four edges count as inside.
+
+    A wrong object (not a :class:`Region` / :class:`PedersenCommitment`) or a
+    wrong field type anywhere — including a ``bool`` masquerading as an
+    integer — raises :class:`TypeError`. Every other rejection (an opening
+    mismatch, an out-of-range blinding or embedded parameter, a declared
+    range that does not match the region bounds, an illegal declaration with
+    ``lower > upper`` or a value outside the declared range, or a point
+    outside the rectangle) returns ``False``. Swapping either commitment or
+    blinding therefore returns ``False``. The function is pure: it is
+    deterministic, performs no I/O and never mutates its inputs.
+    """
+    if not isinstance(region, Region):
+        raise TypeError("region must be a Region")
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError("x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError("y_commitment must be a PedersenCommitment")
+    _check_region_fields(region)
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    _check_int(x, "x")
+    _check_int(y, "y")
+    _check_int(x_blinding, "x_blinding")
+    _check_int(y_blinding, "y_blinding")
+    if (x_commitment.lower, x_commitment.upper) != (region.min_x, region.max_x):
+        return False
+    if (y_commitment.lower, y_commitment.upper) != (region.min_y, region.max_y):
+        return False
+    if not verify_pedersen_opening(x_commitment, x, x_blinding):
+        return False
+    if not verify_pedersen_opening(y_commitment, y, y_blinding):
+        return False
+    return region.min_x <= x <= region.max_x and region.min_y <= y <= region.max_y
 
 
 @dataclass(frozen=True)

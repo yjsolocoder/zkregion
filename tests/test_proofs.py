@@ -70,6 +70,7 @@ from zkregion import (
     prove_range,
     prove_region,
     prove_schnorr_batch_bound,
+    region_contains_committed,
     verify_bound,
     verify_consistency,
     verify_consistency_batch,
@@ -4751,6 +4752,318 @@ class RegionTest(unittest.TestCase):
     def test_non_integer_coordinates_rejected(self):
         with self.assertRaises(TypeError):
             Region(0, 10, 0, 10).contains(1.5, 2)
+
+
+class RegionContainsCommittedTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def commit(self, value, lower, upper, blinding, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    def point(self, x=40, y=60, region=None, x_blinding=1234, y_blinding=4321,
+              x_range=None, y_range=None):
+        region = Region(0, 100, 0, 100) if region is None else region
+        x_lower, x_upper = (region.min_x, region.max_x) if x_range is None else x_range
+        y_lower, y_upper = (region.min_y, region.max_y) if y_range is None else y_range
+        x_commitment, x_r = self.commit(x, x_lower, x_upper, x_blinding)
+        y_commitment, y_r = self.commit(y, y_lower, y_upper, y_blinding)
+        return region, x_commitment, y_commitment, x, y, x_r, y_r
+
+    def call(self, point):
+        region, xc, yc, x, y, xr, yr = point
+        return region_contains_committed(region, xc, yc, x, y, xr, yr)
+
+    # ---- both-axis honest openings ----------------------------------------
+
+    def test_honest_point_inside_verifies(self):
+        point = self.point()
+        self.assertTrue(self.call(point))
+
+    def test_closed_rectangle_boundaries_are_inside(self):
+        region = Region(0, 10, 20, 30)
+        for x, y in ((0, 20), (10, 30), (0, 30), (10, 20), (5, 25)):
+            self.assertTrue(self.call(self.point(x=x, y=y, region=region)))
+
+    def test_negative_region_supported(self):
+        region = Region(-50, -10, -40, -5)
+        self.assertTrue(self.call(self.point(x=-30, y=-12, region=region)))
+
+    def test_non_default_group_and_explicit_h_are_honoured(self):
+        prime = DEFAULT_PRIME
+        generator = 5
+        h = 11
+        region = Region(0, 20, 0, 20)
+        x_commitment, x_r = pedersen_commit(
+            7, 0, 20, prime=prime, generator=generator, h=h, blinding=888
+        )
+        y_commitment, y_r = pedersen_commit(
+            13, 0, 20, prime=prime, generator=generator, h=h, blinding=999
+        )
+        self.assertTrue(
+            region_contains_committed(region, x_commitment, y_commitment, 7, 13, x_r, y_r)
+        )
+
+    # ---- opening mismatch / rebinding -------------------------------------
+
+    def test_wrong_value_or_blinding_returns_false(self):
+        region, xc, yc, x, y, xr, yr = self.point()
+        self.assertFalse(region_contains_committed(region, xc, yc, x + 1, y, xr, yr))
+        self.assertFalse(region_contains_committed(region, xc, yc, x, y - 1, xr, yr))
+        self.assertFalse(region_contains_committed(region, xc, yc, x, y, xr + 1, yr))
+        self.assertFalse(region_contains_committed(region, xc, yc, x, y, xr, yr - 1))
+
+    def test_swapped_commitments_or_blindings_return_false(self):
+        region, xc, yc, x, y, xr, yr = self.point()
+        # commitments swapped across axes: range match fails on both axes
+        self.assertFalse(region_contains_committed(region, yc, xc, x, y, xr, yr))
+        # blindings swapped across axes: opening fails per axis
+        self.assertFalse(region_contains_committed(region, xc, yc, x, y, yr, xr))
+
+    def test_rebinding_either_commitment_returns_false(self):
+        region, xc, yc, x, y, xr, yr = self.point()
+        other_x, _ = self.commit(41, 0, 100, 1234)
+        other_y, _ = self.commit(59, 0, 100, 9999)
+        # Replacement commitments presented with the original openings must
+        # fail: the original value/blinding pair opens only the old object.
+        self.assertFalse(
+            region_contains_committed(region, other_x, yc, x, y, xr, yr)
+        )
+        self.assertFalse(
+            region_contains_committed(region, xc, other_y, x, y, xr, yr)
+        )
+
+    def test_tampered_commitment_element_returns_false(self):
+        region, xc, yc, x, y, xr, yr = self.point()
+        tampered_x = dataclasses.replace(xc, element=(xc.element + 1) % self.PRIME)
+        tampered_y = dataclasses.replace(yc, element=(yc.element - 1) % self.PRIME)
+        self.assertFalse(region_contains_committed(region, tampered_x, yc, x, y, xr, yr))
+        self.assertFalse(region_contains_committed(region, xc, tampered_y, x, y, xr, yr))
+
+    # ---- declared range vs region bounds ----------------------------------
+
+    def test_declared_range_mismatching_region_bounds_returns_false(self):
+        point = self.point(x_range=(10, 100), y_range=(0, 100))
+        self.assertFalse(self.call(point))
+        point = self.point(x_range=(0, 100), y_range=(0, 90))
+        self.assertFalse(self.call(point))
+        point = self.point(x_range=(0, 99), y_range=(1, 100))
+        self.assertFalse(self.call(point))
+
+    def test_ranges_match_exactly_not_just_contain_the_bounds(self):
+        # A wider declared range than the region is still a mismatch.
+        region = Region(10, 90, 10, 90)
+        x_commitment, x_r = self.commit(40, 0, 100, 1234)
+        y_commitment, y_r = self.commit(60, 0, 100, 4321)
+        self.assertFalse(
+            region_contains_committed(region, x_commitment, y_commitment, 40, 60, x_r, y_r)
+        )
+
+    # ---- illegal declarations and bad embedded parameters -----------------
+
+    def test_illegal_declaration_returns_false(self):
+        region = Region(0, 100, 0, 100)
+        good_x, x_r = self.commit(40, 0, 100, 1234)
+        good_y, y_r = self.commit(60, 0, 100, 4321)
+        # A declared range with lower > upper that nonetheless equals the
+        # region bounds requires bypassing Region.__post_init__; the opening
+        # check (verify_pedersen_opening) must still return False rather than
+        # raise.
+        inverted = Region.__new__(Region)
+        for name, value in (
+            ("min_x", 101), ("max_x", 0), ("min_y", 0), ("max_y", 100)
+        ):
+            object.__setattr__(inverted, name, value)
+        inverted_x = dataclasses.replace(good_x, lower=101, upper=0)
+        self.assertFalse(
+            region_contains_committed(inverted, inverted_x, good_y, 40, 60, x_r, y_r)
+        )
+        # lower > upper with mismatching region bounds: rejected at the range
+        # comparison, again with False.
+        inverted_y = dataclasses.replace(good_y, lower=101, upper=0)
+        self.assertFalse(
+            region_contains_committed(region, good_x, inverted_y, 40, 60, x_r, y_r)
+        )
+
+    def test_value_outside_declared_range_returns_false(self):
+        # Commit at 40, then claim a value outside [0, 100]: range match with
+        # the region still holds, but the opening check rejects the value.
+        region, xc, yc, _, _, xr, yr = self.point()
+        self.assertFalse(region_contains_committed(region, xc, yc, 101, 60, xr, yr))
+        self.assertFalse(region_contains_committed(region, xc, yc, -1, 60, xr, yr))
+
+    def test_out_of_range_blinding_returns_false(self):
+        region, xc, yc, x, y, _, yr = self.point()
+        for bad_r in (0, -1, self.PRIME - 1, self.PRIME, self.PRIME + 5):
+            self.assertFalse(
+                region_contains_committed(region, xc, yc, x, y, bad_r, yr)
+            )
+        for bad_r in (0, self.PRIME - 1):
+            self.assertFalse(
+                region_contains_committed(region, xc, yc, x, y, 1234, bad_r)
+            )
+
+    def test_bad_embedded_group_parameters_return_false(self):
+        region, xc, yc, x, y, xr, yr = self.point()
+        for field_name, bad in (
+            ("prime", 3),
+            ("generator", 1),
+            ("generator", self.PRIME),
+            ("h", 1),
+            ("h", self.PRIME),
+            ("element", 0),
+            ("element", self.PRIME),
+        ):
+            bad_x = dataclasses.replace(xc, **{field_name: bad})
+            self.assertFalse(
+                region_contains_committed(region, bad_x, yc, x, y, xr, yr),
+                f"{field_name}={bad} should be rejected",
+            )
+
+    def test_range_width_at_least_prime_minus_one_returns_false(self):
+        region = Region(0, SMALL_PRIME - 2, 0, 10)
+        x_commitment = PedersenCommitment(
+            element=1,
+            lower=0,
+            upper=SMALL_PRIME - 2,  # width == prime - 1
+            prime=SMALL_PRIME,
+            generator=self.G,
+            h=self.H,
+        )
+        y_commitment, y_r = self.commit(5, 0, 10, 4321)
+        self.assertFalse(
+            region_contains_committed(region, x_commitment, y_commitment, 1, 5, 1, y_r)
+        )
+
+    # ---- type errors -------------------------------------------------------
+
+    def test_wrong_object_types_raise_typeerror(self):
+        region, xc, yc, x, y, xr, yr = self.point()
+        with self.assertRaises(TypeError):
+            region_contains_committed("region", xc, yc, x, y, xr, yr)
+        with self.assertRaises(TypeError):
+            region_contains_committed(region, "x", yc, x, y, xr, yr)
+        with self.assertRaises(TypeError):
+            region_contains_committed(region, xc, y, x, y, xr, yr)
+        with self.assertRaises(TypeError):
+            region_contains_committed(region, xc, "y", x, y, xr, yr)
+        with self.assertRaises(TypeError):
+            region_contains_committed(region, xc, Region(0, 1, 0, 1), x, y, xr, yr)
+
+    def test_non_integer_scalar_fields_raise_typeerror(self):
+        region, xc, yc, x, y, xr, yr = self.point()
+        for bad in (1.5, "40", None, [40], (40,)):
+            with self.assertRaises(TypeError):
+                region_contains_committed(region, xc, yc, bad, y, xr, yr)
+            with self.assertRaises(TypeError):
+                region_contains_committed(region, xc, yc, x, bad, xr, yr)
+            with self.assertRaises(TypeError):
+                region_contains_committed(region, xc, yc, x, y, bad, yr)
+            with self.assertRaises(TypeError):
+                region_contains_committed(region, xc, yc, x, y, xr, bad)
+
+    def test_bool_scalars_raise_typeerror(self):
+        region, xc, yc, x, y, xr, yr = self.point()
+        for bad in (True, False):
+            with self.assertRaises(TypeError):
+                region_contains_committed(region, xc, yc, bad, y, xr, yr)
+            with self.assertRaises(TypeError):
+                region_contains_committed(region, xc, yc, x, bad, xr, yr)
+            with self.assertRaises(TypeError):
+                region_contains_committed(region, xc, yc, x, y, bad, yr)
+            with self.assertRaises(TypeError):
+                region_contains_committed(region, xc, yc, x, y, xr, bad)
+
+    def test_wrong_region_field_types_raise_typeerror(self):
+        # A structurally similar object that is not a Region -> TypeError.
+        region, xc, yc, x, y, xr, yr = self.point()
+
+        class FakeRegion:
+            min_x = 0
+            max_x = 100
+            min_y = 0
+            max_y = 100
+
+        with self.assertRaises(TypeError):
+            region_contains_committed(FakeRegion(), xc, yc, x, y, xr, yr)
+
+        # Region.__post_init__ forbids non-int fields; build malformed frozen
+        # instances without it so the entry's own field check is exercised.
+        def broken_region(name, bad):
+            instance = Region.__new__(Region)
+            fields = {"min_x": 0, "max_x": 100, "min_y": 0, "max_y": 100}
+            fields[name] = bad
+            for field_name, value in fields.items():
+                object.__setattr__(instance, field_name, value)
+            return instance
+
+        for name in ("min_x", "max_x", "min_y", "max_y"):
+            for bad in (1.5, "0", True, False, None):
+                with self.assertRaises(TypeError, msg=f"region {name}={bad!r}"):
+                    region_contains_committed(
+                        broken_region(name, bad), xc, yc, x, y, xr, yr
+                    )
+
+    def test_wrong_commitment_field_types_raise_typeerror(self):
+        region, xc, yc, x, y, xr, yr = self.point()
+        for commitment, prefix in ((xc, "x"), (yc, "y")):
+            for name in ("element", "lower", "upper", "prime", "generator", "h"):
+                for bad in (1.5, "1", True, False, None):
+                    broken = dataclasses.replace(commitment, **{name: bad})
+                    args_x = (broken, yc, x, y, xr, yr)
+                    args_y = (xc, broken, x, y, xr, yr)
+                    with self.assertRaises(
+                        TypeError, msg=f"{prefix} commitment {name}={bad!r}"
+                    ):
+                        if prefix == "x":
+                            region_contains_committed(region, *args_x)
+                        else:
+                            region_contains_committed(region, *args_y)
+
+    def test_exception_type_for_type_failures_is_exactly_typeerror(self):
+        region, xc, yc, x, y, xr, yr = self.point()
+        for bad in (True, False, 1.5, "x", None):
+            for slot in range(4):
+                args = [region, xc, yc, x, y, xr, yr]
+                args[3 + slot] = bad
+                with self.assertRaises(Exception) as ctx:
+                    region_contains_committed(*args)
+                self.assertIs(type(ctx.exception), TypeError)
+
+    # ---- determinism and purity -------------------------------------------
+
+    def test_repeated_calls_are_consistent(self):
+        point = self.point()
+        first = self.call(point)
+        for _ in range(5):
+            self.assertIs(self.call(point), first)
+
+    def test_fixed_axis_order_x_then_y(self):
+        # A value out of range on x alone and on y alone each return False,
+        # and an x failure is detected even when y is also invalid.
+        region, xc, yc, _, _, xr, yr = self.point()
+        self.assertFalse(region_contains_committed(region, xc, yc, 101, 60, xr, yr))
+        self.assertFalse(region_contains_committed(region, xc, yc, 40, 101, xr, yr))
+        self.assertFalse(region_contains_committed(region, xc, yc, 101, 101, xr, yr))
+
+    def test_inputs_are_not_mutated(self):
+        point = self.point()
+        region, xc, yc, x, y, xr, yr = point
+        snapshots = (
+            dataclasses.asdict(region),
+            dataclasses.asdict(xc),
+            dataclasses.asdict(yc),
+            (x, y, xr, yr),
+        )
+        self.assertTrue(self.call(point))
+        self.assertEqual(dataclasses.asdict(region), snapshots[0])
+        self.assertEqual(dataclasses.asdict(xc), snapshots[1])
+        self.assertEqual(dataclasses.asdict(yc), snapshots[2])
+        self.assertEqual((x, y, xr, yr), snapshots[3])
 
 
 class MerkleMultiProofTest(unittest.TestCase):

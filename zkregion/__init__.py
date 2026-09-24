@@ -15,6 +15,9 @@ BoundPedersenOpeningReplayGuard /
 RangeProof / prove_range /
 verify_range / RangeBatchEntry / verify_range_batch / RegionProof /
 prove_region / verify_region / region_contains_committed /
+RegionContainsEntry / verify_region_contains_batch /
+BoundRegionContainsBatch / prove_region_contains_bound /
+verify_region_contains_bound /
 RegionBatchEntry / verify_region_batch /
 RegionBatchReplayGuard /
 SchnorrProof / SchnorrBatchEntry / SchnorrProver /
@@ -92,6 +95,7 @@ __all__ = [
     "BoundPedersenOpeningReplayGuard",
     "BoundRangeBatch",
     "BoundRegionBatch",
+    "BoundRegionContainsBatch",
     "BoundRegionReplayGuard",
     "BoundRangeReplayGuard",
     "BoundSchnorrBatch",
@@ -124,6 +128,7 @@ __all__ = [
     "Region",
     "RegionBatchEntry",
     "RegionBatchReplayGuard",
+    "RegionContainsEntry",
     "RegionProof",
     "RegionReplayGuard",
     "ReplayBinding",
@@ -155,6 +160,7 @@ __all__ = [
     "prove_range_batch_bound",
     "prove_region",
     "prove_region_batch_bound",
+    "prove_region_contains_bound",
     "prove_schnorr_batch_bound",
     "region_contains_committed",
     "verify_bound",
@@ -182,6 +188,8 @@ __all__ = [
     "verify_region",
     "verify_region_batch",
     "verify_region_bound",
+    "verify_region_contains_batch",
+    "verify_region_contains_bound",
     "verify_schnorr_batch",
 ]
 
@@ -1854,6 +1862,130 @@ def verify_region_batch(
 
     for (prime, generator, h), state in groups.items():
         if pow(h, state["sum"], prime) != state["product"]:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Commitment-bound region-contains batch verification
+#
+# A RegionContainsEntry freezes the seven arguments of
+# region_contains_committed (region, both commitments, both coordinates and
+# both blinding factors, x axis before y axis); verify_region_contains_batch
+# preflights the nested types of the whole batch and then delegates each
+# entry to region_contains_committed unchanged.
+
+
+@dataclass(frozen=True)
+class RegionContainsEntry:
+    """One item of a committed region-contains batch verification.
+
+    Fields, in order: ``region`` (:class:`Region`), ``x_commitment`` and
+    ``y_commitment`` (:class:`PedersenCommitment`), the coordinates ``x``
+    and ``y`` and the blinding factors ``x_blinding`` / ``y_blinding``
+    (all non-``bool`` integers) — exactly the arguments of
+    :func:`region_contains_committed`, in the same order (x axis before
+    y axis). All seven are positional construction arguments; entries
+    compare by value and are immutable.
+    """
+
+    region: Region
+    x_commitment: PedersenCommitment
+    y_commitment: PedersenCommitment
+    x: int
+    y: int
+    x_blinding: int
+    y_blinding: int
+
+
+def _check_region_contains_entries_types(
+    entries: object,
+) -> list[RegionContainsEntry]:
+    """Validate the region-contains-batch ``entries`` argument types.
+
+    Mirrors the type checks of :func:`region_contains_committed` for
+    *every* entry before any verification runs: ``entries`` must be a
+    non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`RegionContainsEntry` objects whose ``region`` is a
+    :class:`Region` with non-``bool`` integer bounds, whose
+    ``x_commitment`` / ``y_commitment`` are :class:`PedersenCommitment`
+    objects with non-``bool`` integer ``element`` / ``lower`` /
+    ``upper`` / ``prime`` / ``generator`` / ``h`` fields and whose
+    ``x`` / ``y`` / ``x_blinding`` / ``y_blinding`` are non-``bool``
+    integers. The whole batch is walked (a bad type in a later entry
+    still raises), and the entries are copied into a fresh list so the
+    inputs are never mutated. An empty batch is left to
+    :func:`verify_region_contains_batch` to reject with ``False``;
+    value problems (an opening mismatch, an out-of-range blinding or
+    embedded parameter, a declared range that does not match the region
+    bounds or a point outside the rectangle) are left to
+    :func:`region_contains_committed` during verification.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of RegionContainsEntry")
+    items: list[RegionContainsEntry] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, RegionContainsEntry):
+            raise TypeError(
+                f"entries[{position}] must be a RegionContainsEntry"
+            )
+        region = entry.region
+        if not isinstance(region, Region):
+            raise TypeError(f"entries[{position}] region must be a Region")
+        for name in ("min_x", "max_x", "min_y", "max_y"):
+            _check_int(getattr(region, name), f"entries[{position}] region {name}")
+        for axis in ("x_commitment", "y_commitment"):
+            commitment = getattr(entry, axis)
+            if not isinstance(commitment, PedersenCommitment):
+                raise TypeError(
+                    f"entries[{position}] {axis} must be a PedersenCommitment"
+                )
+            for name in ("element", "lower", "upper", "prime", "generator", "h"):
+                _check_int(
+                    getattr(commitment, name),
+                    f"entries[{position}] {axis} {name}",
+                )
+        _check_int(entry.x, f"entries[{position}] x")
+        _check_int(entry.y, f"entries[{position}] y")
+        _check_int(entry.x_blinding, f"entries[{position}] x_blinding")
+        _check_int(entry.y_blinding, f"entries[{position}] y_blinding")
+        items.append(entry)
+    return items
+
+
+def verify_region_contains_batch(
+    entries: Sequence[RegionContainsEntry],
+) -> bool:
+    """Check several independent commitment-bound rectangle decisions.
+
+    ``entries`` must be a non-``bytes`` / ``bytearray`` / ``str``
+    sequence of :class:`RegionContainsEntry`; an empty batch returns
+    ``False`` and lists, tuples, reordered and duplicate entries are
+    legal. The nested types of the *whole* batch are preflighted first,
+    so a wrong type in any entry — including a later one, and including
+    a ``bool`` passed as an integer — raises :class:`TypeError` rather
+    than being converted into a batch rejection (returning ``False``).
+    Each entry is then checked, in order, with
+    :func:`region_contains_committed` against its own fields, reusing
+    its per-axis declared-range, opening and closed-rectangle rules; the
+    first entry that returns ``False`` short-circuits the batch. Entries
+    are independent of one another: their regions, commitments and
+    ranges need not relate, and no encoding or cryptographic aggregation
+    is added. Inputs are never mutated.
+    """
+    items = _check_region_contains_entries_types(entries)
+    if not items:
+        return False
+    for entry in items:
+        if not region_contains_committed(
+            entry.region,
+            entry.x_commitment,
+            entry.y_commitment,
+            entry.x,
+            entry.y,
+            entry.x_blinding,
+            entry.y_blinding,
+        ):
             return False
     return True
 
@@ -4499,6 +4631,217 @@ def prove_pedersen_opening_batch_bound(
     root = merkle_root(leaves)
     proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
     batch = BoundPedersenOpeningBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed complete region-contains batches
+#
+# A BoundRegionContainsBatch commits a whole RegionContainsEntry batch to a
+# Merkle tree: each entry is encoded to its outer leaf (domain separator
+# b"zkregion/rcb/v1", then the entry fields in construction order with
+# nested objects expanded in dataclass field order, every integer as
+# decimal ASCII with the sign kept and every atom length-prefixed), the
+# leaves are committed in batch order and the batch carries a complete
+# multi-inclusion proof. verify_region_contains_bound checks the root
+# first, then delegates to verify_region_contains_batch unchanged;
+# prove_region_contains_bound is the canonical constructor.
+
+_REGION_CONTAINS_BOUND_DOMAIN = b"zkregion/rcb/v1"
+
+
+@dataclass(frozen=True)
+class BoundRegionContainsBatch:
+    """A complete region-contains batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of
+    :class:`RegionContainsEntry`; ``leaf_count`` — a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``; ``proof`` — the :class:`MerkleMultiProof` whose
+    indices cover ``0 .. leaf_count - 1`` without gaps or duplicates. All
+    three are positional construction arguments; batches compare by value
+    and are immutable.
+    """
+
+    entries: tuple[RegionContainsEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_region_contains_leaf(entry: RegionContainsEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`RegionContainsEntry`.
+
+    The leaf is the framed domain separator ``b"zkregion/rcb/v1"``
+    followed by the entry's fields in construction order: the region's
+    ``min_x`` / ``max_x`` / ``min_y`` / ``max_y`` bounds, the x
+    commitment's ``element`` / ``lower`` / ``upper`` / ``prime`` /
+    ``generator`` / ``h`` fields, the y commitment's six fields in the
+    same order, and the entry's ``x`` / ``y`` / ``x_blinding`` /
+    ``y_blinding`` — together the arguments of
+    :func:`region_contains_committed`, in the same order. Nested objects
+    are expanded in dataclass field order; every integer is encoded as
+    decimal ASCII with the sign kept and every atom is prefixed with its
+    four-byte unsigned big-endian length.
+    """
+    region = entry.region
+    items = [_REGION_CONTAINS_BOUND_DOMAIN]
+    items.extend(
+        str(bound).encode("ascii")
+        for bound in (region.min_x, region.max_x, region.min_y, region.max_y)
+    )
+    for commitment in (entry.x_commitment, entry.y_commitment):
+        items.extend(
+            str(getattr(commitment, name)).encode("ascii")
+            for name in ("element", "lower", "upper", "prime", "generator", "h")
+        )
+    items.extend(
+        str(value).encode("ascii")
+        for value in (entry.x, entry.y, entry.x_blinding, entry.y_blinding)
+    )
+    leaf = bytearray()
+    for item in items:
+        leaf += len(item).to_bytes(4, "big")
+        leaf += item
+    return bytes(leaf)
+
+
+def _region_contains_batch_encodable(
+    entries: Sequence[RegionContainsEntry],
+) -> bool:
+    """The batch length must fit in an unsigned 64-bit integer.
+
+    Each entry's integers are encoded as decimal ASCII with the sign
+    kept, so every integer field frames for any value and no per-entry
+    encodability rule is needed.
+    """
+    return 0 <= len(entries) <= _UINT64_MAX
+
+
+def verify_region_contains_bound(
+    batch: BoundRegionContainsBatch,
+    root: bytes,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundRegionContainsBatch`.
+
+    The Merkle binding is checked first: every entry is encoded to its
+    leaf exactly as specified by :func:`_bound_region_contains_leaf` and
+    the whole batch is checked against ``root`` with
+    :func:`verify_multi_inclusion`. ``leaf_count`` must be a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``, and ``proof.indices`` must cover
+    ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering; an
+    empty batch, a missing entry, a count mismatch or any index mismatch
+    returns ``False``. Only after the root checks does the batch go
+    through :func:`verify_region_contains_batch` unchanged, which
+    rechecks every entry in order under each commitment's own group
+    parameters and declared range.
+
+    Type errors — a batch that is not a
+    :class:`BoundRegionContainsBatch`, non-tuple entries,
+    non-:class:`RegionContainsEntry` items, a non-integer or ``bool``
+    ``leaf_count``, a wrong proof/root object, or malformed nested field
+    types (including a ``bool`` passed as an integer, a non-tuple
+    ``indices`` / ``siblings`` or a non-``bytes`` sibling) — raise
+    :class:`TypeError`; every other invalidity (empty batch, miscount,
+    incomplete indices, wrong root, tampered leaf bytes or any
+    :func:`verify_region_contains_batch` rejection) returns ``False``.
+    Inputs are never mutated.
+    """
+    if not isinstance(batch, BoundRegionContainsBatch):
+        raise TypeError("batch must be a BoundRegionContainsBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(
+            "batch entries must be a tuple of RegionContainsEntry"
+        )
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    _check_region_contains_entries_types(entries)
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_region_contains_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf, then
+    # 2) the unchanged region-contains batch verification runs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_region_contains_batch(entries)
+
+
+def prove_region_contains_bound(
+    entries: Sequence[RegionContainsEntry],
+) -> tuple[BoundRegionContainsBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundRegionContainsBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`RegionContainsEntry` rules as
+    :func:`verify_region_contains_batch` and must be non-empty; every
+    item is copied into a tuple in its original order with duplicates
+    preserved, and the inputs are never mutated. Each item is encoded to
+    its outer leaf byte for byte with
+    :func:`_bound_region_contains_leaf`; the domain separator, length
+    framing, decimal ASCII integer convention and field order stay
+    unchanged, and the leaf digests and internal nodes follow the
+    existing SHA-256 Merkle rules. With ``n = len(entries)``, the
+    complete multi-inclusion proof is built with
+    :func:`prove_multi_inclusion` over the encoded leaves and the full
+    indices ``tuple(range(n))`` — so its ``indices`` cover every leaf
+    from zero and its ``siblings`` are empty — and the returned batch
+    carries ``leaf_count = n`` alongside that proof. The second return
+    value is the outer tree's :func:`merkle_root` of the encoded leaves,
+    which is exactly the root the batch verifies under:
+    ``verify_region_contains_bound(batch, root)`` returns ``True``.
+    Single-item, odd- and even-sized batches and duplicate items are all
+    deterministic, and repeated constructions are byte for byte
+    identical.
+
+    A type preflight over the whole batch — every item and every nested
+    field, including ``bool`` integers and later items — raises
+    :class:`TypeError` before anything is built; an empty batch, a batch
+    count outside uint64, or :func:`verify_region_contains_batch`
+    returning ``False`` (an opening mismatch, an out-of-range blinding
+    or embedded parameter, a declared range that does not match the
+    region bounds or a point outside the rectangle) raises
+    :class:`ValueError`.
+    """
+    items = _check_region_contains_entries_types(entries)
+    if not items:
+        raise ValueError("entries must not be empty")
+    if not _region_contains_batch_encodable(items):
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    if not verify_region_contains_batch(items):
+        raise ValueError("entries must pass verify_region_contains_batch")
+    ordered = tuple(items)
+    leaves = [_bound_region_contains_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundRegionContainsBatch(
         entries=ordered,
         leaf_count=len(ordered),
         proof=proof,

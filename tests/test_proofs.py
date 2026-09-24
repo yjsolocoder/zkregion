@@ -69,6 +69,7 @@ from zkregion import (
     prove_multi_inclusion,
     prove_range,
     prove_region,
+    prove_schnorr_batch_bound,
     verify_bound,
     verify_consistency,
     verify_consistency_batch,
@@ -3277,6 +3278,442 @@ class SingleKeyBoundBatchTest(unittest.TestCase):
         )
         self.verifier.verify_bound_batch(batch, root, randbelow=counter_randbelow())
         self.assertEqual(batch, snapshot)
+
+
+def _manual_bound_schnorr(entries):
+    leaves = [bound_schnorr_leaf(entry) for entry in entries]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+    return BoundSchnorrBatch(tuple(entries), len(entries), proof), root
+
+
+def _manual_single_key_bound(entries, verifier, prime, generator):
+    leaves = [
+        bound_schnorr_leaf(
+            MultiSchnorrEntry(
+                verifier.public_key,
+                entry.message,
+                entry.proof,
+                entry.context,
+                prime,
+                generator,
+            )
+        )
+        for entry in entries
+    ]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+    return SingleKeyBoundBatch(tuple(entries), len(entries), proof), root
+
+
+class ProveSchnorrBatchBoundTest(unittest.TestCase):
+    G_PRIME = SMALL_PRIME
+    G2_PRIME = 104723
+
+    def prover(self, secret, prime, generator):
+        return SchnorrProver(
+            secret=secret, prime=prime, generator=generator, randbelow=counter_randbelow()
+        )
+
+    def setUp(self):
+        self.alice = self.prover(4321, self.G_PRIME, 3)
+        self.bob = self.prover(7777, self.G_PRIME, 3)
+        self.carol = self.prover(5566, self.G2_PRIME, 3)
+
+    def entry(self, prover, message, *, prime, generator, context=b"ctx"):
+        return MultiSchnorrEntry(
+            public_key=prover.public_key,
+            message=message,
+            proof=prover.prove(message, context=context),
+            context=context,
+            prime=prime,
+            generator=generator,
+        )
+
+    def honest_entries(self):
+        return [
+            self.entry(self.alice, b"alpha", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"beta", prime=self.G_PRIME, generator=3),
+            self.entry(self.carol, b"gamma", prime=self.G2_PRIME, generator=3),
+        ]
+
+    # ---- round trip ----------------------------------------------------------
+
+    def test_constructed_batch_passes_verify_bound_once(self):
+        entries = self.honest_entries()
+        batch, root = prove_schnorr_batch_bound(entries, randbelow=counter_randbelow())
+        self.assertTrue(verify_bound(batch, root, randbelow=counter_randbelow()))
+        self.assertTrue(verify_bound(batch, root))  # default secrets.randbelow
+
+    def test_single_item_and_duplicates(self):
+        only = [self.entry(self.alice, b"only", prime=self.G_PRIME, generator=3)]
+        batch, root = prove_schnorr_batch_bound(only, randbelow=counter_randbelow())
+        self.assertEqual(batch.leaf_count, 1)
+        self.assertEqual(batch.entries, tuple(only))
+        self.assertTrue(verify_bound(batch, root, randbelow=counter_randbelow()))
+
+        dup = [only[0], only[0]]
+        dbatch, droot = prove_schnorr_batch_bound(dup, randbelow=counter_randbelow())
+        self.assertEqual(dbatch.leaf_count, 2)
+        self.assertEqual(dbatch.entries, (only[0], only[0]))
+        self.assertTrue(verify_bound(dbatch, droot, randbelow=counter_randbelow()))
+
+    def test_two_item_batch_verifies(self):
+        entries = [
+            self.entry(self.alice, b"alpha", prime=self.G_PRIME, generator=3),
+            self.entry(self.bob, b"beta", prime=self.G_PRIME, generator=3),
+        ]
+        batch, root = prove_schnorr_batch_bound(entries, randbelow=counter_randbelow())
+        self.assertTrue(verify_bound(batch, root, randbelow=counter_randbelow()))
+
+    def test_full_proof_covers_every_position_from_zero(self):
+        batch, _ = prove_schnorr_batch_bound(
+            self.honest_entries(), randbelow=counter_randbelow()
+        )
+        self.assertEqual(batch.leaf_count, 3)
+        self.assertEqual(batch.proof.leaf_count, 3)
+        self.assertEqual(batch.proof.indices, (0, 1, 2))
+        self.assertEqual(batch.proof.siblings, ())
+
+    def test_order_and_duplicates_preserved(self):
+        entries = self.honest_entries()
+        reordered = [entries[2], entries[0], entries[1]]
+        batch, _ = prove_schnorr_batch_bound(reordered, randbelow=counter_randbelow())
+        self.assertEqual(batch.entries, tuple(reordered))
+        self.assertEqual([entry.message for entry in batch.entries], [b"gamma", b"alpha", b"beta"])
+
+    # ---- compatibility and determinism --------------------------------------
+
+    def test_equals_manual_construction_byte_for_byte(self):
+        entries = self.honest_entries()
+        batch, root = prove_schnorr_batch_bound(entries, randbelow=counter_randbelow())
+        manual_batch, manual_root = _manual_bound_schnorr(entries)
+        self.assertEqual(root, manual_root)
+        self.assertEqual(batch, manual_batch)
+        self.assertEqual(dataclasses.asdict(batch), dataclasses.asdict(manual_batch))
+
+    def test_repeated_construction_is_byte_identical(self):
+        entries = self.honest_entries()
+        batch, root = prove_schnorr_batch_bound(entries, randbelow=counter_randbelow())
+        batch2, root2 = prove_schnorr_batch_bound(list(entries), randbelow=counter_randbelow())
+        self.assertEqual(batch, batch2)
+        self.assertEqual(root, root2)
+
+    # ---- input hygiene -------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        entries = self.honest_entries()
+        snapshot = [dataclasses.replace(entry) for entry in entries]
+        prove_schnorr_batch_bound(entries, randbelow=counter_randbelow())
+        self.assertEqual(entries, snapshot)
+        self.assertIsInstance(entries, list)
+
+    # ---- rejections ----------------------------------------------------------
+
+    def test_empty_batch_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            prove_schnorr_batch_bound([], randbelow=counter_randbelow())
+
+    def test_type_errors(self):
+        good = self.honest_entries()
+        for bad in (b"abc", "abc", 123, None, {good[0]}, 4.5):
+            with self.assertRaises(TypeError):
+                prove_schnorr_batch_bound(bad, randbelow=counter_randbelow())
+        # a generator is not a Sequence
+        with self.assertRaises(TypeError):
+            prove_schnorr_batch_bound(iter(good), randbelow=counter_randbelow())
+        # non-entry items, including a later bad item
+        with self.assertRaises(TypeError):
+            prove_schnorr_batch_bound(["x"], randbelow=counter_randbelow())
+        with self.assertRaises(TypeError):
+            prove_schnorr_batch_bound([good[0], "x"], randbelow=counter_randbelow())
+        # nested field type errors, including bool masquerading as an integer
+        cases = [
+            dataclasses.replace(good[0], public_key="pk"),
+            dataclasses.replace(good[0], public_key=True),
+            dataclasses.replace(good[0], message="m"),
+            dataclasses.replace(good[0], context=7),
+            dataclasses.replace(good[0], prime=str(self.G_PRIME)),
+            dataclasses.replace(good[0], prime=True),
+            dataclasses.replace(good[0], generator=True),
+            dataclasses.replace(
+                good[0], proof=SchnorrProof(True, good[0].proof.response)
+            ),
+            dataclasses.replace(
+                good[0], proof=SchnorrProof(good[0].proof.commitment, False)
+            ),
+            dataclasses.replace(
+                good[0], proof=(good[0].proof.commitment, good[0].proof.response)
+            ),
+        ]
+        for bad_entry in cases:
+            with self.assertRaises(TypeError):
+                prove_schnorr_batch_bound([bad_entry], randbelow=counter_randbelow())
+            # a later bad entry still raises after the first is valid
+            with self.assertRaises(TypeError):
+                prove_schnorr_batch_bound(
+                    [good[1], bad_entry], randbelow=counter_randbelow()
+                )
+
+    def test_non_callable_randbelow_raises_type_error(self):
+        entries = self.honest_entries()
+        with self.assertRaises(TypeError):
+            prove_schnorr_batch_bound(entries, randbelow=7)
+        # the type preflight wins over the bad random source
+        with self.assertRaises(TypeError):
+            prove_schnorr_batch_bound(b"x", randbelow=7)
+
+    def test_inner_batch_failure_raises_value_error(self):
+        entries = self.honest_entries()
+        tampered = dataclasses.replace(entries[0], message=b"different")
+        with self.assertRaises(ValueError):
+            prove_schnorr_batch_bound([tampered], randbelow=counter_randbelow())
+        # a negative proof response is a valid int but cannot be leaf-framed
+        negative = dataclasses.replace(
+            entries[0],
+            proof=SchnorrProof(entries[0].proof.commitment, -1),
+        )
+        with self.assertRaises(ValueError):
+            prove_schnorr_batch_bound([negative], randbelow=counter_randbelow())
+
+    def test_rejections_are_deterministic(self):
+        entries = self.honest_entries()
+        tampered = dataclasses.replace(entries[0], message=b"different")
+        for _ in range(3):
+            with self.assertRaises(ValueError):
+                prove_schnorr_batch_bound([tampered], randbelow=counter_randbelow())
+
+    def test_random_source_exceptions_pass_through_unchanged(self):
+        class Boom(Exception):
+            pass
+
+        def boom(_):
+            raise Boom()
+
+        with self.assertRaises(Boom):
+            prove_schnorr_batch_bound(self.honest_entries(), randbelow=boom)
+
+        def non_integer(_):
+            return "x"
+
+        with self.assertRaises(TypeError):
+            prove_schnorr_batch_bound(self.honest_entries(), randbelow=non_integer)
+
+        def out_of_range(_):
+            return 10**18
+
+        with self.assertRaises(ValueError):
+            prove_schnorr_batch_bound(self.honest_entries(), randbelow=out_of_range)
+
+
+class ProveBoundBatchTest(unittest.TestCase):
+    G_PRIME = SMALL_PRIME
+    G_GENERATOR = 3
+
+    def prover(self, secret):
+        return SchnorrProver(
+            secret=secret,
+            prime=self.G_PRIME,
+            generator=self.G_GENERATOR,
+            randbelow=counter_randbelow(),
+        )
+
+    def setUp(self):
+        self.alice = self.prover(4321)
+        self.bob = self.prover(7777)
+        self.verifier = SchnorrVerifier(
+            self.alice.public_key, prime=self.G_PRIME, generator=self.G_GENERATOR
+        )
+
+    def entry(self, prover, message, *, context=b"ctx"):
+        return SchnorrBatchEntry(message, prover.prove(message, context=context), context)
+
+    def honest_entries(self):
+        return [
+            self.entry(self.alice, b"alpha"),
+            self.entry(self.alice, b"beta"),
+            self.entry(self.alice, b"gamma"),
+        ]
+
+    # ---- round trip ----------------------------------------------------------
+
+    def test_constructed_batch_passes_verify_bound_batch_once(self):
+        entries = self.honest_entries()
+        batch, root = self.verifier.prove_bound_batch(entries, randbelow=counter_randbelow())
+        self.assertTrue(
+            self.verifier.verify_bound_batch(batch, root, randbelow=counter_randbelow())
+        )
+        self.assertTrue(self.verifier.verify_bound_batch(batch, root))
+
+    def test_single_item_and_duplicates(self):
+        only = [self.entry(self.alice, b"only")]
+        batch, root = self.verifier.prove_bound_batch(only, randbelow=counter_randbelow())
+        self.assertEqual(batch.leaf_count, 1)
+        self.assertEqual(batch.entries, tuple(only))
+        self.assertTrue(
+            self.verifier.verify_bound_batch(batch, root, randbelow=counter_randbelow())
+        )
+
+        dup = [only[0], only[0]]
+        dbatch, droot = self.verifier.prove_bound_batch(dup, randbelow=counter_randbelow())
+        self.assertEqual(dbatch.leaf_count, 2)
+        self.assertEqual(dbatch.entries, (only[0], only[0]))
+        self.assertTrue(
+            self.verifier.verify_bound_batch(dbatch, droot, randbelow=counter_randbelow())
+        )
+
+    def test_two_item_batch_verifies(self):
+        entries = [self.entry(self.alice, b"alpha"), self.entry(self.alice, b"beta")]
+        batch, root = self.verifier.prove_bound_batch(entries, randbelow=counter_randbelow())
+        self.assertTrue(
+            self.verifier.verify_bound_batch(batch, root, randbelow=counter_randbelow())
+        )
+
+    def test_full_proof_covers_every_position_from_zero(self):
+        batch, _ = self.verifier.prove_bound_batch(
+            self.honest_entries(), randbelow=counter_randbelow()
+        )
+        self.assertEqual(batch.leaf_count, 3)
+        self.assertEqual(batch.proof.leaf_count, 3)
+        self.assertEqual(batch.proof.indices, (0, 1, 2))
+        self.assertEqual(batch.proof.siblings, ())
+
+    def test_order_preserved(self):
+        entries = self.honest_entries()
+        reordered = [entries[2], entries[0], entries[1]]
+        batch, _ = self.verifier.prove_bound_batch(reordered, randbelow=counter_randbelow())
+        self.assertEqual(batch.entries, tuple(reordered))
+
+    def test_fixed_key_and_group_of_the_verifier_are_used(self):
+        # a batch built under alice's verifier does not verify under bob's
+        entries = self.honest_entries()
+        batch, root = self.verifier.prove_bound_batch(entries, randbelow=counter_randbelow())
+        bob_verifier = SchnorrVerifier(
+            self.bob.public_key, prime=self.G_PRIME, generator=self.G_GENERATOR
+        )
+        self.assertFalse(
+            bob_verifier.verify_bound_batch(batch, root, randbelow=counter_randbelow())
+        )
+
+    # ---- compatibility and determinism --------------------------------------
+
+    def test_equals_manual_construction_byte_for_byte(self):
+        entries = self.honest_entries()
+        batch, root = self.verifier.prove_bound_batch(entries, randbelow=counter_randbelow())
+        manual_batch, manual_root = _manual_single_key_bound(
+            entries, self.verifier, self.G_PRIME, self.G_GENERATOR
+        )
+        self.assertEqual(root, manual_root)
+        self.assertEqual(batch, manual_batch)
+        self.assertEqual(dataclasses.asdict(batch), dataclasses.asdict(manual_batch))
+
+    def test_repeated_construction_is_byte_identical(self):
+        entries = self.honest_entries()
+        batch, root = self.verifier.prove_bound_batch(entries, randbelow=counter_randbelow())
+        batch2, root2 = self.verifier.prove_bound_batch(
+            list(entries), randbelow=counter_randbelow()
+        )
+        self.assertEqual(batch, batch2)
+        self.assertEqual(root, root2)
+
+    # ---- input hygiene -------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        entries = self.honest_entries()
+        snapshot = [dataclasses.replace(entry) for entry in entries]
+        self.verifier.prove_bound_batch(entries, randbelow=counter_randbelow())
+        self.assertEqual(entries, snapshot)
+        self.assertIsInstance(entries, list)
+
+    # ---- rejections ----------------------------------------------------------
+
+    def test_empty_batch_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            self.verifier.prove_bound_batch([], randbelow=counter_randbelow())
+
+    def test_type_errors(self):
+        good = self.honest_entries()
+        for bad in (b"abc", "abc", 123, None, {good[0]}, 4.5):
+            with self.assertRaises(TypeError):
+                self.verifier.prove_bound_batch(bad, randbelow=counter_randbelow())
+        with self.assertRaises(TypeError):
+            self.verifier.prove_bound_batch(iter(good), randbelow=counter_randbelow())
+        # a MultiSchnorrEntry is not a SchnorrBatchEntry
+        foreign = MultiSchnorrEntry(
+            self.verifier.public_key,
+            good[0].message,
+            good[0].proof,
+            good[0].context,
+            self.G_PRIME,
+            self.G_GENERATOR,
+        )
+        with self.assertRaises(TypeError):
+            self.verifier.prove_bound_batch([foreign], randbelow=counter_randbelow())
+        with self.assertRaises(TypeError):
+            self.verifier.prove_bound_batch([good[0], 1], randbelow=counter_randbelow())
+        cases = [
+            SchnorrBatchEntry("m", good[0].proof, b""),
+            SchnorrBatchEntry(b"m", good[0].proof, "c"),
+            SchnorrBatchEntry(b"m", "p", b""),
+            SchnorrBatchEntry(b"m", SchnorrProof(True, good[0].proof.response), b""),
+            SchnorrBatchEntry(b"m", SchnorrProof(good[0].proof.commitment, False), b""),
+        ]
+        for bad_entry in cases:
+            with self.assertRaises(TypeError):
+                self.verifier.prove_bound_batch([bad_entry], randbelow=counter_randbelow())
+            with self.assertRaises(TypeError):
+                self.verifier.prove_bound_batch(
+                    [good[1], bad_entry], randbelow=counter_randbelow()
+                )
+
+    def test_non_callable_randbelow_raises_type_error(self):
+        entries = self.honest_entries()
+        with self.assertRaises(TypeError):
+            self.verifier.prove_bound_batch(entries, randbelow=7)
+        with self.assertRaises(TypeError):
+            self.verifier.prove_bound_batch(b"x", randbelow=7)
+
+    def test_inner_batch_failure_raises_value_error(self):
+        entries = self.honest_entries()
+        tampered = SchnorrBatchEntry(b"different", entries[0].proof, entries[0].context)
+        with self.assertRaises(ValueError):
+            self.verifier.prove_bound_batch([tampered], randbelow=counter_randbelow())
+        negative = SchnorrBatchEntry(
+            entries[0].message,
+            SchnorrProof(entries[0].proof.commitment, -1),
+            entries[0].context,
+        )
+        with self.assertRaises(ValueError):
+            self.verifier.prove_bound_batch([negative], randbelow=counter_randbelow())
+
+    def test_rejections_are_deterministic(self):
+        entries = self.honest_entries()
+        tampered = SchnorrBatchEntry(b"different", entries[0].proof, entries[0].context)
+        for _ in range(3):
+            with self.assertRaises(ValueError):
+                self.verifier.prove_bound_batch([tampered], randbelow=counter_randbelow())
+
+    def test_random_source_exceptions_pass_through_unchanged(self):
+        class Boom(Exception):
+            pass
+
+        def boom(_):
+            raise Boom()
+
+        with self.assertRaises(Boom):
+            self.verifier.prove_bound_batch(self.honest_entries(), randbelow=boom)
+
+        def non_integer(_):
+            return "x"
+
+        with self.assertRaises(TypeError):
+            self.verifier.prove_bound_batch(self.honest_entries(), randbelow=non_integer)
+
+        def out_of_range(_):
+            return 10**18
+
+        with self.assertRaises(ValueError):
+            self.verifier.prove_bound_batch(self.honest_entries(), randbelow=out_of_range)
 
 
 def bound_range_leaf(entry: RangeBatchEntry) -> bytes:

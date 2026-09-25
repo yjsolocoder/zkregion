@@ -1142,6 +1142,8 @@ python3 -m zkregion
 - `prove_range_wide(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> WideRangeProof` — 按位分解的宽区间非交互证明：声明区间内整数个数须恰为 2 的幂，且以 2 为底的位宽须在 1 到 24 之间，越界或个数非 2 的幂抛 `ValueError`；生成前以 `verify_pedersen_opening` 同一口径重算承诺开合，开合不符或值越出声明区间抛 `ValueError`；随机源不可调用或返回非整数（含 `bool`）抛 `TypeError`、抽取值越界抛 `ValueError`；同一组承诺、值、盲因子与上下文在相同随机源下重复生成的证明逐字节一致，输入不被改写
 - `verify_range_wide(commitment, proof, context=b"") -> bool` — 验证宽区间证明：各比特承诺按位加权（`2**i`）的乘积须等于承诺值，逐位重算每个比特分支两条 OR 分支的公告并核对两个挑战份额之和等于转录挑战；位宽越界、个数非 2 的幂、换承诺、换上下文、换声明区间、交换或替换任意比特分支、改动分支内的承诺/挑战份额/响应、挪动位序一律返回 `False` 且不抛异常；任一层字段错型（含用 `bool` 冒充整数）抛 `TypeError`，输入不被改写
 - `WideRangeProof(commitments, challenges, responses)` — 不可变宽区间证明对象；`commitments` 为按位序（低位在前）的比特承诺 `tuple[int, ...]`，`challenges` 与 `responses` 为每个比特分支的两个挑战份额、两个响应组成的 `tuple[tuple[int, int], ...]`，三者长度均为位宽 `k`；可位置构造、按值相等且不可变
+- `WideRangeBatchEntry(commitment, proof, context=b"")` — 不可变宽区间批验条目，字段类型依次为 `PedersenCommitment`、`WideRangeProof`、`bytes`，字段次序与 `verify_range_wide` 入参一致；可位置构造、按值相等且不可变，构造时不做任何校验
+- `verify_range_wide_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 宽区间证明的批量验证：先整批预检嵌套类型（序列本身、条目、承诺六字段、证明三层元组整数与 `context`，错型含后项错型与用 `bool` 冒充整数，一律抛唯一的 `TypeError`；随机源不可调用或返回非整数同样抛 `TypeError`），预检通过后才逐条核对；空批返回 `False`，任一条无效即短路返回 `False`。比特承诺按 `2**i` 加权的绑定与各比特两个挑战份额之和等于转录挑战逐条核对、不参与聚合；每个比特的两条 OR 子分支各恰取一次非零系数 `a = r + 1`（`r = randbelow(prime - 1)`），按 `(prime, generator, h)` 分组做一次随机线性组合，越界系数抛 `ValueError`；换承诺、换上下文、换声明区间、交换替换比特分支、改动分支内承诺/挑战份额/响应、挪动位序一律返回 `False` 且不抛异常；条目独立、可乱序可重复，固定随机源下结果可重复，输入不被改写
 - `verify_range_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 区间证明的批量验证，按 `(prime, generator, h)` 分组做一次随机线性组合
 - `RangeBatchEntry(commitment, proof, context=b"")` — 不可变批量验证条目，字段类型依次为 `PedersenCommitment`、`RangeProof`、`bytes`，字段次序与 `verify_range` 入参一致
 - `verify_range_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的区间证明完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_range_batch` 验证明
@@ -1481,6 +1483,22 @@ h**Σ(a*s) == Π(t**a * D_i**(a*e))   (mod prime)
 即把该组内所有条目的全部分支纳入同一个随机线性组合，而**不是**逐分支或逐条目验证后做布尔汇总——因此同组内响应误差可以在系数为 1 时相消，而不同 `(prime, generator, h)`（不同群或不同 `h`）之间不能跨组相消。传入固定的 `randbelow` 结果可重复，缺省为 `secrets.randbelow`。
 
 类型错误（含 `bool` 整数、非元组证明字段、非 `bytes` 的 `context`、`randbelow` 不可调用或返回非整数）抛 `TypeError`；系数来源返回值超出 `[0, prime - 1)` 抛 `ValueError`。其余非法结构、篡改、承诺/context 绑定错误均返回 `False`；入口不改写任何输入。这里的随机线性组合只供演示。
+
+### 宽区间证明批量验证
+
+`verify_range_wide_batch(entries, *, randbelow=secrets.randbelow)` 一次验证一批 `WideRangeProof`，每个条目就是 `verify_range_wide` 的三个入参（`commitment`、`proof`、`context`，后者缺省 `b""`）冻结成的不可变数据类 `WideRangeBatchEntry`；字段类型依次为 `PedersenCommitment`、`WideRangeProof`、`bytes`，构造条目不做任何校验。`entries` 须为非 `bytes`/`bytearray`/`str` 的非空序列：空批返回 `False`，重复条目合法并各自独立取系数。
+
+验证分两个固定阶段。先对**整批**做嵌套类型预检：序列本身错型或不是序列、任一条目不是 `WideRangeBatchEntry`、承诺不是 `PedersenCommitment` 或其六字段不是非 `bool` 整数、证明不是 `WideRangeProof` 或其任一层字段不是整数元组（含用 `bool` 冒充整数）、`context` 不是 `bytes`，都抛同一个 `TypeError`；预检走完整批，错型哪怕出现在最后一个条目也照样抛出。预检通过后才逐条核对，任一条无效即短路返回 `False`：群参数与声明区间合法、声明区间恰含 `2**k` 个整数（`1 <= k <= 24`）、三个证明字段长度均为 `k`、各对长度恰为 2、比特承诺/挑战份额/响应取值在界，以及**逐条**核对的比特承诺按 `2**i` 加权乘积等于承诺值、各比特两个挑战份额之和等于该条目的转录挑战——这两项绑定不参与聚合。
+
+通过逐条核对后，**每个比特的两条 OR 子分支**（位 `0` 分支以比特承诺 `C_i` 为基点，位 `1` 分支以 `C_i * generator**(-1)` 为基点）各恰调用一次 `randbelow(prime - 1)` 得 `r`，取非零系数 `a = r + 1`。所有子分支按 `(prime, generator, h)` 分组，每组只检查一次聚合等式
+
+```
+h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
+```
+
+其中 `t` 为按响应与挑战份额重算出的公告，`D` 即该子分支的基点；与区间证明批验一致，每个群只做这一次多指数等式而不逐子分支做布尔汇总。条目的安全性由前述逐条核对（加权绑定、转录与挑战份额之和）保证：任何改动响应或挑战份额的篡改都会改变重算公告、进而改变转录挑战，在逐条阶段即返回 `False`，不会留到聚合阶段。传入固定的 `randbelow` 结果可重复，缺省为 `secrets.randbelow`。
+
+随机源不可调用或返回非整数抛 `TypeError`，系数返回值超出 `[0, prime - 1)` 抛 `ValueError`；异常唯一——任何错型情形都只抛 `TypeError`。换承诺、换上下文、换声明区间、交换或替换比特分支、改动分支内的承诺/挑战份额/响应、挪动位序一律返回 `False` 且不抛异常。条目相互独立、可乱序可重复，固定随机源下结果可重复；漏项无法被发现，批次完整性由调用方保证。入口不改写任何输入，不引入落盘或持久化。这里的随机线性组合只供演示。
 
 ### Merkle 承诺的区间证明完整批验
 

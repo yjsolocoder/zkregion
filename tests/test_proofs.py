@@ -78,6 +78,8 @@ from zkregion import (
     SingleKeyBoundBatch,
     SingleKeyBoundReplayGuard,
     SingleKeyEntryReplayGuard,
+    WideRangeBatchEntry,
+    WideRangeProof,
     commit,
     commit_coordinate,
     merkle_root,
@@ -89,6 +91,7 @@ from zkregion import (
     prove_opening_batch_bound,
     prove_pedersen_opening_batch_bound,
     prove_range,
+    prove_range_wide,
     prove_region,
     prove_region_contains_bound,
     prove_schnorr_batch_bound,
@@ -115,6 +118,8 @@ from zkregion import (
     verify_range,
     verify_range_batch,
     verify_range_bound,
+    verify_range_wide,
+    verify_range_wide_batch,
     verify_region,
     verify_region_batch,
     verify_region_bound,
@@ -1342,6 +1347,646 @@ class RangeBatchTest(unittest.TestCase):
         proof = prove_range(commitment, 40, blinding, b"demo")
         entry = RangeBatchEntry(commitment, proof, b"demo")
         self.assertTrue(verify_range_batch([entry], randbelow=counter_randbelow()))
+
+
+class WideRangeBatchTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def commit(self, value=5, lower=0, upper=15, blinding=1234, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    def prove(self, value=5, lower=0, upper=15, blinding=1234, context=b"ctx", **kwargs):
+        commitment, returned = self.commit(value, lower, upper, blinding, **kwargs)
+        proof = prove_range_wide(
+            commitment, value, returned, context, randbelow=counter_randbelow()
+        )
+        return commitment, returned, proof
+
+    def entry(self, value=5, lower=0, upper=15, context=b"ctx", blinding=1234, **kwargs):
+        commitment, returned = self.commit(value, lower, upper, blinding, **kwargs)
+        proof = prove_range_wide(
+            commitment, value, returned, context, randbelow=counter_randbelow()
+        )
+        return WideRangeBatchEntry(commitment, proof, context)
+
+    # ---- entry object -------------------------------------------------------
+
+    def test_entry_positional_defaults_equality_and_immutability(self):
+        commitment, blinding = self.commit()
+        proof = prove_range_wide(
+            commitment, 5, blinding, b"", randbelow=counter_randbelow()
+        )
+        entry = WideRangeBatchEntry(commitment, proof)
+        self.assertEqual(entry.context, b"")
+        self.assertEqual(WideRangeBatchEntry(commitment, proof, b""), entry)
+        self.assertEqual(
+            tuple(getattr(entry, name) for name in ("commitment", "proof", "context")),
+            (commitment, proof, b""),
+        )
+        other = WideRangeBatchEntry(commitment, proof, b"other")
+        self.assertNotEqual(entry, other)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            entry.context = b"other"
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            entry.proof = proof
+
+    def test_entry_construction_does_no_validation(self):
+        # Constructing the entry never validates its arguments.
+        entry = WideRangeBatchEntry("commitment", ("p",), 123)
+        self.assertEqual(
+            (entry.commitment, entry.proof, entry.context),
+            ("commitment", ("p",), 123),
+        )
+
+    def test_entry_field_types(self):
+        entry = self.entry()
+        self.assertIsInstance(entry.commitment, PedersenCommitment)
+        self.assertIsInstance(entry.proof, WideRangeProof)
+        self.assertIsInstance(entry.context, bytes)
+
+    # ---- honest round trip --------------------------------------------------
+
+    def test_honest_batch_verifies(self):
+        entries = [self.entry(value=value) for value in (0, 5, 15)]
+        self.assertTrue(verify_range_wide_batch(entries, randbelow=counter_randbelow()))
+        self.assertTrue(verify_range_wide_batch(tuple(entries)))  # default source
+
+    def test_single_entry_agrees_with_verify_range_wide(self):
+        commitment, _, proof = self.prove()
+        entry = WideRangeBatchEntry(commitment, proof, b"ctx")
+        self.assertTrue(verify_range_wide_batch([entry], randbelow=counter_randbelow()))
+        self.assertTrue(verify_range_wide(commitment, proof, b"ctx"))
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(verify_range_wide_batch([], randbelow=counter_randbelow()))
+        self.assertFalse(verify_range_wide_batch(()))
+
+    def test_duplicate_entries_are_legal(self):
+        entry = self.entry()
+        self.assertTrue(
+            verify_range_wide_batch([entry, entry, entry], randbelow=counter_randbelow())
+        )
+
+    def test_entries_verify_in_any_order(self):
+        entries = [
+            self.entry(value=0, blinding=11),
+            self.entry(value=7, blinding=22),
+            self.entry(value=15, blinding=33),
+        ]
+        source = counter_randbelow
+        self.assertTrue(verify_range_wide_batch(entries, randbelow=source()))
+        self.assertTrue(verify_range_wide_batch(list(reversed(entries)), randbelow=source()))
+        self.assertTrue(
+            verify_range_wide_batch([entries[2], entries[0], entries[1]], randbelow=source())
+        )
+
+    def test_every_width_from_one_to_sixteen_accepted_on_small_prime(self):
+        for k in range(1, 17):
+            upper = (1 << k) - 1
+            entry = self.entry(value=upper, lower=0, upper=upper, blinding=100 + k)
+            self.assertEqual(len(entry.proof.commitments), k)
+            self.assertTrue(
+                verify_range_wide_batch([entry], randbelow=counter_randbelow()),
+                f"k={k}",
+            )
+
+    def test_maximum_width_24_accepted_on_default_prime(self):
+        commitment, blinding = pedersen_commit(123456, 0, (1 << 24) - 1, blinding=77)
+        proof = prove_range_wide(
+            commitment, 123456, blinding, b"w", randbelow=counter_randbelow()
+        )
+        self.assertEqual(len(proof.commitments), 24)
+        entry = WideRangeBatchEntry(commitment, proof, b"w")
+        self.assertTrue(verify_range_wide_batch([entry], randbelow=counter_randbelow()))
+        self.assertTrue(verify_range_wide(commitment, proof, b"w"))
+
+    def test_default_group_parameters_are_usable(self):
+        commitment, blinding = pedersen_commit(40000, 0, 65535, blinding=987654321)
+        proof = prove_range_wide(commitment, 40000, blinding, b"demo")
+        entry = WideRangeBatchEntry(commitment, proof, b"demo")
+        self.assertTrue(verify_range_wide_batch([entry], randbelow=counter_randbelow()))
+
+    # ---- randomness ----------------------------------------------------------
+
+    def test_randbelow_called_twice_per_bit_with_prime_minus_one(self):
+        entries = [self.entry(blinding=1234), self.entry(blinding=4321)]
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(verify_range_wide_batch(entries, randbelow=recording))
+        # width 4 -> 2 OR sub-branches per bit -> 8 draws per entry
+        self.assertEqual(calls, [self.PRIME - 1] * 16)
+
+    def test_mixed_groups_each_checked_under_its_own_parameters(self):
+        small = self.entry()
+        commitment, blinding = pedersen_commit(40, 0, 255, blinding=987654321)
+        proof = prove_range_wide(commitment, 40, blinding, b"ctx")
+        default_entry = WideRangeBatchEntry(commitment, proof, b"ctx")
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(
+            verify_range_wide_batch([small, default_entry], randbelow=recording)
+        )
+        self.assertEqual(sorted(set(calls)), sorted({self.PRIME - 1, DEFAULT_PRIME - 1}))
+        self.assertEqual(len(calls), 8 + 16)  # width 4 + width 8
+
+    def test_fixed_coefficient_source_is_reproducible(self):
+        entries = [self.entry(blinding=1234), self.entry(blinding=4321)]
+        first = verify_range_wide_batch(entries, randbelow=counter_randbelow(9))
+        second = verify_range_wide_batch(entries, randbelow=counter_randbelow(9))
+        self.assertEqual(first, second)
+
+    def test_response_tampering_cannot_hide_inside_the_aggregate(self):
+        # Wide-proof announcements are recomputed from (s, e) and bound by the
+        # transcript, so unlike the stored-t range proof, paired +/-1 response
+        # deltas cannot cancel in the random linear combination: the per-entry
+        # challenge-share sums are checked first and reject both entries.
+        first, second = self.entry(blinding=1234), self.entry(blinding=5555)
+        first_tampered = WideRangeProof(
+            first.proof.commitments,
+            first.proof.challenges,
+            (((first.proof.responses[0][0] + 1) % self.PRIME,
+              first.proof.responses[0][1]),)
+            + first.proof.responses[1:],
+        )
+        second_tampered = WideRangeProof(
+            second.proof.commitments,
+            second.proof.challenges,
+            (((second.proof.responses[0][0] - 1) % (self.PRIME - 1),
+              second.proof.responses[0][1]),)
+            + second.proof.responses[1:],
+        )
+        self.assertFalse(
+            verify_range_wide(first.commitment, first_tampered, b"ctx")
+        )
+        self.assertFalse(
+            verify_range_wide(second.commitment, second_tampered, b"ctx")
+        )
+        forged = [
+            WideRangeBatchEntry(first.commitment, first_tampered, b"ctx"),
+            WideRangeBatchEntry(second.commitment, second_tampered, b"ctx"),
+        ]
+        self.assertFalse(verify_range_wide_batch(forged, randbelow=lambda upper: 0))
+
+    def test_response_tampering_cannot_cancel_across_groups_either(self):
+        # Different (prime, generator, h) groups, paired +/-1 response deltas:
+        # the per-entry transcript checks reject both before any aggregation.
+        first = self.entry(blinding=1234)
+        commitment, blinding = self.commit(5, 0, 15, 333, h=7)
+        other_proof = prove_range_wide(
+            commitment, 5, blinding, b"ctx", randbelow=counter_randbelow()
+        )
+        first_tampered = WideRangeProof(
+            first.proof.commitments,
+            first.proof.challenges,
+            (((first.proof.responses[0][0] + 1), first.proof.responses[0][1]),)
+            + first.proof.responses[1:],
+        )
+        other_tampered = WideRangeProof(
+            other_proof.commitments,
+            other_proof.challenges,
+            (((other_proof.responses[0][0] - 1) % (self.PRIME - 1),
+              other_proof.responses[0][1]),)
+            + other_proof.responses[1:],
+        )
+        forged = [
+            WideRangeBatchEntry(first.commitment, first_tampered, b"ctx"),
+            WideRangeBatchEntry(commitment, other_tampered, b"ctx"),
+        ]
+        self.assertFalse(verify_range_wide_batch(forged, randbelow=lambda upper: 0))
+
+    # ---- rejection: tampering never raises -----------------------------------
+
+    def test_tampering_branch_material_fails(self):
+        entry = self.entry()
+        proof = entry.proof
+        cases = [
+            # response of bit 0, branch 0
+            WideRangeProof(
+                proof.commitments,
+                proof.challenges,
+                ((proof.responses[0][0] + 1, proof.responses[0][1]),)
+                + proof.responses[1:],
+            ),
+            # challenge share of bit 1, branch 1
+            WideRangeProof(
+                proof.commitments,
+                proof.challenges[:1]
+                + (
+                    (
+                        proof.challenges[1][0],
+                        (proof.challenges[1][1] + 1) % self.PRIME,
+                    ),
+                )
+                + proof.challenges[2:],
+                proof.responses,
+            ),
+            # bit commitment of bit 2
+            WideRangeProof(
+                proof.commitments[:2] + ((proof.commitments[2] % (self.PRIME - 1)) + 1,)
+                + proof.commitments[3:],
+                proof.challenges,
+                proof.responses,
+            ),
+        ]
+        for forged in cases:
+            self.assertFalse(
+                verify_range_wide_batch(
+                    [WideRangeBatchEntry(entry.commitment, forged, entry.context)],
+                    randbelow=counter_randbelow(),
+                ),
+                f"batch accepted: {forged!r}",
+            )
+
+    def test_swapping_the_two_or_subbranches_fails(self):
+        entry = self.entry()
+        proof = entry.proof
+
+        def pair_swapped(seq, i=0):
+            data = list(seq)
+            data[i] = (seq[i][1], seq[i][0])
+            return tuple(data)
+
+        forged = WideRangeProof(
+            proof.commitments,
+            pair_swapped(proof.challenges),
+            pair_swapped(proof.responses),
+        )
+        self.assertFalse(
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(entry.commitment, forged, entry.context)],
+                randbelow=counter_randbelow(),
+            )
+        )
+
+    def test_moving_bit_positions_fails(self):
+        entry = self.entry(value=5)  # bits 0 and 2 differ
+        proof = entry.proof
+
+        def swapped(seq, a=0, b=2):
+            data = list(seq)
+            data[a], data[b] = data[b], data[a]
+            return tuple(data)
+
+        forged = WideRangeProof(
+            swapped(proof.commitments),
+            swapped(proof.challenges),
+            swapped(proof.responses),
+        )
+        self.assertFalse(
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(entry.commitment, forged, entry.context)],
+                randbelow=counter_randbelow(),
+            )
+        )
+
+    def test_replacing_one_bit_branch_with_anothers_fails(self):
+        entry = self.entry(value=5)
+        proof = entry.proof
+        forged = WideRangeProof(
+            proof.commitments,
+            proof.challenges[:1] + (proof.challenges[2],) + proof.challenges[2:],
+            proof.responses[:1] + (proof.responses[2],) + proof.responses[2:],
+        )
+        self.assertFalse(
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(entry.commitment, forged, entry.context)],
+                randbelow=counter_randbelow(),
+            )
+        )
+
+    def test_context_binds_proof(self):
+        entry = self.entry(context=b"ctx")
+        for bad_context in (b"", b"other"):
+            bad = WideRangeBatchEntry(entry.commitment, entry.proof, bad_context)
+            self.assertFalse(verify_range_wide_batch([bad], randbelow=counter_randbelow()))
+
+    def test_foreign_commitment_fails(self):
+        entry = self.entry()
+        other, _ = self.commit(value=6, blinding=4321)
+        self.assertFalse(
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(other, entry.proof, entry.context)],
+                randbelow=counter_randbelow(),
+            )
+        )
+        shifted = dataclasses.replace(
+            entry.commitment, element=(entry.commitment.element + 1) % self.PRIME
+        )
+        self.assertFalse(
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(shifted, entry.proof, entry.context)],
+                randbelow=counter_randbelow(),
+            )
+        )
+
+    def test_changed_declared_range_fails(self):
+        entry = self.entry(value=5, lower=0, upper=15)
+        # same range size, shifted lower: width matches but transcript changes
+        shifted = dataclasses.replace(entry.commitment, lower=1, upper=16)
+        self.assertFalse(
+            verify_range_wide(shifted, entry.proof, entry.context)
+        )
+        self.assertFalse(
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(shifted, entry.proof, entry.context)],
+                randbelow=counter_randbelow(),
+            )
+        )
+        # different power-of-two width: tuple lengths no longer match
+        widened = dataclasses.replace(entry.commitment, upper=31)
+        self.assertFalse(
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(widened, entry.proof, entry.context)],
+                randbelow=counter_randbelow(),
+            )
+        )
+
+    def test_non_power_of_two_range_fails(self):
+        commitment, blinding = self.commit(value=0, lower=0, upper=14)  # 15 integers
+        proof = WideRangeProof((), (), ())
+        self.assertFalse(
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(commitment, proof, b"ctx")],
+                randbelow=counter_randbelow(),
+            )
+        )
+
+    def test_single_integer_and_25_bit_ranges_fail(self):
+        commitment, _ = self.commit(value=3, lower=3, upper=3)
+        self.assertFalse(
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(commitment, WideRangeProof((), (), ()), b"ctx")],
+                randbelow=counter_randbelow(),
+            )
+        )
+        big_commitment, _ = pedersen_commit(0, 0, (1 << 25) - 1, blinding=1)
+        honest_commitment, honest_blinding = pedersen_commit(
+            1, 0, (1 << 24) - 1, blinding=2
+        )
+        proof24 = prove_range_wide(
+            honest_commitment, 1, honest_blinding, b"x"
+        )
+        bad = WideRangeBatchEntry(big_commitment, proof24, b"x")
+        self.assertFalse(verify_range_wide_batch([bad], randbelow=counter_randbelow()))
+
+    def test_structural_errors_return_false(self):
+        entry = self.entry()
+        proof = entry.proof
+        k = len(proof.commitments)
+        cases = [
+            WideRangeProof(proof.commitments[:-1], proof.challenges, proof.responses),
+            WideRangeProof(proof.commitments, proof.challenges, proof.responses + (((1, 1),))),
+            WideRangeProof((), (), ()),
+            WideRangeProof(
+                proof.commitments,
+                proof.challenges[:-1] + (((1, 2, 3),)),
+                proof.responses,
+            ),
+        ]
+        for forged in cases:
+            self.assertFalse(
+                verify_range_wide_batch(
+                    [WideRangeBatchEntry(entry.commitment, forged, b"ctx")],
+                    randbelow=counter_randbelow(),
+                )
+            )
+        # pair of the wrong arity is itself a type error when it is not a
+        # tuple-of-integers only at value level; length-2 out-of-range values
+        for bad_share in (-1, self.PRIME):
+            forged = WideRangeProof(
+                proof.commitments,
+                (((bad_share), proof.challenges[0][1]),) + proof.challenges[1:],
+                proof.responses,
+            )
+            self.assertFalse(
+                verify_range_wide_batch(
+                    [WideRangeBatchEntry(entry.commitment, forged, b"ctx")],
+                    randbelow=counter_randbelow(),
+                ),
+                f"share={bad_share}",
+            )
+        for bad_commitment in (0, self.PRIME):
+            forged = WideRangeProof(
+                (bad_commitment,) + proof.commitments[1:],
+                proof.challenges,
+                proof.responses,
+            )
+            self.assertFalse(
+                verify_range_wide_batch(
+                    [WideRangeBatchEntry(entry.commitment, forged, b"ctx")],
+                    randbelow=counter_randbelow(),
+                ),
+                f"commitment={bad_commitment}",
+            )
+        self.assertEqual(k, 4)
+
+    def test_bad_embedded_commitment_parameters_return_false(self):
+        entry = self.entry()
+        for name, value in (
+            ("element", 0),
+            ("prime", 3),
+            ("generator", 1),
+            ("h", self.PRIME),
+            ("lower", 16),
+        ):
+            broken = dataclasses.replace(entry.commitment, **{name: value})
+            bad = WideRangeBatchEntry(broken, entry.proof, entry.context)
+            self.assertFalse(
+                verify_range_wide_batch([bad], randbelow=counter_randbelow()), name
+            )
+
+    def test_invalid_entry_short_circuits_before_drawing(self):
+        entry = self.entry()
+        proof = entry.proof
+        short = WideRangeProof(
+            proof.commitments[:-1], proof.challenges, proof.responses
+        )
+        invalid = WideRangeBatchEntry(entry.commitment, short, entry.context)
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertFalse(
+            verify_range_wide_batch([invalid, entry], randbelow=recording)
+        )
+        self.assertEqual(calls, [])  # the invalid entry is rejected before any draw
+        self.assertFalse(
+            verify_range_wide_batch([entry, invalid], randbelow=recording)
+        )
+        self.assertEqual(calls, [self.PRIME - 1] * 8)  # two draws per bit of entry 1
+
+    def test_one_invalid_entry_in_a_honest_batch_returns_false(self):
+        good = [self.entry(value=v, blinding=100 + v) for v in (1, 7, 15)]
+        other_commitment, _ = self.commit(value=6, blinding=4321)
+        bad = WideRangeBatchEntry(other_commitment, good[0].proof, b"ctx")
+        for position in range(4):
+            batch = good[:position] + [bad] + good[position:]
+            self.assertFalse(
+                verify_range_wide_batch(batch, randbelow=counter_randbelow()),
+                f"position={position}",
+            )
+
+    # ---- type errors --------------------------------------------------------
+
+    def test_sequence_type_errors(self):
+        for bad in ("entries", b"entries", bytearray(b"x"), 42, None):
+            with self.assertRaises(TypeError):
+                verify_range_wide_batch(bad)
+
+    def test_entry_and_field_type_errors(self):
+        entry = self.entry()
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch([(entry.commitment, entry.proof)])
+        with self.assertRaises(TypeError):
+            # RangeBatchEntry is never a WideRangeBatchEntry
+            verify_range_wide_batch(
+                [RangeBatchEntry(entry.commitment, RangeProof((), (), ()), b"ctx")]
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(entry.commitment, entry.proof, "ctx")]
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(entry.commitment, ("c", "e", "s"), b"ctx")]
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch(
+                [WideRangeBatchEntry("commitment", entry.proof, b"ctx")]
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(
+                    (entry.commitment.element, 0, 15, self.PRIME, self.G, self.H),
+                    entry.proof, b"ctx",
+                )]
+            )
+
+    def test_proof_nested_field_type_errors(self):
+        entry = self.entry()
+        proof = entry.proof
+        # non-tuple top level fields
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch([WideRangeBatchEntry(
+                entry.commitment, WideRangeProof(list(proof.commitments), proof.challenges, proof.responses), b"ctx"
+            )])
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch([WideRangeBatchEntry(
+                entry.commitment, WideRangeProof(proof.commitments, list(proof.challenges), proof.responses), b"ctx"
+            )])
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch([WideRangeBatchEntry(
+                entry.commitment, WideRangeProof(proof.commitments, proof.challenges, list(proof.responses)), b"ctx"
+            )])
+        # pairs that are not tuples
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch([WideRangeBatchEntry(
+                entry.commitment,
+                WideRangeProof(proof.commitments, [proof.challenges[0]] + list(proof.challenges[1:]), proof.responses),
+                b"ctx",
+            )])
+        # bool masquerading as an integer, at every nesting level
+        bool_commitments = WideRangeProof((True,) + proof.commitments[1:], proof.challenges, proof.responses)
+        bool_challenges = WideRangeProof(
+            proof.commitments,
+            (((True, proof.challenges[0][1]),) + proof.challenges[1:]),
+            proof.responses,
+        )
+        bool_responses = WideRangeProof(
+            proof.commitments,
+            proof.challenges,
+            (((proof.responses[0][0], True),) + proof.responses[1:]),
+        )
+        for forged in (bool_commitments, bool_challenges, bool_responses):
+            with self.assertRaises(TypeError):
+                verify_range_wide_batch(
+                    [WideRangeBatchEntry(entry.commitment, forged, b"ctx")]
+                )
+        # bool masquerading as a commitment field
+        bad_commitment = dataclasses.replace(entry.commitment, h=True)
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch(
+                [WideRangeBatchEntry(bad_commitment, entry.proof, b"ctx")]
+            )
+
+    def test_preflight_walks_the_whole_batch_and_raises_once(self):
+        good = [self.entry(value=v, blinding=200 + v) for v in (1, 7, 15)]
+        proof = good[0].proof
+        # wrong type in the LAST entry still raises, after the whole walk
+        bad_last = WideRangeBatchEntry(good[0].commitment, proof, "ctx")
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch(good + [bad_last])
+        # every nested wrong type in the last position behaves the same
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch(
+                good
+                + [WideRangeBatchEntry(
+                    good[0].commitment,
+                    WideRangeProof((True,), proof.challenges, proof.responses),
+                    b"ctx",
+                )]
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch(good + ["not-an-entry"])
+        # exactly one TypeError escapes even when several entries are bad
+        with self.assertRaises(TypeError) as ctx:
+            verify_range_wide_batch(["bad-0", "bad-1", 42])
+        self.assertIs(type(ctx.exception), TypeError)
+        self.assertIsNotNone(ctx.exception.args)
+
+    def test_preflight_precedes_randbelow_and_per_entry_checks(self):
+        # a type error surfaces even though the random source is unusable
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch(["not-an-entry"], randbelow=7)
+        # an empty batch preflight succeeds and rejects as False, regardless
+        # of whether the random source is callable
+        self.assertFalse(verify_range_wide_batch([], randbelow=counter_randbelow()))
+
+    def test_coefficient_source_errors(self):
+        entry = self.entry()
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch([entry], randbelow=7)
+        for bad in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                verify_range_wide_batch([entry], randbelow=lambda upper, bad=bad: bad)
+        for bad in (-1, self.PRIME - 1, self.PRIME):
+            with self.assertRaises(ValueError):
+                verify_range_wide_batch([entry], randbelow=lambda upper, bad=bad: bad)
+        # the source is only consulted after the whole-batch preflight
+        def boom(upper):
+            raise AssertionError("randbelow must not be called during preflight")
+
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch(["not-an-entry"], randbelow=boom)
+
+    # ---- hygiene -------------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        entries = [self.entry(blinding=1234), self.entry(blinding=4321)]
+        snapshot = [dataclasses.replace(entry) for entry in entries]
+        sequence_snapshot = list(entries)
+        verify_range_wide_batch(entries, randbelow=counter_randbelow())
+        self.assertEqual(entries, snapshot)
+        self.assertEqual(entries, sequence_snapshot)
+        for entry in entries:
+            self.assertIsInstance(entry.proof.commitments, tuple)
+            self.assertIsInstance(entry.proof.challenges, tuple)
+            self.assertIsInstance(entry.proof.responses, tuple)
 
 
 class RegionProofTest(unittest.TestCase):

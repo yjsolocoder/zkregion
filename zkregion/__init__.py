@@ -15,6 +15,7 @@ PedersenOpeningBatchReplayGuard /
 BoundPedersenOpeningReplayGuard /
 RangeProof / prove_range /
 verify_range / RangeBatchEntry / verify_range_batch / RegionProof /
+WideRangeProof / prove_range_wide / verify_range_wide /
 prove_region / verify_region / region_contains_committed /
 RegionContainsEntry / verify_region_contains_batch /
 BoundRegionContainsBatch / prove_region_contains_bound /
@@ -156,6 +157,7 @@ __all__ = [
     "SingleKeyBoundBatch",
     "SingleKeyBoundReplayGuard",
     "SingleKeyEntryReplayGuard",
+    "WideRangeProof",
     "commit",
     "commit_coordinate",
     "merkle_root",
@@ -172,6 +174,7 @@ __all__ = [
     "prove_pedersen_opening_batch_bound",
     "prove_range",
     "prove_range_batch_bound",
+    "prove_range_wide",
     "prove_region",
     "prove_region_batch_bound",
     "prove_region_contains_bound",
@@ -199,6 +202,7 @@ __all__ = [
     "verify_range",
     "verify_range_batch",
     "verify_range_bound",
+    "verify_range_wide",
     "verify_region",
     "verify_region_batch",
     "verify_region_bound",
@@ -866,6 +870,315 @@ def verify_range(
         left = pow(h, proof.s[i], prime)
         right = proof.t[i] * pow(offset, proof.e[i], prime) % prime
         if left != right:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive Pedersen wide range proofs (bit decomposition)
+#
+# A declared range of exactly 2**k integers (1 <= k <= 24) is proven by
+# decomposing the offset m = value - lower into bits b_0 .. b_{k-1}. The
+# prover commits to each bit as C_i = g**b_i * h**r_i mod prime with
+# sum(2**i * r_i) == blinding (mod prime - 1), so the bit commitments
+# multiply back to the commitment: product(C_i**(2**i)) == element.
+# Each bit is then proven to be 0 or 1 with a Schnorr OR over the two
+# statements D_{i,0} = C_i and D_{i,1} = C_i * generator**(-1) mod prime;
+# the per-bit challenge shares sum to the transcript challenge modulo
+# prime. The announcements are recomputed by the verifier from the
+# challenge shares and responses, so each bit branch stores exactly its
+# commitment, its two challenge shares and its two responses.
+
+_WIDE_RANGE_DOMAIN = b"zkregion/pedersen-range-wide/v1"
+_MAX_WIDE_RANGE_BITS = 24
+
+
+@dataclass(frozen=True)
+class WideRangeProof:
+    """A non-interactive wide range proof over a :class:`PedersenCommitment`.
+
+    ``commitments`` holds the per-bit Pedersen commitments ``C_i`` in bit
+    order (least significant bit first); ``challenges`` and ``responses``
+    hold, per bit, the two challenge shares and the two responses of the
+    Schnorr OR that proves the committed bit to be 0 or 1. All three are
+    tuples of ``k`` entries, where ``k`` is the base-2 bit width of the
+    declared range (the range must contain exactly ``2**k`` integers).
+    """
+
+    commitments: tuple[int, ...]
+    challenges: tuple[tuple[int, int], ...]
+    responses: tuple[tuple[int, int], ...]
+
+
+def _wide_range_challenge(
+    commitment: PedersenCommitment,
+    context: bytes,
+    width: int,
+    commitments: tuple[int, ...],
+    announcements: tuple[tuple[int, int], ...],
+) -> int:
+    """SHA-256 transcript challenge as a big-endian integer mod ``prime``.
+
+    The transcript is the domain separator, the six commitment fields, the
+    context, the bit width ``k`` and, per bit in bit order, the bit
+    commitment ``C_i`` and the two recomputed announcements; each item is
+    prefixed with its four-byte big-endian length and integers are encoded
+    as decimal ASCII, mirroring :func:`_range_challenge`.
+    """
+    fields = (
+        commitment.element,
+        commitment.lower,
+        commitment.upper,
+        commitment.prime,
+        commitment.generator,
+        commitment.h,
+    )
+    items = [_WIDE_RANGE_DOMAIN]
+    items.extend(str(field).encode("ascii") for field in fields)
+    items.append(context)
+    items.append(str(width).encode("ascii"))
+    for bit_commitment, pair in zip(commitments, announcements):
+        items.append(str(bit_commitment).encode("ascii"))
+        items.append(str(pair[0]).encode("ascii"))
+        items.append(str(pair[1]).encode("ascii"))
+    transcript = hashlib.sha256()
+    for item in items:
+        transcript.update(len(item).to_bytes(4, "big"))
+        transcript.update(item)
+    return int.from_bytes(transcript.digest(), "big") % commitment.prime
+
+
+def _wide_range_bit_width(commitment: PedersenCommitment) -> int:
+    """Bit width of the declared range, or 0 if it is not a power of two."""
+    count = commitment.upper - commitment.lower + 1
+    if count < 2:
+        return 0
+    width = count.bit_length() - 1
+    if count != 1 << width:
+        return 0
+    return width
+
+
+def prove_range_wide(
+    commitment: PedersenCommitment,
+    value: int,
+    blinding: int,
+    context: bytes = b"",
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> WideRangeProof:
+    """Prove that ``commitment`` opens at some value inside its declared range.
+
+    The declared range must contain exactly ``2**k`` integers with the
+    base-2 bit width ``k`` between 1 and 24; any other size raises
+    :class:`ValueError`. ``value`` and ``blinding`` must be a valid opening
+    of ``commitment``; the opening is verified with
+    :func:`verify_pedersen_opening` before any proving work happens and a
+    mismatch — including a value outside the declared range — raises
+    :class:`ValueError`, mirroring :func:`prove_range`. Randomness is drawn
+    from ``randbelow`` (default :func:`secrets.randbelow`); a non-callable
+    source or a draw that is not a non-bool integer raises
+    :class:`TypeError`, an out-of-range draw raises :class:`ValueError`.
+    The same inputs under the same random source produce a byte-identical
+    proof. Inputs are never mutated.
+    """
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment")
+    _check_commitment_fields(commitment)
+    _check_int(value, "value")
+    _check_int(blinding, "blinding")
+    _check_bytes(context, "context")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    width = _wide_range_bit_width(commitment)
+    if not 1 <= width <= _MAX_WIDE_RANGE_BITS:
+        raise ValueError(
+            "range must contain exactly 2**k integers with 1 <= k <= "
+            f"{_MAX_WIDE_RANGE_BITS}"
+        )
+    if not verify_pedersen_opening(commitment, value, blinding):
+        raise ValueError("commitment does not open at (value, blinding)")
+    prime = commitment.prime
+    generator = commitment.generator
+    h = commitment.h
+
+    def draw(upper: int) -> int:
+        drawn = randbelow(upper)
+        _check_int(drawn, "randbelow return value")
+        if not 0 <= drawn < upper:
+            raise ValueError(f"randbelow must return a value in [0, {upper})")
+        return drawn
+
+    offset = value - commitment.lower
+    # Bit blindings: r_1 .. r_{k-1} are random, r_0 closes the weighted sum
+    # so sum(2**i * r_i) == blinding (mod prime - 1); its weight is 1, so
+    # the correction is always an integer.
+    bit_blindings = [0] + [draw(prime - 1) for _ in range(width - 1)]
+    bit_blindings[0] = (
+        blinding - sum((1 << i) * r for i, r in enumerate(bit_blindings))
+    ) % (prime - 1)
+    bit_commitments: list[int] = []
+    challenges: list[list[int]] = []
+    responses: list[list[int]] = []
+    announcements: list[list[int]] = []
+    nonces: list[int] = []
+    generator_inverse = pow(generator, -1, prime)
+    for i in range(width):
+        bit = (offset >> i) & 1
+        bit_commitment = (
+            pow(generator, bit, prime) * pow(h, bit_blindings[i], prime) % prime
+        )
+        bit_commitments.append(bit_commitment)
+        simulated = 1 - bit
+        pair_e = [0, 0]
+        pair_s = [0, 0]
+        pair_t = [0, 0]
+        pair_e[simulated] = draw(prime)  # challenge share in [0, prime)
+        pair_s[simulated] = draw(prime - 1)  # response in [0, prime - 1)
+        nonce = draw(prime - 1)  # Schnorr nonce for the real branch
+        nonces.append(nonce)
+        pair_t[bit] = pow(h, nonce, prime)
+        statement = bit_commitment
+        if simulated:
+            statement = statement * generator_inverse % prime
+        pair_t[simulated] = (
+            pow(h, pair_s[simulated], prime)
+            * pow(statement, -pair_e[simulated], prime)
+            % prime
+        )
+        challenges.append(pair_e)
+        responses.append(pair_s)
+        announcements.append(pair_t)
+    challenge = _wide_range_challenge(
+        commitment,
+        context,
+        width,
+        tuple(bit_commitments),
+        tuple(tuple(pair) for pair in announcements),
+    )
+    for i in range(width):
+        bit = (offset >> i) & 1
+        challenges[i][bit] = (challenge - challenges[i][1 - bit]) % prime
+        responses[i][bit] = (
+            nonces[i] + challenges[i][bit] * bit_blindings[i]
+        ) % (prime - 1)
+    return WideRangeProof(
+        commitments=tuple(bit_commitments),
+        challenges=tuple(tuple(pair) for pair in challenges),
+        responses=tuple(tuple(pair) for pair in responses),
+    )
+
+
+def verify_range_wide(
+    commitment: PedersenCommitment,
+    proof: WideRangeProof,
+    context: bytes = b"",
+) -> bool:
+    """Verify a :class:`WideRangeProof` against ``commitment`` and ``context``.
+
+    The declared range must contain exactly ``2**k`` integers with
+    ``1 <= k <= 24``; any other size returns ``False``. The bit commitments
+    must multiply back to the commitment
+    (``product(C_i**(2**i)) == element mod prime``) and, per bit, the two
+    announcements are recomputed as ``h**s == t * D**e (mod prime)`` with
+    ``D`` the bit commitment or the bit commitment divided by
+    ``generator``; the two challenge shares of every bit must sum to the
+    transcript challenge modulo ``prime``. Type errors (wrong object,
+    non-tuple or non-integer proof fields at any nesting level — including
+    ``bool`` integers — or a non-bytes context) raise :class:`TypeError`;
+    any other invalid structure, tampering, branch reordering or binding
+    mismatch returns ``False``. Inputs are never mutated.
+    """
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment")
+    _check_commitment_fields(commitment)
+    if not isinstance(proof, WideRangeProof):
+        raise TypeError("proof must be a WideRangeProof")
+    if not isinstance(proof.commitments, tuple):
+        raise TypeError("proof commitments must be a tuple of integers")
+    for item in proof.commitments:
+        _check_int(item, "proof commitments entry")
+    for field_name in ("challenges", "responses"):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(f"proof {field_name} must be a tuple of integer pairs")
+        for pair in field:
+            if not isinstance(pair, tuple):
+                raise TypeError(f"proof {field_name} entry must be a tuple of integers")
+            for item in pair:
+                _check_int(item, f"proof {field_name} entry item")
+    _check_bytes(context, "context")
+    prime = commitment.prime
+    if prime <= 3:
+        return False
+    if not 1 < commitment.generator < prime or not 1 < commitment.h < prime:
+        return False
+    if not 0 < commitment.element < prime:
+        return False
+    if commitment.lower > commitment.upper:
+        return False
+    if commitment.upper - commitment.lower >= prime - 1:
+        return False
+    width = _wide_range_bit_width(commitment)
+    if not 1 <= width <= _MAX_WIDE_RANGE_BITS:
+        return False
+    if not (
+        len(proof.commitments) == len(proof.challenges) == len(proof.responses) == width
+    ):
+        return False
+    if any(len(pair) != 2 for pair in proof.challenges):
+        return False
+    if any(len(pair) != 2 for pair in proof.responses):
+        return False
+    if any(not 1 <= c_i < prime for c_i in proof.commitments):
+        return False
+    if any(
+        not 0 <= share < prime for pair in proof.challenges for share in pair
+    ):
+        return False
+    if any(
+        not 0 <= response < prime - 1
+        for pair in proof.responses
+        for response in pair
+    ):
+        return False
+    product = 1
+    for i, bit_commitment in enumerate(proof.commitments):
+        product = product * pow(bit_commitment, 1 << i, prime) % prime
+    if product != commitment.element:
+        return False
+    generator = commitment.generator
+    h = commitment.h
+    try:
+        generator_inverse = pow(generator, -1, prime)
+    except ValueError:
+        return False  # generator not invertible modulo prime
+    announcements: list[tuple[int, int]] = []
+    for i in range(width):
+        pair: list[int] = []
+        for branch in (0, 1):
+            statement = proof.commitments[i]
+            if branch:
+                statement = statement * generator_inverse % prime
+            try:
+                announcement = (
+                    pow(h, proof.responses[i][branch], prime)
+                    * pow(statement, -proof.challenges[i][branch], prime)
+                    % prime
+                )
+            except ValueError:
+                return False  # statement not invertible modulo prime
+            pair.append(announcement)
+        announcements.append((pair[0], pair[1]))
+    challenge = _wide_range_challenge(
+        commitment,
+        context,
+        width,
+        proof.commitments,
+        tuple(announcements),
+    )
+    for pair_e in proof.challenges:
+        if (pair_e[0] + pair_e[1]) % prime != challenge:
             return False
     return True
 

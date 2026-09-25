@@ -50,6 +50,7 @@ from zkregion import (
     PedersenCommitment,
     PedersenOpeningBatchEntry,
     PedersenOpeningBatchReplayGuard,
+    PedersenOpeningReplayGuard,
     RangeBatchEntry,
     RangeBatchReplayGuard,
     RangeProof,
@@ -25153,6 +25154,646 @@ class OpeningReplayGuardTest(unittest.TestCase):
 
         def attempt():
             won = OpeningReplayGuard(store=store).check(entry, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+        store.close()
+
+
+class PedersenOpeningReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for one Pedersen opening entry."""
+
+    DOMAIN = b"zr/porr/v1"
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "porr.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def entry(self, value=50, lower=0, upper=100, blinding=1234, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        commitment, r = pedersen_commit(
+            value, lower, upper, blinding=blinding, **kwargs
+        )
+        return PedersenOpeningBatchEntry(commitment, value, r)
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def entry_with(self, **changes):
+        return dataclasses.replace(self.entry(), **changes)
+
+    @staticmethod
+    def expected_digest(entry, session_id, expires_at=None):
+        def frame(item):
+            return len(item).to_bytes(4, "big") + item
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = (
+            frame(b"zr/porr/v1") + frame(session_id)
+            + bound_pedersen_opening_leaf(entry) + frame(expiry)
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(entry, b"s1"))
+        binding = guard.bind_once(entry, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(binding.digest, self.expected_digest(entry, b"s2", 1000))
+
+    def test_digest_reuses_bound_batch_outer_leaf(self):
+        import zkregion
+
+        entry = self.entry()
+        binding = PedersenOpeningReplayGuard().bind_once(entry, b"s")
+        self.assertEqual(
+            binding.digest,
+            hashlib.sha256(
+                len(b"zr/porr/v1").to_bytes(4, "big") + b"zr/porr/v1"
+                + len(b"s").to_bytes(4, "big") + b"s"
+                + zkregion._bound_pedersen_opening_leaf(entry)
+                + len(b"\x00").to_bytes(4, "big") + b"\x00"
+            ).digest(),
+        )
+
+    def test_domain_separator_is_distinct(self):
+        entry = self.entry()
+        binding = PedersenOpeningReplayGuard().bind_once(entry, b"s")
+
+        def frame(item):
+            return len(item).to_bytes(4, "big") + item
+
+        framing = frame(b"s") + bound_pedersen_opening_leaf(entry) + frame(b"\x00")
+        for other_domain in (
+            b"zr/pobr/v1", b"zr/pbobr/v1", b"zr/orr/v1", b"zr/r/v1"
+        ):
+            self.assertNotEqual(
+                binding.digest,
+                hashlib.sha256(frame(other_domain) + framing).digest(),
+            )
+
+    def test_digest_binds_every_component(self):
+        entry = self.entry()
+        commitment = entry.commitment
+
+        def bind(item=entry, s=b"s", **kw):
+            return PedersenOpeningReplayGuard().bind_once(item, s, **kw).digest
+
+        base = bind()
+        self.assertNotEqual(base, bind(s=b"other"))
+        self.assertNotEqual(base, bind(expires_at=1))
+        self.assertNotEqual(bind(expires_at=1), bind(expires_at=2))
+        self.assertNotEqual(base, bind(self.entry_with(value=entry.value + 1)))
+        self.assertNotEqual(
+            base, bind(self.entry_with(blinding=entry.blinding + 1))
+        )
+        for field in ("element", "lower", "upper", "prime", "generator", "h"):
+            tampered_commitment = dataclasses.replace(
+                commitment, **{field: getattr(commitment, field) + 1}
+            )
+            self.assertNotEqual(
+                base, bind(self.entry_with(commitment=tampered_commitment)), field
+            )
+
+    def test_negative_integers_frame_and_verify(self):
+        entry = self.entry(-3, -10, 10, blinding=77)
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding, now=1))
+        self.assertFalse(guard.check(entry, binding, now=1))
+        positive = PedersenOpeningReplayGuard().bind_once(
+            self.entry(3, 0, 10, blinding=77), b"s"
+        )
+        negative = PedersenOpeningReplayGuard().bind_once(entry, b"s")
+        self.assertNotEqual(positive.digest, negative.digest)
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        entry = self.entry()
+        none_binding = PedersenOpeningReplayGuard().bind_once(entry, b"a")
+        zero_binding = PedersenOpeningReplayGuard().bind_once(entry, b"b", expires_at=0)
+        one_binding = PedersenOpeningReplayGuard().bind_once(entry, b"c", expires_at=1)
+        digests = {none_binding.digest, zero_binding.digest, one_binding.digest}
+        self.assertEqual(len(digests), 3)
+
+    # ---- bind_once state and validation -------------------------------------
+
+    def test_pending_claimed_and_consumed_ids_cannot_be_rebound(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        guard.bind_once(entry, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+        binding = guard.bind_once(entry, b"t")
+        self.assertTrue(guard._registry.claim(b"t", binding))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"t")
+        guard._registry.release(b"t")
+        self.assertTrue(guard.check(entry, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"t")
+
+    def test_distinct_session_ids_are_independent(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        first = guard.bind_once(entry, b"s1")
+        second = guard.bind_once(entry, b"s2")
+        self.assertNotEqual(first, second)
+        self.assertTrue(guard.check(entry, first, now=1))
+        self.assertFalse(guard.check(entry, first, now=1))
+        self.assertTrue(guard.check(entry, second, now=1))
+
+    def test_bind_type_errors(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        for bad in ("entry", 7, None, True, object(), 1.5, b"raw", [entry]):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(bad, b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entry, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entry, b"s", expires_at=bad)
+
+    def test_bind_nested_field_type_errors(self):
+        guard = PedersenOpeningReplayGuard()
+        commitment = self.entry().commitment
+        bad_entries = [
+            self.entry_with(commitment=object()),
+            self.entry_with(value=True),
+            self.entry_with(value=1.5),
+            self.entry_with(value="50"),
+            self.entry_with(blinding=False),
+            self.entry_with(blinding="1234"),
+        ]
+        for field in ("element", "lower", "upper", "prime", "generator", "h"):
+            bad_entries.append(
+                self.entry_with(
+                    commitment=dataclasses.replace(commitment, **{field: True})
+                )
+            )
+            bad_entries.append(
+                self.entry_with(
+                    commitment=dataclasses.replace(commitment, **{field: 1.5})
+                )
+            )
+        for bad in bad_entries:
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(bad, b"s")
+
+    def test_bind_value_errors(self):
+        entry = self.entry()
+        with self.assertRaises(ValueError):
+            PedersenOpeningReplayGuard().bind_once(entry, b"")
+        for bad_expiry in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                PedersenOpeningReplayGuard().bind_once(
+                    entry, b"s", expires_at=bad_expiry
+                )
+
+    def test_construction_rejects_non_store(self):
+        for bad in (object(), "path", 1, True, b"ns", {}):
+            with self.assertRaises(TypeError):
+                PedersenOpeningReplayGuard(store=bad)
+
+    # ---- check: accept, reject, consume -------------------------------------
+
+    def test_check_accepts_then_consumes_first_true_second_false(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entry, binding, now=999))   # 首次判真
+        self.assertFalse(guard.check(entry, binding, now=999))  # 二次判假
+        self.assertEqual(guard._consumed, {b"s"})
+        self.assertNotIn(b"s", guard._pending)
+
+    def test_check_with_default_now(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding))
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s", expires_at=10**12)
+        self.assertTrue(guard.check(entry, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding, now=0))
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding, now=2**64 - 1))
+
+    def test_expiry_boundary_is_inclusive(self):
+        entry = self.entry()
+        for now in (1000, 1001, 2**64 - 1):
+            guard = PedersenOpeningReplayGuard()
+            binding = guard.bind_once(entry, b"s", expires_at=1000)
+            self.assertFalse(guard.check(entry, binding, now=now))
+            self.assertIn(b"s", guard._pending)
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entry, binding, now=999))
+
+    def test_substituted_entry_rejected_without_consuming(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        for bad in (
+            self.entry_with(value=entry.value + 1),
+            self.entry_with(blinding=entry.blinding + 1),
+        ):
+            self.assertFalse(guard.check(bad, binding, now=1))
+            self.assertIn(b"s", guard._pending)
+        commitment = entry.commitment
+        tampered_commitment = dataclasses.replace(
+            commitment, element=commitment.element + 1
+        )
+        self.assertFalse(
+            guard.check(self.entry_with(commitment=tampered_commitment), binding, now=1)
+        )
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    def test_bound_but_unverifiable_entry_rejected_and_restored(self):
+        entry = self.entry()
+        forged = PedersenOpeningBatchEntry(
+            entry.commitment, entry.value, entry.blinding + 1
+        )
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(forged, b"s")
+        self.assertFalse(guard.check(forged, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        with self.assertRaises(ValueError):
+            guard.bind_once(forged, b"s")
+
+    def test_rejected_id_can_succeed_once_later(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        wrong = self.entry_with(value=entry.value + 1)
+        self.assertFalse(guard.check(wrong, binding, now=10**9))
+        self.assertTrue(guard.check(entry, binding, now=10**9))
+        self.assertFalse(guard.check(entry, binding, now=10**9))
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        self.assertFalse(
+            guard.check(entry, ReplayBinding(b"never", b"\x00" * 32), now=1)
+        )
+        binding = guard.bind_once(entry, b"s")
+        foreign = PedersenOpeningReplayGuard().bind_once(entry, b"s")
+        self.assertEqual(foreign, binding)
+        self.assertFalse(
+            PedersenOpeningReplayGuard().check(entry, foreign, now=1)
+        )
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        guard.bind_once(entry, b"s")
+        forged = ReplayBinding(b"s", b"\x01" * 32)  # 换绑判假
+        self.assertFalse(guard._registry.claim(b"s", forged))
+        self.assertFalse(guard.check(entry, forged, now=1))
+        self.assertIn(b"s", guard._pending)
+
+    def test_instances_are_independent(self):
+        entry = self.entry()
+        first = PedersenOpeningReplayGuard()
+        second = PedersenOpeningReplayGuard()
+        binding = first.bind_once(entry, b"s")
+        self.assertFalse(second.check(entry, binding, now=1))
+        self.assertTrue(first.check(entry, binding, now=1))
+
+    def test_delegation_error_propagates_and_restores_pending(self):
+        import zkregion
+
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        original = zkregion.verify_pedersen_opening
+
+        def boom(_commitment, _value, _blinding):
+            raise RuntimeError("boom")
+
+        zkregion.verify_pedersen_opening = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entry, binding, now=1)
+        finally:
+            zkregion.verify_pedersen_opening = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    def test_concurrent_checks_have_exactly_one_winner(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = guard.check(entry, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+
+    def test_slow_check_of_one_id_does_not_block_other_ids(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        slow_binding = guard.bind_once(entry, b"slow")
+        guard.bind_once(entry, b"fast")
+        entered = threading.Event()
+        release = threading.Event()
+        outcomes = []
+
+        import zkregion
+        original = zkregion.verify_pedersen_opening
+        state = {"slow_pending": True}
+
+        def slow_verify(commitment, value, blinding):
+            if state["slow_pending"]:
+                state["slow_pending"] = False
+                entered.set()
+                release.wait(timeout=5)
+            return original(commitment, value, blinding)
+
+        def slow():
+            outcomes.append(("slow", guard.check(entry, slow_binding, now=1)))
+
+        zkregion.verify_pedersen_opening = slow_verify
+        try:
+            thread = threading.Thread(target=slow)
+            thread.start()
+            self.assertTrue(entered.wait(timeout=5))
+            fast = guard.check(entry, guard._pending[b"fast"], now=1)
+            self.assertTrue(fast)
+            release.set()
+            thread.join()
+        finally:
+            zkregion.verify_pedersen_opening = original
+        self.assertIn(("slow", True), outcomes)
+
+    # ---- check argument validation ------------------------------------------
+
+    def test_check_type_errors(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        for bad in ("entry", 7, None, True, object(), 1.5, b"raw", [entry]):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.check(bad, binding, now=1)
+        for bad in (7, None, True, "binding", (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(entry, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(entry, binding, now=bad)
+
+    def test_check_nested_field_type_errors(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        commitment = entry.commitment
+        bad_entries = [
+            self.entry_with(commitment=object()),
+            self.entry_with(value=True),
+            self.entry_with(value=1.5),
+            self.entry_with(blinding=False),
+            self.entry_with(blinding="1234"),
+        ]
+        for field in ("element", "lower", "upper", "prime", "generator", "h"):
+            bad_entries.append(
+                self.entry_with(
+                    commitment=dataclasses.replace(commitment, **{field: True})
+                )
+            )
+        for bad in bad_entries:
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.check(bad, binding, now=1)
+        self.assertIn(b"s", guard._pending)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(entry, binding, now=bad)
+
+    def test_inputs_are_not_mutated(self):
+        entry = self.entry()
+        guard = PedersenOpeningReplayGuard()
+        snapshot = (
+            tuple(
+                getattr(entry.commitment, name)
+                for name in ("element", "lower", "upper", "prime", "generator", "h")
+            ),
+            entry.value,
+            entry.blinding,
+        )
+        binding = guard.bind_once(entry, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        self.assertTrue(guard.check(entry, binding, now=1))
+        current = (
+            tuple(
+                getattr(entry.commitment, name)
+                for name in ("element", "lower", "upper", "prime", "generator", "h")
+            ),
+            entry.value,
+            entry.blinding,
+        )
+        self.assertEqual(current, snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        entry = self.entry()
+        store = self.make_store()
+        binder = PedersenOpeningReplayGuard(store=store)
+        binding = binder.bind_once(entry, b"s", expires_at=1000)
+        checker = PedersenOpeningReplayGuard(store=store)
+        self.assertTrue(checker.check(entry, binding, now=999))
+        self.assertFalse(binder.check(entry, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        entry = self.entry()
+        store = self.make_store()
+        binding = PedersenOpeningReplayGuard(store=store).bind_once(entry, b"s")
+        store.close()
+        reopened = self.make_store()
+        guard = PedersenOpeningReplayGuard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = PedersenOpeningReplayGuard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(entry, b"s")
+        reopened_again.close()
+
+    def test_store_domain_isolation_from_pedersen_batch_guard(self):
+        entry = self.entry()
+        store = self.make_store()
+        single_guard = PedersenOpeningReplayGuard(store=store)
+        batch_guard = PedersenOpeningBatchReplayGuard(store=store)
+        single_binding = single_guard.bind_once(entry, b"same-id")
+        batch_binding = batch_guard.bind_once([entry], b"same-id")
+        self.assertTrue(single_guard.check(entry, single_binding, now=1))
+        self.assertTrue(batch_guard.check([entry], batch_binding, now=1))
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/pobr/v1", domains)
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        entry = self.entry()
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = PedersenOpeningReplayGuard(store=first).bind_once(entry, b"s")
+        self.assertFalse(
+            PedersenOpeningReplayGuard(store=second).check(entry, binding_a, now=1)
+        )
+        self.assertTrue(
+            PedersenOpeningReplayGuard(store=first).check(entry, binding_a, now=1)
+        )
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        entry = self.entry()
+        store = self.make_store()
+        binder = PedersenOpeningReplayGuard(store=store)
+        binding = binder.bind_once(entry, b"s")
+        checker = PedersenOpeningReplayGuard(store=store)
+        wrong = self.entry_with(value=entry.value + 1)
+        self.assertFalse(checker.check(wrong, binding, now=1))
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(
+            PedersenOpeningReplayGuard(store=store).check(entry, binding, now=1)
+        )
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        entry = self.entry()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = PedersenOpeningReplayGuard(store=store)
+        binding = guard.bind_once(entry, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):  # live claim cannot be rebound
+            guard.bind_once(entry, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):  # expired claim still cannot be rebound
+            guard.bind_once(entry, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):  # consumed id can never be rebound
+            guard.bind_once(entry, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        entry = self.entry()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = PedersenOpeningReplayGuard(store=store).bind_once(entry, b"s")
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+    def test_store_delegation_error_restores_pending(self):
+        import zkregion
+
+        entry = self.entry()
+        store = self.make_store()
+        guard = PedersenOpeningReplayGuard(store=store)
+        binding = guard.bind_once(entry, b"s")
+        original = zkregion.verify_pedersen_opening
+
+        def boom(_commitment, _value, _blinding):
+            raise RuntimeError("boom")
+
+        zkregion.verify_pedersen_opening = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entry, binding, now=1)
+        finally:
+            zkregion.verify_pedersen_opening = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            PedersenOpeningReplayGuard(store=store).check(entry, binding, now=1)
+        )
+        store.close()
+
+    def test_store_concurrent_checks_have_exactly_one_winner(self):
+        entry = self.entry()
+        store = self.make_store()
+        binding = PedersenOpeningReplayGuard(store=store).bind_once(entry, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = PedersenOpeningReplayGuard(store=store).check(
+                entry, binding, now=1
+            )
             with lock:
                 results.append(won)
 

@@ -46,6 +46,7 @@ from zkregion import (
     MultiSchnorrEntry,
     OpeningBatchEntry,
     OpeningBatchReplayGuard,
+    OpeningReplayGuard,
     PedersenCommitment,
     PedersenOpeningBatchEntry,
     PedersenOpeningBatchReplayGuard,
@@ -27853,6 +27854,596 @@ class RegionContainsReplayGuardTest(unittest.TestCase):
 
         def attempt():
             won = RegionContainsReplayGuard(store=store).check(entry, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+        store.close()
+
+
+class OpeningReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for one hash-commitment opening entry."""
+
+    DOMAIN = b"zr/orr/v1"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "orr.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def entry(self, value=b"alpha", *, nonce=None):
+        if nonce is None:
+            commitment, chosen = commit(value)
+        else:
+            commitment, chosen = commit(value, nonce=nonce)
+        return OpeningBatchEntry(commitment, value, chosen)
+
+    def entry_with(self, **changes):
+        return dataclasses.replace(self.entry(), **changes)
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def expected_digest(self, entry, session_id, expires_at=None):
+        def frame(item):
+            return len(item).to_bytes(4, "big") + item
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = (
+            frame(self.DOMAIN) + frame(session_id)
+            + frame(b"zkregion/ob/v1")
+            + frame(entry.commitment) + frame(entry.value) + frame(entry.nonce)
+            + frame(expiry)
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(entry, b"s1"))
+        binding = guard.bind_once(entry, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(binding.digest, self.expected_digest(entry, b"s2", 1000))
+
+    def test_leaf_reuses_bound_opening_outer_leaf(self):
+        import zkregion
+
+        entry = self.entry()
+        binding = OpeningReplayGuard().bind_once(entry, b"s")
+        self.assertEqual(
+            binding.digest,
+            hashlib.sha256(
+                zkregion._frame_length_prefixed(self.DOMAIN)
+                + zkregion._frame_length_prefixed(b"s")
+                + zkregion._bound_opening_leaf(entry)
+                + zkregion._frame_length_prefixed(b"\x00")
+            ).digest(),
+        )
+
+    def test_domain_separator_is_distinct(self):
+        entry = self.entry()
+        self.assertEqual(
+            OpeningReplayGuard().bind_once(entry, b"s").digest,
+            self.expected_digest(entry, b"s"),
+        )
+        for other_domain in (b"zr/obr/v1", b"zr/bobr/v1", b"zr/r/v1"):
+            self.assertNotEqual(
+                OpeningReplayGuard().bind_once(entry, b"s").digest,
+                hashlib.sha256(
+                    len(other_domain).to_bytes(4, "big") + other_domain
+                    + len(b"s").to_bytes(4, "big") + b"s"
+                    + len(b"zkregion/ob/v1").to_bytes(4, "big") + b"zkregion/ob/v1"
+                    + len(entry.commitment).to_bytes(4, "big") + entry.commitment
+                    + len(entry.value).to_bytes(4, "big") + entry.value
+                    + len(entry.nonce).to_bytes(4, "big") + entry.nonce
+                    + len(b"\x00").to_bytes(4, "big") + b"\x00"
+                ).digest(),
+            )
+
+    def test_digest_binds_every_component(self):
+        entry = self.entry(b"alpha")
+        guard = OpeningReplayGuard()
+        base = guard.bind_once(entry, b"s")
+        self.assertNotEqual(base.digest, self.expected_digest(entry, b"other"))
+        self.assertNotEqual(base.digest, self.expected_digest(entry, b"s", 1))
+        self.assertNotEqual(
+            base.digest, self.expected_digest(self.entry(b"beta"), b"s")
+        )
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(self.entry_with(commitment=b"\x00" * 32), b"s"),
+        )
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(self.entry_with(nonce=b"\x00" * 16), b"s"),
+        )
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        entry = self.entry()
+        no_expiry = OpeningReplayGuard().bind_once(entry, b"s")
+        with_expiry = OpeningReplayGuard().bind_once(entry, b"s", expires_at=0)
+        later = OpeningReplayGuard().bind_once(entry, b"s", expires_at=1)
+        self.assertNotEqual(no_expiry.digest, with_expiry.digest)
+        self.assertNotEqual(with_expiry.digest, later.digest)
+
+    def test_pending_and_consumed_ids_cannot_be_rebound(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        guard.bind_once(entry, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+        binding = guard.bind_once(entry, b"t")
+        self.assertTrue(guard.check(entry, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"t")
+
+    def test_distinct_session_ids_are_independent(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        first = guard.bind_once(entry, b"s1")
+        second = guard.bind_once(entry, b"s2")
+        self.assertNotEqual(first, second)
+        self.assertTrue(guard.check(entry, first, now=1))
+        self.assertTrue(guard.check(entry, second, now=1))
+
+    def test_bind_once_type_errors(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        for bad in ("entry", 7, None, True, object()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(bad, b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entry, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entry, b"s", expires_at=bad)
+
+    def test_bind_once_nested_type_errors(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        for bad_entry in (
+            dataclasses.replace(entry, commitment="c"),
+            dataclasses.replace(entry, value=7),
+            dataclasses.replace(entry, nonce=bytearray(entry.nonce)),
+        ):
+            with self.assertRaises(TypeError, msg=repr(bad_entry)):
+                guard.bind_once(bad_entry, b"s")
+
+    def test_bind_once_value_errors(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.bind_once(entry, b"s", expires_at=bad)
+
+    def test_store_argument_type_error(self):
+        with self.assertRaises(TypeError):
+            OpeningReplayGuard(store="store")
+        with self.assertRaises(TypeError):
+            OpeningReplayGuard(store=object())
+
+    # ---- honest check and single use ----------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entry, binding, now=999))
+        # the consumed id is rejected and cannot be replayed
+        self.assertFalse(guard.check(entry, binding, now=999))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+
+    def test_check_without_expiry_ignores_now(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding, now=0))
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding, now=2**64 - 1))
+
+    def test_check_with_default_now(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding))
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s", expires_at=10**12)
+        self.assertTrue(guard.check(entry, binding))
+
+    def test_expiry_boundary_is_inclusive(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s1", expires_at=1000)
+        self.assertTrue(guard.check(entry, binding, now=999))
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s2", expires_at=1000)
+        self.assertFalse(guard.check(entry, binding, now=1000))
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s3", expires_at=1000)
+        self.assertFalse(guard.check(entry, binding, now=1001))
+
+    # ---- rejection never consumes -------------------------------------------
+
+    def test_expired_rejection_does_not_consume(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s", expires_at=1000)
+        self.assertFalse(guard.check(entry, binding, now=2000))
+        # still pending: an earlier clock succeeds and consumes it
+        self.assertTrue(guard.check(entry, binding, now=999))
+        self.assertFalse(guard.check(entry, binding, now=999))
+
+    def test_bad_opening_rejection_does_not_consume(self):
+        entry = self.entry()
+        bad = dataclasses.replace(entry, value=b"other")
+        self.assertFalse(verify_opening(bad.commitment, bad.value, bad.nonce))
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(bad, b"s")
+        self.assertFalse(guard.check(bad, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        with self.assertRaises(ValueError):
+            guard.bind_once(bad, b"s")
+
+    def test_entry_mismatch_rejection_does_not_consume(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        for changed in (
+            dataclasses.replace(entry, value=b"other"),
+            dataclasses.replace(entry, commitment=b"\x00" * 32),
+            dataclasses.replace(entry, nonce=b"\x01" * 16),
+        ):
+            self.assertFalse(guard.check(changed, binding, now=1))
+        # the originally bound entry still verifies once
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        guard.bind_once(entry, b"local")
+        foreign = OpeningReplayGuard().bind_once(entry, b"elsewhere")
+        self.assertFalse(guard.check(entry, foreign, now=1))
+        equal = OpeningReplayGuard().bind_once(entry, b"local")
+        self.assertTrue(guard.check(entry, equal, now=1))
+        unknown = ReplayBinding(b"never-bound", b"\x00" * 32)
+        self.assertFalse(guard.check(entry, unknown, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        guard.bind_once(entry, b"s")
+        forged_digest = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(guard.check(entry, forged_digest, now=1))
+        self.assertIn(b"s", guard._pending)
+        forged_expiry = ReplayBinding(
+            b"s", self.expected_digest(entry, b"s", 1), 1
+        )
+        self.assertFalse(guard.check(entry, forged_expiry, now=0))
+        self.assertIn(b"s", guard._pending)
+
+    def test_cross_guard_binding_rejected(self):
+        entry = self.entry()
+        # an opening-batch-guard binding for the same id is not an
+        # opening-guard binding: the batch S framing differs from the raw
+        # BoundOpening leaf framing
+        single = OpeningReplayGuard().bind_once(entry, b"s")
+        batch = OpeningBatchReplayGuard().bind_once([entry], b"s")
+        self.assertNotEqual(single.digest, batch.digest)
+        guard = OpeningReplayGuard()
+        guard.bind_once(entry, b"s")
+        self.assertFalse(guard.check(entry, batch, now=1))
+
+    def test_instances_are_independent(self):
+        entry = self.entry()
+        first = OpeningReplayGuard()
+        second = OpeningReplayGuard()
+        binding = first.bind_once(entry, b"s")
+        self.assertFalse(second.check(entry, binding, now=1))
+        # the rejected foreign check did not touch the first guard
+        self.assertTrue(first.check(entry, binding, now=1))
+
+    def test_delegation_error_propagates_and_restores_pending(self):
+        import zkregion
+
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        original = zkregion.verify_opening
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        zkregion.verify_opening = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entry, binding, now=1)
+        finally:
+            zkregion.verify_opening = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    def test_concurrent_checks_have_exactly_one_winner(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = guard.check(entry, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+
+    def test_slow_check_for_one_id_does_not_block_other_ids(self):
+        import zkregion
+
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        first_binding = guard.bind_once(entry, b"slow")
+        second_binding = guard.bind_once(entry, b"fast")
+        original = zkregion.verify_opening
+        entered = threading.Event()
+        proceed = threading.Event()
+
+        def slow(commitment, value, nonce):
+            entered.set()
+            proceed.wait(2)
+            return original(commitment, value, nonce)
+
+        zkregion.verify_opening = slow
+        try:
+            thread = threading.Thread(
+                target=lambda: guard.check(entry, first_binding, now=1)
+            )
+            thread.start()
+            self.assertTrue(entered.wait(2))
+            # while the first id is mid-check, registering a third id and
+            # claiming the second never block on the per-id registry state
+            third_binding = guard.bind_once(entry, b"third")
+            self.assertFalse(guard._registry.claim(b"never", second_binding))
+            proceed.set()
+            thread.join()
+        finally:
+            zkregion.verify_opening = original
+        self.assertTrue(guard.check(entry, second_binding, now=1))
+        self.assertTrue(guard.check(entry, third_binding, now=1))
+
+    # ---- check argument validation ------------------------------------------
+
+    def test_check_type_errors(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        for bad in ("entry", 7, None, True, object()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.check(bad, binding, now=1)
+        for bad in (7, None, True, "binding", (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(entry, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(entry, binding, now=bad)
+
+    def test_check_nested_type_errors(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        for changed in (
+            dataclasses.replace(entry, commitment="c"),
+            dataclasses.replace(entry, value=7),
+        ):
+            with self.assertRaises(TypeError):
+                guard.check(changed, binding, now=1)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        binding = guard.bind_once(entry, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(entry, binding, now=bad)
+
+    def test_inputs_are_not_mutated(self):
+        entry = self.entry()
+        guard = OpeningReplayGuard()
+        snapshot = dataclasses.replace(entry)
+        binding = guard.bind_once(entry, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        self.assertTrue(guard.check(entry, binding, now=1))
+        self.assertEqual(entry, snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        entry = self.entry()
+        store = self.make_store()
+        binder = OpeningReplayGuard(store=store)
+        binding = binder.bind_once(entry, b"s", expires_at=1000)
+        checker = OpeningReplayGuard(store=store)
+        self.assertTrue(checker.check(entry, binding, now=999))
+        self.assertFalse(binder.check(entry, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        entry = self.entry()
+        store = self.make_store()
+        binding = OpeningReplayGuard(store=store).bind_once(entry, b"s")
+        store.close()
+        reopened = self.make_store()
+        guard = OpeningReplayGuard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = OpeningReplayGuard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(entry, b"s")
+        reopened_again.close()
+
+    def test_store_domain_isolation_from_other_opening_guards(self):
+        entry = self.entry()
+        store = self.make_store()
+        single_guard = OpeningReplayGuard(store=store)
+        batch_guard = OpeningBatchReplayGuard(store=store)
+        bound_guard = BoundOpeningReplayGuard(store=store)
+        single_binding = single_guard.bind_once(entry, b"same-id")
+        batch_binding = batch_guard.bind_once([entry], b"same-id")
+        batch, root = prove_opening_batch_bound([entry])
+        bound_binding = bound_guard.bind_once(batch, root, b"same-id")
+        self.assertEqual(
+            len({single_binding.digest, batch_binding.digest, bound_binding.digest}),
+            3,
+        )
+        self.assertTrue(single_guard.check(entry, single_binding, now=1))
+        self.assertTrue(batch_guard.check([entry], batch_binding, now=1))
+        self.assertTrue(bound_guard.check(batch, root, bound_binding, now=1))
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/obr/v1", domains)
+        self.assertIn(b"zr/bobr/v1", domains)
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        entry = self.entry()
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = OpeningReplayGuard(store=first).bind_once(entry, b"s")
+        self.assertFalse(
+            OpeningReplayGuard(store=second).check(entry, binding_a, now=1)
+        )
+        self.assertTrue(
+            OpeningReplayGuard(store=first).check(entry, binding_a, now=1)
+        )
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        entry = self.entry()
+        store = self.make_store()
+        binder = OpeningReplayGuard(store=store)
+        binding = binder.bind_once(entry, b"s")
+        checker = OpeningReplayGuard(store=store)
+        self.assertFalse(
+            checker.check(dataclasses.replace(entry, value=b"other"), binding, now=1)
+        )
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(
+            OpeningReplayGuard(store=store).check(entry, binding, now=1)
+        )
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        entry = self.entry()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = OpeningReplayGuard(store=store)
+        binding = guard.bind_once(entry, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):  # live claim cannot be rebound
+            guard.bind_once(entry, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):  # expired claim still cannot be rebound
+            guard.bind_once(entry, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):  # consumed id can never be rebound
+            guard.bind_once(entry, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        entry = self.entry()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = OpeningReplayGuard(store=store).bind_once(entry, b"s")
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+    def test_store_delegation_error_restores_pending(self):
+        import zkregion
+
+        entry = self.entry()
+        store = self.make_store()
+        guard = OpeningReplayGuard(store=store)
+        binding = guard.bind_once(entry, b"s")
+        original = zkregion.verify_opening
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        zkregion.verify_opening = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entry, binding, now=1)
+        finally:
+            zkregion.verify_opening = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            OpeningReplayGuard(store=store).check(entry, binding, now=1)
+        )
+        store.close()
+
+    def test_store_concurrent_checks_have_exactly_one_winner(self):
+        entry = self.entry()
+        store = self.make_store()
+        binding = OpeningReplayGuard(store=store).bind_once(entry, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = OpeningReplayGuard(store=store).check(entry, binding, now=1)
             with lock:
                 results.append(won)
 

@@ -4,6 +4,7 @@ Public API: commit / verify_opening / OpeningBatchEntry /
 verify_opening_batch / BoundOpeningBatch /
 prove_opening_batch_bound / verify_opening_batch_bound /
 OpeningBatchReplayGuard /
+OpeningReplayGuard /
 BoundOpeningReplayGuard /
 commit_coordinate / PedersenCommitment /
 pedersen_commit / verify_pedersen_opening / PedersenOpeningBatchEntry /
@@ -120,6 +121,7 @@ __all__ = [
     "MultiSchnorrEntry",
     "OpeningBatchEntry",
     "OpeningBatchReplayGuard",
+    "OpeningReplayGuard",
     "PedersenCommitment",
     "PedersenOpeningBatchEntry",
     "PedersenOpeningBatchReplayGuard",
@@ -4903,6 +4905,7 @@ _BOUND_CONSISTENCY_CHAIN_REPLAY_DOMAIN = b"zr/bccbr/v1"
 _BOUND_MERKLE_MULTI_BATCH_REPLAY_DOMAIN = b"zr/bmmbr/v1"
 _BOUND_MERKLE_INCLUSION_BATCH_REPLAY_DOMAIN = b"zr/bmibr/v1"
 _OPENING_BATCH_REPLAY_DOMAIN = b"zr/obr/v1"
+_OPENING_REPLAY_DOMAIN = b"zr/orr/v1"
 _PEDERSEN_OPENING_BATCH_REPLAY_DOMAIN = b"zr/pobr/v1"
 _BOUND_OPENING_REPLAY_DOMAIN = b"zr/bobr/v1"
 _BOUND_PEDERSEN_OPENING_REPLAY_DOMAIN = b"zr/pbobr/v1"
@@ -5062,7 +5065,8 @@ class SQLiteReplayStore:
     :class:`MerkleInclusionBatchReplayGuard`,
     :class:`MerkleMultiReplayGuard`,
     :class:`SchnorrBatchReplayGuard`,
-    :class:`OpeningBatchReplayGuard` and
+    :class:`OpeningBatchReplayGuard`,
+    :class:`OpeningReplayGuard` and
     :class:`PedersenOpeningBatchReplayGuard`)
     keeps its rows in the same table under its own domain segment via
     :meth:`_view`, so one store file and namespace can serve several guard
@@ -13452,6 +13456,277 @@ class OpeningBatchReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_opening_batch(entries):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for a single hash-commitment opening entry
+#
+# An OpeningReplayGuard binds one OpeningBatchEntry — the same entry shape
+# used by verify_opening_batch, i.e. the commitment / value / nonce arguments
+# of verify_opening in that order — to a caller-chosen session id, reusing
+# the ReplayBinding type and, byte for byte, the F framing and the E expiry
+# encoding of the other single-entry guards. The binding is single-use:
+# without a store the state is local to the guard instance, while an
+# SQLiteReplayStore keeps pending, claimed and consumed ids in the store
+# under b"zr/orr/v1", shared across instances, processes and restarts.
+# bind_once registers a pending binding, check claims the id atomically,
+# recomputes the digest, checks the expiry, delegates the opening check to
+# verify_opening and consumes the id only on full success; every rejection
+# leaves the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || L(entry) || F(E)
+# )
+#   D = b"zr/orr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   L(entry) = the BoundOpeningBatch outer-leaf bytes
+#              (_bound_opening_leaf), raw, i.e. without an F framing:
+#              F(b"zkregion/ob/v1") || F(commitment) || F(value) || F(nonce)
+#   E = b"\x00"                          when expires_at is None
+#     = b"\x01" + uint64be(expires_at)   otherwise
+
+
+def _check_opening_batch_entry(
+    entry: object, name: str = "entry"
+) -> OpeningBatchEntry:
+    """Validate one :class:`OpeningBatchEntry` and its field types.
+
+    Mirrors the per-item checks of
+    :func:`_check_opening_batch_entries_types` for a single entry: the
+    object must be an :class:`OpeningBatchEntry` whose ``commitment``,
+    ``value`` and ``nonce`` are all ``bytes``.
+    """
+    if not isinstance(entry, OpeningBatchEntry):
+        raise TypeError(f"{name} must be an OpeningBatchEntry")
+    _check_bytes(entry.commitment, f"{name} commitment")
+    _check_bytes(entry.value, f"{name} value")
+    _check_bytes(entry.nonce, f"{name} nonce")
+    return entry
+
+
+def _opening_replay_digest(
+    entry: OpeningBatchEntry,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute ``SHA-256(F(D) || F(session_id) || L(entry) || F(E))``.
+
+    Byte for byte the single-entry guard framing with the domain
+    ``b"zr/orr/v1"`` and the :class:`BoundOpeningBatch` outer-leaf bytes
+    (:func:`_bound_opening_leaf`) as the raw per-entry leaf — that leaf's
+    field run is itself the ``Q(entry)`` framing reused from
+    :class:`OpeningBatchReplayGuard`.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_OPENING_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    transcript.update(_bound_opening_leaf(entry))  # raw leaf, no F framing
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+class OpeningReplayGuard:
+    """Single-use replay protection for one hash-commitment opening entry.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits one
+    :class:`OpeningBatchEntry` — the same entry shape accepted by
+    :func:`verify_opening_batch`, whose ``commitment`` / ``value`` /
+    ``nonce`` fields are exactly the arguments of :func:`verify_opening` —
+    to a session id; :meth:`check` accepts an equal pending binding
+    exactly once, recomputing the binding digest, checking the expiry,
+    delegating to :func:`verify_opening`, and then marks the id consumed.
+    The digest frames the entry under
+    ``SHA-256(F(D) || F(session_id) || L(entry) || F(E))`` with domain
+    ``b"zr/orr/v1"``, where ``L(entry)`` is the
+    :class:`BoundOpeningBatch` outer-leaf encoding
+    (:func:`_bound_opening_leaf`,
+    ``F(b"zkregion/ob/v1") || F(commitment) || F(value) || F(nonce)``),
+    raw under no extra framing; the F framing and the E expiry encoding
+    are reused byte for byte from the other single-entry guards. By
+    default both the pending and the consumed state live on this guard
+    instance and are never shared between instances; passing an
+    :class:`SQLiteReplayStore` as ``store`` instead keeps the state in
+    that store under the ``b"zr/orr/v1"`` key domain, so opening guards
+    attached to the same store namespace share pending, claimed and
+    consumed ids across independent instances, processes and process
+    restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim
+    taken before the digest/expiry work and the delegated opening check
+    (the in-instance registry lock, or the store's short transaction and
+    unique claim token); the claim is per-id registry state rather than a
+    global lock, so an opening being checked under one id never
+    serializes checks or binds of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None if store is None else store._view(_OPENING_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        entry: OpeningBatchEntry,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to ``entry``.
+
+        Returns the frozen :class:`ReplayBinding`. ``entry`` must be an
+        :class:`OpeningBatchEntry` whose ``commitment``, ``value`` and
+        ``nonce`` are all ``bytes`` — the same nested type rules as one
+        item of :func:`verify_opening_batch`. ``session_id`` must be
+        non-empty ``bytes`` and ``expires_at`` must be either ``None`` or
+        a non-``bool`` unsigned 64-bit Unix-second timestamp. A session
+        id that is already pending, being checked or has been consumed
+        raises :class:`ValueError`. Wrong argument or nested field types
+        raise :class:`TypeError`; an empty id or an out-of-uint64 expiry
+        raises :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_opening_batch_entry(entry)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        binding = ReplayBinding(
+            session_id,
+            _opening_replay_digest(entry, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entry: OpeningBatchEntry,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for the entry.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated opening check, so among concurrent calls for the same id
+        at most one can return ``True``. The digest is recomputed over the
+        presented ``entry``; for a binding with an expiry,
+        ``now >= expires_at`` makes the check fail (``now`` defaults to the
+        current Unix seconds and must otherwise be a non-``bool`` uint64).
+        Only then is the entry handed unchanged to :func:`verify_opening`
+        with ``entry.commitment``, ``entry.value`` and ``entry.nonce``.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, or
+        :func:`verify_opening` returning ``False``) returns ``False``,
+        releases the claim and leaves the registration pending, so a
+        rejected id can still succeed once later. An exception escaping
+        the delegated opening check likewise releases the claim and then
+        propagates unchanged, leaving the id usable. With a store
+        backend, only the holder of the current claim token can consume
+        the id (an expired claim may be taken over by a later equal
+        ``check``); a stale token neither consumes nor restores
+        anything. Verification runs without any lock or transaction
+        held, so other ids are never serialized. Argument type errors
+        raise :class:`TypeError`; an out-of-range ``now`` raises
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_opening_batch_entry(entry)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(entry, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _opening_replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_opening(entry.commitment, entry.value, entry.nonce):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entry: OpeningBatchEntry,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _opening_replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_opening(entry.commitment, entry.value, entry.nonce):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

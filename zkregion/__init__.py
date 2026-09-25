@@ -16,6 +16,7 @@ BoundPedersenOpeningReplayGuard /
 RangeProof / prove_range /
 verify_range / RangeBatchEntry / verify_range_batch / RegionProof /
 WideRangeProof / prove_range_wide / verify_range_wide /
+WideRangeBatchEntry / verify_range_wide_batch /
 prove_region / verify_region / region_contains_committed /
 RegionContainsEntry / verify_region_contains_batch /
 BoundRegionContainsBatch / prove_region_contains_bound /
@@ -157,6 +158,7 @@ __all__ = [
     "SingleKeyBoundBatch",
     "SingleKeyBoundReplayGuard",
     "SingleKeyEntryReplayGuard",
+    "WideRangeBatchEntry",
     "WideRangeProof",
     "commit",
     "commit_coordinate",
@@ -203,6 +205,7 @@ __all__ = [
     "verify_range_batch",
     "verify_range_bound",
     "verify_range_wide",
+    "verify_range_wide_batch",
     "verify_region",
     "verify_region_batch",
     "verify_region_bound",
@@ -1301,6 +1304,283 @@ def verify_range_batch(
                 responses[i],
                 offset_i,
             )
+
+    for (prime, _generator, _h), state in groups.items():
+        if pow(_h, state["sum"], prime) != state["product"]:
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class WideRangeBatchEntry:
+    """One item of a wide range batch verification.
+
+    Fields are the :class:`PedersenCommitment`, the :class:`WideRangeProof`
+    and the ``context`` (empty by default) — exactly the arguments of
+    :func:`verify_range_wide`, in the same order. All three are positional
+    construction arguments; entries compare by value and are immutable, and
+    construction performs no validation.
+    """
+
+    commitment: PedersenCommitment
+    proof: WideRangeProof
+    context: bytes = b""
+
+
+def _check_wide_range_batch_entry(
+    entry: object, name: str = "entry"
+) -> WideRangeBatchEntry:
+    """Validate a WideRangeBatchEntry and its nested field types."""
+    if not isinstance(entry, WideRangeBatchEntry):
+        raise TypeError(f"{name} must be a WideRangeBatchEntry")
+    commitment = entry.commitment
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError(f"{name} commitment must be a PedersenCommitment")
+    _check_commitment_fields(commitment)
+    proof = entry.proof
+    if not isinstance(proof, WideRangeProof):
+        raise TypeError(f"{name} proof must be a WideRangeProof")
+    if not isinstance(proof.commitments, tuple):
+        raise TypeError(f"{name} proof commitments must be a tuple of integers")
+    for item in proof.commitments:
+        _check_int(item, f"{name} proof commitments entry")
+    for field_name in ("challenges", "responses"):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(
+                f"{name} proof {field_name} must be a tuple of integer pairs"
+            )
+        for pair in field:
+            if not isinstance(pair, tuple):
+                raise TypeError(
+                    f"{name} proof {field_name} entry must be a tuple of integers"
+                )
+            for item in pair:
+                _check_int(item, f"{name} proof {field_name} entry item")
+    _check_bytes(entry.context, f"{name} context")
+    return entry
+
+
+def _check_wide_range_batch_entries_types(
+    entries: object,
+) -> list[WideRangeBatchEntry]:
+    """Validate the wide-range-batch ``entries`` argument types.
+
+    Mirrors the sequence and nested type rules of
+    :func:`verify_range_wide_batch` for *every* entry before any
+    verification runs: ``entries`` must be a non-``bytes`` / ``bytearray``
+    / ``str`` sequence of :class:`WideRangeBatchEntry` objects whose
+    :class:`PedersenCommitment`, :class:`WideRangeProof` ``commitments`` /
+    ``challenges`` / ``responses`` integer tuples and ``context`` are
+    nestedly well-typed. The whole batch is walked (a bad type in a later
+    entry still raises), and the entries are copied into a fresh list so
+    the inputs are never mutated. An empty batch is left to
+    :func:`verify_range_wide_batch` to reject with ``False``;
+    structural/value problems are left to the per-entry check.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of WideRangeBatchEntry")
+    items: list[WideRangeBatchEntry] = []
+    for position, entry in enumerate(entries):
+        items.append(_check_wide_range_batch_entry(entry, f"entries[{position}]"))
+    return items
+
+
+def _wide_range_proof_check_material(
+    commitment: PedersenCommitment,
+    proof: WideRangeProof,
+    context: bytes,
+) -> tuple[int, int, int, int, tuple[tuple[int, int], ...]]:
+    """Validate one wide range proof structurally and return its batch material.
+
+    This mirrors :func:`verify_range_wide` up to (but excluding) the
+    per-branch Schnorr equations: group parameters, ranges, the bit width,
+    tuple and pair lengths, the ``commitments`` / ``challenges`` /
+    ``responses`` bounds, the weighted bit-commitment binding
+    (``product(C_i**(2**i)) == element mod prime``) and the per-bit
+    challenge share sums are all checked against the byte-for-byte
+    transcript. The returned tuple is ``(prime, generator, h, width,
+    announcements)`` where ``announcements`` holds the recomputed
+    ``(t_0, t_1)`` pair of each bit; the per-bit OR statements are
+    recomputed by the caller as ``C_i`` and
+    ``C_i * generator**(-1) mod prime``.
+    """
+    prime = commitment.prime
+    generator = commitment.generator
+    h = commitment.h
+    if prime <= 3 or not 1 < generator < prime or not 1 < h < prime:
+        raise ValueError("invalid commitment group parameters")
+    if not 0 < commitment.element < prime:
+        raise ValueError("commitment element out of range")
+    if commitment.lower > commitment.upper:
+        raise ValueError("commitment lower must not exceed upper")
+    if commitment.upper - commitment.lower >= prime - 1:
+        raise ValueError("commitment range width must be smaller than prime - 1")
+    width = _wide_range_bit_width(commitment)
+    if not 1 <= width <= _MAX_WIDE_RANGE_BITS:
+        raise ValueError(
+            "range must contain exactly 2**k integers with 1 <= k <= "
+            f"{_MAX_WIDE_RANGE_BITS}"
+        )
+    if not (
+        len(proof.commitments) == len(proof.challenges) == len(proof.responses) == width
+    ):
+        raise ValueError("proof fields must have one entry per bit")
+    if any(len(pair) != 2 for pair in proof.challenges):
+        raise ValueError("proof challenge shares must come in pairs")
+    if any(len(pair) != 2 for pair in proof.responses):
+        raise ValueError("proof responses must come in pairs")
+    if any(not 1 <= c_i < prime for c_i in proof.commitments):
+        raise ValueError("proof bit commitment out of range")
+    if any(
+        not 0 <= share < prime for pair in proof.challenges for share in pair
+    ):
+        raise ValueError("proof challenge share out of range")
+    if any(
+        not 0 <= response < prime - 1
+        for pair in proof.responses
+        for response in pair
+    ):
+        raise ValueError("proof response out of range")
+    product = 1
+    for i, bit_commitment in enumerate(proof.commitments):
+        product = product * pow(bit_commitment, 1 << i, prime) % prime
+    if product != commitment.element:
+        raise ValueError("bit commitments do not multiply back to the commitment")
+    try:
+        generator_inverse = pow(generator, -1, prime)
+    except ValueError:
+        raise ValueError("generator not invertible modulo prime") from None
+    announcements: list[tuple[int, int]] = []
+    for i in range(width):
+        pair: list[int] = []
+        for branch in (0, 1):
+            statement = proof.commitments[i]
+            if branch:
+                statement = statement * generator_inverse % prime
+            try:
+                announcement = (
+                    pow(h, proof.responses[i][branch], prime)
+                    * pow(statement, -proof.challenges[i][branch], prime)
+                    % prime
+                )
+            except ValueError:
+                raise ValueError("statement not invertible modulo prime") from None
+            pair.append(announcement)
+        announcements.append((pair[0], pair[1]))
+    challenge = _wide_range_challenge(
+        commitment,
+        context,
+        width,
+        proof.commitments,
+        tuple(announcements),
+    )
+    for pair_e in proof.challenges:
+        if (pair_e[0] + pair_e[1]) % prime != challenge:
+            raise ValueError(
+                "proof challenge shares do not sum to the transcript challenge"
+            )
+    return prime, generator, h, width, tuple(announcements)
+
+
+def verify_range_wide_batch(
+    entries: Sequence[WideRangeBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a batch of :class:`WideRangeProof` objects with random linear checks.
+
+    ``entries`` must be a non-empty, non-string sequence of
+    :class:`WideRangeBatchEntry`; an empty batch returns ``False`` and
+    duplicate entries are legal (each draws its own coefficients). The
+    nested types of the *whole* batch are preflighted first, so a wrong
+    type in any entry — including a later one — raises :class:`TypeError`
+    rather than being converted into a batch rejection. Every entry then
+    reuses the established :class:`WideRangeProof` transcript byte for
+    byte, binding the six commitment fields, the declared range and the
+    ``context``: the bit width and tuple sizes must match, the
+    ``commitments`` / ``challenges`` / ``responses`` values must be in
+    range, the bit commitments must multiply back to the commitment
+    (``product(C_i**(2**i)) == element mod prime``) and the two challenge
+    shares of every bit must sum to the transcript challenge — both
+    checked per entry, never aggregated.
+
+    Each of the two OR sub-branches of every bit then draws exactly one
+    random coefficient ``a = r + 1`` with ``r = randbelow(prime - 1)``.
+    Branches sharing the same ``(prime, generator, h)`` group are checked
+    together with a single aggregate equation
+
+    ``h**Σ(a*s) == Π(t**a * D**(a*e)) (mod prime)``
+
+    where ``t`` is the recomputed announcement and ``D`` the branch
+    statement (``C_i`` or ``C_i * generator**(-1) mod prime``), both
+    unchanged from :func:`verify_range_wide`; per-branch results are never
+    AND-ed together. Type errors — including ``bool`` integers and a
+    non-callable ``randbelow`` or one that returns a non-integer — raise
+    :class:`TypeError`; a coefficient outside ``[0, prime - 1)`` raises
+    :class:`ValueError`. Every other invalid structure, tampering, branch
+    reordering or swapping, commitment, range or context binding mismatch
+    returns ``False``; the first invalid entry short-circuits the batch.
+    Missing entries cannot be detected: the caller guarantees the batch
+    is complete. Inputs are never mutated.
+    """
+    items = _check_wide_range_batch_entries_types(entries)
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not items:
+        return False
+
+    # group -> {"sum": Σ(a*s), "product": Π(t**a * D**(a*e))}
+    groups: dict[tuple[int, int, int], dict[str, int]] = {}
+
+    def add_branch(
+        group_key: tuple[int, int, int],
+        t_i: int,
+        e_i: int,
+        s_i: int,
+        statement_i: int,
+    ) -> None:
+        prime, _generator, _h = group_key
+        r = randbelow(prime - 1)
+        if not isinstance(r, int) or isinstance(r, bool):
+            raise TypeError("coefficient source randbelow must return an integer")
+        if not 0 <= r < prime - 1:
+            raise ValueError("coefficient source must satisfy 0 <= r < prime - 1")
+        coefficient = r + 1
+        state = groups.setdefault(group_key, {"sum": 0, "product": 1})
+        state["sum"] += coefficient * s_i
+        state["product"] = (
+            state["product"]
+            * pow(t_i, coefficient, prime)
+            % prime
+            * pow(statement_i, coefficient * e_i, prime)
+            % prime
+        )
+
+    for entry in items:
+        commitment = entry.commitment
+        proof = entry.proof
+        try:
+            prime, generator, h, width, announcements = (
+                _wide_range_proof_check_material(commitment, proof, entry.context)
+            )
+            generator_inverse = pow(generator, -1, prime)
+        except (TypeError, ValueError):
+            return False  # structural/transcript mismatch: short-circuit
+        group_key = (prime, generator, h)
+        for i in range(width):
+            statements = (
+                proof.commitments[i],
+                proof.commitments[i] * generator_inverse % prime,
+            )
+            for branch in (0, 1):
+                add_branch(
+                    group_key,
+                    announcements[i][branch],
+                    proof.challenges[i][branch],
+                    proof.responses[i][branch],
+                    statements[branch],
+                )
 
     for (prime, _generator, _h), state in groups.items():
         if pow(_h, state["sum"], prime) != state["product"]:

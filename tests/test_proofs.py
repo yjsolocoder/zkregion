@@ -78,6 +78,7 @@ from zkregion import (
     SingleKeyBoundBatch,
     SingleKeyBoundReplayGuard,
     SingleKeyEntryReplayGuard,
+    WideRangeProof,
     commit,
     commit_coordinate,
     merkle_root,
@@ -89,6 +90,7 @@ from zkregion import (
     prove_opening_batch_bound,
     prove_pedersen_opening_batch_bound,
     prove_range,
+    prove_range_wide,
     prove_region,
     prove_region_contains_bound,
     prove_schnorr_batch_bound,
@@ -115,6 +117,7 @@ from zkregion import (
     verify_range,
     verify_range_batch,
     verify_range_bound,
+    verify_range_wide,
     verify_region,
     verify_region_batch,
     verify_region_bound,
@@ -1013,6 +1016,315 @@ class RangeProofTest(unittest.TestCase):
         commitment, blinding, proof = self.prove()
         snapshot = (dataclasses.replace(commitment), RangeProof(*map(tuple, (proof.t, proof.e, proof.s))))
         verify_range(commitment, proof, b"ctx")
+        self.assertEqual((commitment, proof), snapshot)
+        self.assertEqual(blinding, 1234)
+
+
+class WideRangeProofTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def commit(self, value=50, lower=0, upper=255, blinding=1234, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    def prove(self, value=50, lower=0, upper=255, blinding=1234, context=b"ctx", **kwargs):
+        commitment, returned = self.commit(value, lower, upper, blinding, **kwargs)
+        proof = prove_range_wide(
+            commitment, value, returned, context, randbelow=counter_randbelow()
+        )
+        return commitment, returned, proof
+
+    # ---- honest round trip -------------------------------------------------
+
+    def test_honest_proof_verifies(self):
+        commitment, _, proof = self.prove()
+        self.assertIsInstance(proof, WideRangeProof)
+        self.assertTrue(verify_range_wide(commitment, proof, b"ctx"))
+        self.assertTrue(verify_range_wide(commitment, proof, context=b"ctx"))
+
+    def test_proof_shape_and_immutability(self):
+        commitment, _, proof = self.prove(lower=10, upper=25, value=15)
+        # [10, 25] holds 16 = 2**4 integers: 4 bit commitments, 8 branches
+        self.assertEqual(len(proof.commitments), 4)
+        self.assertEqual(len(proof.e), 8)
+        self.assertEqual(len(proof.s), 8)
+        for field in (proof.commitments, proof.e, proof.s):
+            self.assertIsInstance(field, tuple)
+            for item in field:
+                self.assertIsInstance(item, int)
+                self.assertNotIsInstance(item, bool)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            proof.e = proof.e + (1,)
+
+    def test_every_value_in_range_proves(self):
+        for value in (0, 1, 100, 254, 255):
+            commitment, _, proof = self.prove(value=value)
+            self.assertTrue(verify_range_wide(commitment, proof, b"ctx"), f"value={value}")
+
+    def test_negative_range_supported(self):
+        commitment, _, proof = self.prove(value=-400, lower=-512, upper=-257)
+        self.assertTrue(verify_range_wide(commitment, proof, b"ctx"))
+
+    def test_power_of_two_sizes_accepted(self):
+        for bits in (1, 2, 8, 16):
+            upper = (1 << bits) - 1
+            commitment, _, proof = self.prove(value=upper, lower=0, upper=upper)
+            self.assertEqual(len(proof.commitments), bits)
+            self.assertTrue(verify_range_wide(commitment, proof, b"ctx"), f"bits={bits}")
+
+    def test_maximum_width_2_to_the_24_accepted(self):
+        commitment, blinding = pedersen_commit(1234567, 0, (1 << 24) - 1, blinding=987654321)
+        proof = prove_range_wide(
+            commitment, 1234567, blinding, b"ctx", randbelow=counter_randbelow()
+        )
+        self.assertEqual(len(proof.commitments), 24)
+        self.assertTrue(verify_range_wide(commitment, proof, b"ctx"))
+
+    def test_non_power_of_two_rejected(self):
+        for upper in (2, 254, 256, 1000):
+            commitment, blinding = self.commit(value=0, lower=0, upper=upper)
+            with self.assertRaises(ValueError, msg=f"upper={upper}"):
+                prove_range_wide(commitment, 0, blinding, randbelow=counter_randbelow())
+            self.assertFalse(
+                verify_range_wide(commitment, WideRangeProof((), (), ()), b"ctx"),
+                f"upper={upper}",
+            )
+
+    def test_width_outside_1_to_24_rejected(self):
+        # a single integer (2**0) is too narrow
+        commitment, blinding = self.commit(value=0, lower=0, upper=0)
+        with self.assertRaises(ValueError):
+            prove_range_wide(commitment, 0, blinding, randbelow=counter_randbelow())
+        self.assertFalse(verify_range_wide(commitment, WideRangeProof((), (), ()), b"ctx"))
+        # 2**25 integers exceed the maximum bit width
+        wide, wide_blinding = pedersen_commit(0, 0, (1 << 25) - 1, blinding=7)
+        with self.assertRaises(ValueError):
+            prove_range_wide(wide, 0, wide_blinding, randbelow=counter_randbelow())
+        self.assertFalse(verify_range_wide(wide, WideRangeProof((), (), ()), b"ctx"))
+
+    def test_fixed_randbelow_is_reproducible(self):
+        commitment, blinding = self.commit()
+        first = prove_range_wide(commitment, 50, blinding, b"c", randbelow=counter_randbelow())
+        second = prove_range_wide(commitment, 50, blinding, b"c", randbelow=counter_randbelow())
+        self.assertEqual(first, second)
+
+    def test_default_group_parameters_are_usable(self):
+        commitment, blinding = pedersen_commit(40000, 0, 65535, blinding=987654321)
+        proof = prove_range_wide(commitment, 40000, blinding, b"demo")
+        self.assertTrue(verify_range_wide(commitment, proof, b"demo"))
+
+    # ---- transcript --------------------------------------------------------
+
+    def test_challenge_shares_sum_to_each_bit_challenge(self):
+        commitment, _, proof = self.prove()
+        inverse = pow(self.G, -1, self.PRIME)
+        for i, b_i in enumerate(proof.commitments):
+            t = []
+            for branch in (0, 1):
+                y = b_i * pow(inverse, branch, self.PRIME) % self.PRIME
+                t.append(
+                    pow(self.H, proof.s[2 * i + branch], self.PRIME)
+                    * pow(y, -proof.e[2 * i + branch], self.PRIME)
+                    % self.PRIME
+                )
+            items = [b"zkregion/pedersen-range-wide/v1"]
+            for field in (
+                commitment.element,
+                commitment.lower,
+                commitment.upper,
+                commitment.prime,
+                commitment.generator,
+                commitment.h,
+            ):
+                items.append(str(field).encode("ascii"))
+            items.append(b"ctx")
+            items.append(str(8).encode("ascii"))
+            items.append(str(i).encode("ascii"))
+            items.append(str(b_i).encode("ascii"))
+            items.extend(str(t_b).encode("ascii") for t_b in t)
+            transcript = hashlib.sha256()
+            for item in items:
+                transcript.update(len(item).to_bytes(4, "big"))
+                transcript.update(item)
+            c = int.from_bytes(transcript.digest(), "big") % self.PRIME
+            self.assertEqual((proof.e[2 * i] + proof.e[2 * i + 1]) % self.PRIME, c, f"bit={i}")
+        for share in proof.e:
+            self.assertTrue(0 <= share < self.PRIME)
+        for response in proof.s:
+            self.assertGreaterEqual(response, 0)
+
+    # ---- prove-time validation ----------------------------------------------
+
+    def test_prove_requires_a_valid_opening(self):
+        commitment, blinding = self.commit()
+        with self.assertRaises(ValueError):
+            prove_range_wide(commitment, 51, blinding, randbelow=counter_randbelow())
+        with self.assertRaises(ValueError):
+            prove_range_wide(commitment, 50, blinding + 1, randbelow=counter_randbelow())
+
+    def test_prove_value_outside_declared_range_rejected(self):
+        commitment, blinding = self.commit(value=0, lower=0, upper=255)
+        for value in (-1, 256):
+            with self.assertRaises(ValueError, msg=f"value={value}"):
+                prove_range_wide(commitment, value, blinding, randbelow=counter_randbelow())
+
+    def test_prove_type_errors(self):
+        commitment, blinding = self.commit()
+        with self.assertRaises(TypeError):
+            prove_range_wide("commitment", 50, blinding)
+        bad = dataclasses.replace(commitment, element=1.5)
+        with self.assertRaises(TypeError):
+            prove_range_wide(bad, 50, blinding)
+        for bad_value in (1.5, "50", True, None):
+            with self.assertRaises(TypeError):
+                prove_range_wide(commitment, bad_value, blinding)
+            with self.assertRaises(TypeError):
+                prove_range_wide(commitment, 50, bad_value)
+        with self.assertRaises(TypeError):
+            prove_range_wide(commitment, 50, blinding, "ctx")
+        with self.assertRaises(TypeError):
+            prove_range_wide(commitment, 50, blinding, randbelow=7)
+
+    def test_prove_randbelow_draws_are_validated(self):
+        commitment, blinding = self.commit()
+        for bad in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                prove_range_wide(
+                    commitment, 50, blinding, randbelow=lambda upper, bad=bad: bad
+                )
+        for bad in (-1, self.PRIME):
+            with self.assertRaises(ValueError):
+                prove_range_wide(
+                    commitment, 50, blinding, randbelow=lambda upper, bad=bad: bad
+                )
+
+    # ---- verify-time rejection ----------------------------------------------
+
+    def test_tampering_fails(self):
+        commitment, _, proof = self.prove()
+        self.assertFalse(
+            verify_range_wide(commitment, WideRangeProof(proof.commitments, proof.e, proof.s[:-1] + (proof.s[-1] + 1,)), b"ctx")
+        )
+        self.assertFalse(
+            verify_range_wide(commitment, WideRangeProof(proof.commitments, proof.e[:-1] + ((proof.e[-1] + 1) % self.PRIME,), proof.s), b"ctx")
+        )
+        self.assertFalse(
+            verify_range_wide(commitment, WideRangeProof(proof.commitments[:-1] + ((proof.commitments[-1] % (self.PRIME - 1)) + 1,), proof.e, proof.s), b"ctx")
+        )
+
+    def test_swapping_or_reordering_bit_branches_fails(self):
+        commitment, _, proof = self.prove()
+        # exchange the two branches of bit 0
+        e = list(proof.e)
+        s = list(proof.s)
+        e[0], e[1] = e[1], e[0]
+        s[0], s[1] = s[1], s[0]
+        self.assertFalse(
+            verify_range_wide(commitment, WideRangeProof(proof.commitments, tuple(e), tuple(s)), b"ctx")
+        )
+        # move bit order: swap bit 0 and bit 1 wholesale
+        commitments = list(proof.commitments)
+        commitments[0], commitments[1] = commitments[1], commitments[0]
+        e = list(proof.e)
+        s = list(proof.s)
+        e[0:2], e[2:4] = e[2:4], e[0:2]
+        s[0:2], s[2:4] = s[2:4], s[0:2]
+        self.assertFalse(
+            verify_range_wide(commitment, WideRangeProof(tuple(commitments), tuple(e), tuple(s)), b"ctx")
+        )
+
+    def test_context_binds_proof(self):
+        commitment, _, proof = self.prove(context=b"ctx")
+        self.assertFalse(verify_range_wide(commitment, proof))
+        self.assertFalse(verify_range_wide(commitment, proof, b"other"))
+
+    def test_foreign_commitment_fails(self):
+        commitment, _, proof = self.prove()
+        other, _ = self.commit(value=51, blinding=4321)
+        self.assertFalse(verify_range_wide(other, proof, b"ctx"))
+        shifted = dataclasses.replace(commitment, element=(commitment.element + 1) % self.PRIME)
+        self.assertFalse(verify_range_wide(shifted, proof, b"ctx"))
+
+    def test_declared_range_binds_proof(self):
+        commitment, _, proof = self.prove()
+        # same width class but shifted declared range
+        other, _ = self.commit(value=60, lower=10, upper=265, blinding=1234)
+        self.assertFalse(verify_range_wide(other, proof, b"ctx"))
+        # narrower declared range changes the bit width
+        narrower, _ = self.commit(value=50, lower=0, upper=127, blinding=1234)
+        self.assertFalse(verify_range_wide(narrower, proof, b"ctx"))
+
+    def test_structural_errors_return_false(self):
+        commitment, _, proof = self.prove()
+        # wrong tuple lengths
+        self.assertFalse(verify_range_wide(commitment, WideRangeProof(proof.commitments, proof.e[:-1], proof.s), b"ctx"))
+        self.assertFalse(verify_range_wide(commitment, WideRangeProof(proof.commitments, proof.e, proof.s + (1,)), b"ctx"))
+        self.assertFalse(verify_range_wide(commitment, WideRangeProof(proof.commitments[:-1], proof.e, proof.s), b"ctx"))
+        self.assertFalse(verify_range_wide(commitment, WideRangeProof((), (), ()), b"ctx"))
+        # bit commitments outside [1, prime)
+        for bad_b in (0, self.PRIME, self.PRIME + 1, -1):
+            bad = WideRangeProof(proof.commitments[:-1] + (bad_b,), proof.e, proof.s)
+            self.assertFalse(verify_range_wide(commitment, bad, b"ctx"), f"b={bad_b}")
+        # e outside [0, prime)
+        for bad_e in (-1, self.PRIME, self.PRIME + 1):
+            bad = WideRangeProof(proof.commitments, proof.e[:-1] + (bad_e,), proof.s)
+            self.assertFalse(verify_range_wide(commitment, bad, b"ctx"), f"e={bad_e}")
+        # negative response
+        bad = WideRangeProof(proof.commitments, proof.e, proof.s[:-1] + (-1,))
+        self.assertFalse(verify_range_wide(commitment, bad, b"ctx"))
+        # challenge shares that do not sum to the bit challenge
+        bad = WideRangeProof(proof.commitments, (proof.e[0] + 1,) + proof.e[1:], proof.s)
+        self.assertFalse(verify_range_wide(commitment, bad, b"ctx"))
+
+    def test_bad_embedded_parameters_return_false(self):
+        commitment, _, proof = self.prove()
+        for field, bad_value in (
+            ("prime", 3),
+            ("generator", 1),
+            ("generator", self.PRIME),
+            ("h", 1),
+            ("h", self.PRIME),
+            ("element", 0),
+            ("element", self.PRIME),
+            ("lower", 256),
+        ):
+            bad = dataclasses.replace(commitment, **{field: bad_value})
+            self.assertFalse(verify_range_wide(bad, proof, b"ctx"), f"{field}={bad_value}")
+
+    def test_verify_type_errors(self):
+        commitment, _, proof = self.prove()
+        with self.assertRaises(TypeError):
+            verify_range_wide("commitment", proof, b"ctx")
+        with self.assertRaises(TypeError):
+            verify_range_wide(commitment, (proof.commitments, proof.e, proof.s), b"ctx")
+        with self.assertRaises(TypeError):
+            verify_range_wide(commitment, proof, "ctx")
+        with self.assertRaises(TypeError):
+            verify_range_wide(commitment, WideRangeProof(list(proof.commitments), proof.e, proof.s), b"ctx")
+        with self.assertRaises(TypeError):
+            verify_range_wide(commitment, WideRangeProof(proof.commitments, proof.e, list(proof.s)), b"ctx")
+        for bad_item in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                verify_range_wide(commitment, WideRangeProof(proof.commitments[:-1] + (bad_item,), proof.e, proof.s), b"ctx")
+            with self.assertRaises(TypeError):
+                verify_range_wide(commitment, WideRangeProof(proof.commitments, proof.e[:-1] + (bad_item,), proof.s), b"ctx")
+            with self.assertRaises(TypeError):
+                verify_range_wide(commitment, WideRangeProof(proof.commitments, proof.e, proof.s[:-1] + (bad_item,)), b"ctx")
+        bad_commitment = dataclasses.replace(commitment, h=True)
+        with self.assertRaises(TypeError):
+            verify_range_wide(bad_commitment, proof, b"ctx")
+
+    def test_inputs_are_not_mutated(self):
+        commitment, blinding, proof = self.prove()
+        snapshot = (
+            dataclasses.replace(commitment),
+            WideRangeProof(*map(tuple, (proof.commitments, proof.e, proof.s))),
+        )
+        verify_range_wide(commitment, proof, b"ctx")
         self.assertEqual((commitment, proof), snapshot)
         self.assertEqual(blinding, 1234)
 

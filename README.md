@@ -1,6 +1,6 @@
 # zkregion
 
-面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含证明、量化区间的 Pedersen 陷门承诺及其上的 Schnorr OR 非交互区间证明、二维矩形区域成员非交互证明，以及量化整数坐标下的矩形区域判定。
+面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含证明、量化区间的 Pedersen 陷门承诺及其上的 Schnorr OR 非交互区间证明、按位分解的宽区间非交互证明、二维矩形区域成员非交互证明，以及量化整数坐标下的矩形区域判定。
 
 ## 环境
 
@@ -336,6 +336,14 @@ from zkregion import prove_range, verify_range
 proof = prove_range(commitment, 40, blinding, context=b"session-1")
 assert verify_range(commitment, proof, context=b"session-1")
 assert not verify_range(commitment, proof, context=b"other")
+
+# 按位分解的宽区间证明：声明区间须恰含 2**k 个整数（1 <= k <= 24）
+from zkregion import prove_range_wide, verify_range_wide
+
+wide_commitment, wide_blinding = pedersen_commit(40000, 0, 65535)  # 2**16 个整数
+wide_proof = prove_range_wide(wide_commitment, 40000, wide_blinding, context=b"session-1")
+assert verify_range_wide(wide_commitment, wide_proof, context=b"session-1")
+assert not verify_range_wide(wide_commitment, wide_proof, context=b"other")
 
 # 区间证明的批量验证（按 (prime, generator, h) 分组做随机线性组合）
 from zkregion import RangeBatchEntry, verify_range_batch
@@ -1131,6 +1139,9 @@ python3 -m zkregion
 - `prove_range(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> RangeProof` — 生成 Pedersen 承诺的非交互区间证明（Schnorr OR）
 - `verify_range(commitment, proof, context=b"") -> bool` — 验证区间证明
 - `RangeProof(t, e, s)` — 不可变区间证明对象，三个字段均为长度 `upper - lower + 1` 的 `tuple[int, ...]`
+- `prove_range_wide(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> WideRangeProof` — 生成按位分解的宽区间非交互证明：声明区间须恰含 `2**k` 个整数且 `1 <= k <= 24`，生成前复用 `verify_pedersen_opening` 重算开合，越界值或开合不符抛 `ValueError`
+- `verify_range_wide(commitment, proof, context=b"") -> bool` — 验证宽区间证明：按位宽逐位核对每个比特分支的等式，换承诺、换 `context`、换声明区间或任何篡改一律返回 `False`
+- `WideRangeProof(commitments, e, s)` — 不可变宽区间证明对象；`commitments` 为长度 `k` 的逐比特承诺元组（低位在前），`e` / `s` 为每个比特两条 OR 分支的挑战份额与响应（长度 `2 * k`），均可位置构造、按值相等
 - `verify_range_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 区间证明的批量验证，按 `(prime, generator, h)` 分组做一次随机线性组合
 - `RangeBatchEntry(commitment, proof, context=b"")` — 不可变批量验证条目，字段类型依次为 `PedersenCommitment`、`RangeProof`、`bytes`，字段次序与 `verify_range` 入参一致
 - `verify_range_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的区间证明完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_range_batch` 验证明
@@ -1454,6 +1465,20 @@ D_i = element * g**(-i) mod prime
 挑战 `c` 为 SHA-256 摘要的大端整数模 `prime`。转录依次写入域 `b"zkregion/pedersen-range/v1"`、承诺六字段（`element`、`lower`、`upper`、`prime`、`generator`、`h`）、`context`、`n` 与全部 `t_i`；每项前置四字节无符号大端长度，整数编码为十进制 ASCII。
 
 验证要求：每个 `t_i ∈ [1, prime)`、`e_i ∈ [0, prime)`、`s_i ≥ 0`，`sum(e) mod prime == c`，且每个分支满足 Schnorr 等式 `h**s_i == t_i * D_i**e_i (mod prime)`。生成前会先复用 `verify_pedersen_opening` 校验开合，开合不符抛 `ValueError`；类型错误（含 `bool` 整数、非元组证明字段、非 `bytes` 的 `context`、不可调用的 `randbelow`）抛 `TypeError`；其他非法结构、篡改或绑定不符（错误的承诺、`context` 或证明）一律返回 `False`。入口均不改写输入。
+
+### Pedersen 宽区间证明（按位分解）
+
+`prove_range` 的 OR 证明需要为声明区间内每个整数各设一条分支，因此最多覆盖 256 个整数。`prove_range_wide(commitment, value, blinding, context=b"")` 改为把偏移量 `m = value - lower` 按位分解：声明区间须恰含 `2**k` 个整数且位宽 `1 <= k <= 24`（个数不是 2 的幂或位宽越界时，生成抛 `ValueError`、验证返回 `False`）。对每一位 `i`（`0 <= i < k`，低位在前），证明方取随机盲因子 `r_i ∈ [1, prime - 1)`，计算该位的 Pedersen 承诺
+
+```
+B_i = g**b_i * h**r_i mod prime        （b_i 为 m 的第 i 位）
+```
+
+并对每一位证明 OR 论断"`B_i` 承诺的是 0 或 1"——即 `B_i = h**r_i` 或 `B_i * g**(-1) = h**r_i`，正是 `prove_range` 两值区间的情形：真实分支走诚实 Schnorr（取随机 `k`，`t = h**k`，挑战份额 `e = (c_i - e_模拟) mod prime`，响应 `s = k + e * r_i`，非负、不取模），另一分支模拟（随机 `e_模拟 ∈ [0, prime)` 与非负 `s_模拟`，`t_模拟 = h**s_模拟 * Y**(-e_模拟)`，`Y` 为该分支公钥）。证明为冻结的 `WideRangeProof(commitments, e, s)`：`commitments` 按位序保存 `k` 个比特承诺 `B_i`，`e` / `s` 按同一位序保存每个比特两条分支（先分支 0 后分支 1）的挑战份额与响应，长度均为 `2 * k`。
+
+每个比特的挑战 `c_i` 为 SHA-256 摘要的大端整数模 `prime`。转录依次写入域 `b"zkregion/pedersen-range-wide/v1"`、承诺六字段（`element`、`lower`、`upper`、`prime`、`generator`、`h`）、`context`、位宽 `k`、位序号 `i`、比特承诺 `B_i` 与该位的两条分支宣告；每项前置四字节无符号大端长度，整数编码为十进制 ASCII——由此把承诺、`context`、声明区间（个数与位宽）、位序与每个比特分支全部绑定。
+
+验证按位宽逐位核对：证明须含 `k` 个比特承诺与 `2 * k` 个份额、响应；每个 `B_i ∈ [1, prime)`、`e ∈ [0, prime)`、`s ≥ 0`；对每一位的每条分支，由 `t_b = h**s_b * Y_b**(-e_b) mod prime`（`Y_b = B_i * g**(-b)`）重算宣告并核对两条份额之和等于该位转录挑战 `c_i`。生成前复用 `verify_pedersen_opening` 重算开合，开合不符（含值落在声明区间外）抛 `ValueError`，与既有区间证明的拒绝口径一致；类型错误（含 `bool` 整数、非元组证明字段、非 `bytes` 的 `context`、不可调用的 `randbelow`）抛 `TypeError`；`randbelow` 返回非整数抛 `TypeError`、越界抛 `ValueError`。其余非法结构、交换或替换任意比特分支、改动分支里的承诺或响应、挪动位序、换承诺、换 `context`、换声明区间一律返回 `False`，不抛异常。同一组承诺、值、盲因子与 `context` 在相同随机源下重复生成的证明逐字节一致。入口均不改写输入，不引入任何落盘或持久化。与 `prove_range` 一样，这只是演示级构造（默认 `h` 的陷门公开，见 `PedersenCommitment` 的警告）。
 
 ### 区间证明批量验证
 
@@ -1985,7 +2010,7 @@ digest = SHA-256(
 
 ## 限制
 
-`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。区域判定方面，`Region.contains` 只是朴素的坐标比较；与承诺绑定的 `region_contains_committed` 会在判定前按 `verify_pedersen_opening` 的口径逐轴校验开合与声明区间，但同样只是演示级构造，不构成生产级保证。批量验证所用的随机线性组合与默认群一样仅供演示。Pedersen 承诺默认的 `h = g**2 mod prime` 带有公开陷门、破坏绑定性；其上的 Schnorr OR 区间证明与二维区域成员证明同样是演示级构造——区间上限 256 个整数、挑战来自 SHA-256 Fiat-Shamir 转录、群参数与默认 `h` 均未做生产级安全分析，不能用于真实部署。
+`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。区域判定方面，`Region.contains` 只是朴素的坐标比较；与承诺绑定的 `region_contains_committed` 会在判定前按 `verify_pedersen_opening` 的口径逐轴校验开合与声明区间，但同样只是演示级构造，不构成生产级保证。批量验证所用的随机线性组合与默认群一样仅供演示。Pedersen 承诺默认的 `h = g**2 mod prime` 带有公开陷门、破坏绑定性；其上的 Schnorr OR 区间证明与二维区域成员证明同样是演示级构造——区间上限 256 个整数、挑战来自 SHA-256 Fiat-Shamir 转录、群参数与默认 `h` 均未做生产级安全分析，不能用于真实部署。按位分解的宽区间证明（`prove_range_wide` / `verify_range_wide`）把声明区间放宽到恰为 `2**k` 个整数（`1 <= k <= 24`），但同样是演示级构造，不构成生产级保证。
 
 ## 测试
 

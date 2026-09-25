@@ -96,6 +96,7 @@ __all__ = [
     "BoundRangeBatch",
     "BoundRegionBatch",
     "BoundRegionContainsBatch",
+    "BoundRegionContainsReplayGuard",
     "BoundRegionReplayGuard",
     "BoundRangeReplayGuard",
     "BoundSchnorrBatch",
@@ -128,6 +129,7 @@ __all__ = [
     "Region",
     "RegionBatchEntry",
     "RegionBatchReplayGuard",
+    "RegionContainsBatchReplayGuard",
     "RegionContainsEntry",
     "RegionProof",
     "RegionReplayGuard",
@@ -4902,6 +4904,8 @@ _OPENING_BATCH_REPLAY_DOMAIN = b"zr/obr/v1"
 _PEDERSEN_OPENING_BATCH_REPLAY_DOMAIN = b"zr/pobr/v1"
 _BOUND_OPENING_REPLAY_DOMAIN = b"zr/bobr/v1"
 _BOUND_PEDERSEN_OPENING_REPLAY_DOMAIN = b"zr/pbobr/v1"
+_REGION_CONTAINS_BATCH_REPLAY_DOMAIN = b"zr/rcbr/v1"
+_BOUND_REGION_CONTAINS_REPLAY_DOMAIN = b"zr/brcbr/v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -5055,8 +5059,10 @@ class SQLiteReplayStore:
     :class:`MerkleInclusionBatchReplayGuard`,
     :class:`MerkleMultiReplayGuard`,
     :class:`SchnorrBatchReplayGuard`,
-    :class:`OpeningBatchReplayGuard` and
-    :class:`PedersenOpeningBatchReplayGuard`)
+    :class:`OpeningBatchReplayGuard`,
+    :class:`PedersenOpeningBatchReplayGuard`,
+    :class:`RegionContainsBatchReplayGuard` and
+    :class:`BoundRegionContainsReplayGuard`)
     keeps its rows in the same table under its own domain segment via
     :meth:`_view`, so one store file and namespace can serve several guard
     kinds without their ids colliding.
@@ -14146,6 +14152,634 @@ class BoundPedersenOpeningReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_pedersen_opening_batch_bound(batch, root):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for region-contains batches
+#
+# A RegionContainsBatchReplayGuard binds a whole non-empty batch of
+# RegionContainsEntry items — the same sequence shape accepted by
+# verify_region_contains_batch, kept in the given order with duplicates
+# preserved — to a caller-chosen session id, reusing the ReplayBinding type
+# and, byte for byte, the F / U / S framing and the E expiry encoding of the
+# other batch replay guards; only the domain separator and the per-entry
+# leaves differ. Like the other batch guards the binding is single-use:
+# without a store the state is local to the guard instance, while an
+# SQLiteReplayStore keeps pending, claimed and consumed ids in the store
+# under b"zr/rcbr/v1", shared across instances, processes and restarts.
+# bind_once registers a pending binding, check claims the id atomically,
+# recomputes the digest, checks the expiry, delegates the batch decision to
+# verify_region_contains_batch and consumes the id only on full success;
+# every rejection leaves the id untouched.
+#
+# digest = SHA-256(F(D) || F(session_id) || S(entries, L) || F(E))
+#   D = b"zr/rcbr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   L(entry) = the complete bound region-contains outer-leaf bytes
+#              (_bound_region_contains_leaf), raw under F — the existing
+#              b"zkregion/rcb/v1" outer-leaf encoding
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+#
+# The entries keep their batch order, duplicates included; entries are never
+# dropped or reordered.
+
+
+def _region_contains_batch_replay_encodable(
+    entries: Sequence[RegionContainsEntry],
+) -> bool:
+    """The S-framed batch length must fit in an unsigned 64-bit integer.
+
+    The outer ``S`` sequence writes the batch count with ``U`` (eight-byte
+    unsigned big-endian). Each entry is framed as the existing bound
+    region-contains leaf, whose integers are encoded as decimal ASCII with
+    the sign kept, so every integer field frames for any value and no
+    per-entry encodability rule is needed.
+    """
+    return 0 <= len(entries) <= _UINT64_MAX
+
+
+def _region_contains_batch_replay_digest(
+    entries: Sequence[RegionContainsEntry],
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the region-contains-batch replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``S(entries, L)`` and
+    ``F(E)``; ``L(entry)`` is the existing bound region-contains outer-leaf
+    raw bytes and the entries keep their batch order (duplicates included).
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_REGION_CONTAINS_BATCH_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    # S(entries, L) = F(U(|entries|)) || Σ F(L(entry))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(entries))))
+    for entry in entries:
+        transcript.update(_frame_length_prefixed(_bound_region_contains_leaf(entry)))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+class RegionContainsBatchReplayGuard:
+    """Single-use replay protection for a batch of :class:`RegionContainsEntry`.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole non-empty batch of
+    :class:`RegionContainsEntry` items — the same sequence shape accepted
+    by :func:`verify_region_contains_batch`, kept in the given order with
+    duplicates preserved — to a session id; :meth:`check` accepts an equal
+    pending binding exactly once, recomputing the binding digest, checking
+    the expiry and delegating to :func:`verify_region_contains_batch`, and
+    then marks the id consumed. The digest frames the batch under
+    ``SHA-256(F(D) || F(session_id) || S(entries, L) || F(E))`` with domain
+    ``b"zr/rcbr/v1"``, where ``L(entry)`` is the existing bound
+    region-contains outer-leaf raw bytes (the same bytes
+    :func:`_bound_region_contains_leaf` builds for
+    :func:`verify_region_contains_bound`); the F / U / S framing and the E
+    expiry encoding are reused byte for byte from the other replay guards.
+    By default both the pending and the consumed state live on this guard
+    instance and are never shared between instances; passing an
+    :class:`SQLiteReplayStore` as ``store`` instead keeps the state in that
+    store under the ``b"zr/rcbr/v1"`` key domain, so batch guards attached
+    to the same store namespace share pending, claimed and consumed ids
+    across independent instances, processes and process restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the digest/expiry work and the delegated batch verification (the
+    in-instance registry lock, or the store's short transaction and unique
+    claim token); the claim is per-id registry state rather than a global
+    lock, so a batch being verified under one id never serializes checks or
+    binds of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None
+            if store is None
+            else store._view(_REGION_CONTAINS_BATCH_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        entries: Sequence[RegionContainsEntry],
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to the batch.
+
+        Returns the frozen :class:`ReplayBinding`. ``entries`` must be a
+        non-string, non-empty sequence of :class:`RegionContainsEntry`
+        objects following the same sequence and nested type rules as
+        :func:`verify_region_contains_batch`: every entry's :class:`Region`
+        four bounds, its two :class:`PedersenCommitment` six integer fields
+        and its ``x`` / ``y`` / ``x_blinding`` / ``y_blinding`` integers
+        are type-checked; entries are kept in the given order with
+        duplicates preserved and no item dropped. ``session_id`` must be
+        non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
+        non-``bool`` unsigned 64-bit Unix-second timestamp; the ``U``-framed
+        batch length must fit in uint64. A session id that is already
+        pending, being checked or consumed raises :class:`ValueError`.
+        Wrong argument or nested field types (including ``bool`` integers)
+        raise :class:`TypeError`; an empty batch or empty id, an
+        out-of-uint64 expiry or batch length or a rebind raise
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        items = _check_region_contains_entries_types(entries)
+        _check_bytes(session_id, "session_id")
+        if not items:
+            raise ValueError("entries must not be empty")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _region_contains_batch_replay_encodable(items):
+            raise ValueError("batch length must be an unsigned 64-bit integer")
+        binding = ReplayBinding(
+            session_id,
+            _region_contains_batch_replay_digest(items, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entries: Sequence[RegionContainsEntry],
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id
+        at most one can return ``True``. The digest is recomputed over the
+        presented ``entries`` in their given order; for a binding with an
+        expiry, ``now >= expires_at`` makes the check fail (``now``
+        defaults to the current Unix seconds and must otherwise be a
+        non-``bool`` uint64). Only then is the batch handed to
+        :func:`verify_region_contains_batch` unchanged, under that
+        function's sequence, structure and decision contract.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, an empty batch or
+        :func:`verify_region_contains_batch` returning ``False``) returns
+        ``False``, releases the claim and leaves the registration pending.
+        An exception escaping the delegated verification likewise releases
+        the claim and then propagates unchanged, leaving the id usable.
+        With a store backend, only the holder of the current claim token
+        can consume the id (an expired claim may be taken over by a later
+        equal ``check``); a stale token neither consumes nor restores
+        anything. Verification runs without any lock or transaction held,
+        so other ids are never serialized. Argument type errors raise
+        :class:`TypeError`; an out-of-range ``now`` raises
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        items = _check_region_contains_entries_types(entries)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _region_contains_batch_replay_encodable(items):
+            return False  # an oversized batch
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(items, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _region_contains_batch_replay_digest(
+                    items, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_region_contains_batch(items):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entries: Sequence[RegionContainsEntry],
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _region_contains_batch_replay_digest(
+                    entries, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_region_contains_batch(entries):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for Merkle-committed region-contains batches
+#
+# A BoundRegionContainsReplayGuard binds a whole BoundRegionContainsBatch
+# together with the Merkle root it is claimed under to a caller-chosen
+# session id, reusing the ReplayBinding type and, byte for byte, the
+# F / U / S framing, the E expiry encoding and the SHA-256 formula of the
+# other bound replay guards; only the domain separator and the per-item
+# leaves differ. Like the other bound guards the binding is single-use:
+# without a store the state is local to the guard instance, while an
+# SQLiteReplayStore keeps pending, claimed and consumed ids in the store
+# under b"zr/brcbr/v1", shared across instances, processes and restarts.
+# bind_once registers a pending binding, check claims the id atomically,
+# recomputes the digest, checks the expiry, delegates the root and inner
+# batch verification to verify_region_contains_bound and consumes the id
+# only on full success; every rejection leaves the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || F(root) || F(U(batch.leaf_count))
+#     || Σ_i F(L(entry_i))
+#     || F(U(proof.leaf_count)) || S(proof.indices, U)
+#     || S(proof.siblings, λx.x) || F(E)
+# )
+#   D = b"zr/brcbr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   L(entry) = the complete bound region-contains outer-leaf bytes
+#              (_bound_region_contains_leaf), raw under F — the existing
+#              b"zkregion/rcb/v1" outer-leaf encoding
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+#
+# The entries keep their batch order, duplicates included; entries are never
+# dropped or reordered, and the outer MerkleMultiProof's three fields are
+# all bound verbatim.
+
+
+def _bound_region_contains_replay_encodable(batch: BoundRegionContainsBatch) -> bool:
+    """Every U-framed integer must fit in unsigned 64 bits.
+
+    The outer transcript frames ``batch.leaf_count``,
+    ``batch.proof.leaf_count`` and every outer proof index with ``U``; a
+    negative or larger-than-uint64 value cannot be framed. Each entry's
+    integers are encoded as decimal ASCII with the sign kept, so every
+    integer field frames for any value and no per-entry encodability rule
+    is needed.
+    """
+    proof = batch.proof
+    values = [batch.leaf_count, proof.leaf_count, *proof.indices]
+    return all(0 <= value <= _UINT64_MAX for value in values)
+
+
+def _bound_region_contains_replay_digest(
+    batch: BoundRegionContainsBatch,
+    root: bytes,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the BoundRegionContainsBatch replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``F(root)``,
+    ``F(U(batch.leaf_count))``, one ``F(L(entry))`` per entry in batch
+    order, then ``F(U(proof.leaf_count))``, ``S(proof.indices, U)``,
+    ``S(proof.siblings, identity)`` and ``F(E)``. This is byte for byte
+    the :func:`_bound_opening_replay_digest` formula with the domain
+    ``b"zr/brcbr/v1"`` and :func:`_bound_region_contains_leaf` bytes as
+    the per-item leaves.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_BOUND_REGION_CONTAINS_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    transcript.update(_frame_length_prefixed(root))
+    transcript.update(_frame_length_prefixed(_uint64_be(batch.leaf_count)))
+    for entry in batch.entries:  # entries order, each bound region-contains leaf under F
+        transcript.update(_frame_length_prefixed(_bound_region_contains_leaf(entry)))
+    proof = batch.proof
+    transcript.update(_frame_length_prefixed(_uint64_be(proof.leaf_count)))
+    # S(proof.indices, U) = F(U(|indices|)) || Σ F(U(index))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.indices))))
+    for index in proof.indices:
+        transcript.update(_frame_length_prefixed(_uint64_be(index)))
+    # S(proof.siblings, λx.x) = F(U(|siblings|)) || Σ F(sibling)
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.siblings))))
+    for sibling in proof.siblings:
+        transcript.update(_frame_length_prefixed(sibling))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+def _check_bound_region_contains_batch_types(batch: object, root: object) -> None:
+    """Validate BoundRegionContainsBatch argument types for the replay guard.
+
+    Mirrors the type checks of :func:`verify_region_contains_bound`: the
+    batch must be a :class:`BoundRegionContainsBatch` whose entries tuple
+    holds nestedly well-typed :class:`RegionContainsEntry` objects, whose
+    ``leaf_count`` is a non-``bool`` integer and whose proof is a
+    well-typed :class:`MerkleMultiProof`; ``root`` must be ``bytes``.
+    Structural and value problems (coverage, counts, digest lengths) are
+    left to :func:`verify_region_contains_bound` at check time.
+    """
+    if not isinstance(batch, BoundRegionContainsBatch):
+        raise TypeError("batch must be a BoundRegionContainsBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(
+            "batch entries must be a tuple of RegionContainsEntry"
+        )
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    _check_region_contains_entries_types(entries)
+
+
+class BoundRegionContainsReplayGuard:
+    """Single-use replay protection for a Merkle-committed region-contains batch.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole
+    :class:`BoundRegionContainsBatch` together with the Merkle ``root`` it
+    is claimed under; :meth:`check` accepts an equal pending binding
+    exactly once — recomputing the binding digest, checking the expiry and
+    delegating to :func:`verify_region_contains_bound` — and then marks
+    the id consumed. By default both the pending and the consumed state
+    live on this guard instance and are never shared between instances;
+    passing an :class:`SQLiteReplayStore` as ``store`` instead keeps the
+    state in that store under the ``b"zr/brcbr/v1"`` key domain, so
+    bound-region-contains-batch guards attached to the same store
+    namespace share pending, claimed and consumed ids across independent
+    instances, processes and process restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the digest/expiry work and the delegated batch verification (the
+    in-instance registry lock, or the store's short transaction and unique
+    claim token); the claim is per-id registry state rather than a global
+    lock, so a batch being verified under one id never serializes checks or
+    binds of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None
+            if store is None
+            else store._view(_BOUND_REGION_CONTAINS_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        batch: BoundRegionContainsBatch,
+        root: bytes,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to a batch/root.
+
+        Only registers the pending binding after a full preflight; no
+        verification is run. Returns the frozen :class:`ReplayBinding`.
+        ``session_id`` must be non-empty ``bytes`` and ``expires_at`` must
+        be either ``None`` or a non-``bool`` unsigned 64-bit Unix-second
+        timestamp; every U-framed integer (the outer ``leaf_count`` /
+        ``proof.leaf_count`` and proof indices, plus the batch length) must
+        likewise fit in uint64. A session id that is already pending, being
+        checked or consumed raises :class:`ValueError`. Wrong argument or
+        nested field types (including ``bool`` integers) raise
+        :class:`TypeError`; an empty id, an out-of-uint64 expiry or framed
+        integer, or a rebind raise :class:`ValueError`. Inputs are never
+        mutated.
+        """
+        _check_bound_region_contains_batch_types(batch, root)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _bound_region_contains_replay_encodable(batch):
+            raise ValueError("leaf_count, indices and framed counts must be unsigned 64-bit integers")
+        binding = ReplayBinding(
+            session_id,
+            _bound_region_contains_replay_digest(
+                batch, root, session_id, expires_at
+            ),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        batch: BoundRegionContainsBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch/root.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id
+        at most one can return ``True``. The digest is recomputed over the
+        presented ``batch`` / ``root``; for a binding with an expiry,
+        ``now >= expires_at`` makes the check fail (``now`` defaults to the
+        current Unix seconds and must otherwise be a non-``bool`` uint64).
+        Only then is the batch/root handed to
+        :func:`verify_region_contains_bound` under that function's root,
+        structure and inner batch contract.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, a non-32-byte root
+        or sibling, or :func:`verify_region_contains_bound` returning
+        ``False``) returns ``False``, releases the claim and leaves the
+        registration pending. An exception escaping the delegated
+        verification likewise releases the claim and then propagates
+        unchanged, leaving the id usable. With a store backend, only the
+        holder of the current claim token can consume the id (an expired
+        claim may be taken over by a later equal ``check``); a stale token
+        neither consumes nor restores anything. Verification runs without
+        any lock or transaction held, so other ids are never serialized.
+        Argument type errors raise :class:`TypeError`; an out-of-range
+        ``now`` raises :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_bound_region_contains_batch_types(batch, root)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _bound_region_contains_replay_encodable(batch):
+            return False  # negative or oversized U-framed integers
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(batch, root, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_region_contains_replay_digest(
+                    batch, root, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_region_contains_bound(batch, root):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        batch: BoundRegionContainsBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_region_contains_replay_digest(
+                    batch, root, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_region_contains_bound(batch, root):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

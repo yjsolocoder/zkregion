@@ -34,6 +34,7 @@ MerkleConsistencyChainReplayGuard /
 MerkleConsistencyChainBatchReplayGuard /
 MerkleConsistencyReplayGuard /
 MerkleConsistencyBatchReplayGuard /
+MerkleConsistencyEntryReplayGuard /
 MerkleInclusionReplayGuard /
 MerkleMultiReplayGuard /
 MerkleMultiEntryReplayGuard /
@@ -109,6 +110,7 @@ __all__ = [
     "MerkleConsistencyChain",
     "MerkleConsistencyChainBatchReplayGuard",
     "MerkleConsistencyChainReplayGuard",
+    "MerkleConsistencyEntryReplayGuard",
     "MerkleConsistencyProof",
     "MerkleConsistencyReplayGuard",
     "MerkleInclusionBatchEntry",
@@ -4949,6 +4951,7 @@ _MERKLE_MULTI_REPLAY_DOMAIN = b"zr/mmr/v1"
 _MERKLE_MULTI_ENTRY_REPLAY_DOMAIN = b"zr/mmer/v1"
 _MERKLE_MULTI_BATCH_REPLAY_DOMAIN = b"zr/mmb/v1"
 _MERKLE_CONSISTENCY_BATCH_REPLAY_DOMAIN = b"zr/mcbr/v1"
+_MERKLE_CONSISTENCY_ENTRY_REPLAY_DOMAIN = b"zr/mcer/v1"
 _SCHNORR_BATCH_REPLAY_DOMAIN = b"zr/sbr/v1"
 _SINGLE_KEY_BATCH_REPLAY_DOMAIN = b"zr/skbr/v1"
 _SINGLE_KEY_BOUND_REPLAY_DOMAIN = b"zr/skbbr/v1"
@@ -11161,6 +11164,330 @@ class MerkleConsistencyBatchReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_consistency_batch(entries):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for single Merkle consistency batch entries
+#
+# A MerkleConsistencyEntryReplayGuard binds one MerkleConsistencyBatchEntry —
+# the same (old_root, new_root, proof) item shape accepted by
+# verify_consistency_batch — to a caller-chosen session id, reusing the
+# ReplayBinding type and, byte for byte, the F framing and the E expiry
+# encoding of the other guards. Like them the binding is single-use: without
+# a store the state is local to the guard instance, while an SQLiteReplayStore
+# keeps pending, claimed and consumed ids in the store under b"zr/mcer/v1",
+# shared across instances, processes and restarts. bind_once registers a
+# pending binding, check claims the id atomically, recomputes the digest,
+# checks the expiry, delegates the single append-only consistency check to
+# verify_consistency in the old_root, new_root, proof order and consumes the
+# id only on full success; every rejection leaves the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || L(entry) || F(E)
+# )
+#   D = b"zr/mcer/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   L(entry) is the raw outer leaf of the Merkle-committed complete
+#   single-entry consistency batch (_bound_consistency_leaf), no extra F
+#   framing around the leaf itself:
+#     F(D0) || F(old_root) || F(new_root) || F(str(old_count))
+#     || F(str(new_count)) || Σ F(node)
+#   with D0 = b"zkregion/consistency-bound/v1" and the counts decimal ASCII —
+#   the same per-item leaf bytes verify_consistency_batch_bound recomputes
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+
+
+def _check_merkle_consistency_entry(
+    entry: object, name: str = "entry"
+) -> MerkleConsistencyBatchEntry:
+    """Validate one :class:`MerkleConsistencyBatchEntry` and its nested types.
+
+    Applies the per-entry rules of :func:`verify_consistency_batch`: the
+    entry must be a :class:`MerkleConsistencyBatchEntry` whose
+    ``old_root`` / ``new_root`` are ``bytes`` and whose ``proof`` is a
+    :class:`MerkleConsistencyProof` with non-``bool`` integer
+    ``old_count`` / ``new_count`` and a tuple-of-bytes ``nodes``.
+    Structural and value problems (count ranges, node count and digest
+    lengths) are left to :func:`verify_consistency` at check time.
+    """
+    if not isinstance(entry, MerkleConsistencyBatchEntry):
+        raise TypeError(f"{name} must be a MerkleConsistencyBatchEntry")
+    _check_bytes(entry.old_root, f"{name} old_root")
+    _check_bytes(entry.new_root, f"{name} new_root")
+    proof = entry.proof
+    if not isinstance(proof, MerkleConsistencyProof):
+        raise TypeError(f"{name} proof must be a MerkleConsistencyProof")
+    for field_name in ("old_count", "new_count"):
+        value = getattr(proof, field_name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"{name} proof {field_name} must be an integer")
+    if not isinstance(proof.nodes, tuple):
+        raise TypeError(f"{name} proof nodes must be a tuple of bytes")
+    for position, node in enumerate(proof.nodes):
+        _check_bytes(node, f"{name} proof nodes[{position}]")
+    return entry
+
+
+def _merkle_consistency_entry_replay_encodable(
+    entry: MerkleConsistencyBatchEntry,
+) -> bool:
+    """Every framed count must fit in unsigned 64 bits.
+
+    The bound leaf writes the proof's ``old_count`` / ``new_count`` as
+    decimal ASCII (so a negative count has no encoding) and frames each
+    item with a four-byte length prefix; keeping the count values inside
+    uint64 matches the framing-count rule shared with the other replay
+    guards. The raw root and node bytes need no encodability rule.
+    """
+    values = (entry.proof.old_count, entry.proof.new_count)
+    return all(0 <= value <= _UINT64_MAX for value in values)
+
+
+def _merkle_consistency_entry_replay_digest(
+    entry: MerkleConsistencyBatchEntry,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the Merkle-consistency-entry replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``L(entry)`` and
+    ``F(E)``, where ``L(entry)`` is the raw outer leaf of the
+    Merkle-committed complete single-entry consistency batch
+    (:func:`_bound_consistency_leaf`), the same per-item leaf bytes that
+    :func:`verify_consistency_batch_bound` recomputes when checking the
+    outer root. The proof's nodes keep their proof order inside the leaf.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(
+        _frame_length_prefixed(_MERKLE_CONSISTENCY_ENTRY_REPLAY_DOMAIN)
+    )
+    transcript.update(_frame_length_prefixed(session_id))
+    transcript.update(_bound_consistency_leaf(entry))  # raw leaf, no F framing
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+class MerkleConsistencyEntryReplayGuard:
+    """Single-use replay protection for one consistency batch entry.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a single
+    :class:`MerkleConsistencyBatchEntry` — the ``old_root`` and
+    ``new_root`` it links and its append-only
+    :class:`MerkleConsistencyProof` — to a session id; :meth:`check`
+    accepts an equal pending binding exactly once, recomputing the
+    binding digest, checking the expiry and delegating to
+    :func:`verify_consistency`, and then marks the id consumed. The
+    digest frames the entry under
+    ``SHA-256(F(D) || F(session_id) || L(entry) || F(E))`` with domain
+    ``b"zr/mcer/v1"``, where ``L(entry)`` is the raw outer leaf of the
+    Merkle-committed complete single-entry consistency batch
+    (:func:`_bound_consistency_leaf`), i.e. the four-byte length-prefixed
+    run of the ``b"zkregion/consistency-bound/v1"`` separator,
+    ``old_root``, ``new_root``, decimal-ASCII ``old_count`` /
+    ``new_count`` and every proof node in order — the same per-item leaf
+    bytes :func:`verify_consistency_batch_bound` recomputes; the F framing
+    and the E expiry encoding are reused byte for byte from the other
+    guards. By default both the pending and the consumed state live on
+    this guard instance and are never shared between instances; passing
+    an :class:`SQLiteReplayStore` as ``store`` instead keeps the state in
+    that store under the ``b"zr/mcer/v1"`` key domain, so entry guards
+    attached to the same store namespace share pending, claimed and
+    consumed ids across independent instances, processes and process
+    restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the digest/expiry work and the delegated verification (the
+    in-instance registry lock, or the store's short transaction and
+    unique claim token); the claim is per-id registry state rather than a
+    global lock, so a proof being verified under one id never serializes
+    checks or binds of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None
+            if store is None
+            else store._view(_MERKLE_CONSISTENCY_ENTRY_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        entry: MerkleConsistencyBatchEntry,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to the entry.
+
+        Returns the frozen :class:`ReplayBinding`. ``entry`` must be a
+        :class:`MerkleConsistencyBatchEntry` (``bytes`` ``old_root`` /
+        ``new_root`` and a well-typed :class:`MerkleConsistencyProof`),
+        ``session_id`` must be non-empty ``bytes`` and ``expires_at``
+        must be either ``None`` or a non-``bool`` unsigned 64-bit
+        Unix-second timestamp. The framed proof counts
+        (``proof.old_count`` / ``new_count``, written decimal ASCII
+        inside the bound leaf) must likewise fit in uint64. A session id
+        that is already pending, being checked or consumed raises
+        :class:`ValueError`. Wrong argument or nested field types
+        (including a ``bool`` count) raise :class:`TypeError`; an empty
+        id, an out-of-uint64 expiry or framed count, or a rebind raise
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_merkle_consistency_entry(entry)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _merkle_consistency_entry_replay_encodable(entry):
+            raise ValueError("proof counts must be unsigned 64-bit integers")
+        binding = ReplayBinding(
+            session_id,
+            _merkle_consistency_entry_replay_digest(
+                entry, session_id, expires_at
+            ),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entry: MerkleConsistencyBatchEntry,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for the entry.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id
+        at most one can return ``True``. The digest is recomputed over the
+        presented ``entry``; for a binding with an expiry,
+        ``now >= expires_at`` makes the check fail (``now`` defaults to
+        the current Unix seconds and must otherwise be a non-``bool``
+        uint64). Only then are the entry's ``old_root``, ``new_root`` and
+        ``proof`` handed to :func:`verify_consistency`, in that order,
+        which recombines the old peaks, folds in the appended leaf
+        digests and checks both roots.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, or
+        :func:`verify_consistency` returning ``False``) returns ``False``,
+        releases the claim and leaves the registration pending. An
+        exception escaping the delegated verification likewise releases
+        the claim and then propagates unchanged, leaving the id usable.
+        With a store backend, only the holder of the current claim token
+        can consume the id (an expired claim may be taken over by a later
+        equal ``check``); a stale token neither consumes nor restores
+        anything. Verification runs without any lock or transaction held,
+        so other ids are never serialized. Argument type errors raise
+        :class:`TypeError`; an out-of-range ``now`` raises
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_merkle_consistency_entry(entry)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _merkle_consistency_entry_replay_encodable(entry):
+            return False  # negative or oversized proof counts in the bound leaf
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(entry, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _merkle_consistency_entry_replay_digest(
+                    entry, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_consistency(entry.old_root, entry.new_root, entry.proof):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entry: MerkleConsistencyBatchEntry,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim
+        is taken over and issued a fresh random token); verification runs
+        with no transaction held; only the token returned by the winning
+        claim can consume the id, and every rejection or escaped error
+        restores the id to pending with that same token. A stale token
+        (a claim taken over while verification ran) neither consumes nor
+        restores anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _merkle_consistency_entry_replay_digest(
+                    entry, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_consistency(entry.old_root, entry.new_root, entry.proof):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

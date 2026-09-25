@@ -27,6 +27,7 @@ SchnorrBatchReplayGuard /
 RangeBatchReplayGuard /
 BoundSchnorrBatch / verify_bound /
 SingleKeyBoundBatch / SchnorrVerifier.verify_bound_batch /
+SingleKeyEntryReplayGuard /
 BoundRegionBatch / verify_region_bound /
 BoundRangeBatch / verify_range_bound /
 BoundSchnorrReplayGuard /
@@ -154,6 +155,7 @@ __all__ = [
     "SingleKeyBatchGuard",
     "SingleKeyBoundBatch",
     "SingleKeyBoundReplayGuard",
+    "SingleKeyEntryReplayGuard",
     "commit",
     "commit_coordinate",
     "merkle_root",
@@ -4954,6 +4956,7 @@ _MERKLE_CONSISTENCY_BATCH_REPLAY_DOMAIN = b"zr/mcbr/v1"
 _MERKLE_CONSISTENCY_ENTRY_REPLAY_DOMAIN = b"zr/mcer/v1"
 _SCHNORR_BATCH_REPLAY_DOMAIN = b"zr/sbr/v1"
 _SINGLE_KEY_BATCH_REPLAY_DOMAIN = b"zr/skbr/v1"
+_SINGLE_KEY_ENTRY_REPLAY_DOMAIN = b"zr/sker/v1"
 _SINGLE_KEY_BOUND_REPLAY_DOMAIN = b"zr/skbbr/v1"
 _BOUND_CONSISTENCY_REPLAY_DOMAIN = b"zr/bcbr/v1"
 _BOUND_CONSISTENCY_CHAIN_REPLAY_DOMAIN = b"zr/bccbr/v1"
@@ -5115,6 +5118,7 @@ class SQLiteReplayStore:
     :class:`RegionReplayGuard`, :class:`RegionBatchReplayGuard`,
     :class:`BoundRegionReplayGuard`,
     :class:`BoundRangeReplayGuard`, :class:`BoundSchnorrReplayGuard`,
+    :class:`SingleKeyEntryReplayGuard`,
     :class:`SingleKeyBoundReplayGuard`,
     :class:`MerkleConsistencyChainReplayGuard`,
     :class:`MerkleConsistencyReplayGuard`,
@@ -12220,6 +12224,363 @@ class SingleKeyBatchGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not self._verifier.verify_batch(entries, randbelow=randbelow):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for one same-key Schnorr entry
+#
+# A SingleKeyEntryReplayGuard binds a single SchnorrBatchEntry — one
+# message, proof and context made for one fixed public key and group — to
+# one caller-chosen session id. It reuses the ReplayBinding type and, byte
+# for byte, the F framing and the E expiry encoding of the other
+# single-entry guards (ReplayGuard / OpeningReplayGuard / ...): only the
+# domain separator and the leaf differ. The guard is constructed with one
+# fixed public_key and group (prime / generator), and the leaf is the
+# BoundSchnorr leaf raw bytes (_single_key_batch_leaf, i.e.
+# _bound_schnorr_leaf over the entry lifted with the guard's fixed key and
+# group) — the same per-item outer leaf byte the same-key batch guards use.
+# Without a store the pending/claimed/consumed states are local to the
+# guard instance, while an SQLiteReplayStore keeps them in the store under
+# b"zr/sker/v1", shared across instances, processes and restarts.
+# bind_once registers a pending binding, check claims the id atomically,
+# recomputes the digest, checks the expiry, delegates the single proof to
+# the fixed SchnorrVerifier's verify_proof with the entry's message, proof
+# and context in field order and consumes the id only on full success;
+# every rejection leaves the id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || L(entry) || F(E)
+# )
+#   D = b"zr/sker/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   L(entry) = the BoundSchnorr leaf raw bytes (_bound_schnorr_leaf) built
+#       from a MultiSchnorrEntry carrying this guard's fixed public_key,
+#       prime and generator together with the entry's message, proof and
+#       context, raw, i.e. without an F framing
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+
+
+def _check_single_key_entry_type(entry: object) -> SchnorrBatchEntry:
+    """Validate the single same-key ``entry`` argument types.
+
+    Mirrors the nested type rules of :meth:`SchnorrVerifier.verify_proof`
+    and of one item of :meth:`SchnorrVerifier.verify_batch`: ``entry`` must
+    be a :class:`SchnorrBatchEntry` whose ``message`` / ``context`` are
+    ``bytes`` and whose ``proof`` is a :class:`SchnorrProof` with
+    non-``bool`` integer commitment / response. Structural and value
+    problems (commitment range, negative response) are left to
+    :meth:`~SchnorrVerifier.verify_proof` at check time.
+    """
+    if not isinstance(entry, SchnorrBatchEntry):
+        raise TypeError("entry must be a SchnorrBatchEntry")
+    _check_bytes(entry.message, "entry message")
+    proof = entry.proof
+    if not isinstance(proof, SchnorrProof):
+        raise TypeError("entry proof must be a SchnorrProof")
+    if (
+        not isinstance(proof.commitment, int)
+        or isinstance(proof.commitment, bool)
+        or not isinstance(proof.response, int)
+        or isinstance(proof.response, bool)
+    ):
+        raise TypeError("entry proof commitment and response must be integers")
+    _check_bytes(entry.context, "entry context")
+    return entry
+
+
+def _single_key_entry_replay_encodable(entry: SchnorrBatchEntry) -> bool:
+    """Every leaf integer must be non-negative.
+
+    The BoundSchnorr leaf frames the proof commitment / response with the
+    shortest unsigned big-endian encoding, so a negative integer cannot be
+    framed. The guard's own ``prime`` / ``generator`` / ``public_key`` are
+    validated at construction.
+    """
+    return min(entry.proof.commitment, entry.proof.response) >= 0
+
+
+def _single_key_entry_replay_digest(
+    entry: SchnorrBatchEntry,
+    session_id: bytes,
+    expires_at: int | None,
+    *,
+    public_key: int,
+    prime: int,
+    generator: int,
+) -> bytes:
+    """Compute the single same-key Schnorr entry replay binding digest.
+
+    Byte for byte the :class:`ReplayGuard` single-entry framing with the
+    same-key entry replay domain and the BoundSchnorr leaf raw bytes built
+    from the entry under the fixed public key and group. Writes, in order:
+    ``F(D)``, ``F(session_id)``, ``L(entry)`` (raw, without an F framing)
+    and ``F(E)``.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_SINGLE_KEY_ENTRY_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    transcript.update(
+        _single_key_batch_leaf(entry, public_key, prime, generator)
+    )  # raw leaf, no F framing
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+class SingleKeyEntryReplayGuard:
+    """Single-use replay protection for one same-key :class:`SchnorrBatchEntry`.
+
+    The guard is bound to one fixed ``public_key`` and group (``prime`` /
+    ``generator``, defaulting to :data:`DEFAULT_PRIME` /
+    :data:`DEFAULT_GENERATOR`); the entry it protects is a single
+    :class:`SchnorrBatchEntry` whose ``message``, ``proof`` and ``context``
+    are verified under that fixed key and group by the
+    :class:`SchnorrVerifier` constructed once from those parameters. A
+    fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits one entry to a session id;
+    :meth:`check` accepts an equal pending binding exactly once — claiming
+    the id atomically, recomputing the binding digest, checking the expiry
+    and delegating to the fixed verifier's
+    :meth:`~SchnorrVerifier.verify_proof` with the entry's ``message``,
+    ``proof`` and ``context`` in field order — and then marks the id
+    consumed. The digest frames the entry under
+    ``SHA-256(F(D) || F(session_id) || L(entry) || F(E))`` with domain
+    ``b"zr/sker/v1"``, where ``L(entry)`` is byte for byte the per-item
+    BoundSchnorr leaf built with this guard's fixed public key and group
+    parameters (the same raw bytes :class:`SingleKeyBatchGuard` frames per
+    batch item); the F framing and the E expiry encoding are reused byte
+    for byte from the other single-entry replay guards. By default both
+    the pending and the consumed state live on this guard instance and are
+    never shared between instances; passing an :class:`SQLiteReplayStore`
+    as ``store`` instead keeps the state in that store under the
+    ``b"zr/sker/v1"`` key domain, so same-key entry guards attached to the
+    same store namespace share pending, claimed and consumed ids across
+    independent instances, processes and process restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the digest/expiry work and the delegated proof verification
+    (the in-instance registry lock, or the store's short transaction and
+    unique claim token); the claim is per-id registry state rather than a
+    global lock, so an entry being verified under one id never serializes
+    checks or binds of other ids.
+    """
+
+    def __init__(
+        self,
+        public_key: int,
+        *,
+        prime: int = DEFAULT_PRIME,
+        generator: int = DEFAULT_GENERATOR,
+        store: SQLiteReplayStore | None = None,
+    ) -> None:
+        _check_int(public_key, "public_key")
+        _check_int(prime, "prime")
+        _check_int(generator, "generator")
+        # The fixed verifier carries the group-value range checks.
+        self._verifier = SchnorrVerifier(public_key, prime=prime, generator=generator)
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._public_key = public_key
+        self._prime = prime
+        self._generator = generator
+        self._store = (
+            None
+            if store is None
+            else store._view(_SINGLE_KEY_ENTRY_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def public_key(self) -> int:
+        return self._public_key
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def _digest(
+        self,
+        entry: SchnorrBatchEntry,
+        session_id: bytes,
+        expires_at: int | None,
+    ) -> bytes:
+        """The binding digest over ``entry`` under this guard's key/group."""
+        return _single_key_entry_replay_digest(
+            entry,
+            session_id,
+            expires_at,
+            public_key=self._public_key,
+            prime=self._prime,
+            generator=self._generator,
+        )
+
+    def bind_once(
+        self,
+        entry: SchnorrBatchEntry,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to ``entry``.
+
+        Returns the frozen :class:`ReplayBinding`. ``entry`` follows the
+        same nested type rules as one item of
+        :meth:`SchnorrVerifier.verify_batch`: its ``message`` and
+        ``context`` are ``bytes`` and its ``proof`` is a
+        :class:`SchnorrProof` with non-``bool`` integer commitment /
+        response. ``session_id`` must be non-empty ``bytes`` and
+        ``expires_at`` must be either ``None`` or a non-``bool`` unsigned
+        64-bit Unix-second timestamp; every leaf integer (the proof
+        commitment / response) must be non-negative. A session id that is
+        already pending, being checked or consumed raises
+        :class:`ValueError`. Wrong argument or nested field types
+        (including ``bool`` integers) raise :class:`TypeError`; an empty
+        id, an out-of-uint64 expiry, a negative leaf integer or a rebind
+        raise :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_single_key_entry_type(entry)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _single_key_entry_replay_encodable(entry):
+            raise ValueError("leaf integers must be non-negative unsigned integers")
+        binding = ReplayBinding(
+            session_id,
+            self._digest(entry, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entry: SchnorrBatchEntry,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for the entry.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id
+        at most one can return ``True``. The digest is recomputed over the
+        presented ``entry`` under this guard's fixed public key and group;
+        for a binding with an expiry, ``now >= expires_at`` makes the check
+        fail (``now`` defaults to the current Unix seconds and must
+        otherwise be a non-``bool`` uint64). Only then is the entry's
+        ``message``, ``proof`` and ``context`` handed to the fixed
+        verifier's :meth:`~SchnorrVerifier.verify_proof` in field order.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, a negative leaf
+        integer, or ``verify_proof`` returning ``False``) returns
+        ``False``, releases the claim and leaves the registration pending.
+        An exception escaping the delegated verification likewise releases
+        the claim and then propagates unchanged, leaving the id usable.
+        With a store backend, only the holder of the current claim token
+        can consume the id (an expired claim may be taken over by a later
+        equal ``check``); a stale token neither consumes nor restores
+        anything. Verification runs without any lock or transaction held,
+        so other ids are never serialized. Argument type errors raise
+        :class:`TypeError`; an out-of-range ``now`` raises
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_single_key_entry_type(entry)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _single_key_entry_replay_encodable(entry):
+            return False  # negative leaf integers
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(entry, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                self._digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not self._verifier.verify_proof(
+                entry.message, entry.proof, context=entry.context
+            ):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entry: SchnorrBatchEntry,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                self._digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not self._verifier.verify_proof(
+                entry.message, entry.proof, context=entry.context
+            ):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

@@ -77,6 +77,7 @@ from zkregion import (
     SingleKeyBatchGuard,
     SingleKeyBoundBatch,
     SingleKeyBoundReplayGuard,
+    SingleKeyEntryReplayGuard,
     commit,
     commit_coordinate,
     merkle_root,
@@ -21701,6 +21702,597 @@ class SingleKeyBoundReplayGuardTest(unittest.TestCase):
         with self.assertRaises(sqlite3.Error):
             guard.check(batch, root,
                         ReplayBinding(b"s", b"\x00" * 32), now=1)
+        store.close()
+
+
+class SingleKeyEntryReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for one same-key SchnorrBatchEntry."""
+
+    DOMAIN = b"zr/sker/v1"
+    G_PRIME = SMALL_PRIME
+    G2_PRIME = 104723
+
+    def setUp(self):
+        self.alice = SchnorrProver(
+            secret=4321, prime=self.G_PRIME, generator=3,
+            randbelow=counter_randbelow(),
+        )
+        self.bob = SchnorrProver(
+            secret=7777, prime=self.G_PRIME, generator=3,
+            randbelow=counter_randbelow(),
+        )
+        self.carol = SchnorrProver(
+            secret=5566, prime=self.G2_PRIME, generator=3,
+            randbelow=counter_randbelow(),
+        )
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "sker.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def guard(self, **kwargs):
+        return SingleKeyEntryReplayGuard(
+            self.alice.public_key, prime=self.G_PRIME, generator=3, **kwargs
+        )
+
+    def entry(self, prover=None, message=b"alpha", context=b"single"):
+        prover = self.alice if prover is None else prover
+        return SchnorrBatchEntry(
+            message, prover.prove(message, context=context), context
+        )
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    @staticmethod
+    def expected_digest(entry, session_id, expires_at=None, *,
+                        public_key, prime, generator):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        leaf = bound_schnorr_leaf(
+            MultiSchnorrEntry(
+                public_key, entry.message, entry.proof, entry.context,
+                prime, generator,
+            )
+        )
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = F(b"zr/sker/v1") + F(session_id) + leaf + F(expiry)
+        return hashlib.sha256(material).digest()
+
+    # ---- construction --------------------------------------------------------
+
+    def test_constructor_type_errors(self):
+        for bad in (True, 1.5, "104729", None, b"key", object()):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                SingleKeyEntryReplayGuard(bad, prime=self.G_PRIME, generator=3)
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                SingleKeyEntryReplayGuard(self.alice.public_key, prime=bad,
+                                          generator=3)
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                SingleKeyEntryReplayGuard(self.alice.public_key,
+                                          prime=self.G_PRIME, generator=bad)
+        for bad_store in (object(), "path", 1, True, b"ns", {}):
+            with self.assertRaises(TypeError, msg=repr(bad_store)):
+                self.guard(store=bad_store)
+
+    def test_constructor_value_errors(self):
+        for bad_key in (0, -1, self.G_PRIME, self.G_PRIME + 1):
+            with self.assertRaises(ValueError, msg=repr(bad_key)):
+                SingleKeyEntryReplayGuard(bad_key, prime=self.G_PRIME,
+                                          generator=3)
+        for bad_generator in (0, 1, -3, self.G_PRIME, self.G_PRIME + 1):
+            with self.assertRaises(ValueError, msg=repr(bad_generator)):
+                SingleKeyEntryReplayGuard(self.alice.public_key,
+                                          prime=self.G_PRIME,
+                                          generator=bad_generator)
+
+    def test_default_group_parameters(self):
+        prover = SchnorrProver(secret=12345, randbelow=counter_randbelow())
+        guard = SingleKeyEntryReplayGuard(prover.public_key)
+        self.assertEqual(guard.public_key, prover.public_key)
+        entry = SchnorrBatchEntry(b"m", prover.prove(b"m"), b"")
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding))
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(
+            binding.digest,
+            self.expected_digest(
+                entry, b"s1",
+                public_key=self.alice.public_key,
+                prime=self.G_PRIME, generator=3,
+            ),
+        )
+        binding = guard.bind_once(entry, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest,
+            self.expected_digest(
+                entry, b"s2", 1000,
+                public_key=self.alice.public_key,
+                prime=self.G_PRIME, generator=3,
+            ),
+        )
+
+    def test_domain_separator_is_distinct(self):
+        entry = self.entry()
+        binding = self.guard().bind_once(entry, b"s")
+
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        leaf = bound_schnorr_leaf(
+            MultiSchnorrEntry(
+                self.alice.public_key, entry.message, entry.proof,
+                entry.context, self.G_PRIME, 3,
+            )
+        )
+        framing = F(b"s") + leaf + F(b"\x00")
+        for other_domain in (
+            b"zr/r/v1",
+            b"zr/rr/v1",
+            b"zr/rg/v1",
+            b"zr/brg/v1",
+            b"zr/brr/v1",
+            b"zr/bsr/v1",
+            b"zr/mccr/v1",
+            b"zr/mcr/v1",
+            b"zr/mir/v1",
+            b"zr/mirr/v1",
+            b"zr/mmr/v1",
+            b"zr/mcbr/v1",
+            b"zr/sbr/v1",
+            b"zr/skbr/v1",
+            b"zr/skbbr/v1",
+            b"zr/rbr/v1",
+            b"zr/rgbr/v1",
+        ):
+            foreign_digest = hashlib.sha256(F(other_domain) + framing).digest()
+            self.assertNotEqual(binding.digest, foreign_digest)
+
+    def test_digest_binds_every_component(self):
+        entry = self.entry()
+
+        def bind(e=entry, s=b"s", **kw):
+            return self.guard().bind_once(e, s, **kw).digest
+
+        base = bind()
+        self.assertNotEqual(base, bind(s=b"other"))
+        self.assertNotEqual(base, bind(expires_at=1))
+        self.assertNotEqual(bind(expires_at=1), bind(expires_at=2))
+        # swapping the message, context or proof moves the leaf
+        self.assertNotEqual(
+            base, bind(dataclasses.replace(entry, message=b"other"))
+        )
+        self.assertNotEqual(
+            base, bind(dataclasses.replace(entry, context=b"elsewhere"))
+        )
+        tampered_proof = dataclasses.replace(
+            entry,
+            proof=SchnorrProof(entry.proof.commitment, entry.proof.response + 1),
+        )
+        self.assertNotEqual(base, bind(tampered_proof))
+
+    def test_digest_binds_the_guard_key_and_group(self):
+        entry = self.entry()
+        base = self.guard().bind_once(entry, b"s").digest
+        other_key = SingleKeyEntryReplayGuard(
+            self.bob.public_key, prime=self.G_PRIME, generator=3
+        ).bind_once(entry, b"s").digest
+        self.assertNotEqual(base, other_key)
+        other_generator = SingleKeyEntryReplayGuard(
+            self.alice.public_key, prime=self.G_PRIME, generator=5
+        ).bind_once(entry, b"s").digest
+        self.assertNotEqual(base, other_generator)
+        other_group = SingleKeyEntryReplayGuard(
+            self.carol.public_key, prime=self.G2_PRIME, generator=3
+        ).bind_once(entry, b"s").digest
+        self.assertNotEqual(base, other_group)
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        entry = self.entry()
+        none_binding = self.guard().bind_once(entry, b"a")
+        zero_binding = self.guard().bind_once(entry, b"b", expires_at=0)
+        one_binding = self.guard().bind_once(entry, b"c", expires_at=1)
+        digests = {none_binding.digest, zero_binding.digest, one_binding.digest}
+        self.assertEqual(len(digests), 3)
+
+    # ---- bind_once state and validation -------------------------------------
+
+    def test_pending_id_cannot_be_rebound(self):
+        entry = self.entry()
+        guard = self.guard()
+        guard.bind_once(entry, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+
+    def test_claimed_id_cannot_be_rebound(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard._registry.claim(b"s", binding))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        entry = self.entry()
+        guard = self.guard()
+        first = guard.bind_once(entry, b"s1")
+        second = guard.bind_once(entry, b"s2")
+        self.assertTrue(guard.check(entry, first, now=1))
+        self.assertFalse(guard.check(entry, first, now=1))
+        self.assertTrue(guard.check(entry, second, now=1))
+
+    def test_bind_type_errors(self):
+        entry = self.entry()
+        guard = self.guard()
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(bad, b"s")
+        bad_fields = [
+            dataclasses.replace(entry, message="alpha"),
+            dataclasses.replace(entry, message=bytearray(b"alpha")),
+            dataclasses.replace(entry, proof=object()),
+            dataclasses.replace(entry, proof=SchnorrProof(True, 1)),
+            dataclasses.replace(entry, proof=SchnorrProof(1, False)),
+            dataclasses.replace(entry, proof=SchnorrProof(1.5, 1)),
+            dataclasses.replace(entry, context=bytearray(b"single")),
+            dataclasses.replace(entry, context="single"),
+        ]
+        for bad in bad_fields:
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(bad, b"s")
+        for bad_id in ("abc", bytearray(b"abc"), 7, None, True):
+            with self.assertRaises(TypeError, msg=repr(bad_id)):
+                guard.bind_once(entry, bad_id)
+        for bad_expiry in (True, 1.5, "1000", b"\x00"):
+            with self.assertRaises(TypeError, msg=repr(bad_expiry)):
+                guard.bind_once(entry, b"s", expires_at=bad_expiry)
+
+    def test_bind_value_errors(self):
+        entry = self.entry()
+        guard = self.guard()
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"")
+        for bad_expiry in (-1, 1 << 64, (1 << 64) + 1):
+            with self.assertRaises(ValueError, msg=repr(bad_expiry)):
+                guard.bind_once(entry, b"s", expires_at=bad_expiry)
+        for bad_proof in (
+            SchnorrProof(-1, 1),
+            SchnorrProof(1, -1),
+            SchnorrProof(-1, -1),
+        ):
+            with self.assertRaises(ValueError, msg=repr(bad_proof)):
+                guard.bind_once(dataclasses.replace(entry, proof=bad_proof), b"s")
+
+    # ---- check ---------------------------------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding, now=1))
+        self.assertFalse(guard.check(entry, binding, now=1))
+        self.assertIn(b"s", guard._consumed)
+
+    def test_check_with_default_now(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding, now=(1 << 64) - 1))
+
+    def test_expiry_boundary_is_inclusive(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s", expires_at=1000)
+        self.assertFalse(guard.check(entry, binding, now=1000))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=999))
+
+    def test_wrong_entry_rejected_without_consuming(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        other = self.entry(message=b"beta")
+        self.assertFalse(guard.check(other, binding, now=1))
+        tampered = dataclasses.replace(entry, context=b"elsewhere")
+        self.assertFalse(guard.check(tampered, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    def test_bound_but_unverifiable_entry_rejected_and_restored(self):
+        # the bound entry itself does not verify: the proof is for b"delta"
+        entry = SchnorrBatchEntry(
+            b"gamma", self.alice.prove(b"delta", context=b"single"), b"single"
+        )
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertFalse(guard.check(entry, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertFalse(guard.check(entry, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        entry = self.entry()
+        guard = self.guard()
+        foreign = self.guard().bind_once(entry, b"s")
+        self.assertFalse(guard.check(entry, foreign, now=1))
+        binding = guard.bind_once(entry, b"s")
+        self.assertFalse(self.guard().check(entry, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        forged = ReplayBinding(b"s", b"\x00" * 32)
+        self.assertFalse(guard.check(entry, forged, now=1))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    def test_instances_are_independent(self):
+        entry = self.entry()
+        first = self.guard()
+        second = self.guard()
+        binding = first.bind_once(entry, b"s")
+        self.assertFalse(second.check(entry, binding, now=1))
+        self.assertTrue(first.check(entry, binding, now=1))
+
+    def test_delegation_error_propagates_and_restores_pending(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        original = SchnorrVerifier.verify_proof
+
+        def boom(_self, _message, _proof, **_kwargs):
+            raise RuntimeError("boom")
+
+        SchnorrVerifier.verify_proof = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entry, binding, now=1)
+        finally:
+            SchnorrVerifier.verify_proof = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    def test_check_type_errors(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.check(bad, binding, now=1)
+        for bad_binding in (7, None, True, "binding", (b"s", b"\x00" * 32)):
+            with self.assertRaises(TypeError, msg=repr(bad_binding)):
+                guard.check(entry, bad_binding, now=1)
+        for bad_now in (True, 1.5, "1", b"\x00"):
+            with self.assertRaises(TypeError, msg=repr(bad_now)):
+                guard.check(entry, binding, now=bad_now)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        for bad in (-1, 1 << 64, (1 << 64) + 1):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                guard.check(entry, binding, now=bad)
+
+    def test_inputs_are_not_mutated(self):
+        entry = self.entry()
+        guard = self.guard()
+        snapshot = (entry.message, entry.proof, entry.context)
+        binding = guard.bind_once(entry, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        self.assertTrue(guard.check(entry, binding, now=1))
+        self.assertEqual((entry.message, entry.proof, entry.context), snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+    def test_concurrent_checks_have_exactly_one_winner(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = guard.check(entry, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        entry = self.entry()
+        store = self.make_store()
+        binder = self.guard(store=store)
+        binding = binder.bind_once(entry, b"s", expires_at=1000)
+        checker = self.guard(store=store)
+        self.assertTrue(checker.check(entry, binding, now=999))
+        self.assertFalse(binder.check(entry, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        entry = self.entry()
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(entry, b"s")
+        store.close()
+        reopened = self.make_store()
+        guard = self.guard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = self.guard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(entry, b"s")
+        reopened_again.close()
+
+    def test_store_domain_isolation_from_other_guards(self):
+        entry = self.entry()
+        store = self.make_store()
+        entry_guard = self.guard(store=store)
+        batch_guard = SingleKeyBatchGuard(
+            self.alice.public_key, prime=self.G_PRIME, generator=3, store=store
+        )
+        binding = entry_guard.bind_once(entry, b"same-id")
+        batch_binding = batch_guard.bind_once([entry], b"same-id")
+        self.assertNotEqual(binding.digest, batch_binding.digest)
+        self.assertTrue(entry_guard.check(entry, binding, now=1))
+        self.assertTrue(
+            batch_guard.check([entry], batch_binding, now=1,
+                              randbelow=counter_randbelow())
+        )
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/skbr/v1", domains)
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        entry = self.entry()
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = self.guard(store=first).bind_once(entry, b"s")
+        self.assertFalse(self.guard(store=second).check(entry, binding_a, now=1))
+        self.assertTrue(self.guard(store=first).check(entry, binding_a, now=1))
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        entry = self.entry()
+        store = self.make_store()
+        binder = self.guard(store=store)
+        binding = binder.bind_once(entry, b"s")
+        checker = self.guard(store=store)
+        other = self.entry(message=b"beta")
+        self.assertFalse(checker.check(other, binding, now=1))
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(self.guard(store=store).check(entry, binding, now=1))
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        entry = self.entry()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = self.guard(store=store)
+        binding = guard.bind_once(entry, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):  # live claim cannot be rebound
+            guard.bind_once(entry, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):  # expired claim still cannot be rebound
+            guard.bind_once(entry, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):  # consumed id can never be rebound
+            guard.bind_once(entry, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        entry = self.entry()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = self.guard(store=store).bind_once(entry, b"s")
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+    def test_store_delegation_error_restores_pending(self):
+        entry = self.entry()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        binding = guard.bind_once(entry, b"s")
+        original = SchnorrVerifier.verify_proof
+
+        def boom(_self, _message, _proof, **_kwargs):
+            raise RuntimeError("boom")
+
+        SchnorrVerifier.verify_proof = boom
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entry, binding, now=1)
+        finally:
+            SchnorrVerifier.verify_proof = original
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(self.guard(store=store).check(entry, binding, now=1))
+        store.close()
+
+    def test_store_concurrent_checks_have_exactly_one_winner(self):
+        entry = self.entry()
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(entry, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = self.guard(store=store).check(entry, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
         store.close()
 
 

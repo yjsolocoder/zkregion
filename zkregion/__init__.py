@@ -131,6 +131,7 @@ __all__ = [
     "RegionBatchReplayGuard",
     "RegionContainsBatchReplayGuard",
     "RegionContainsEntry",
+    "RegionContainsReplayGuard",
     "RegionProof",
     "RegionReplayGuard",
     "ReplayBinding",
@@ -4906,6 +4907,7 @@ _BOUND_OPENING_REPLAY_DOMAIN = b"zr/bobr/v1"
 _BOUND_PEDERSEN_OPENING_REPLAY_DOMAIN = b"zr/pbobr/v1"
 _REGION_CONTAINS_BATCH_REPLAY_DOMAIN = b"zr/rcbr/v1"
 _BOUND_REGION_CONTAINS_REPLAY_DOMAIN = b"zr/brcbr/v1"
+_REGION_CONTAINS_REPLAY_DOMAIN = b"zr/rcrr/v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -14754,6 +14756,293 @@ class BoundRegionContainsReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_region_contains_bound(batch, root):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for single region-contains decision entries
+#
+# A RegionContainsReplayGuard binds one RegionContainsEntry — the same entry
+# shape accepted by verify_region_contains_batch, with the same nested type
+# rules — to a caller-chosen session id, reusing the ReplayBinding type and,
+# byte for byte, the F framing and the E expiry encoding of the other
+# single-entry guards; only the domain separator and the per-entry leaf
+# differ. The binding is single-use: without a store the pending and consumed
+# state lives on this guard instance and is never shared between instances,
+# while an SQLiteReplayStore keeps pending, claimed and consumed ids in the
+# store under b"zr/rcrr/v1", shared across instances, processes and restarts.
+# bind_once registers a pending binding, check claims the id atomically,
+# recomputes the digest, checks the expiry, delegates the decision to
+# region_contains_committed and consumes the id only on full success; every
+# rejection leaves the id untouched.
+#
+# digest = SHA-256(F(D) || F(session_id) || L(entry) || F(E))
+#   D = b"zr/rcrr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   L(entry) = the BoundRegionContains outer-leaf bytes
+#              (_bound_region_contains_leaf), raw (no F framing)
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+
+
+def _check_region_contains_entry(entry: object, name: str = "entry") -> RegionContainsEntry:
+    """Validate a RegionContainsEntry and its nested field types."""
+    if not isinstance(entry, RegionContainsEntry):
+        raise TypeError(f"{name} must be a RegionContainsEntry")
+    region = entry.region
+    if not isinstance(region, Region):
+        raise TypeError(f"{name} region must be a Region")
+    _check_region_fields(region)
+    for axis in ("x_commitment", "y_commitment"):
+        commitment = getattr(entry, axis)
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(f"{name} {axis} must be a PedersenCommitment")
+        _check_commitment_fields(commitment)
+    _check_int(entry.x, f"{name} x")
+    _check_int(entry.y, f"{name} y")
+    _check_int(entry.x_blinding, f"{name} x_blinding")
+    _check_int(entry.y_blinding, f"{name} y_blinding")
+    return entry
+
+
+def _region_contains_replay_digest(
+    entry: RegionContainsEntry,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute ``SHA-256(F(D) || F(session_id) || L(entry) || F(E))``."""
+    transcript = hashlib.sha256()
+    transcript.update(len(_REGION_CONTAINS_REPLAY_DOMAIN).to_bytes(4, "big"))
+    transcript.update(_REGION_CONTAINS_REPLAY_DOMAIN)
+    transcript.update(len(session_id).to_bytes(4, "big"))
+    transcript.update(session_id)
+    transcript.update(_bound_region_contains_leaf(entry))  # raw leaf, no F framing
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(len(expiry).to_bytes(4, "big"))
+    transcript.update(expiry)
+    return transcript.digest()
+
+
+class RegionContainsReplayGuard:
+    """Single-use replay protection for region-contains decision entries.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a pending
+    :class:`ReplayBinding` that commits a single :class:`RegionContainsEntry`
+    — the same entry shape accepted by
+    :func:`verify_region_contains_batch`, under the same nested type rules —
+    to a session id; :meth:`check` accepts an equal pending binding exactly
+    once, recomputing the binding digest, checking the expiry and delegating
+    to :func:`region_contains_committed`, and then marks the id consumed. The
+    digest frames the entry under
+    ``SHA-256(F(D) || F(session_id) || L(entry) || F(E))`` with domain
+    ``b"zr/rcrr/v1"``, where ``L(entry)`` is the existing BoundRegionContains
+    outer-leaf raw bytes (the same bytes :func:`_bound_region_contains_leaf`
+    builds for :func:`verify_region_contains_bound`); the F framing and the
+    E expiry encoding are reused byte for byte from the other replay guards.
+    By default both the pending and the consumed state live on this guard
+    instance and are never shared between instances; passing an
+    :class:`SQLiteReplayStore` as ``store`` instead keeps the state in that
+    store under the ``b"zr/rcrr/v1"`` key domain, so region-contains guards
+    attached to the same store namespace share pending, claimed and consumed
+    ids across independent instances, processes and process restarts.
+
+    As with the other single-entry guards, concurrent checks of the same id
+    are decided by an atomic claim taken before the region-contains decision
+    runs (the in-instance registry lock, or the store's short transaction and
+    unique claim token); the decision runs without any lock or transaction
+    held, so different ids are never serialized by it.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None
+            if store is None
+            else store._view(_REGION_CONTAINS_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        entry: RegionContainsEntry,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to ``entry``.
+
+        Returns the frozen :class:`ReplayBinding`. ``entry`` must be a
+        :class:`RegionContainsEntry` following the same nested type rules as
+        :func:`verify_region_contains_batch`: its :class:`Region` four
+        bounds, its two :class:`PedersenCommitment` six integer fields and
+        its ``x`` / ``y`` / ``x_blinding`` / ``y_blinding`` integers are
+        type-checked. ``session_id`` must be non-empty ``bytes`` and
+        ``expires_at`` must be either ``None`` or a non-``bool`` unsigned
+        64-bit Unix-second timestamp. A session id that is already pending,
+        being checked or has been consumed raises :class:`ValueError`; wrong
+        argument or nested field types (including ``bool`` integers) raise
+        :class:`TypeError` (an empty id or an out-of-range expiry raise
+        :class:`ValueError`). Inputs are never mutated.
+        """
+        _check_region_contains_entry(entry)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        binding = ReplayBinding(
+            session_id,
+            _region_contains_replay_digest(entry, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entry: RegionContainsEntry,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for ``entry``.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated decision, so among concurrent calls for the same id at
+        most one can return ``True``. The digest is recomputed over the
+        presented ``entry``; for a binding with an expiry,
+        ``now >= expires_at`` makes the check fail (``now`` defaults to the
+        current Unix seconds and must otherwise be a non-``bool`` uint64).
+        Only then is the entry handed to :func:`region_contains_committed`
+        called in field order with ``entry.region``, ``entry.x_commitment``,
+        ``entry.y_commitment``, ``entry.x``, ``entry.y``,
+        ``entry.x_blinding`` and ``entry.y_blinding``, unchanged.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry or
+        :func:`region_contains_committed` returning ``False``) returns
+        ``False``, releases the claim and leaves the registration pending,
+        so a rejected id can still succeed later. An exception escaping the
+        delegated decision likewise releases the claim and then propagates
+        unchanged, leaving the id usable. With a store backend, only the
+        holder of the current claim token can consume the id (an expired
+        claim may be taken over by a later equal ``check``); a stale token
+        neither consumes nor restores anything. Verification runs without
+        any lock or transaction held, so other ids are never serialized.
+        Argument type errors raise :class:`TypeError`; an out-of-range
+        ``now`` raises :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_region_contains_entry(entry)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(entry, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _region_contains_replay_digest(
+                    entry, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not region_contains_committed(
+                entry.region,
+                entry.x_commitment,
+                entry.y_commitment,
+                entry.x,
+                entry.y,
+                entry.x_blinding,
+                entry.y_blinding,
+            ):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entry: RegionContainsEntry,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _region_contains_replay_digest(
+                    entry, session_id, binding.expires_at
+                ),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not region_contains_committed(
+                entry.region,
+                entry.x_commitment,
+                entry.y_commitment,
+                entry.x,
+                entry.y,
+                entry.x_blinding,
+                entry.y_blinding,
+            ):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

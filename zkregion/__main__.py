@@ -306,15 +306,15 @@ def main() -> int:
     response = prover.respond(challenge)
     print(f"  public={prover.public_key}  commitment={t}")
     print(f"  valid response accepted: {verifier.verify(t, challenge, response)}")
-    print(f"  tampered response rejected: {verifier.verify(t, challenge, response + 1)}")
+    print(f"  tampered response rejected: {not verifier.verify(t, challenge, response + 1)}")
 
     print()
     print("non-interactive Schnorr (Fiat-Shamir):")
     proof = prover.prove(b"payload", context=b"demo")
     print(f"  proof commitment={proof.commitment}")
     print(f"  valid proof accepted: {verifier.verify_proof(b'payload', proof, context=b'demo')}")
-    print(f"  wrong message rejected: {verifier.verify_proof(b'other', proof, context=b'demo')}")
-    print(f"  wrong context rejected: {verifier.verify_proof(b'payload', proof)}")
+    print(f"  wrong message rejected: {not verifier.verify_proof(b'other', proof, context=b'demo')}")
+    print(f"  wrong context rejected: {not verifier.verify_proof(b'payload', proof)}")
 
     print()
     print("batch Fiat-Shamir verification (same public key):")

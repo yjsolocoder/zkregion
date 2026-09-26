@@ -47,6 +47,7 @@ MerkleMultiBatchReplayGuard /
 BoundRegionReplayGuard /
 BoundRangeReplayGuard /
 BoundWideRangeReplayGuard /
+WideRangeReplayGuard /
 BoundConsistencyReplayGuard /
 BoundConsistencyChainReplayGuard /
 ReplayBinding / ReplayGuard / SQLiteReplayStore /
@@ -165,6 +166,7 @@ __all__ = [
     "SingleKeyEntryReplayGuard",
     "WideRangeBatchEntry",
     "WideRangeProof",
+    "WideRangeReplayGuard",
     "commit",
     "commit_coordinate",
     "merkle_root",
@@ -5787,6 +5789,7 @@ _REGION_CONTAINS_REPLAY_DOMAIN = b"zr/rcrr/v1"
 _BOUND_REGION_CONTAINS_REPLAY_DOMAIN = b"zr/brcbr/v1"
 _BOUND_WIDE_RANGE_REPLAY_DOMAIN = b"zr/bwrr/v1"
 _MERKLE_INCLUSION_ENTRY_REPLAY_DOMAIN = b"zr/mirr/v1"
+_WIDE_RANGE_REPLAY_DOMAIN = b"zr/wrr/v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -18185,6 +18188,254 @@ class BoundWideRangeReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_range_wide_batch_bound(batch, root, randbelow=randbelow):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+def _wide_range_replay_digest(
+    entry: WideRangeBatchEntry,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute ``SHA-256(F(D) || F(session_id) || L(entry) || F(E))``."""
+    transcript = hashlib.sha256()
+    transcript.update(len(_WIDE_RANGE_REPLAY_DOMAIN).to_bytes(4, "big"))
+    transcript.update(_WIDE_RANGE_REPLAY_DOMAIN)
+    transcript.update(len(session_id).to_bytes(4, "big"))
+    transcript.update(session_id)
+    transcript.update(_bound_wide_range_leaf(entry))  # raw leaf, no F framing
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(len(expiry).to_bytes(4, "big"))
+    transcript.update(expiry)
+    return transcript.digest()
+
+
+def _check_wide_range_batch_entry(
+    entry: object, name: str = "entry"
+) -> WideRangeBatchEntry:
+    """Validate one WideRangeBatchEntry and its nested field types."""
+    if not isinstance(entry, WideRangeBatchEntry):
+        raise TypeError(f"{name} must be a WideRangeBatchEntry")
+    commitment = entry.commitment
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError(f"{name} commitment must be a PedersenCommitment")
+    _check_commitment_fields(commitment)
+    proof = entry.proof
+    if not isinstance(proof, WideRangeProof):
+        raise TypeError(f"{name} proof must be a WideRangeProof")
+    if not isinstance(proof.commitments, tuple):
+        raise TypeError(
+            f"{name} proof commitments must be a tuple of integers"
+        )
+    for item in proof.commitments:
+        _check_int(item, f"{name} proof commitments entry")
+    for field_name in ("challenges", "responses"):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(
+                f"{name} proof {field_name} must be a tuple of integer pairs"
+            )
+        for pair in field:
+            if not isinstance(pair, tuple):
+                raise TypeError(
+                    f"{name} proof {field_name} entry must be a tuple of integers"
+                )
+            for item in pair:
+                _check_int(item, f"{name} proof {field_name} entry item")
+    _check_bytes(entry.context, f"{name} context")
+    return entry
+
+
+class WideRangeReplayGuard:
+    """Single-use replay protection for one wide range batch entry.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a pending
+    :class:`ReplayBinding` for a single :class:`WideRangeBatchEntry`;
+    :meth:`check` accepts an equal pending binding exactly once and then
+    marks the id consumed. By default both the pending and the consumed
+    state live on this guard instance and are never shared between
+    instances; passing an :class:`SQLiteReplayStore` as ``store`` instead
+    keeps the state in that store under the ``b"zr/wrr/v1"`` key domain, so
+    guards attached to the same store namespace share pending, claimed and
+    consumed ids across independent instances, processes and restarts.
+
+    The binding digest reuses the single-entry guard framing of
+    :class:`RangeReplayGuard` byte for byte (``F(D) || F(session_id) ||
+    L(entry) || F(E)``), differing only in the domain separator
+    (``b"zr/wrr/v1"``, which doubles as the store row-key domain) and in
+    ``L(entry)``: the raw per-item outer leaf bytes of a complete wide
+    range batch (:func:`_bound_wide_range_leaf`, the existing outer leaf
+    encoding under ``b"zkregion/wrb/v1"``).
+
+    As with :class:`RangeReplayGuard`, concurrent checks of the same id are
+    decided by an atomic claim taken before the digest/expiry work and the
+    potentially slow wide range verification (the in-instance registry
+    lock, or the store's short transaction and unique claim token); the
+    verification runs without any lock or transaction held, so different
+    ids are never serialized.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None if store is None else store._view(_WIDE_RANGE_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        entry: WideRangeBatchEntry,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to ``entry``.
+
+        Returns the frozen :class:`ReplayBinding`. ``session_id`` must be
+        non-empty ``bytes`` and ``expires_at`` must be either ``None`` or a
+        non-``bool`` unsigned 64-bit Unix-second timestamp. A session id
+        that is already pending, being checked or has been consumed raises
+        :class:`ValueError`; wrong argument or nested field types
+        (including ``bool`` integers) raise :class:`TypeError` (an empty id
+        or an out-of-range expiry raises :class:`ValueError`). Inputs are
+        never mutated.
+        """
+        _check_wide_range_batch_entry(entry)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        binding = ReplayBinding(
+            session_id,
+            _wide_range_replay_digest(entry, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entry: WideRangeBatchEntry,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for ``entry``.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before verification, so among concurrent
+        calls for the same id at most one can return ``True``. The digest
+        is then recomputed over the presented entry, the expiry is checked
+        (``now >= expires_at`` makes the check fail; ``now`` defaults to
+        the current Unix seconds and must otherwise be a non-``bool``
+        unsigned 64-bit integer), and only then is the entry's wide range
+        proof checked with :func:`verify_range_wide` called with
+        ``entry.commitment``, ``entry.proof`` and ``entry.context`` in
+        field order, unchanged.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry or a failing wide
+        range proof) returns ``False``, releases any claim and leaves the
+        registration pending, so a rejected id can succeed on a later
+        attempt. An exception escaping the delegated verification likewise
+        releases the claim and then propagates unchanged, leaving the id
+        usable; a database error restores the claim before it propagates.
+        With a store backend, only the holder of the current claim token
+        can consume the id (an expired claim may be taken over by a later
+        equal ``check``); a stale token neither consumes nor restores
+        anything. Verification runs without a lock, so other ids are never
+        blocked. Type errors raise :class:`TypeError`; an out-of-range
+        ``now`` raises :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_wide_range_batch_entry(entry)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(entry, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _wide_range_replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_range_wide(entry.commitment, entry.proof, entry.context):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entry: WideRangeBatchEntry,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over); verification runs with no transaction held; only the
+        token returned by the winning claim can consume the id, and every
+        rejection or escaped error restores the id to pending with that
+        same token. A stale token (a claim taken over while verification
+        ran) neither consumes nor restores anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _wide_range_replay_digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_range_wide(entry.commitment, entry.proof, entry.context):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

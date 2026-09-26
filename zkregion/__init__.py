@@ -21,6 +21,9 @@ BoundWideRangeBatch / prove_range_wide_batch_bound /
 verify_range_wide_batch_bound /
 prove_region / verify_region / region_contains_committed /
 RegionWideProof / prove_region_wide / verify_region_wide /
+RegionWideBatchEntry / verify_region_wide_batch /
+BoundRegionWideBatch / prove_region_wide_batch_bound /
+verify_region_wide_batch_bound /
 RegionContainsEntry / verify_region_contains_batch /
 BoundRegionContainsBatch / prove_region_contains_bound /
 verify_region_contains_bound /
@@ -111,6 +114,7 @@ __all__ = [
     "BoundRegionContainsBatch",
     "BoundRegionContainsReplayGuard",
     "BoundRegionReplayGuard",
+    "BoundRegionWideBatch",
     "BoundRangeReplayGuard",
     "BoundSchnorrBatch",
     "BoundSchnorrReplayGuard",
@@ -154,6 +158,7 @@ __all__ = [
     "RegionContainsReplayGuard",
     "RegionProof",
     "RegionReplayGuard",
+    "RegionWideBatchEntry",
     "RegionWideProof",
     "ReplayBinding",
     "ReplayGuard",
@@ -193,6 +198,7 @@ __all__ = [
     "prove_region_batch_bound",
     "prove_region_contains_bound",
     "prove_region_wide",
+    "prove_region_wide_batch_bound",
     "prove_schnorr_batch_bound",
     "region_contains_committed",
     "verify_bound",
@@ -226,6 +232,8 @@ __all__ = [
     "verify_region_contains_batch",
     "verify_region_contains_bound",
     "verify_region_wide",
+    "verify_region_wide_batch",
+    "verify_region_wide_batch_bound",
     "verify_schnorr_batch",
 ]
 
@@ -2683,6 +2691,623 @@ def verify_region_wide(
         proof.y_proof,
         _region_sub_context(b"y", context, region, x_commitment, y_commitment),
     )
+
+
+# ---------------------------------------------------------------------------
+# Batch verification of 2-D region membership proofs over wide ranges
+#
+# Each entry freezes the five verify_region_wide arguments in order
+# (x commitment, y commitment, region, proof, context). Per entry the two
+# axes reuse the established wide-range transcript byte for byte: the
+# power-of-two weighted bit-commitment binding and the per-bit challenge
+# share sums stay per entry, while the two OR sub-branches of every bit on
+# both axes draw one non-zero coefficient each and are combined into a
+# single aggregate equation per (prime, generator, h) group.
+
+@dataclass(frozen=True)
+class RegionWideBatchEntry:
+    """One item of a wide region batch verification.
+
+    Fields are the two :class:`PedersenCommitment` objects, the claimed
+    :class:`Region`, the :class:`RegionWideProof` and the external
+    ``context`` (empty by default) — exactly the arguments of
+    :func:`verify_region_wide`, in the same order.
+    """
+
+    x_commitment: PedersenCommitment
+    y_commitment: PedersenCommitment
+    region: Region
+    proof: RegionWideProof
+    context: bytes = b""
+
+
+def _check_region_wide_batch_entries_types(
+    entries: object,
+) -> list[RegionWideBatchEntry]:
+    """Validate the wide-region-batch ``entries`` argument types.
+
+    Mirrors the type expectations of :func:`verify_region_wide` for
+    *every* entry before any verification runs: ``entries`` must be a
+    non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`RegionWideBatchEntry` objects whose two commitments are
+    :class:`PedersenCommitment` objects with non-``bool`` integer fields,
+    whose ``region`` is a :class:`Region` with non-``bool`` integer
+    bounds, whose ``proof`` is a :class:`RegionWideProof` carrying two
+    :class:`WideRangeProof` objects with tuple fields of non-``bool``
+    integers at every nesting level and whose ``context`` is ``bytes``.
+    The whole batch is walked (a bad type in the last entry still
+    raises), and the entries are copied into a fresh list so the inputs
+    are never mutated. An empty batch is left to
+    :func:`verify_region_wide_batch` to reject with ``False``;
+    structural and value problems are left to the per-entry checks
+    during verification.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of RegionWideBatchEntry")
+    items: list[RegionWideBatchEntry] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, RegionWideBatchEntry):
+            raise TypeError(f"entries[{position}] must be a RegionWideBatchEntry")
+        for axis_name, commitment in (
+            ("x_commitment", entry.x_commitment),
+            ("y_commitment", entry.y_commitment),
+        ):
+            if not isinstance(commitment, PedersenCommitment):
+                raise TypeError(
+                    f"entries[{position}] {axis_name} must be a PedersenCommitment"
+                )
+            _check_commitment_fields(commitment)
+        region = entry.region
+        if not isinstance(region, Region):
+            raise TypeError(f"entries[{position}] region must be a Region")
+        _check_region_fields(region)
+        proof = entry.proof
+        if not isinstance(proof, RegionWideProof):
+            raise TypeError(f"entries[{position}] proof must be a RegionWideProof")
+        for axis_name, sub_proof in (
+            ("x_proof", proof.x_proof),
+            ("y_proof", proof.y_proof),
+        ):
+            if not isinstance(sub_proof, WideRangeProof):
+                raise TypeError(
+                    f"entries[{position}] proof {axis_name} must be a WideRangeProof"
+                )
+            if not isinstance(sub_proof.commitments, tuple):
+                raise TypeError(
+                    f"entries[{position}] proof {axis_name} commitments must be a "
+                    "tuple of integers"
+                )
+            for item in sub_proof.commitments:
+                _check_int(
+                    item, f"entries[{position}] proof {axis_name} commitments entry"
+                )
+            for field_name in ("challenges", "responses"):
+                field = getattr(sub_proof, field_name)
+                if not isinstance(field, tuple):
+                    raise TypeError(
+                        f"entries[{position}] proof {axis_name} {field_name} must be "
+                        "a tuple of integer pairs"
+                    )
+                for pair in field:
+                    if not isinstance(pair, tuple):
+                        raise TypeError(
+                            f"entries[{position}] proof {axis_name} {field_name} "
+                            "entry must be a tuple of integers"
+                        )
+                    for item in pair:
+                        _check_int(
+                            item,
+                            f"entries[{position}] proof {axis_name} {field_name} "
+                            "entry item",
+                        )
+        _check_bytes(entry.context, f"entries[{position}] context")
+        items.append(entry)
+    return items
+
+
+def _wide_region_axis_material(
+    commitment: PedersenCommitment,
+    proof: WideRangeProof,
+    context: bytes,
+) -> tuple[int, int, int, int, int, tuple[tuple[int, int], ...]]:
+    """Validate one wide axis structurally and return its batch material.
+
+    This mirrors :func:`verify_range_wide` up to (but excluding) the
+    per-sub-branch Schnorr equations: group parameters, the declared
+    range, tuple and pair lengths, the bit-commitment / challenge-share /
+    response bounds, the ``2**i`` weighted binding and the per-bit
+    challenge-share sums are all checked against the byte-for-byte
+    transcript. The returned tuple is
+    ``(prime, generator, h, width, generator_inverse, announcements)``;
+    the statement ``D`` per sub-branch is recomputed by the caller as the
+    bit commitment, times ``generator_inverse`` for the ``bit == 1``
+    branch.
+    """
+    prime = commitment.prime
+    if prime <= 3:
+        raise ValueError("invalid commitment group parameters")
+    generator = commitment.generator
+    h = commitment.h
+    if not 1 < generator < prime or not 1 < h < prime:
+        raise ValueError("invalid commitment group parameters")
+    if not 0 < commitment.element < prime:
+        raise ValueError("commitment element out of range")
+    if commitment.lower > commitment.upper:
+        raise ValueError("commitment lower must not exceed upper")
+    if commitment.upper - commitment.lower >= prime - 1:
+        raise ValueError("commitment range width must be smaller than prime - 1")
+    width = _wide_range_bit_width(commitment)
+    if not 1 <= width <= _MAX_WIDE_RANGE_BITS:
+        raise ValueError("range must contain exactly 2**k integers with 1 <= k <= 24")
+    if not (
+        len(proof.commitments) == len(proof.challenges) == len(proof.responses) == width
+    ):
+        raise ValueError("proof fields must have one entry per bit")
+    if any(len(pair) != 2 for pair in proof.challenges):
+        raise ValueError("proof challenge pairs must hold exactly two shares")
+    if any(len(pair) != 2 for pair in proof.responses):
+        raise ValueError("proof response pairs must hold exactly two responses")
+    if any(not 1 <= c_i < prime for c_i in proof.commitments):
+        raise ValueError("bit commitment out of range")
+    if any(not 0 <= share < prime for pair in proof.challenges for share in pair):
+        raise ValueError("proof challenge share out of range")
+    if any(
+        not 0 <= response < prime - 1
+        for pair in proof.responses
+        for response in pair
+    ):
+        raise ValueError("proof response out of range")
+    product = 1
+    for i, bit_commitment in enumerate(proof.commitments):
+        product = product * pow(bit_commitment, 1 << i, prime) % prime
+    if product != commitment.element:
+        raise ValueError("weighted bit commitments do not bind the commitment")
+    try:
+        generator_inverse = pow(generator, -1, prime)
+    except ValueError as exc:
+        raise ValueError("generator not invertible modulo prime") from exc
+    announcements: list[tuple[int, int]] = []
+    for i in range(width):
+        pair: list[int] = []
+        for branch in (0, 1):
+            statement = proof.commitments[i]
+            if branch:
+                statement = statement * generator_inverse % prime
+            try:
+                announcement = (
+                    pow(h, proof.responses[i][branch], prime)
+                    * pow(statement, -proof.challenges[i][branch], prime)
+                    % prime
+                )
+            except ValueError as exc:
+                raise ValueError("statement not invertible modulo prime") from exc
+            pair.append(announcement)
+        announcements.append((pair[0], pair[1]))
+    challenge = _wide_range_challenge(
+        commitment,
+        context,
+        width,
+        proof.commitments,
+        tuple(announcements),
+    )
+    for pair_e in proof.challenges:
+        if (pair_e[0] + pair_e[1]) % prime != challenge:
+            raise ValueError("proof challenge shares do not sum to the transcript challenge")
+    return prime, generator, h, width, generator_inverse, tuple(announcements)
+
+
+def verify_region_wide_batch(
+    entries: Sequence[RegionWideBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a batch of :class:`RegionWideProof` objects with random linear checks.
+
+    ``entries`` must be a non-empty, non-string sequence of
+    :class:`RegionWideBatchEntry`; an empty batch returns ``False`` and
+    duplicate entries are legal (each draws its own coefficients). The
+    nested types of the *whole* batch are preflighted first, so a wrong
+    type in any entry — including the last one, and including a
+    ``bool`` passed as an integer or a context that is not a byte string
+    — raises the single :class:`TypeError`; only then are the entries
+    checked one by one and the first invalid entry short-circuits the
+    batch.
+
+    Every entry reuses the established :func:`verify_region_wide`
+    binding byte for byte: each commitment's declared range must equal
+    the corresponding region bounds, and each axis sub-proof must pass
+    the wide-range structure, range and transcript checks. The bit
+    commitments weighted by ``2**i`` multiplying back to the commitment
+    element and the two challenge shares of every bit summing to the
+    transcript challenge stay per-entry checks and are never aggregated.
+
+    Each of the two OR sub-branches of every bit on *both* axes then
+    draws exactly one random coefficient ``a = r + 1`` with
+    ``r = randbelow(prime - 1)`` (x axis first, then y, bits in order).
+    Sub-branches sharing the same ``(prime, generator, h)`` group are
+    checked together with a single aggregate equation
+
+    ``h**Σ(a*s) == Π(t**a * D**(a*e)) (mod prime)``
+
+    where ``D`` is the bit commitment for the ``bit == 0`` sub-branch
+    and the bit commitment divided by ``generator`` for the
+    ``bit == 1`` sub-branch, exactly as in :func:`verify_range_wide`;
+    per-sub-branch results are never AND-ed together. Type errors —
+    including ``bool`` integers and a non-callable ``randbelow`` or one
+    that returns a non-integer — raise :class:`TypeError`; a coefficient
+    outside ``[0, prime - 1)`` raises :class:`ValueError`. Every other
+    invalid structure, tampering, commitment swap, region or context
+    swap, swapped axes, a replaced sub-proof or a bit-position move
+    returns ``False``. Entries are independent and may appear in any
+    order; the same batch under the same random source gives the same
+    result. Missing entries cannot be detected: the caller guarantees
+    the batch is complete. Inputs are never mutated.
+    """
+    items = _check_region_wide_batch_entries_types(entries)
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not items:
+        return False
+
+    # group -> {"sum": Σ(a*s), "product": Π(t**a * D**(a*e))}
+    groups: dict[tuple[int, int, int], dict[str, int]] = {}
+
+    def add_branch(
+        group_key: tuple[int, int, int],
+        t_i: int,
+        e_i: int,
+        s_i: int,
+        statement_i: int,
+    ) -> None:
+        prime, _generator, _h = group_key
+        r = randbelow(prime - 1)
+        if not isinstance(r, int) or isinstance(r, bool):
+            raise TypeError("coefficient source randbelow must return an integer")
+        if not 0 <= r < prime - 1:
+            raise ValueError("coefficient source must satisfy 0 <= r < prime - 1")
+        coefficient = r + 1
+        state = groups.setdefault(group_key, {"sum": 0, "product": 1})
+        state["sum"] += coefficient * s_i
+        state["product"] = (
+            state["product"]
+            * pow(t_i, coefficient, prime)
+            % prime
+            * pow(statement_i, coefficient * e_i, prime)
+            % prime
+        )
+
+    for entry in items:
+        x_commitment = entry.x_commitment
+        y_commitment = entry.y_commitment
+        region = entry.region
+        proof = entry.proof
+        if (x_commitment.lower, x_commitment.upper) != (region.min_x, region.max_x):
+            return False
+        if (y_commitment.lower, y_commitment.upper) != (region.min_y, region.max_y):
+            return False
+        axes = (
+            (
+                x_commitment,
+                proof.x_proof,
+                _region_sub_context(
+                    b"x", entry.context, region, x_commitment, y_commitment
+                ),
+            ),
+            (
+                y_commitment,
+                proof.y_proof,
+                _region_sub_context(
+                    b"y", entry.context, region, x_commitment, y_commitment
+                ),
+            ),
+        )
+        axis_material = []
+        for commitment, sub_proof, sub_context in axes:
+            try:
+                prime, generator, h, _width, generator_inverse, announcements = (
+                    _wide_region_axis_material(commitment, sub_proof, sub_context)
+                )
+            except (TypeError, ValueError):
+                return False  # structural/transcript mismatch: short-circuit
+            axis_material.append(
+                (prime, generator, h, generator_inverse, announcements)
+            )
+        for (_commitment, sub_proof, _sub_context), material in zip(
+            axes, axis_material
+        ):
+            prime, generator, h, generator_inverse, announcements = material
+            group_key = (prime, generator, h)
+            for i in range(len(announcements)):
+                for branch in (0, 1):
+                    statement = sub_proof.commitments[i]
+                    if branch:
+                        statement = statement * generator_inverse % prime
+                    add_branch(
+                        group_key,
+                        announcements[i][branch],
+                        sub_proof.challenges[i][branch],
+                        sub_proof.responses[i][branch],
+                        statement,
+                    )
+
+    for (prime, _generator, _h), state in groups.items():
+        if pow(_h, state["sum"], prime) != state["product"]:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed wide region batches
+#
+# A complete wide region batch frozen together with the Merkle proof that
+# commits to every entry. Each Merkle leaf starts from the domain separator
+# b"zkregion/rwb/v1" and frames, in order, the six fields of the x then the
+# y commitment, the four region bounds, the context and, for the x and the
+# y WideRangeProof, the commitments sequence (count then every bit
+# commitment) followed by the challenges and responses pair sequences
+# (count then every pair item flattened in pair order). Verification first
+# checks every leaf against the Merkle root, then runs the unchanged wide
+# region batch verification.
+
+_REGION_WIDE_BOUND_DOMAIN = b"zkregion/rwb/v1"
+
+
+@dataclass(frozen=True)
+class BoundRegionWideBatch:
+    """A complete wide region batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of
+    :class:`RegionWideBatchEntry`; ``leaf_count`` — a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``; ``proof`` — the :class:`MerkleMultiProof`
+    whose indices cover ``0 .. leaf_count - 1`` without gaps or
+    duplicates. All three are positional construction arguments;
+    batches compare by value and are immutable.
+    """
+
+    entries: tuple[RegionWideBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_region_wide_leaf(entry: RegionWideBatchEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`RegionWideBatchEntry`.
+
+    Items, in order: the domain separator, the six fields of the x then
+    the y commitment (dataclass field order), the four region bounds,
+    the context, then for the x and the y sub-proof each of the
+    ``commitments`` sequence framed as its decimal element count
+    followed by every bit commitment, followed by each of the
+    ``challenges`` / ``responses`` pair sequences framed as its decimal
+    pair count followed by every pair item flattened in pair order.
+    Every item is prefixed with its four-byte unsigned big-endian
+    length; integers are encoded as decimal ASCII (negative sign kept).
+    """
+    items = [_REGION_WIDE_BOUND_DOMAIN]
+    for commitment in (entry.x_commitment, entry.y_commitment):
+        items.extend(
+            str(getattr(commitment, name)).encode("ascii")
+            for name in ("element", "lower", "upper", "prime", "generator", "h")
+        )
+    items.extend(
+        str(bound).encode("ascii")
+        for bound in (
+            entry.region.min_x,
+            entry.region.max_x,
+            entry.region.min_y,
+            entry.region.max_y,
+        )
+    )
+    items.append(entry.context)
+    for sub_proof in (entry.proof.x_proof, entry.proof.y_proof):
+        items.append(str(len(sub_proof.commitments)).encode("ascii"))
+        items.extend(str(value).encode("ascii") for value in sub_proof.commitments)
+        for field_name in ("challenges", "responses"):
+            sequence = getattr(sub_proof, field_name)
+            items.append(str(len(sequence)).encode("ascii"))
+            items.extend(
+                str(item).encode("ascii") for pair in sequence for item in pair
+            )
+    leaf = bytearray()
+    for item in items:
+        leaf += len(item).to_bytes(4, "big")
+        leaf += item
+    return bytes(leaf)
+
+
+def verify_region_wide_batch_bound(
+    batch: BoundRegionWideBatch,
+    root: bytes,
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundRegionWideBatch`.
+
+    The outer Merkle root is checked first: every entry is encoded to
+    its leaf exactly as specified by :func:`_bound_region_wide_leaf`
+    and the whole batch is checked against ``root`` with
+    :func:`verify_multi_inclusion`. ``leaf_count`` must be a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``, and ``proof.indices`` must cover
+    ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering; an
+    empty batch, a missing entry or any index mismatch returns
+    ``False``. Only after the root checks does the batch go through
+    :func:`verify_region_wide_batch` with the same ``randbelow``, under
+    its unchanged randomness contract: it is called once per
+    structurally valid OR sub-branch on either axis as
+    ``randbelow(prime - 1)``.
+
+    Type errors — a batch that is not a :class:`BoundRegionWideBatch`,
+    non-tuple entries, non-:class:`RegionWideBatchEntry` items, a
+    non-integer or ``bool`` ``leaf_count``, a wrong proof/root object,
+    malformed nested field types (a non-:class:`RegionWideProof` proof,
+    a non-:class:`WideRangeProof` axis sub-proof or non-tuple integer
+    fields at any nesting level, a non-:class:`Region` region or a
+    context that is not ``bytes``), or a non-callable ``randbelow`` —
+    raise :class:`TypeError`; a non-integer randomness return raises
+    :class:`TypeError` and an out-of-range one raises
+    :class:`ValueError`, both surfaced by
+    :func:`verify_region_wide_batch` per its own contract. Every other
+    invalidity (an empty batch, a count or index mismatch, a wrong
+    root, tampered leaf bytes or an inner batch rejection) returns
+    ``False``. Inputs are never mutated.
+    """
+    if not isinstance(batch, BoundRegionWideBatch):
+        raise TypeError("batch must be a BoundRegionWideBatch")
+    _check_bytes(root, "root")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError("batch entries must be a tuple of RegionWideBatchEntry")
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, RegionWideBatchEntry):
+            raise TypeError(f"entries[{position}] must be a RegionWideBatchEntry")
+        for axis_name, commitment in (
+            ("x_commitment", entry.x_commitment),
+            ("y_commitment", entry.y_commitment),
+        ):
+            if not isinstance(commitment, PedersenCommitment):
+                raise TypeError(
+                    f"entries[{position}] {axis_name} must be a PedersenCommitment"
+                )
+            _check_commitment_fields(commitment)
+        region = entry.region
+        if not isinstance(region, Region):
+            raise TypeError(f"entries[{position}] region must be a Region")
+        _check_region_fields(region)
+        entry_proof = entry.proof
+        if not isinstance(entry_proof, RegionWideProof):
+            raise TypeError(f"entries[{position}] proof must be a RegionWideProof")
+        for axis_name, sub_proof in (
+            ("x_proof", entry_proof.x_proof),
+            ("y_proof", entry_proof.y_proof),
+        ):
+            if not isinstance(sub_proof, WideRangeProof):
+                raise TypeError(
+                    f"entries[{position}] proof {axis_name} must be a WideRangeProof"
+                )
+            if not isinstance(sub_proof.commitments, tuple):
+                raise TypeError(
+                    f"entries[{position}] proof {axis_name} commitments must be a "
+                    "tuple of integers"
+                )
+            for item in sub_proof.commitments:
+                _check_int(
+                    item, f"entries[{position}] proof {axis_name} commitments entry"
+                )
+            for field_name in ("challenges", "responses"):
+                field = getattr(sub_proof, field_name)
+                if not isinstance(field, tuple):
+                    raise TypeError(
+                        f"entries[{position}] proof {axis_name} {field_name} must be "
+                        "a tuple of integer pairs"
+                    )
+                for pair in field:
+                    if not isinstance(pair, tuple):
+                        raise TypeError(
+                            f"entries[{position}] proof {axis_name} {field_name} "
+                            "entry must be a tuple of integers"
+                        )
+                    for item in pair:
+                        _check_int(
+                            item,
+                            f"entries[{position}] proof {axis_name} {field_name} "
+                            "entry item",
+                        )
+        _check_bytes(entry.context, f"entries[{position}] context")
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_region_wide_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf, then
+    # 2) the unchanged wide region batch verification checks the proofs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_region_wide_batch(entries, randbelow=randbelow)
+
+
+def prove_region_wide_batch_bound(
+    entries: Sequence[RegionWideBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> tuple[BoundRegionWideBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundRegionWideBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`RegionWideBatchEntry` rules as
+    :func:`verify_region_wide_batch` and must be non-empty; every entry
+    is copied into a tuple in its original order with duplicates
+    preserved, and the inputs are never mutated. Each entry is encoded
+    to its outer leaf byte for byte with
+    :func:`_bound_region_wide_leaf`; the domain separator
+    ``b"zkregion/rwb/v1"``, the four-byte length framing, decimal
+    integer encoding (negative sign kept) and field order stay
+    unchanged, and the leaf digests and internal nodes follow the
+    existing SHA-256 Merkle rules. With ``n = len(entries)``, the
+    complete multi-inclusion proof is built with
+    :func:`prove_multi_inclusion` over the encoded leaves and the full
+    indices ``tuple(range(n))`` — so its ``indices`` cover every leaf
+    from zero and its ``siblings`` are empty — and the returned batch
+    carries ``leaf_count = n`` alongside that proof. The second return
+    value is the outer tree's :func:`merkle_root` of the encoded
+    leaves, which is exactly the root the batch verifies under:
+    ``verify_region_wide_batch_bound(batch, root)`` returns ``True``.
+    Single-item, odd- and even-sized batches and duplicate entries are
+    all deterministic, and the same inputs under the same random source
+    rebuild a byte-identical batch, root and proof.
+
+    A type preflight over the whole batch — every entry and every
+    nested field, including ``bool`` counts and later entries — raises
+    :class:`TypeError` before anything is built; an empty batch, a
+    ``U``-framed batch count outside uint64, or
+    :func:`verify_region_wide_batch` returning ``False`` (an invalid
+    inner region proof) raises :class:`ValueError`. The ``randbelow``
+    argument is passed through to :func:`verify_region_wide_batch`
+    unchanged under its randomness contract.
+    """
+    items = _check_region_wide_batch_entries_types(entries)
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not items:
+        raise ValueError("entries must not be empty")
+    if len(items) > _UINT64_MAX:
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    if not verify_region_wide_batch(items, randbelow=randbelow):
+        raise ValueError("entries must pass verify_region_wide_batch")
+    ordered = tuple(items)
+    leaves = [_bound_region_wide_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundRegionWideBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
 
 
 @dataclass(frozen=True)

@@ -17,6 +17,8 @@ RangeProof / prove_range /
 verify_range / RangeBatchEntry / verify_range_batch / RegionProof /
 WideRangeProof / prove_range_wide / verify_range_wide /
 WideRangeBatchEntry / verify_range_wide_batch /
+BoundWideRangeBatch / prove_range_wide_batch_bound /
+verify_range_wide_batch_bound /
 prove_region / verify_region / region_contains_committed /
 RegionContainsEntry / verify_region_contains_batch /
 BoundRegionContainsBatch / prove_region_contains_bound /
@@ -108,6 +110,7 @@ __all__ = [
     "BoundRangeReplayGuard",
     "BoundSchnorrBatch",
     "BoundSchnorrReplayGuard",
+    "BoundWideRangeBatch",
     "MerkleConsistencyBatchEntry",
     "MerkleConsistencyBatchReplayGuard",
     "MerkleConsistencyChain",
@@ -177,6 +180,7 @@ __all__ = [
     "prove_range",
     "prove_range_batch_bound",
     "prove_range_wide",
+    "prove_range_wide_batch_bound",
     "prove_region",
     "prove_region_batch_bound",
     "prove_region_contains_bound",
@@ -206,6 +210,7 @@ __all__ = [
     "verify_range_bound",
     "verify_range_wide",
     "verify_range_wide_batch",
+    "verify_range_wide_batch_bound",
     "verify_region",
     "verify_region_batch",
     "verify_region_bound",
@@ -4935,6 +4940,250 @@ def prove_range_batch_bound(
     root = merkle_root(leaves)
     proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
     batch = BoundRangeBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed wide range batches
+#
+# A complete wide range batch frozen together with the Merkle proof that
+# commits to every entry. Each Merkle leaf starts from the domain separator
+# b"zkregion/wrb/v1" and frames, in order, the six commitment fields, the
+# context and the proof's commitments / challenges / responses sequences
+# (each sequence framed as its decimal element count followed by every
+# value, the challenge and response pairs flattened in bit and branch
+# order). The framing, the decimal-ASCII integer encoding and the SHA-256
+# Merkle digest rules are item for item the ones of the range complete
+# batch. Verification first checks every leaf against the Merkle root,
+# then runs the unchanged wide range batch verification.
+
+_WIDE_RANGE_BOUND_DOMAIN = b"zkregion/wrb/v1"
+
+
+@dataclass(frozen=True)
+class BoundWideRangeBatch:
+    """A complete wide range batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of :class:`WideRangeBatchEntry`;
+    ``leaf_count`` — a positive, non-``bool`` integer equal to both
+    ``len(entries)`` and ``proof.leaf_count``; ``proof`` — the
+    :class:`MerkleMultiProof` whose indices cover ``0 .. leaf_count - 1``
+    without gaps or duplicates. All three are positional construction
+    arguments; batches compare by value and are immutable.
+    """
+
+    entries: tuple[WideRangeBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_wide_range_leaf(entry: WideRangeBatchEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`WideRangeBatchEntry`.
+
+    Items, in order: the domain separator, the six commitment fields
+    (dataclass field order), the context, then each of the proof's
+    ``commitments`` / ``challenges`` / ``responses`` sequences framed as
+    its decimal element count followed by every value (the challenge and
+    response pairs contribute their two values in branch order). Every
+    item is prefixed with its four-byte unsigned big-endian length;
+    integers are encoded as decimal ASCII (negative sign kept).
+    """
+    commitment = entry.commitment
+    items = [_WIDE_RANGE_BOUND_DOMAIN]
+    items.extend(
+        str(getattr(commitment, name)).encode("ascii")
+        for name in ("element", "lower", "upper", "prime", "generator", "h")
+    )
+    items.append(entry.context)
+    proof = entry.proof
+    items.append(str(len(proof.commitments)).encode("ascii"))
+    items.extend(str(value).encode("ascii") for value in proof.commitments)
+    for field_name in ("challenges", "responses"):
+        pairs = getattr(proof, field_name)
+        items.append(str(len(pairs)).encode("ascii"))
+        for pair in pairs:
+            items.extend(str(value).encode("ascii") for value in pair)
+    leaf = bytearray()
+    for item in items:
+        leaf += len(item).to_bytes(4, "big")
+        leaf += item
+    return bytes(leaf)
+
+
+def _bound_wide_range_batch_encodable(
+    entries: Sequence[WideRangeBatchEntry],
+) -> bool:
+    """The framed batch length must fit in an unsigned 64-bit integer.
+
+    Each entry is framed as the BoundWideRange leaf, whose integers are
+    encoded as decimal ASCII with the sign kept, so every integer field
+    frames for any value and no per-entry encodability rule is needed.
+    """
+    return 0 <= len(entries) <= _UINT64_MAX
+
+
+def verify_range_wide_batch_bound(
+    batch: BoundWideRangeBatch,
+    root: bytes,
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundWideRangeBatch`.
+
+    The Merkle binding is checked first: every entry is encoded to its
+    leaf exactly as specified by :func:`_bound_wide_range_leaf` and the
+    whole batch is checked against ``root`` with
+    :func:`verify_multi_inclusion`. ``leaf_count`` must be a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``, and ``proof.indices`` must cover
+    ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering; an
+    empty batch, a missing entry or any index mismatch returns ``False``.
+    Only after the root checks does the batch go through
+    :func:`verify_range_wide_batch` with the same ``randbelow``, under its
+    unchanged randomness contract: it is called once per structurally
+    valid bit sub-branch as ``randbelow(prime - 1)``.
+
+    Type errors — a batch that is not a :class:`BoundWideRangeBatch`,
+    non-tuple entries, non-:class:`WideRangeBatchEntry` items, a
+    non-integer or ``bool`` ``leaf_count``, a wrong proof/root object,
+    malformed nested field types, or a non-callable ``randbelow`` — raise
+    :class:`TypeError`; every other invalidity (including bad randomness
+    outcomes surfaced by :func:`verify_range_wide_batch` per its own
+    contract) behaves exactly as the delegated calls do. Inputs are never
+    mutated.
+    """
+    if not isinstance(batch, BoundWideRangeBatch):
+        raise TypeError("batch must be a BoundWideRangeBatch")
+    _check_bytes(root, "root")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError("batch entries must be a tuple of WideRangeBatchEntry")
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, WideRangeBatchEntry):
+            raise TypeError(f"entries[{position}] must be a WideRangeBatchEntry")
+        commitment = entry.commitment
+        entry_proof = entry.proof
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(f"entries[{position}] commitment must be a PedersenCommitment")
+        _check_commitment_fields(commitment)
+        if not isinstance(entry_proof, WideRangeProof):
+            raise TypeError(f"entries[{position}] proof must be a WideRangeProof")
+        if not isinstance(entry_proof.commitments, tuple):
+            raise TypeError(
+                f"entries[{position}] proof commitments "
+                "must be a tuple of integers"
+            )
+        for item in entry_proof.commitments:
+            _check_int(item, f"entries[{position}] proof commitments entry")
+        for field_name in ("challenges", "responses"):
+            field = getattr(entry_proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"entries[{position}] proof {field_name} "
+                    "must be a tuple of integer pairs"
+                )
+            for pair in field:
+                if not isinstance(pair, tuple):
+                    raise TypeError(
+                        f"entries[{position}] proof {field_name} entry "
+                        "must be a tuple of integers"
+                    )
+                for item in pair:
+                    _check_int(
+                        item,
+                        f"entries[{position}] proof {field_name} entry item",
+                    )
+        _check_bytes(entry.context, f"entries[{position}] context")
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_wide_range_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf, then
+    # 2) the unchanged wide range batch verification checks the proofs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_range_wide_batch(entries, randbelow=randbelow)
+
+
+def prove_range_wide_batch_bound(
+    entries: Sequence[WideRangeBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> tuple[BoundWideRangeBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundWideRangeBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`WideRangeBatchEntry` rules as
+    :func:`verify_range_wide_batch` and must be non-empty; every item is
+    copied into a tuple in its original order with duplicates preserved,
+    and the inputs are never mutated. Each item is encoded to its outer
+    leaf byte for byte with :func:`_bound_wide_range_leaf`; the domain
+    separator, length framing and field order stay unchanged, and the
+    leaf digests and internal nodes follow the existing SHA-256 Merkle
+    rules. With ``n = len(entries)``, the complete multi-inclusion proof
+    is built with :func:`prove_multi_inclusion` over the encoded leaves
+    and the full indices ``tuple(range(n))`` — so its ``indices`` cover
+    every leaf from zero and its ``siblings`` are empty — and the
+    returned batch carries ``leaf_count = n`` alongside that proof. The
+    second return value is the outer tree's :func:`merkle_root` of the
+    encoded leaves, which is exactly the root the batch verifies under:
+    ``verify_range_wide_batch_bound(batch, root)`` returns ``True``.
+    Single-item, odd- and even-sized batches and duplicate items are all
+    deterministic: the same inputs produce a byte-identical batch, root
+    and proof.
+
+    A type preflight over the whole batch — every item and every nested
+    field, including ``bool`` counts and later items — raises
+    :class:`TypeError` before anything is built; an empty batch, a
+    framed batch count outside uint64, or
+    :func:`verify_range_wide_batch` returning ``False`` (an invalid inner
+    wide range proof) raises :class:`ValueError`. The ``randbelow``
+    argument is passed through to :func:`verify_range_wide_batch`
+    unchanged under its randomness contract.
+    """
+    items = _check_wide_range_batch_entries_types(entries)
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not items:
+        raise ValueError("entries must not be empty")
+    if not _bound_wide_range_batch_encodable(items):
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    if not verify_range_wide_batch(items, randbelow=randbelow):
+        raise ValueError("entries must pass verify_range_wide_batch")
+    ordered = tuple(items)
+    leaves = [_bound_wide_range_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundWideRangeBatch(
         entries=ordered,
         leaf_count=len(ordered),
         proof=proof,

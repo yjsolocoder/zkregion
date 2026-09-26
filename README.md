@@ -228,6 +228,7 @@ assert verify_consistency_chain(chain)
 # 独立 Merkle 一致性链批验：一次检查多条互不相关的一致性链
 from zkregion import verify_consistency_chain_batch
 
+more_leaves = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon", b"zeta"]
 chain_batch = [
     prove_consistency_chain(more_leaves, (1, 3, 5)),
     prove_consistency_chain(more_leaves, (2, 4, 6)),
@@ -238,7 +239,6 @@ assert not verify_consistency_chain_batch(())
 # 独立 Merkle 一致性证明批验：一次检查多组互不相关的旧根、新根与证明
 from zkregion import MerkleConsistencyBatchEntry, verify_consistency_batch
 
-more_leaves = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon", b"zeta"]
 batch = [
     MerkleConsistencyBatchEntry(
         merkle_root(more_leaves[:old_count]),
@@ -421,6 +421,7 @@ assert verify_region_bound(bound_region, region_root)
 # 宽区间二维区域证明的批量验证与 Merkle 完整批（两轴位宽可各自不同）
 from zkregion import (
     RegionWideBatchEntry,
+    prove_region_wide,
     verify_region_wide_batch,
     BoundRegionWideBatch,
     prove_region_wide_batch_bound,
@@ -823,6 +824,53 @@ bwrr_binding = bwrr_a.bind_once(wide_bound, wide_root, b"session-3")
 bwrr_b = BoundWideRangeReplayGuard(store=store)               # 另一个独立实例
 assert bwrr_b.check(wide_bound, wide_root, bwrr_binding)     # 认领、验根与内层批验并消费（行键域 b"zr/bwrr/v1"）
 assert not bwrr_a.check(wide_bound, wide_root, bwrr_binding) # 已消费，二次提交被拒
+store.close()
+
+# 宽区间二维区域的三个防重放守卫：单条、整批与 Merkle 完整批的一次性绑定
+from zkregion import (
+    RegionWideReplayGuard,
+    RegionWideBatchReplayGuard,
+    BoundRegionWideReplayGuard,
+)
+
+wide_entry = RegionWideBatchEntry(                         # 一条 RegionWideBatchEntry
+    x_wide_commitment, y_wide_commitment, wide_region,
+    region_wide_proof, b"session-1",
+)
+region_wide_entries = [wide_entry]
+rwr = RegionWideReplayGuard()
+rwr_binding = rwr.bind_once(wide_entry, b"session-1")
+assert rwr.check(wide_entry, rwr_binding)                    # 验宽区间二维区域证明并消费：首次判真
+assert not rwr.check(wide_entry, rwr_binding)                # 二次判假
+try:
+    rwr.bind_once(wide_entry, b"session-1")                  # 已消费标识重绑抛 ValueError
+except ValueError:
+    pass
+
+rwbr = RegionWideBatchReplayGuard()
+rwbr_binding = rwbr.bind_once(region_wide_entries, b"session-1")
+assert rwbr.check(region_wide_entries, rwbr_binding)         # 批量验宽区间二维区域证明并消费：首次判真
+assert not rwbr.check(region_wide_entries, rwbr_binding)     # 二次判假
+try:
+    rwbr.bind_once(region_wide_entries, b"session-1")        # 已消费标识重绑抛 ValueError
+except ValueError:
+    pass
+
+brwr = BoundRegionWideReplayGuard()
+brwr_binding = brwr.bind_once(bound_wide_region, wide_region_root, b"session-1")
+assert brwr.check(bound_wide_region, wide_region_root, brwr_binding)      # 验外层根与内层批验并消费：首次判真
+assert not brwr.check(bound_wide_region, wide_region_root, brwr_binding)  # 二次判假
+try:
+    brwr.bind_once(bound_wide_region, wide_region_root, b"session-1")     # 已消费标识重绑抛 ValueError
+except ValueError:
+    pass
+
+store = SQLiteReplayStore(tempfile.mktemp(suffix=".db"))
+rwr_a = RegionWideReplayGuard(store=store)
+rwr_binding = rwr_a.bind_once(wide_entry, b"session-3")
+rwr_b = RegionWideReplayGuard(store=store)                   # 另一个独立实例
+assert rwr_b.check(wide_entry, rwr_binding)                  # 认领、验宽区间二维区域证明并消费（行键域 b"zr/rwr/v1"）
+assert not rwr_a.check(wide_entry, rwr_binding)              # 已消费，二次提交被拒
 store.close()
 
 # 整批 BoundSchnorrBatch 与 bytes 根的一次性绑定（可选 SQLite 后端跨实例共享）

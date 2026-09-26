@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
+import os
+import tempfile
+import threading
 
 from . import (
     BoundConsistencyBatch,
@@ -16,6 +19,7 @@ from . import (
     BoundRangeBatch,
     BoundRegionBatch,
     BoundRegionReplayGuard,
+    BoundRegionWideReplayGuard,
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
@@ -39,6 +43,9 @@ from . import (
     RegionBatchReplayGuard,
     RegionProof,
     RegionReplayGuard,
+    RegionWideBatchEntry,
+    RegionWideBatchReplayGuard,
+    RegionWideReplayGuard,
     ReplayBinding,
     ReplayGuard,
     SchnorrBatchEntry,
@@ -46,6 +53,7 @@ from . import (
     SchnorrProof,
     SchnorrProver,
     SchnorrVerifier,
+    SQLiteReplayStore,
     SingleKeyBatchGuard,
     SingleKeyBoundBatch,
     SingleKeyBoundReplayGuard,
@@ -59,6 +67,8 @@ from . import (
     prove_multi_inclusion,
     prove_range,
     prove_region,
+    prove_region_wide,
+    prove_region_wide_batch_bound,
     verify_bound,
     verify_consistency_batch,
     verify_consistency_batch_bound,
@@ -1193,6 +1203,227 @@ def main() -> int:
     print(f"  region size {region.width()}x{region.height()}")
     for x, y in ((50, 50), (0, 0), (100, 100), (101, 50), (-1, 50)):
         print(f"  contains({x:>4}, {y:>4}) = {region.contains(x, y)}")
+
+    print()
+    print("per-instance replay protection for wide-range 2-D region entries (bind once, check once):")
+    wide_region = Region(0, 1023, 0, 511)
+    wx_commit, wx_blind = pedersen_commit(300, wide_region.min_x, wide_region.max_x, blinding=3000)
+    wy_commit, wy_blind = pedersen_commit(200, wide_region.min_y, wide_region.max_y, blinding=4000)
+    wide_proof = prove_region_wide(
+        wx_commit, wy_commit, 300, 200, wx_blind, wy_blind,
+        wide_region, context=b"wide-demo", randbelow=counter_randbelow(),
+    )
+    wide_entry = RegionWideBatchEntry(wx_commit, wy_commit, wide_region, wide_proof, b"wide-demo")
+    print(f"  region=({wide_region.min_x}..{wide_region.max_x}, "
+          f"{wide_region.min_y}..{wide_region.max_y})  point=(300, 200)  context=b'wide-demo'")
+    rwr = RegionWideReplayGuard()
+    rwr_binding = rwr.bind_once(wide_entry, b"region-wide-session-1", expires_at=10**12)
+    print(f"  session_id={rwr_binding.session_id}  digest={rwr_binding.digest.hex()[:32]}…  "
+          f"expires_at={rwr_binding.expires_at}")
+    print(f"  valid first check accepted: {rwr.check(wide_entry, rwr_binding, now=100)}")
+    print(f"  replay rejected: {not rwr.check(wide_entry, rwr_binding, now=101)}")
+    try:
+        rwr.bind_once(wide_entry, b"region-wide-session-1")
+    except ValueError:
+        print("  rebind of a consumed id rejected: True")
+    else:
+        print("  rebind of a consumed id rejected: False")
+    other_rwr = RegionWideReplayGuard()
+    other_rwr_binding = other_rwr.bind_once(wide_entry, b"region-wide-session-2")
+    swapped_entry = RegionWideBatchEntry(wy_commit, wx_commit, wide_region, wide_proof, b"wide-demo")
+    print(f"  swapped commitments rejected without consuming the id: "
+          f"{not other_rwr.check(swapped_entry, other_rwr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_rwr.check(wide_entry, other_rwr_binding, now=1)}")
+    foreign_rwr = RegionWideReplayGuard()
+    foreign_rwr_binding = foreign_rwr.bind_once(wide_entry, b"region-wide-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_rwr.check(wide_entry, foreign_rwr_binding, now=1)}")
+    pending_rwr = RegionWideReplayGuard()
+    pending_rwr.bind_once(wide_entry, b"region-wide-session-4")
+    try:
+        pending_rwr.bind_once(wide_entry, b"region-wide-session-4")
+    except ValueError:
+        print("  rebind of a pending id rejected: True")
+    else:
+        print("  rebind of a pending id rejected: False")
+    try:
+        rwr.bind_once(wide_entry, b"")
+    except ValueError:
+        print("  empty session id rejected: True")
+    else:
+        print("  empty session id rejected: False")
+    try:
+        rwr.bind_once(wide_entry, b"region-wide-session-5", expires_at=1 << 64)
+    except ValueError:
+        print("  expiry beyond uint64 rejected: True")
+    else:
+        print("  expiry beyond uint64 rejected: False")
+    try:
+        rwr.bind_once(wide_entry, "region-wide-session-6")
+    except TypeError:
+        print("  non-bytes session id rejected: True")
+    else:
+        print("  non-bytes session id rejected: False")
+
+    print()
+    print("per-instance replay protection for wide-range 2-D region batches (bind once, check once):")
+    wx2_commit, wx2_blind = pedersen_commit(1000, wide_region.min_x, wide_region.max_x, blinding=5000)
+    wy2_commit, wy2_blind = pedersen_commit(500, wide_region.min_y, wide_region.max_y, blinding=6000)
+    wide_proof2 = prove_region_wide(
+        wx2_commit, wy2_commit, 1000, 500, wx2_blind, wy2_blind,
+        wide_region, context=b"wide-demo", randbelow=counter_randbelow(),
+    )
+    wide_entry2 = RegionWideBatchEntry(wx2_commit, wy2_commit, wide_region, wide_proof2, b"wide-demo")
+    wide_entries = [wide_entry, wide_entry2]
+    print(f"  entries={len(wide_entries)}  points=(300, 200), (1000, 500)  context=b'wide-demo'")
+    rwbr = RegionWideBatchReplayGuard()
+    rwbr_binding = rwbr.bind_once(wide_entries, b"region-wide-batch-session-1", expires_at=10**12)
+    print(f"  session_id={rwbr_binding.session_id}  digest={rwbr_binding.digest.hex()[:32]}…  "
+          f"expires_at={rwbr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{rwbr.check(wide_entries, rwbr_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not rwbr.check(wide_entries, rwbr_binding, now=101, randbelow=counter_randbelow())}")
+    try:
+        rwbr.bind_once(wide_entries, b"region-wide-batch-session-1")
+    except ValueError:
+        print("  rebind of a consumed id rejected: True")
+    else:
+        print("  rebind of a consumed id rejected: False")
+    other_rwbr = RegionWideBatchReplayGuard()
+    other_rwbr_binding = other_rwbr.bind_once(wide_entries, b"region-wide-batch-session-2")
+    print(f"  reordered batch rejected without consuming the id: "
+          f"{not other_rwbr.check(wide_entries[::-1], other_rwbr_binding, now=1, randbelow=counter_randbelow())}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_rwbr.check(wide_entries, other_rwbr_binding, now=1, randbelow=counter_randbelow())}")
+    foreign_rwbr = RegionWideBatchReplayGuard()
+    foreign_rwbr_binding = foreign_rwbr.bind_once(wide_entries, b"region-wide-batch-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_rwbr.check(wide_entries, foreign_rwbr_binding, now=1, randbelow=counter_randbelow())}")
+
+    print()
+    print("per-instance replay protection for bound wide-range 2-D region batches (bind once, check once):")
+    wide_bound, wide_bound_root = prove_region_wide_batch_bound(
+        wide_entries, randbelow=counter_randbelow()
+    )
+    print(f"  bound entries={len(wide_bound.entries)}  root={wide_bound_root.hex()[:32]}…")
+    brwr = BoundRegionWideReplayGuard()
+    brwr_binding = brwr.bind_once(wide_bound, wide_bound_root, b"bound-region-wide-session-1", expires_at=10**12)
+    print(f"  session_id={brwr_binding.session_id}  digest={brwr_binding.digest.hex()[:32]}…  "
+          f"expires_at={brwr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{brwr.check(wide_bound, wide_bound_root, brwr_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not brwr.check(wide_bound, wide_bound_root, brwr_binding, now=101, randbelow=counter_randbelow())}")
+    try:
+        brwr.bind_once(wide_bound, wide_bound_root, b"bound-region-wide-session-1")
+    except ValueError:
+        print("  rebind of a consumed id rejected: True")
+    else:
+        print("  rebind of a consumed id rejected: False")
+    other_brwr = BoundRegionWideReplayGuard()
+    other_brwr_binding = other_brwr.bind_once(wide_bound, wide_bound_root, b"bound-region-wide-session-2")
+    print(f"  wrong root rejected without consuming the id: "
+          f"{not other_brwr.check(wide_bound, bytes(32), other_brwr_binding, now=1, randbelow=counter_randbelow())}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_brwr.check(wide_bound, wide_bound_root, other_brwr_binding, now=1, randbelow=counter_randbelow())}")
+    foreign_brwr = BoundRegionWideReplayGuard()
+    foreign_brwr_binding = foreign_brwr.bind_once(wide_bound, wide_bound_root, b"bound-region-wide-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_brwr.check(wide_bound, wide_bound_root, foreign_brwr_binding, now=1, randbelow=counter_randbelow())}")
+
+    print()
+    print("concurrent checks of the same wide-range 2-D region session id (at most one success):")
+    race_workers = 8
+    race_rwr = RegionWideReplayGuard()
+    race_rwr_binding = race_rwr.bind_once(wide_entry, b"region-wide-race-1", expires_at=10**12)
+    race_rwr_results = []
+
+    def race_rwr_worker():
+        race_rwr_results.append(race_rwr.check(wide_entry, race_rwr_binding, now=100))
+
+    race_rwr_threads = [threading.Thread(target=race_rwr_worker) for _ in range(race_workers)]
+    for thread in race_rwr_threads:
+        thread.start()
+    for thread in race_rwr_threads:
+        thread.join()
+    print(f"  single-entry guard: {race_rwr_results.count(True)} succeeded, "
+          f"{race_rwr_results.count(False)} failed of {len(race_rwr_results)}")
+    race_rwbr = RegionWideBatchReplayGuard()
+    race_rwbr_binding = race_rwbr.bind_once(wide_entries, b"region-wide-race-2", expires_at=10**12)
+    race_rwbr_results = []
+
+    def race_rwbr_worker():
+        race_rwbr_results.append(
+            race_rwbr.check(wide_entries, race_rwbr_binding, now=100, randbelow=counter_randbelow())
+        )
+
+    race_rwbr_threads = [threading.Thread(target=race_rwbr_worker) for _ in range(race_workers)]
+    for thread in race_rwbr_threads:
+        thread.start()
+    for thread in race_rwbr_threads:
+        thread.join()
+    print(f"  batch guard: {race_rwbr_results.count(True)} succeeded, "
+          f"{race_rwbr_results.count(False)} failed of {len(race_rwbr_results)}")
+    race_brwr = BoundRegionWideReplayGuard()
+    race_brwr_binding = race_brwr.bind_once(wide_bound, wide_bound_root, b"region-wide-race-3", expires_at=10**12)
+    race_brwr_results = []
+
+    def race_brwr_worker():
+        race_brwr_results.append(
+            race_brwr.check(wide_bound, wide_bound_root, race_brwr_binding, now=100,
+                            randbelow=counter_randbelow())
+        )
+
+    race_brwr_threads = [threading.Thread(target=race_brwr_worker) for _ in range(race_workers)]
+    for thread in race_brwr_threads:
+        thread.start()
+    for thread in race_brwr_threads:
+        thread.join()
+    print(f"  bound-batch guard: {race_brwr_results.count(True)} succeeded, "
+          f"{race_brwr_results.count(False)} failed of {len(race_brwr_results)}")
+
+    print()
+    print("shared wide-range 2-D region replay state across instances and restarts (SQLiteReplayStore):")
+    store_path = tempfile.mktemp(suffix=".db")
+    store = SQLiteReplayStore(store_path)
+    persist_rwr_a = RegionWideReplayGuard(store=store)
+    persist_rwr_binding = persist_rwr_a.bind_once(wide_entry, b"region-wide-persist-1", expires_at=10**12)
+    print(f"  session_id={persist_rwr_binding.session_id}  "
+          f"digest={persist_rwr_binding.digest.hex()[:32]}…")
+    print(f"  single-entry guard: first instance consumes the id: "
+          f"{persist_rwr_a.check(wide_entry, persist_rwr_binding, now=100)}")
+    persist_rwr_b = RegionWideReplayGuard(store=store)
+    print(f"  single-entry guard: second instance rejects the consumed id: "
+          f"{not persist_rwr_b.check(wide_entry, persist_rwr_binding, now=101)}")
+    persist_rwbr_a = RegionWideBatchReplayGuard(store=store)
+    persist_rwbr_binding = persist_rwbr_a.bind_once(wide_entries, b"region-wide-persist-2", expires_at=10**12)
+    print(f"  batch guard: first instance consumes the id: "
+          f"{persist_rwbr_a.check(wide_entries, persist_rwbr_binding, now=100, randbelow=counter_randbelow())}")
+    persist_rwbr_b = RegionWideBatchReplayGuard(store=store)
+    print(f"  batch guard: second instance rejects the consumed id: "
+          f"{not persist_rwbr_b.check(wide_entries, persist_rwbr_binding, now=101, randbelow=counter_randbelow())}")
+    persist_brwr_a = BoundRegionWideReplayGuard(store=store)
+    persist_brwr_binding = persist_brwr_a.bind_once(wide_bound, wide_bound_root, b"region-wide-persist-3", expires_at=10**12)
+    print(f"  bound-batch guard: first instance consumes the id: "
+          f"{persist_brwr_a.check(wide_bound, wide_bound_root, persist_brwr_binding, now=100, randbelow=counter_randbelow())}")
+    persist_brwr_b = BoundRegionWideReplayGuard(store=store)
+    print(f"  bound-batch guard: second instance rejects the consumed id: "
+          f"{not persist_brwr_b.check(wide_bound, wide_bound_root, persist_brwr_binding, now=101, randbelow=counter_randbelow())}")
+    store.close()
+    reopened = SQLiteReplayStore(store_path)
+    persist_rwr_c = RegionWideReplayGuard(store=reopened)
+    persist_rwbr_c = RegionWideBatchReplayGuard(store=reopened)
+    persist_brwr_c = BoundRegionWideReplayGuard(store=reopened)
+    print(f"  after restart the consumed single-entry id is still rejected: "
+          f"{not persist_rwr_c.check(wide_entry, persist_rwr_binding, now=102)}")
+    print(f"  after restart the consumed batch id is still rejected: "
+          f"{not persist_rwbr_c.check(wide_entries, persist_rwbr_binding, now=102, randbelow=counter_randbelow())}")
+    print(f"  after restart the consumed bound-batch id is still rejected: "
+          f"{not persist_brwr_c.check(wide_bound, wide_bound_root, persist_brwr_binding, now=102, randbelow=counter_randbelow())}")
+    reopened.close()
+    os.unlink(store_path)
     return 0
 
 

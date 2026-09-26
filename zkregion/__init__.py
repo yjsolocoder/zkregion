@@ -24,6 +24,7 @@ RegionContainsEntry / verify_region_contains_batch /
 BoundRegionContainsBatch / prove_region_contains_bound /
 verify_region_contains_bound /
 RegionBatchEntry / verify_region_batch /
+RegionWideProof / prove_region_wide / verify_region_wide /
 RegionBatchReplayGuard /
 SchnorrProof / SchnorrBatchEntry / SchnorrProver /
 SchnorrVerifier / MultiSchnorrEntry / verify_schnorr_batch /
@@ -153,6 +154,7 @@ __all__ = [
     "RegionContainsReplayGuard",
     "RegionProof",
     "RegionReplayGuard",
+    "RegionWideProof",
     "ReplayBinding",
     "ReplayGuard",
     "SchnorrBatchEntry",
@@ -190,6 +192,7 @@ __all__ = [
     "prove_region",
     "prove_region_batch_bound",
     "prove_region_contains_bound",
+    "prove_region_wide",
     "prove_schnorr_batch_bound",
     "region_contains_committed",
     "verify_bound",
@@ -222,6 +225,7 @@ __all__ = [
     "verify_region_bound",
     "verify_region_contains_batch",
     "verify_region_contains_bound",
+    "verify_region_wide",
     "verify_schnorr_batch",
 ]
 
@@ -2470,6 +2474,152 @@ def verify_region(
         proof.x_proof,
         _region_sub_context(b"x", context, region, x_commitment, y_commitment),
     ) and verify_range(
+        y_commitment,
+        proof.y_proof,
+        _region_sub_context(b"y", context, region, x_commitment, y_commitment),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive 2-D wide region membership proofs (bit decomposition)
+#
+# A wide region proof is a pair of Pedersen wide range proofs, one per axis:
+# the x commitment must be declared over exactly [region.min_x, region.max_x]
+# and the y commitment over exactly [region.min_y, region.max_y], and each
+# axis range must contain exactly 2**k integers with 1 <= k <= 24 (the two
+# axes may use different bit widths). Each sub-proof is produced by
+# prove_range_wide under the same derived context as prove_region — the
+# region domain separator, the axis label, the external context, the four
+# region bounds and both commitments — so a proof cannot be replayed against
+# another region, context, commitment pair or axis assignment.
+
+
+@dataclass(frozen=True)
+class RegionWideProof:
+    """A non-interactive 2-D wide region membership proof.
+
+    ``x_proof`` and ``y_proof`` are :class:`WideRangeProof` objects over the
+    x and y :class:`PedersenCommitment` respectively; the verifier learns
+    nothing about the coordinates or blinding factors.
+    """
+
+    x_proof: WideRangeProof
+    y_proof: WideRangeProof
+
+
+def prove_region_wide(
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    x: int,
+    y: int,
+    x_blinding: int,
+    y_blinding: int,
+    region: Region,
+    context: bytes = b"",
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> RegionWideProof:
+    """Prove that the committed ``(x, y)`` lies inside ``region``.
+
+    ``x_commitment`` must be declared over exactly
+    ``[region.min_x, region.max_x]`` and ``y_commitment`` over exactly
+    ``[region.min_y, region.max_y]``; a mismatch raises :class:`ValueError`.
+    Each axis range must contain exactly ``2**k`` integers with the base-2
+    bit width ``k`` between 1 and 24 (the two axes may differ); any other
+    size raises :class:`ValueError`. Both openings are recomputed and
+    compared with :func:`verify_pedersen_opening` before any sub-proof is
+    produced, and a mismatch — including a coordinate outside the declared
+    range — raises :class:`ValueError`. Type errors (wrong objects,
+    non-integer or ``bool`` numbers, non-``bytes`` context, non-callable
+    ``randbelow``) raise :class:`TypeError`; a draw that is not a non-bool
+    integer raises :class:`TypeError`, an out-of-range draw raises
+    :class:`ValueError`. The same inputs under the same random source
+    produce a byte-identical proof. Inputs are never mutated.
+    """
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError("x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError("y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    _check_int(x, "x")
+    _check_int(y, "y")
+    _check_int(x_blinding, "x_blinding")
+    _check_int(y_blinding, "y_blinding")
+    if not isinstance(region, Region):
+        raise TypeError("region must be a Region")
+    _check_region_fields(region)
+    _check_bytes(context, "context")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if (x_commitment.lower, x_commitment.upper) != (region.min_x, region.max_x):
+        raise ValueError("x commitment range must equal (region.min_x, region.max_x)")
+    if (y_commitment.lower, y_commitment.upper) != (region.min_y, region.max_y):
+        raise ValueError("y commitment range must equal (region.min_y, region.max_y)")
+    if not verify_pedersen_opening(x_commitment, x, x_blinding):
+        raise ValueError("x commitment does not open at (x, x_blinding)")
+    if not verify_pedersen_opening(y_commitment, y, y_blinding):
+        raise ValueError("y commitment does not open at (y, y_blinding)")
+    x_proof = prove_range_wide(
+        x_commitment,
+        x,
+        x_blinding,
+        _region_sub_context(b"x", context, region, x_commitment, y_commitment),
+        randbelow=randbelow,
+    )
+    y_proof = prove_range_wide(
+        y_commitment,
+        y,
+        y_blinding,
+        _region_sub_context(b"y", context, region, x_commitment, y_commitment),
+        randbelow=randbelow,
+    )
+    return RegionWideProof(x_proof=x_proof, y_proof=y_proof)
+
+
+def verify_region_wide(
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    region: Region,
+    proof: RegionWideProof,
+    context: bytes = b"",
+) -> bool:
+    """Verify a :class:`RegionWideProof` against both commitments and ``region``.
+
+    The verifier needs only the two commitments, the region and the proof —
+    never the coordinates or blinding factors. Type errors (wrong objects,
+    non-integer or ``bool`` fields, non-``bytes`` context) raise
+    :class:`TypeError`; a commitment range that does not equal the region
+    bounds, an axis range that is not exactly ``2**k`` integers with
+    ``1 <= k <= 24``, any invalid structure, tampering, a swapped region,
+    context or commitment, swapped axes or a replaced sub-proof returns
+    ``False``. Inputs are never mutated.
+    """
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError("x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError("y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    if not isinstance(region, Region):
+        raise TypeError("region must be a Region")
+    _check_region_fields(region)
+    if not isinstance(proof, RegionWideProof):
+        raise TypeError("proof must be a RegionWideProof")
+    if not isinstance(proof.x_proof, WideRangeProof):
+        raise TypeError("proof x_proof must be a WideRangeProof")
+    if not isinstance(proof.y_proof, WideRangeProof):
+        raise TypeError("proof y_proof must be a WideRangeProof")
+    _check_bytes(context, "context")
+    if (x_commitment.lower, x_commitment.upper) != (region.min_x, region.max_x):
+        return False
+    if (y_commitment.lower, y_commitment.upper) != (region.min_y, region.max_y):
+        return False
+    return verify_range_wide(
+        x_commitment,
+        proof.x_proof,
+        _region_sub_context(b"x", context, region, x_commitment, y_commitment),
+    ) and verify_range_wide(
         y_commitment,
         proof.y_proof,
         _region_sub_context(b"y", context, region, x_commitment, y_commitment),

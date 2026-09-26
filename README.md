@@ -418,6 +418,35 @@ region_multi_proof = prove_multi_inclusion(region_leaves, tuple(range(len(region
 bound_region = BoundRegionBatch(tuple(batch), len(batch), region_multi_proof)
 assert verify_region_bound(bound_region, region_root)
 
+# 宽区间二维区域证明的批量验证与 Merkle 完整批（两轴位宽可各自不同）
+from zkregion import (
+    RegionWideBatchEntry,
+    verify_region_wide_batch,
+    BoundRegionWideBatch,
+    prove_region_wide_batch_bound,
+    verify_region_wide_batch_bound,
+)
+
+wide_region = Region(0, 255, -2048, 2047)
+x_wide_commitment, x_wide_blinding = pedersen_commit(40, 0, 255)
+y_wide_commitment, y_wide_blinding = pedersen_commit(60, -2048, 2047)
+region_wide_proof = prove_region_wide(
+    x_wide_commitment, y_wide_commitment, 40, 60,
+    x_wide_blinding, y_wide_blinding, wide_region, context=b"session-1",
+)
+wide_batch = [
+    RegionWideBatchEntry(
+        x_wide_commitment, y_wide_commitment, wide_region,
+        region_wide_proof, b"session-1",
+    ),
+]
+assert verify_region_wide_batch(wide_batch)
+assert not verify_region_wide_batch([])
+
+bound_wide_region, wide_region_root = prove_region_wide_batch_bound(wide_batch)
+assert verify_region_wide_batch_bound(bound_wide_region, wide_region_root)
+assert not verify_region_wide_batch_bound(bound_wide_region, b"\x00" * 32)
+
 Region(0, 100, 0, 100).contains(50, 50)     # True
 
 # 与承诺绑定的区域判定：先逐轴校验开合与声明区间，再判定坐标是否落在矩形内
@@ -1226,6 +1255,11 @@ python3 -m zkregion
 - `verify_region(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证区域成员证明，无需坐标或盲因子
 - `prove_region_wide(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionWideProof` — 按位分解的宽区间版二维矩形区域成员非交互证明：两轴承诺的声明区间须分别恰为 `(region.min_x, region.max_x)` 与 `(region.min_y, region.max_y)`，生成前先逐轴按 `verify_pedersen_opening` 同一开合校验口径重算比对，两轴都通过后才生成子证明；每轴区间个数与位宽沿用 `prove_range_wide` 的同一套约束（恰含 `2**k` 个整数、`1 <= k <= 24`），两轴位宽可各自不同；子证明逐轴原样复用 `prove_range_wide`，比特顺序、加权绑定与挑战口径一概不改，派生上下文沿用二维区域证明的既有绑定（轴标签、区域四边界、外部上下文与两份承诺均在其中）；开合不符、坐标越界、区间与区域不匹配或位宽约束不满足一律抛 `ValueError`，任一层字段错型（含用 `bool` 冒充整数、上下文不是字节串）或随机源不可调用抛 `TypeError`，随机源返回非整数抛 `TypeError`、抽取值越界抛 `ValueError`；同一组入参在相同随机源下重复生成逐字节一致，随机源可注入且原样透传，输入不被改写
 - `verify_region_wide(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证宽区间版区域成员证明，只需两个承诺、区域与证明，无需坐标或盲因子；两轴承诺声明区间须恰为区域对应轴上下界，子证明逐轴以 `verify_range_wide` 同一口径核对；任一层字段错型（含用 `bool` 冒充整数、上下文不是字节串）抛唯一的 `TypeError`，换区域、换上下文、换任一承诺、交换两轴、替换任一子证明、非法结构或位宽越界一律返回 `False` 且不抛异常，输入不被改写
+- `RegionWideBatchEntry(x_commitment, y_commitment, region, proof, context=b"")` — 不可变宽区间二维区域批验条目，字段次序与 `verify_region_wide` 入参一致（两承诺、`Region`、`RegionWideProof`、`bytes` 上下文）；可位置构造、按值相等且不可变，构造时不做任何校验
+- `verify_region_wide_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 宽区间版二维区域证明的批量验证：先整批预检嵌套类型（序列本身、条目、两承诺各六字段、区域四边界、两轴 `WideRangeProof` 三层元组整数与 `context`，错型含后项错型、用 `bool` 冒充整数与上下文不是字节串，一律抛唯一的 `TypeError`；随机源不可调用或返回非整数同样抛 `TypeError`），哪怕错型出现在最后一个条目也照抛，预检通过后才逐条核对；空批返回 `False`，首条无效即短路返回 `False`。每轴声明区间须恰为区域对应边界；比特承诺按 `2**i` 加权的绑定与各比特两个挑战份额之和等于转录挑战（逐轴派生 context 与单条验证逐字节一致）逐条核对、不参与聚合；两轴子证明的每个比特两条 OR 子分支各恰取一次非零系数 `a = r + 1`（`r = randbelow(prime - 1)`），跨轴跨条目按 `(prime, generator, h)` 分组只做一次聚合等式，越界系数抛 `ValueError`；换承诺、换区域、换上下文、交换两轴或替换任一子证明一律返回 `False` 且不抛异常；条目独立、可乱序可重复，固定随机源下结果可重复，输入不被改写
+- `verify_region_wide_batch_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的宽区间二维区域证明完整批验：先 `verify_multi_inclusion` 验外层根，根通过后才把同一 `randbelow` 交给 `verify_region_wide_batch`
+- `BoundRegionWideBatch(entries, leaf_count, proof)` — 冻结的宽区间二维区域完整批对象；字段依次为 `tuple[RegionWideBatchEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变，构造时不做校验
+- `prove_region_wide_batch_bound(entries, *, randbelow=secrets.randbelow) -> tuple[BoundRegionWideBatch, bytes]` — 顶层构造 Merkle 承诺的规范宽区间二维区域完整批：`entries` 沿用 `verify_region_wide_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，输入不变；每项外层叶逐字节复用宽区间二维区域完整批叶编码（域 `b"zkregion/rwb/v1"`、四字节长度帧、十进制 ASCII 整数保留负号与既有字段顺序：两承诺六字段、区域四边界、`context`，再 x 后 y 各子证明的 `commitments`/`challenges`/`responses` 计数成帧），Merkle 摘要规则不变；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖每片叶、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_region_wide_batch_bound(batch, root) is True`，单项、奇偶批与重复项均确定，保序留重，同一份输入重复构造批、根与证明逐字节一致；`randbelow` 原样透传给 `verify_region_wide_batch`；全批或任一嵌套字段错型（含后项错型与 `bool`）抛 `TypeError`，空批、批次数越出 uint64 或 `verify_region_wide_batch` 返回 `False`（内层证明无效）抛 `ValueError`
 - `region_contains_committed(region, x_commitment, y_commitment, x, y, x_blinding, y_blinding) -> bool` — 与承诺绑定的矩形区域判定：先按 x 后 y 的固定次序逐轴校验声明区间与开合——承诺声明区间须恰为区域对应轴的两个边界（x 承诺为 `(region.min_x, region.max_x)`、y 承诺为 `(region.min_y, region.max_y)`），值与盲因子按 `verify_pedersen_opening` 同一套口径以承诺对象内的群参数（含非默认参数与显式 `h`）重算比对——两轴都通过后才判定坐标是否落在闭区间矩形内（四边算在矩形内）；任一层字段错型（含用 `bool` 冒充整数）或传入非 `Region` / 非 `PedersenCommitment` 对象一律抛 `TypeError`，开合不符、盲因子或承诺内参数越界、声明区间与区域边界不一致、声明非法（`lower > upper` 或值越出声明区间）、换绑任一承诺或盲因子、坐标落在矩形外一律返回 `False`；纯函数、结果确定、次序固定、不改写任何输入、不引入落盘或持久化
 - `RegionContainsEntry(region, x_commitment, y_commitment, x, y, x_blinding, y_blinding)` — 不可变区域判定批验条目，字段类型依次为 `Region`、`PedersenCommitment`、`PedersenCommitment` 与四个非 `bool` `int`，次序与 `region_contains_committed` 入参一致（x 轴先于 y 轴）；可位置构造、按值相等
 - `verify_region_contains_batch(entries) -> bool` — 与承诺绑定的区域判定批验：`entries` 须为非 `bytes`/`bytearray`/`str` 的 `RegionContainsEntry` 序列，先整批预检嵌套类型（区域四边界、两承诺各字段、坐标与盲因子错型，含用 `bool` 冒充整数与后项错型，一律抛 `TypeError`），再逐项委托 `region_contains_committed`；空批返回 `False`，首条不通过即短路返回 `False`；条目相互独立、可乱序可重复，开合不符、换绑承诺或盲因子、声明区间与区域边界不一致、坐标越出矩形一律返回 `False`；不聚合、不新增编码、不改写输入
@@ -1672,6 +1706,41 @@ h**Σ(a*s) == Π(t**a * D_i**(a*e))   (mod prime)
 即把该组内所有条目的两条轴、全部分支纳入同一个随机线性组合，而**不是**逐条分支或逐条目验证后做布尔汇总——因此同组内响应误差可以在系数为 1 时相消，而不同 `(prime, generator, h)`（不同群或不同 `h`）之间不能跨组相消。传入固定的 `randbelow` 结果可重复，缺省为 `secrets.randbelow`。
 
 类型错误（含 `bool` 整数、非元组证明字段、非 `bytes` 的 `context`、`randbelow` 不可调用或返回非整数）抛 `TypeError`；系数来源返回值超出 `[0, prime - 1)` 抛 `ValueError`。其余非法结构、篡改、区域/承诺/context 绑定错误、跨项重组、子证明数量错误均返回 `False`；入口不改写任何输入。与 Schnorr 批量验证一样，这里的随机线性组合只供演示。
+
+### 宽区间二维区域证明批量验证
+
+`verify_region_wide_batch(entries, *, randbelow=secrets.randbelow)` 一次验证一批宽区间版二维区域证明，每个条目就是 `verify_region_wide` 的五个入参（`x_commitment`、`y_commitment`、`region`、`proof`、`context`，后者缺省 `b""`）冻结成的不可变数据类 `RegionWideBatchEntry`，构造条目不做任何校验。`entries` 须为非 `bytes`/`bytearray`/`str` 的非空序列：空批返回 `False`，重复条目合法并各自独立取系数；条目彼此独立、可乱序，漏项无法被发现，批次完整性由调用方保证。
+
+验证分两个固定阶段。先对**整批**做嵌套类型预检：序列本身错型、任一条目不是 `RegionWideBatchEntry`、两个承诺不是 `PedersenCommitment` 或其六字段不是非 `bool` 整数、区域不是 `Region` 或四边界不是非 `bool` 整数、证明不是 `RegionWideProof` 或两轴子证明不是 `WideRangeProof` 或其任一层字段不是整数元组（含用 `bool` 冒充整数）、`context` 不是 `bytes`，都抛同一个 `TypeError`；预检走完整批，错型哪怕出现在最后一个条目也照样抛出。预检通过后才逐条核对，任一条无效即短路返回 `False`：两轴承诺的声明区间必须分别恰为区域的 `(min_x, max_x)` 与 `(min_y, max_y)`，随后逐轴沿用宽区间单条验证的同一口径——群参数合法、声明区间恰含 `2**k` 个整数（`1 <= k <= 24`，两轴可不同）、三个证明字段长度均为 `k`、各对长度恰为 2、比特承诺/挑战份额/响应取值在界，以及**逐条**核对的比特承诺按 `2**i` 加权乘积等于该轴承诺值、各比特两个挑战份额之和等于该轴派生 context 下的转录挑战（派生 context 与 `verify_region_wide` 逐字节一致，轴标签、区域四边界、外部上下文与两份承诺均纳入转录）——这两项绑定不参与聚合。
+
+通过逐条核对后，**两轴子证明每个比特的两条 OR 子分支**各恰调用一次 `randbelow(prime - 1)` 得 `r`，取非零系数 `a = r + 1`。跨轴、跨条目的所有子分支按 `(prime, generator, h)` 分组，每组只检查一次聚合等式
+
+```
+h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
+```
+
+其中位 `0` 分支以比特承诺 `C_i` 为基点、位 `1` 分支以 `C_i * generator**(-1)` 为基点，与 `verify_range_wide_batch` 完全一致；每个群只做这一次多指数等式而不逐子分支做布尔汇总。篡改响应或挑战份额都会改变重算公告与转录挑战，在逐条阶段即返回 `False`。随机源不可调用或返回非整数抛 `TypeError`，系数返回值超出 `[0, prime - 1)` 抛 `ValueError`；换承诺、换区域、换上下文、交换两轴（含交换子证明或交换承诺）、替换任一子证明或任何结构非法一律返回 `False` 且不抛异常。固定随机源下结果可重复，入口不改写任何输入，不引入落盘或持久化。这里的随机线性组合只供演示。
+
+### Merkle 承诺的宽区间二维区域证明完整批验
+
+`BoundRegionWideBatch(entries, leaf_count, proof)` 把一批**完整**的宽区间二维区域证明条目与一棵 Merkle 树的多包含证明冻结在一起，三个字段依次为：
+
+1. `entries: tuple[RegionWideBatchEntry, ...]` —— 必须是元组（不是列表），每项是 `RegionWideBatchEntry`；
+2. `leaf_count: int` —— 正的非 `bool` 整数，且必须同时等于 `len(entries)` 与 `proof.leaf_count`；
+3. `proof: MerkleMultiProof` —— 其 `indices` 必须无缺口、无重复、无乱序地恰好覆盖 `0 .. leaf_count - 1`（即等于 `tuple(range(leaf_count))`）。
+
+三字段均可位置构造、构造时不做校验，对象按值相等且不可变（冻结 dataclass）。空批（`leaf_count < 1` 或 `entries` 为空）、缺项（数量不符）、`leaf_count` 与任一方不一致、索引乱序/重复/有缺口均返回 `False`。
+
+每个条目的 Merkle 叶字节以新域标签 `b"zkregion/rwb/v1"` 开始，再按条目字段顺序逐项成帧：x 承诺六字段、y 承诺六字段（`element`、`lower`、`upper`、`prime`、`generator`、`h`，按数据类字段顺序）、Region 四边界（`min_x`、`max_x`、`min_y`、`max_y`）与 `context`，随后按 x 后 y 的顺序展开两轴宽区间子证明——每个子证明的 `commitments` 先写十进制元素数再逐项写比特承诺，`challenges` 与 `responses` 各自先写十进制对数再按对顺序把每对的两个整数逐项展开。每个原子项前置四字节无符号大端长度，整数编码为十进制 ASCII 且负号保留，Merkle 摘要规则沿用既有约定，不改帧不重排。
+
+`verify_region_wide_batch_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` 的验证分两步、次序固定：
+
+1. 先对**整批**做嵌套类型预检（批对象、元组条目、两承诺六字段、区域四边界、两轴 `WideRangeProof` 三层元组整数、`context`、`leaf_count` 与 `proof` 字段，错型含用 `bool` 冒充整数与后项错型，一律抛唯一的 `TypeError`）；结构校验（空批、计数与 `proof.leaf_count`/条目数相符、`indices` 无缺口）通过后，才以全部 `(index, leaf)` 调用 `verify_multi_inclusion` 校验外层 Merkle 根；
+2. 外层根通过后，以**同一个 `randbelow`** 原样调用 `verify_region_wide_batch(entries, randbelow=randbelow)` 验证明，在根校验通过前不消费任何随机数；随机源不可调用或返回非整数抛 `TypeError`、越界抛 `ValueError`，契约与内层批验完全一致。
+
+空批、计数或索引不符、错误根、叶字节被篡改或内层批验拒绝一律返回 `False`；`root` 不是 `bytes` 等错型抛 `TypeError`。入口不改写任何输入。
+
+`prove_region_wide_batch_bound(entries, *, randbelow=secrets.randbelow) -> (batch, root)` 是规范构造入口：`entries` 沿用 `verify_region_wide_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项（保序留重），不改写输入；每项按上述同一叶编码成叶（即验根时重算的同一份叶），以全索引 `tuple(range(n))` 调 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖从零开始的全部位置、`siblings` 为空），返回批与该批编码叶的 `merkle_root`。构造结果一次通过 `verify_region_wide_batch_bound(batch, root)`，单条目、奇偶批与重复项都给确定结果；同一份输入重复构造所得的批、根与证明逐字节一致。构造预检失败抛 `TypeError`，空批、批次数越出 uint64 或内层 `verify_region_wide_batch` 不通过抛 `ValueError`；`randbelow` 原样透传，随机源自身异常按既有边界原样抛出。既有宽区间与旧二维区域行为全部不变，不新增落盘口径。
 
 ### Fiat-Shamir 转录
 

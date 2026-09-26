@@ -825,6 +825,53 @@ assert bwrr_b.check(wide_bound, wide_root, bwrr_binding)     # 认领、验根�
 assert not bwrr_a.check(wide_bound, wide_root, bwrr_binding) # 已消费，二次提交被拒
 store.close()
 
+# 宽区间二维区域三个守卫的一次性绑定（单条、整批、完整批；可选 SQLite 后端共享状态）
+from zkregion import (
+    BoundRegionWideReplayGuard,
+    RegionWideBatchEntry,
+    RegionWideBatchReplayGuard,
+    RegionWideReplayGuard,
+    prove_region_wide,
+    prove_region_wide_batch_bound,
+)
+
+wide_region = Region(0, 255, -2048, 2047)
+wx, wx_r = pedersen_commit(40, 0, 255)
+wy, wy_r = pedersen_commit(60, -2048, 2047)
+wide_proof = prove_region_wide(
+    wx, wy, 40, 60, wx_r, wy_r, wide_region, context=b"session-1"
+)
+wide_entry = RegionWideBatchEntry(wx, wy, wide_region, wide_proof, b"session-1")
+wide_entries = [wide_entry]                                  # 非空条目序列
+wide_bound, wide_root = prove_region_wide_batch_bound(wide_entries)
+
+rwr = RegionWideReplayGuard()
+rwr_binding = rwr.bind_once(wide_entry, b"session-1")
+assert rwr.check(wide_entry, rwr_binding)                    # 首次判真
+assert not rwr.check(wide_entry, rwr_binding)                # 二次判假
+try:
+    rwr.bind_once(wide_entry, b"session-1")                  # 已消费 id 重绑
+except ValueError:
+    pass
+
+rwbr = RegionWideBatchReplayGuard()
+rwbr_binding = rwbr.bind_once(wide_entries, b"session-1")
+assert rwbr.check(wide_entries, rwbr_binding)                # 首次判真
+assert not rwbr.check(wide_entries, rwbr_binding)            # 二次判假
+
+brwr = BoundRegionWideReplayGuard()
+brwr_binding = brwr.bind_once(wide_bound, wide_root, b"session-1")
+assert brwr.check(wide_bound, wide_root, brwr_binding)       # 首次判真
+assert not brwr.check(wide_bound, wide_root, brwr_binding)   # 二次判假
+
+store = SQLiteReplayStore(tempfile.mktemp(suffix=".db"))
+rwr_a = RegionWideReplayGuard(store=store)
+rwr_binding = rwr_a.bind_once(wide_entry, b"session-3")
+rwr_b = RegionWideReplayGuard(store=store)                   # 另一个独立实例
+assert rwr_b.check(wide_entry, rwr_binding)                  # 认领、验宽区间二维区域证明并消费（行键域 b"zr/rwr/v1"）
+assert not rwr_a.check(wide_entry, rwr_binding)              # 已消费，二次提交被拒
+store.close()
+
 # 整批 BoundSchnorrBatch 与 bytes 根的一次性绑定（可选 SQLite 后端跨实例共享）
 from zkregion import BoundSchnorrReplayGuard
 

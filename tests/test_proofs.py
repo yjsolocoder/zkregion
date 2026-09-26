@@ -30,6 +30,7 @@ from zkregion import (
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
     BoundWideRangeBatch,
+    BoundWideRangeReplayGuard,
     MerkleConsistencyBatchEntry,
     MerkleConsistencyBatchReplayGuard,
     MerkleConsistencyChain,
@@ -32982,6 +32983,967 @@ class RegionContainsReplayGuardTest(unittest.TestCase):
 
         def attempt():
             won = RegionContainsReplayGuard(store=store).check(entry, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+        store.close()
+
+
+class BoundWideRangeReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for Merkle-bound wide range batches."""
+
+    DOMAIN = b"zr/bwrr/v1"
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+    DELEGATE = "verify_range_wide_batch_bound"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "bwrr.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def guard(self, **kwargs):
+        return BoundWideRangeReplayGuard(**kwargs)
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def entry(self, value=5, lower=0, upper=15, context=b"ctx", blinding=1234):
+        commitment, r = pedersen_commit(
+            value, lower, upper, blinding=blinding,
+            prime=self.PRIME, generator=self.G, h=self.H,
+        )
+        proof = prove_range_wide(
+            commitment, value, r, context, randbelow=counter_randbelow()
+        )
+        return WideRangeBatchEntry(commitment, proof, context)
+
+    def build(self, entries):
+        leaves = [bound_wide_range_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        return BoundWideRangeBatch(tuple(entries), len(entries), proof), root
+
+    def honest(self):
+        return self.build([
+            self.entry(value=5, context=b"a"),
+            self.entry(value=7, context=b"b"),
+            self.entry(value=0, context=b"c"),
+        ])
+
+    def broken_inner_batch(self):
+        # honest outer leaves over a forged proof: the outer root checks, only
+        # verify_range_wide_batch rejects the inner batch
+        entries = [
+            self.entry(value=5, context=b"a"),
+            self.entry(value=7, context=b"b"),
+            self.entry(value=0, context=b"c"),
+        ]
+        good = entries[0]
+        last_pair = good.proof.responses[-1]
+        forged_proof = dataclasses.replace(
+            good.proof,
+            responses=good.proof.responses[:-1]
+            + ((last_pair[0], last_pair[1] + 1),),
+        )
+        return self.build([dataclasses.replace(good, proof=forged_proof), *entries[1:]])
+
+    def range_entry(self, value=5, context=b"ctx", blinding=1234):
+        commitment, r = pedersen_commit(
+            value, 0, 10, blinding=blinding,
+            prime=self.PRIME, generator=self.G, h=self.H,
+        )
+        proof = prove_range(
+            commitment, value, r, context, randbelow=counter_randbelow()
+        )
+        return RangeBatchEntry(commitment, proof, context)
+
+    def other_domain_binding(self, store, session_id):
+        # a BoundRangeReplayGuard row under b"zr/brr/v1" with the same id
+        entries = [self.range_entry()]
+        leaves = [bound_range_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        batch = BoundRangeBatch(tuple(entries), len(entries), proof)
+        guard = BoundRangeReplayGuard(store=store)
+        return guard, guard.bind_once(batch, root, session_id), batch, root
+
+    @staticmethod
+    def expected_digest(batch, root, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        proof = batch.proof
+        material = F(b"zr/bwrr/v1") + F(session_id) + F(root) + F(U(batch.leaf_count))
+        material += b"".join(
+            F(bound_wide_range_leaf(entry)) for entry in batch.entries
+        )
+        material += (
+            F(U(proof.leaf_count))
+            + F(U(len(proof.indices)))
+            + b"".join(F(U(index)) for index in proof.indices)
+            + F(U(len(proof.siblings)))
+            + b"".join(F(sibling) for sibling in proof.siblings)
+            + F(expiry)
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(batch, root, b"s1"))
+        binding = guard.bind_once(batch, root, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(batch, root, b"s2", 1000)
+        )
+
+    def test_digest_uses_existing_wide_range_leaf_bytes(self):
+        import zkregion
+
+        batch, root = self.honest()
+        binding = self.guard().bind_once(batch, root, b"s")
+        self.assertEqual(
+            binding.digest,
+            zkregion._bound_wide_range_replay_digest(batch, root, b"s", None),
+        )
+        # the per-item leaf bytes are byte for byte the complete-batch leaf
+        self.assertEqual(
+            bound_wide_range_leaf(batch.entries[0]),
+            zkregion._bound_wide_range_leaf(batch.entries[0]),
+        )
+
+    def test_digest_domain_is_distinct(self):
+        batch, root = self.honest()
+        binding = self.guard().bind_once(batch, root, b"s")
+
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        proof = batch.proof
+        for other_domain in (b"zr/brr/v1", b"zr/brg/v1", b"zkregion/wrb/v1"):
+            material = F(other_domain) + F(b"s") + F(root) + F(U(batch.leaf_count))
+            material += b"".join(
+                F(bound_wide_range_leaf(entry)) for entry in batch.entries
+            )
+            material += (
+                F(U(proof.leaf_count))
+                + F(U(len(proof.indices)))
+                + b"".join(F(U(index)) for index in proof.indices)
+                + F(U(len(proof.siblings)))
+                + b"".join(F(sibling) for sibling in proof.siblings)
+                + F(b"\x00")
+            )
+            self.assertNotEqual(binding.digest, hashlib.sha256(material).digest())
+
+    def test_digest_binds_every_component(self):
+        entries = [
+            self.entry(value=5, context=b"a"),
+            self.entry(value=7, context=b"b"),
+            self.entry(value=0, context=b"c"),
+        ]
+        batch, root = self.build(entries)
+        base = self.guard().bind_once(batch, root, b"s")
+        self.assertNotEqual(base.digest, self.expected_digest(batch, root, b"other"))
+        self.assertNotEqual(base.digest, self.expected_digest(batch, root, b"s", 1))
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(batch, hashlib.sha256(root).digest(), b"s"),
+        )
+        single, single_root = self.build(entries[:1])
+        self.assertNotEqual(base.digest, self.expected_digest(single, single_root, b"s"))
+        reordered, reordered_root = self.build([entries[1], entries[0], entries[2]])
+        self.assertNotEqual(
+            base.digest, self.expected_digest(reordered, reordered_root, b"s")
+        )
+        leaves = [bound_wide_range_leaf(entry) for entry in entries]
+        partial = prove_multi_inclusion(leaves, (0, 1))
+        partial_batch = BoundWideRangeBatch(tuple(entries), 2, partial)
+        self.assertNotEqual(
+            base.digest, self.expected_digest(partial_batch, root, b"s")
+        )
+        with_siblings = BoundWideRangeBatch(
+            batch.entries,
+            batch.leaf_count,
+            MerkleMultiProof(
+                batch.proof.leaf_count, batch.proof.indices, (b"\x00" * 32,)
+            ),
+        )
+        self.assertNotEqual(
+            self.guard().bind_once(with_siblings, root, b"s2").digest,
+            base.digest,
+        )
+
+    def test_duplicate_entries_are_preserved(self):
+        item = self.honest()[0].entries[0]
+        batch, root = self.build([item, item])
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertEqual(binding.digest, self.expected_digest(batch, root, b"s"))
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        batch, root = self.honest()
+        none = self.guard().bind_once(batch, root, b"n")
+        zero = self.guard().bind_once(batch, root, b"z", expires_at=0)
+        one = self.guard().bind_once(batch, root, b"o", expires_at=1)
+        self.assertNotEqual(none.digest, zero.digest)
+        self.assertNotEqual(zero.digest, one.digest)
+
+    def test_pending_id_cannot_be_rebound(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        guard.bind_once(batch, root, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        first = guard.bind_once(batch, root, b"s1")
+        second = guard.bind_once(batch, root, b"s2")
+        self.assertNotEqual(first, second)
+        self.assertTrue(
+            guard.check(batch, root, first, now=1, randbelow=counter_randbelow())
+        )
+        self.assertTrue(
+            guard.check(batch, root, second, now=1, randbelow=counter_randbelow())
+        )
+
+    # ---- bind argument validation -------------------------------------------
+
+    def test_bind_type_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        for bad in ("batch", 7, None, batch.entries, batch.proof):
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, root, b"s")
+        for bad in (bytearray(root), None, 7, "root"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, bad, b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, root, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, root, b"s", expires_at=bad)
+        with self.assertRaises(TypeError):
+            BoundWideRangeReplayGuard(store=object())
+
+    def test_bind_nested_type_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        entries = batch.entries
+        proof = batch.proof
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundWideRangeBatch(list(entries), 3, proof), root, b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundWideRangeBatch(("x",) * 3, 3, proof), root, b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundWideRangeBatch(entries, True, proof), root, b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundWideRangeBatch(entries, 3.0, proof), root, b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundWideRangeBatch(entries, 3, "proof"), root, b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundWideRangeBatch(
+                    entries, 3, MerkleMultiProof(3, [0, 1, 2], ())
+                ), root, b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundWideRangeBatch(
+                    entries, 3, MerkleMultiProof(3, (0, 1, True), ())
+                ), root, b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundWideRangeBatch(
+                    entries, 3, MerkleMultiProof(3, (0, 1, 2), (b"ok", 7))
+                ), root, b"s",
+            )
+        entry = entries[0]
+        bad_entry_cases = [
+            dataclasses.replace(entry, commitment="c"),
+            dataclasses.replace(
+                entry,
+                commitment=dataclasses.replace(entry.commitment, element=True),
+            ),
+            dataclasses.replace(entry, proof="p"),
+            dataclasses.replace(
+                entry,
+                proof=WideRangeProof(
+                    list(entry.proof.commitments),
+                    entry.proof.challenges,
+                    entry.proof.responses,
+                ),
+            ),
+            dataclasses.replace(
+                entry,
+                proof=WideRangeProof(
+                    entry.proof.commitments,
+                    entry.proof.challenges[:-1]
+                    + ((entry.proof.challenges[-1][0], True),),
+                    entry.proof.responses,
+                ),
+            ),
+            dataclasses.replace(
+                entry,
+                proof=WideRangeProof(
+                    entry.proof.commitments,
+                    entry.proof.challenges,
+                    entry.proof.responses[:-1] + (("a", "b"),),
+                ),
+            ),
+            dataclasses.replace(entry, context="ctx"),
+        ]
+        for bad_entry in bad_entry_cases:
+            with self.assertRaises(TypeError, msg=repr(bad_entry)):
+                guard.bind_once(
+                    BoundWideRangeBatch((bad_entry,) + entries[1:], 3, proof),
+                    root, b"s",
+                )
+
+    def test_bind_value_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"")
+        for bad in (-1, 2**64):
+            with self.assertRaises(ValueError):
+                guard.bind_once(batch, root, b"s", expires_at=bad)
+        with self.assertRaises(ValueError):
+            guard.bind_once(
+                BoundWideRangeBatch(batch.entries, 2**64, batch.proof), root, b"t"
+            )
+        negative = MerkleMultiProof(1, (-1,), ())
+        with self.assertRaises(ValueError):
+            guard.bind_once(
+                BoundWideRangeBatch(batch.entries[:1], 1, negative), root, b"t"
+            )
+
+    # ---- honest check and single use ----------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s", expires_at=1000)
+        self.assertTrue(
+            guard.check(batch, root, binding, now=999, randbelow=counter_randbelow())
+        )
+        self.assertFalse(
+            guard.check(batch, root, binding, now=999, randbelow=counter_randbelow())
+        )
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_check_with_default_now_and_randbelow(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        batch, root = self.honest()
+        for now in (0, 2**64 - 1):
+            guard = self.guard()
+            binding = guard.bind_once(batch, root, f"s{now}".encode())
+            self.assertTrue(
+                guard.check(
+                    batch, root, binding, now=now, randbelow=counter_randbelow()
+                )
+            )
+
+    def test_expiry_boundary_is_inclusive(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        first = guard.bind_once(batch, root, b"s1", expires_at=1000)
+        self.assertTrue(
+            guard.check(
+                batch, root, first, now=999, randbelow=counter_randbelow()
+            )
+        )
+        guard = self.guard()
+        second = guard.bind_once(batch, root, b"s2", expires_at=1000)
+        self.assertFalse(guard.check(batch, root, second, now=1000))
+        guard = self.guard()
+        third = guard.bind_once(batch, root, b"s3", expires_at=1000)
+        self.assertFalse(guard.check(batch, root, third, now=1001))
+
+    # ---- random source passthrough ------------------------------------------
+
+    def test_randbelow_is_passed_through_unchanged(self):
+        batch, root = self.honest()
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding, now=1, randbelow=recording))
+        # 3 entries * width 4 * 2 OR sub-branches per bit = 24 draws
+        self.assertEqual(calls, [self.PRIME - 1] * 24)
+
+    def test_no_randomness_drawn_for_a_replayed_id(self):
+        batch, root = self.honest()
+
+        def boom(upper):
+            raise AssertionError("randbelow must not be called")
+
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+        self.assertFalse(guard.check(batch, root, binding, now=1, randbelow=boom))
+
+    def test_delegated_randomness_errors_propagate_and_restore(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        with self.assertRaises(TypeError):
+            guard.check(batch, root, binding, now=1, randbelow=lambda upper: True)
+        # the failed check did not consume the id
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s2")
+        with self.assertRaises(ValueError):
+            guard.check(batch, root, binding, now=1, randbelow=lambda upper: -1)
+        # a ValueError from the random source also leaves the id reusable
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_random_source_own_exception_propagates(self):
+        class RandomFailure(RuntimeError):
+            pass
+
+        def boom(upper):
+            raise RandomFailure("source down")
+
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        with self.assertRaises(RandomFailure):
+            guard.check(batch, root, binding, now=1, randbelow=boom)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    # ---- rejection never consumes -------------------------------------------
+
+    def test_expired_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s", expires_at=1000)
+        self.assertFalse(guard.check(batch, root, binding, now=2000))
+        self.assertTrue(
+            guard.check(batch, root, binding, now=999, randbelow=counter_randbelow())
+        )
+        self.assertFalse(guard.check(batch, root, binding, now=999))
+
+    def test_wrong_root_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertFalse(guard.check(batch, bytes(32), binding, now=1))
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_delegated_inner_batch_rejection_does_not_consume(self):
+        batch, root = self.broken_inner_batch()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertFalse(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+        # rejected id stays pending: rebind is still a ValueError
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+        self.assertIn(b"s", guard._pending)
+
+    def test_short_sibling_rejection_does_not_consume(self):
+        batch, root = self.honest()
+        bogus = MerkleMultiProof(
+            batch.proof.leaf_count, batch.proof.indices, (b"short",)
+        )
+        bogus_batch = BoundWideRangeBatch(batch.entries, batch.leaf_count, bogus)
+        guard = self.guard()
+        binding = guard.bind_once(bogus_batch, root, b"s")
+        self.assertFalse(
+            guard.check(
+                bogus_batch, root, binding, now=1, randbelow=counter_randbelow()
+            )
+        )
+        with self.assertRaises(ValueError):
+            guard.bind_once(bogus_batch, root, b"s")
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        guard.bind_once(batch, root, b"local")
+        foreign = self.guard().bind_once(batch, root, b"elsewhere")
+        self.assertFalse(
+            guard.check(
+                batch, root, foreign, now=1, randbelow=counter_randbelow()
+            )
+        )
+        equal = self.guard().bind_once(batch, root, b"local")
+        self.assertTrue(
+            guard.check(batch, root, equal, now=1, randbelow=counter_randbelow())
+        )
+        unknown = ReplayBinding(b"never-bound", b"\x00" * 32)
+        self.assertFalse(guard.check(batch, root, unknown, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        guard.bind_once(batch, root, b"s")
+        forged_digest = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(guard.check(batch, root, forged_digest, now=1))
+        forged_expiry = ReplayBinding(
+            b"s", self.expected_digest(batch, root, b"s", 1), 1
+        )
+        self.assertFalse(guard.check(batch, root, forged_expiry, now=0))
+
+    def test_replaced_proof_mismatches_digest_without_consuming(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        replaced = BoundWideRangeBatch(
+            batch.entries,
+            batch.leaf_count,
+            MerkleMultiProof(
+                batch.proof.leaf_count,
+                batch.proof.indices,
+                (b"\x00" * 32,),
+            ),
+        )
+        self.assertFalse(guard.check(replaced, root, binding, now=1))
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_instances_are_independent(self):
+        batch, root = self.honest()
+        first = self.guard()
+        second = self.guard()
+        binding = first.bind_once(batch, root, b"s")
+        self.assertFalse(second.check(batch, root, binding, now=1))
+        self.assertTrue(
+            first.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    # ---- check argument validation ------------------------------------------
+
+    def test_check_type_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        for bad in ("batch", 7, None, batch.entries):
+            with self.assertRaises(TypeError):
+                guard.check(bad, root, binding, now=1)
+        for bad in (None, 7, "root", bytearray(root)):
+            with self.assertRaises(TypeError):
+                guard.check(batch, bad, binding, now=1)
+        for bad in ("binding", 7, None, (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(batch, root, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(batch, root, binding, now=bad)
+        with self.assertRaises(TypeError):
+            guard.check(batch, root, binding, now=1, randbelow=7)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(batch, root, binding, now=bad)
+
+    def test_oversized_framed_integer_check_returns_false(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        oversized = BoundWideRangeBatch(batch.entries, 2**64, batch.proof)
+        self.assertFalse(guard.check(oversized, root, binding, now=1))
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_inputs_are_not_mutated(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        batch_snapshot = BoundWideRangeBatch(
+            batch.entries, batch.leaf_count, batch.proof
+        )
+        binding = guard.bind_once(batch, root, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        held_root = bytes(root)
+        guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        self.assertEqual(batch, batch_snapshot)
+        self.assertEqual(binding, binding_snapshot)
+        self.assertEqual(root, held_root)
+
+    def test_delegation_error_restores_pending_in_memory(self):
+        import zkregion
+
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        original = getattr(zkregion, self.DELEGATE)
+
+        def boom(_batch, _root, **_kwargs):
+            raise RuntimeError("boom")
+
+        setattr(zkregion, self.DELEGATE, boom)
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(
+                    batch, root, binding, now=1, randbelow=counter_randbelow()
+                )
+        finally:
+            setattr(zkregion, self.DELEGATE, original)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            guard.check(batch, root, binding, now=1, randbelow=counter_randbelow())
+        )
+
+    # ---- concurrency ---------------------------------------------------------
+
+    def test_concurrent_checks_have_exactly_one_winner(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = guard.check(
+                batch, root, binding, now=1, randbelow=counter_randbelow()
+            )
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+
+    def test_a_slow_check_of_one_id_does_not_serialize_other_ids(self):
+        import zkregion
+
+        slow_batch, slow_root = self.build([self.entry(context=b"slow")])
+        fast_batch, fast_root = self.build([self.entry(context=b"fast")])
+        guard = self.guard()
+        slow_binding = guard.bind_once(slow_batch, slow_root, b"slow")
+        fast_binding = guard.bind_once(fast_batch, fast_root, b"fast")
+        entered = threading.Event()
+        release = threading.Event()
+        original = getattr(zkregion, self.DELEGATE)
+
+        def staged(batch, root, *, randbelow=None):
+            if root == slow_root:
+                entered.set()
+                release.wait(timeout=5)
+                return True
+            return original(batch, root, randbelow=randbelow)
+
+        setattr(zkregion, self.DELEGATE, staged)
+        try:
+            slow_thread = threading.Thread(
+                target=lambda: guard.check(
+                    slow_batch, slow_root, slow_binding, now=1,
+                    randbelow=counter_randbelow(),
+                )
+            )
+            slow_thread.start()
+            self.assertTrue(entered.wait(timeout=5))
+            # the slow id is mid-delegation; the other id must still complete
+            self.assertTrue(
+                guard.check(
+                    fast_batch, fast_root, fast_binding, now=1,
+                    randbelow=counter_randbelow(),
+                )
+            )
+            release.set()
+            slow_thread.join()
+        finally:
+            setattr(zkregion, self.DELEGATE, original)
+        self.assertFalse(guard.check(fast_batch, fast_root, fast_binding, now=1))
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        binder = self.guard(store=store)
+        binding = binder.bind_once(batch, root, b"s", expires_at=1000)
+        checker = self.guard(store=store)
+        self.assertTrue(
+            checker.check(
+                batch, root, binding, now=999, randbelow=counter_randbelow()
+            )
+        )
+        self.assertFalse(binder.check(batch, root, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(batch, root, b"s")
+        store.close()
+        reopened = self.make_store()
+        guard = self.guard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            guard.check(
+                batch, root, binding, now=1, randbelow=counter_randbelow()
+            )
+        )
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = self.guard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(batch, root, b"s")
+        reopened_again.close()
+
+    def test_store_rows_use_the_bwrr_domain(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        self.guard(store=store).bind_once(batch, root, b"s")
+        domains = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(domains[(self.DOMAIN, b"s")], "pending")
+        store.close()
+
+    def test_store_domain_isolation_from_other_guards(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        binding = guard.bind_once(batch, root, b"same-id")
+        other_guard, other_binding, other_batch, other_root = (
+            self.other_domain_binding(store, b"same-id")
+        )
+        self.assertNotEqual(binding.digest, other_binding.digest)
+        self.assertTrue(
+            guard.check(
+                batch, root, binding, now=1, randbelow=counter_randbelow()
+            )
+        )
+        self.assertTrue(
+            other_guard.check(
+                other_batch, other_root, other_binding, now=1,
+                randbelow=counter_randbelow(),
+            )
+        )
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/brr/v1", domains)
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        batch, root = self.honest()
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = self.guard(store=first).bind_once(batch, root, b"s")
+        self.assertFalse(
+            self.guard(store=second).check(batch, root, binding_a, now=1)
+        )
+        self.assertTrue(
+            self.guard(store=first).check(
+                batch, root, binding_a, now=1, randbelow=counter_randbelow()
+            )
+        )
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        binder = self.guard(store=store)
+        binding = binder.bind_once(batch, root, b"s")
+        checker = self.guard(store=store)
+        self.assertFalse(checker.check(batch, bytes(32), binding, now=1))
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(
+            self.guard(store=store).check(
+                batch, root, binding, now=1, randbelow=counter_randbelow()
+            )
+        )
+        store.close()
+
+    def test_store_inner_batch_rejection_restores_pending(self):
+        batch, root = self.broken_inner_batch()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertFalse(
+            guard.check(
+                batch, root, binding, now=1, randbelow=counter_randbelow()
+            )
+        )
+        self.assertIn(b"s", guard._pending)
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        batch, root = self.honest()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = self.guard(store=store)
+        binding = guard.bind_once(batch, root, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        batch, root = self.honest()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = self.guard(store=store).bind_once(batch, root, b"s")
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+    def test_store_delegation_error_restores_pending(self):
+        import zkregion
+
+        batch, root = self.honest()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        binding = guard.bind_once(batch, root, b"s")
+        original = getattr(zkregion, self.DELEGATE)
+
+        def boom(_batch, _root, **_kwargs):
+            raise RuntimeError("boom")
+
+        setattr(zkregion, self.DELEGATE, boom)
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(
+                    batch, root, binding, now=1, randbelow=counter_randbelow()
+                )
+        finally:
+            setattr(zkregion, self.DELEGATE, original)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(
+            self.guard(store=store).check(
+                batch, root, binding, now=1, randbelow=counter_randbelow()
+            )
+        )
+        store.close()
+
+    def test_store_sqlite_errors_propagate(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        guard.bind_once(batch, root, b"s")
+        store._connection.execute("DROP TABLE replay_sessions_v1")
+        with self.assertRaises(sqlite3.Error):
+            guard.check(
+                batch, root, ReplayBinding(b"s", b"\x00" * 32), now=1
+            )
+        store.close()
+
+    def test_store_concurrent_checks_have_exactly_one_winner(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(batch, root, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = self.guard(store=store).check(
+                batch, root, binding, now=1, randbelow=counter_randbelow()
+            )
             with lock:
                 results.append(won)
 

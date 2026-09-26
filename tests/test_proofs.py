@@ -30,6 +30,7 @@ from zkregion import (
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
     BoundWideRangeBatch,
+    BoundWideRangeReplayGuard,
     MerkleConsistencyBatchEntry,
     MerkleConsistencyBatchReplayGuard,
     MerkleConsistencyChain,
@@ -32992,3 +32993,153 @@ class RegionContainsReplayGuardTest(unittest.TestCase):
             thread.join()
         self.assertEqual(sum(results), 1)
         store.close()
+
+
+class BoundWideRangeReplayGuardTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def entry(self, value=5, lower=0, upper=15, context=b"ctx", blinding=1234):
+        commitment, r = pedersen_commit(
+            value, lower, upper, blinding=blinding,
+            prime=self.PRIME, generator=self.G, h=self.H,
+        )
+        proof = prove_range_wide(
+            commitment, value, r, context, randbelow=counter_randbelow()
+        )
+        return WideRangeBatchEntry(commitment, proof, context)
+
+    def build(self, entries):
+        leaves = [bound_wide_range_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        batch = BoundWideRangeBatch(tuple(entries), len(entries), proof)
+        return batch, root
+
+    def honest(self):
+        entries = [
+            self.entry(value=5, context=b"a"),
+            self.entry(value=7, context=b"b"),
+            self.entry(value=0, context=b"c"),
+        ]
+        return self.build(entries)
+
+    @staticmethod
+    def expected_digest(batch, root, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(F(transform(item)) for item in sequence)
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        proof = batch.proof
+        material = F(b"zr/bwrr/v1") + F(session_id) + F(root) + F(U(batch.leaf_count))
+        material += b"".join(F(bound_wide_range_leaf(entry)) for entry in batch.entries)
+        material += (
+            F(U(proof.leaf_count)) + S(proof.indices, U)
+            + S(proof.siblings, lambda sibling: sibling) + F(expiry)
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        batch, root = self.honest()
+        guard = BoundWideRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(
+            binding.digest, self.expected_digest(batch, root, b"s1")
+        )
+        binding = guard.bind_once(batch, root, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(batch, root, b"s2", 1000)
+        )
+
+    def test_domain_separator_is_distinct(self):
+        batch, root = self.honest()
+        binding = BoundWideRangeReplayGuard().bind_once(batch, root, b"s")
+        self.assertEqual(binding.digest, self.expected_digest(batch, root, b"s"))
+        # the BoundRangeReplayGuard domain must produce another digest
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        proof = batch.proof
+        material = F(b"zr/brr/v1") + F(b"s") + F(root) + F(U(batch.leaf_count))
+        material += b"".join(F(bound_wide_range_leaf(entry)) for entry in batch.entries)
+        material += (
+            F(U(proof.leaf_count))
+            + F(U(len(proof.indices)))
+            + b"".join(F(U(index)) for index in proof.indices)
+            + F(U(len(proof.siblings)))
+            + b"".join(F(sibling) for sibling in proof.siblings)
+            + F(b"\x00")
+        )
+        self.assertNotEqual(binding.digest, hashlib.sha256(material).digest())
+
+    # ---- check: first true, second false ------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        batch, root = self.honest()
+        guard = BoundWideRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+        self.assertFalse(guard.check(batch, root, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_rejected_id_can_succeed_later(self):
+        batch, root = self.honest()
+        guard = BoundWideRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertFalse(guard.check(batch, b"\x00" * 32, binding, now=1))
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+
+    # ---- unequal binding -----------------------------------------------------
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        batch, root = self.honest()
+        guard = BoundWideRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        # a binding for another session id is unknown to this registration
+        foreign = BoundWideRangeReplayGuard().bind_once(batch, root, b"elsewhere")
+        self.assertFalse(guard.check(batch, root, foreign, now=1))
+        # same id but a different expiry makes the binding unequal
+        unequal = BoundWideRangeReplayGuard().bind_once(
+            batch, root, b"s", expires_at=500
+        )
+        self.assertFalse(guard.check(batch, root, unequal, now=1))
+        # both rejections left the original registration pending
+        self.assertTrue(guard.check(batch, root, binding, now=1))
+
+    # ---- concurrency ----------------------------------------------------------
+
+    def test_concurrent_checks_have_exactly_one_winner(self):
+        batch, root = self.honest()
+        guard = BoundWideRangeReplayGuard()
+        binding = guard.bind_once(batch, root, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = guard.check(batch, root, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)

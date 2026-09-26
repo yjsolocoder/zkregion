@@ -29,6 +29,7 @@ from zkregion import (
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
+    BoundWideRangeBatch,
     MerkleConsistencyBatchEntry,
     MerkleConsistencyBatchReplayGuard,
     MerkleConsistencyChain,
@@ -92,6 +93,7 @@ from zkregion import (
     prove_pedersen_opening_batch_bound,
     prove_range,
     prove_range_wide,
+    prove_range_wide_batch_bound,
     prove_region,
     prove_region_contains_bound,
     prove_schnorr_batch_bound,
@@ -120,6 +122,7 @@ from zkregion import (
     verify_range_bound,
     verify_range_wide,
     verify_range_wide_batch,
+    verify_range_wide_batch_bound,
     verify_region,
     verify_region_batch,
     verify_region_bound,
@@ -1987,6 +1990,744 @@ class WideRangeBatchTest(unittest.TestCase):
             self.assertIsInstance(entry.proof.commitments, tuple)
             self.assertIsInstance(entry.proof.challenges, tuple)
             self.assertIsInstance(entry.proof.responses, tuple)
+
+
+class BoundWideRangeBatchTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def entry(self, value=5, lower=0, upper=15, context=b"ctx", blinding=1234):
+        commitment, r = pedersen_commit(
+            value, lower, upper, blinding=blinding,
+            prime=self.PRIME, generator=self.G, h=self.H,
+        )
+        proof = prove_range_wide(
+            commitment, value, r, context, randbelow=counter_randbelow()
+        )
+        return WideRangeBatchEntry(commitment, proof, context)
+
+    def build(self, entries):
+        leaves = [bound_wide_range_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        batch = BoundWideRangeBatch(tuple(entries), len(entries), proof)
+        return batch, root
+
+    def honest(self):
+        entries = [
+            self.entry(value=5, context=b"a"),
+            self.entry(value=7, context=b"b"),
+            self.entry(value=0, context=b"c"),
+        ]
+        return self.build(entries)
+
+    # ---- batch object -------------------------------------------------------
+
+    def test_batch_positional_equality_and_immutability(self):
+        batch, root = self.honest()
+        proof = batch.proof
+        rebuilt = BoundWideRangeBatch(batch.entries, 3, proof)
+        self.assertEqual(rebuilt, batch)
+        self.assertEqual(hash(rebuilt), hash(batch))
+        self.assertEqual(
+            tuple(getattr(batch, name) for name in ("entries", "leaf_count", "proof")),
+            (batch.entries, 3, proof),
+        )
+        self.assertIsInstance(batch.entries, tuple)
+        self.assertNotEqual(
+            BoundWideRangeBatch(batch.entries, 4, proof), batch
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.leaf_count = 4
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.entries = ()
+
+    def test_entries_must_be_tuple(self):
+        batch, root = self.honest()
+        loose = BoundWideRangeBatch(list(batch.entries), 3, batch.proof)
+        self.assertNotIsInstance(loose.entries, tuple)
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(loose, root, randbelow=counter_randbelow())
+
+    def test_field_types(self):
+        batch, _ = self.honest()
+        self.assertIsInstance(batch.entries, tuple)
+        for entry in batch.entries:
+            self.assertIsInstance(entry, WideRangeBatchEntry)
+        self.assertIsInstance(batch.leaf_count, int)
+        self.assertNotIsInstance(batch.leaf_count, bool)
+        self.assertIsInstance(batch.proof, MerkleMultiProof)
+
+    # ---- honest round trip --------------------------------------------------
+
+    def test_honest_batch_verifies(self):
+        batch, root = self.honest()
+        self.assertTrue(
+            verify_range_wide_batch_bound(batch, root, randbelow=counter_randbelow())
+        )
+        self.assertTrue(verify_range_wide_batch_bound(batch, root))
+
+    def test_single_entry_batch_verifies(self):
+        entries = [self.entry()]
+        batch, root = self.build(entries)
+        self.assertTrue(
+            verify_range_wide_batch_bound(batch, root, randbelow=counter_randbelow())
+        )
+        self.assertTrue(
+            verify_range_wide_batch(entries, randbelow=counter_randbelow())
+        )
+
+    def test_even_sized_batch_verifies(self):
+        entries = [self.entry(value=0, context=b"a"), self.entry(value=7, context=b"b")]
+        batch, root = self.build(entries)
+        self.assertTrue(
+            verify_range_wide_batch_bound(batch, root, randbelow=counter_randbelow())
+        )
+
+    def test_full_leaf_proof_has_empty_siblings(self):
+        batch, root = self.honest()
+        self.assertEqual(batch.proof.leaf_count, 3)
+        self.assertEqual(batch.proof.indices, (0, 1, 2))
+        self.assertEqual(batch.proof.siblings, ())
+
+    def test_leaf_layout(self):
+        batch, _ = self.honest()
+        entry = batch.entries[0]
+        items = frame_items(bound_wide_range_leaf(entry))
+        width = (entry.commitment.upper - entry.commitment.lower + 1).bit_length() - 1
+        expected_count = 1 + 6 + 1 + (1 + width) + 2 * (1 + 2 * width)
+        self.assertEqual(len(items), expected_count)
+        self.assertEqual(items[0], b"zkregion/wrb/v1")
+        cursor = 1
+        for value in (
+            entry.commitment.element, entry.commitment.lower, entry.commitment.upper,
+            entry.commitment.prime, entry.commitment.generator, entry.commitment.h,
+        ):
+            self.assertEqual(items[cursor], str(value).encode("ascii"))
+            cursor += 1
+        self.assertEqual(items[cursor], entry.context)
+        cursor += 1
+        self.assertEqual(items[cursor], str(width).encode("ascii"))
+        cursor += 1
+        for value in entry.proof.commitments:
+            self.assertEqual(items[cursor], str(value).encode("ascii"))
+            cursor += 1
+        for pairs in (entry.proof.challenges, entry.proof.responses):
+            self.assertEqual(items[cursor], str(len(pairs)).encode("ascii"))
+            cursor += 1
+            for pair in pairs:
+                for value in pair:
+                    self.assertEqual(items[cursor], str(value).encode("ascii"))
+                    cursor += 1
+        self.assertEqual(cursor, len(items))
+
+    def test_leaf_uses_merkle_leaf_domain(self):
+        batch, root = self.honest()
+        self.assertEqual(
+            merkle_root([bound_wide_range_leaf(entry) for entry in batch.entries]),
+            root,
+        )
+
+    def test_empty_context_is_framed_as_zero_length(self):
+        entry = self.entry(context=b"")
+        items = frame_items(bound_wide_range_leaf(entry))
+        self.assertEqual(items[1 + 6], b"")  # context item
+
+    # ---- completeness / count checks ---------------------------------------
+
+    def test_empty_batch_returns_false(self):
+        proof = MerkleMultiProof(1, (), ())
+        batch = BoundWideRangeBatch((), 0, proof)
+        self.assertFalse(
+            verify_range_wide_batch_bound(batch, bytes(32), randbelow=counter_randbelow())
+        )
+
+    def test_leaf_count_must_equal_entry_count(self):
+        entries = [self.entry(context=b"a"), self.entry(context=b"b")]
+        leaves = [bound_wide_range_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, (0, 1))
+        for count in (1, 3, 0):
+            batch = BoundWideRangeBatch(tuple(entries), count, proof)
+            self.assertFalse(
+                verify_range_wide_batch_bound(
+                    batch, root, randbelow=counter_randbelow()
+                ),
+                count,
+            )
+
+    def test_leaf_count_must_equal_proof_leaf_count(self):
+        entries = [self.entry(context=b"a"), self.entry(context=b"b")]
+        leaves = [bound_wide_range_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, (0, 1))
+        for claimed in (1, 3):
+            bad_proof = dataclasses.replace(proof, leaf_count=claimed)
+            batch = BoundWideRangeBatch(tuple(entries), 2, bad_proof)
+            self.assertFalse(
+                verify_range_wide_batch_bound(
+                    batch, root, randbelow=counter_randbelow()
+                ),
+                claimed,
+            )
+
+    def test_indices_must_cover_zero_to_n_without_gaps(self):
+        batch, root = self.honest()
+        for bad_indices in (
+            (0, 1),          # missing one
+            (0, 1, 1),       # duplicate
+            (0, 0, 2),       # duplicate with gap
+            (2, 1, 0),       # reversed
+            (0, 2, 1),       # reordered
+            (1, 2, 3),       # starts at 1
+            (-1, 1, 2),      # negative
+            (0, 1, 3),       # gap at the end
+            (),              # empty
+        ):
+            bad_proof = MerkleMultiProof(3, bad_indices, batch.proof.siblings)
+            bad_batch = BoundWideRangeBatch(batch.entries, 3, bad_proof)
+            self.assertFalse(
+                verify_range_wide_batch_bound(
+                    bad_batch, root, randbelow=counter_randbelow()
+                ),
+                bad_indices,
+            )
+        self.assertEqual(batch.proof.indices, (0, 1, 2))
+
+    def test_missing_entry_returns_false(self):
+        entries = [self.entry(context=b"a"), self.entry(context=b"b")]
+        leaves = [bound_wide_range_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = MerkleMultiProof(3, (0, 1, 2), ())
+        batch = BoundWideRangeBatch(tuple(entries), 3, proof)
+        self.assertFalse(
+            verify_range_wide_batch_bound(batch, root, randbelow=counter_randbelow())
+        )
+
+    # ---- Merkle binding rejection -------------------------------------------
+
+    def test_wrong_root_returns_false(self):
+        batch, _ = self.honest()
+        self.assertFalse(
+            verify_range_wide_batch_bound(batch, bytes(32), randbelow=counter_randbelow())
+        )
+        other = merkle_root([b"alpha", b"beta", b"gamma"])
+        self.assertFalse(
+            verify_range_wide_batch_bound(batch, other, randbelow=counter_randbelow())
+        )
+
+    def test_tampered_leaf_returns_false_even_with_matching_proof(self):
+        entries = [self.entry(context=b"a"), self.entry(context=b"b")]
+        batch, root = self.build(entries)
+        good = entries[0]
+        tampered_commitment = dataclasses.replace(
+            good.commitment, element=good.commitment.element + 1
+        )
+        tampered_commitments = good.proof.commitments[:-1] + (
+            good.proof.commitments[-1] + 1,
+        )
+        last_pair = good.proof.challenges[-1]
+        tampered_challenges = good.proof.challenges[:-1] + (
+            (last_pair[0], last_pair[1] + 1),
+        )
+        for tampered in (
+            dataclasses.replace(good, context=b"other"),
+            dataclasses.replace(good, commitment=tampered_commitment),
+            dataclasses.replace(
+                good,
+                proof=dataclasses.replace(good.proof, commitments=tampered_commitments),
+            ),
+            dataclasses.replace(
+                good,
+                proof=dataclasses.replace(good.proof, challenges=tampered_challenges),
+            ),
+        ):
+            bad_batch = BoundWideRangeBatch((tampered, entries[1]), 2, batch.proof)
+            self.assertFalse(
+                verify_range_wide_batch_bound(
+                    bad_batch, root, randbelow=counter_randbelow()
+                ),
+                tampered,
+            )
+
+    def test_committed_but_forged_proof_fails_at_batch_step(self):
+        entries = [self.entry(context=b"a"), self.entry(context=b"b")]
+        good = entries[0]
+        last_pair = good.proof.responses[-1]
+        forged_proof = dataclasses.replace(
+            good.proof,
+            responses=good.proof.responses[:-1]
+            + ((last_pair[0], last_pair[1] + 1),),
+        )
+        forged_entries = [dataclasses.replace(good, proof=forged_proof), entries[1]]
+        bad_batch, forged_root = self.build(forged_entries)
+        self.assertTrue(  # Merkle step alone passes against the forged root
+            verify_multi_inclusion(
+                [(i, bound_wide_range_leaf(e)) for i, e in enumerate(forged_entries)],
+                bad_batch.proof,
+                forged_root,
+            )
+        )
+        self.assertFalse(
+            verify_range_wide_batch_bound(
+                bad_batch, forged_root, randbelow=counter_randbelow()
+            )
+        )
+
+    def test_tampered_siblings_return_false(self):
+        batch, root = self.honest()
+        self.assertEqual(batch.proof.siblings, ())
+        bogus = MerkleMultiProof(3, batch.proof.indices, (root,))
+        bad_batch = BoundWideRangeBatch(batch.entries, 3, bogus)
+        self.assertFalse(
+            verify_range_wide_batch_bound(bad_batch, root, randbelow=counter_randbelow())
+        )
+        self.assertFalse(
+            verify_range_wide_batch_bound(
+                bad_batch, root + b"\x00", randbelow=counter_randbelow()
+            )
+        )
+
+    # ---- randomness contract ------------------------------------------------
+
+    def test_randbelow_passed_unchanged_and_called_twice_per_bit(self):
+        batch, root = self.honest()
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertTrue(
+            verify_range_wide_batch_bound(batch, root, randbelow=recording)
+        )
+        # width 4 -> 2 OR sub-branches per bit -> 8 draws per entry
+        self.assertEqual(calls, [self.PRIME - 1] * 24)
+
+    def test_no_randomness_consumed_before_the_root_check(self):
+        batch, _ = self.honest()
+
+        def boom(upper):
+            raise AssertionError("randbelow must not be called before the root checks")
+
+        self.assertFalse(
+            verify_range_wide_batch_bound(batch, bytes(32), randbelow=boom)
+        )
+        bad_proof = MerkleMultiProof(3, (0, 1), batch.proof.siblings)
+        bad_batch = BoundWideRangeBatch(batch.entries, 3, bad_proof)
+        self.assertFalse(
+            verify_range_wide_batch_bound(bad_batch, bytes(32), randbelow=boom)
+        )
+
+    def test_fixed_randbelow_is_reproducible(self):
+        batch, root = self.honest()
+        first = verify_range_wide_batch_bound(
+            batch, root, randbelow=counter_randbelow(9)
+        )
+        second = verify_range_wide_batch_bound(
+            batch, root, randbelow=counter_randbelow(9)
+        )
+        self.assertEqual(first, second)
+
+    def test_non_random_source_invalidates_or_raises_per_wide_batch_contract(self):
+        batch, root = self.honest()
+        for bad in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                verify_range_wide_batch_bound(
+                    batch, root, randbelow=lambda upper, bad=bad: bad
+                )
+        for bad in (-1, self.PRIME - 1, self.PRIME):
+            with self.assertRaises(ValueError):
+                verify_range_wide_batch_bound(
+                    batch, root, randbelow=lambda upper, bad=bad: bad
+                )
+
+    # ---- type errors ---------------------------------------------------------
+
+    def test_type_errors(self):
+        batch, root = self.honest()
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound("batch", root)
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(None, root)
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(
+                BoundWideRangeBatch(list(batch.entries), 3, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(
+                BoundWideRangeBatch(("x",) * 3, 3, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(
+                BoundWideRangeBatch(batch.entries, True, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(
+                BoundWideRangeBatch(batch.entries, 3.0, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(
+                BoundWideRangeBatch(batch.entries, "3", batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(
+                BoundWideRangeBatch(batch.entries, 3, "proof"), root
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(batch, "root")
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(batch, bytearray(root))
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(batch, root, randbelow=7)
+        # malformed nested entry fields
+        good = batch.entries[0]
+        bad_commitment = dataclasses.replace(good.commitment, element=True)
+        cases = [
+            dataclasses.replace(good, commitment="c"),
+            dataclasses.replace(good, commitment=bad_commitment),
+            dataclasses.replace(good, proof="p"),
+            dataclasses.replace(good, context="ctx"),
+            dataclasses.replace(
+                good,
+                proof=WideRangeProof(
+                    list(good.proof.commitments),
+                    good.proof.challenges,
+                    good.proof.responses,
+                ),
+            ),
+            dataclasses.replace(
+                good,
+                proof=WideRangeProof(
+                    good.proof.commitments,
+                    good.proof.challenges[:-1]
+                    + ((good.proof.challenges[-1][0], True),),
+                    good.proof.responses,
+                ),
+            ),
+            dataclasses.replace(
+                good,
+                proof=WideRangeProof(
+                    good.proof.commitments,
+                    [good.proof.challenges[0]] * 4,
+                    good.proof.responses,
+                ),
+            ),
+        ]
+        for bad_entry in cases:
+            entries = (bad_entry,) + batch.entries[1:]
+            bad_batch = BoundWideRangeBatch(entries, 3, batch.proof)
+            with self.assertRaises(TypeError):
+                verify_range_wide_batch_bound(
+                    bad_batch, root, randbelow=counter_randbelow()
+                )
+        # the whole batch is walked: a bad type in the last entry still raises
+        late_bad = (
+            batch.entries[0],
+            batch.entries[1],
+            dataclasses.replace(batch.entries[2], context="late"),
+        )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(
+                BoundWideRangeBatch(late_bad, 3, batch.proof),
+                root,
+                randbelow=counter_randbelow(),
+            )
+        # malformed MerkleMultiProof fields
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(
+                BoundWideRangeBatch(batch.entries, 3,
+                                    MerkleMultiProof(True, (0, 1, 2), ())),
+                root,
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(
+                BoundWideRangeBatch(batch.entries, 3,
+                                    MerkleMultiProof(3, [0, 1, 2], ())),
+                root,
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(
+                BoundWideRangeBatch(batch.entries, 3,
+                                    MerkleMultiProof(3, (0, 1, 2.0), ())),
+                root,
+            )
+        with self.assertRaises(TypeError):
+            verify_range_wide_batch_bound(
+                BoundWideRangeBatch(batch.entries, 3,
+                                    MerkleMultiProof(3, (0, 1, 2), ["x"])),
+                root,
+            )
+
+    # ---- hygiene -------------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        batch, root = self.honest()
+        snapshot = BoundWideRangeBatch(
+            tuple(dataclasses.replace(entry) for entry in batch.entries),
+            batch.leaf_count,
+            dataclasses.replace(batch.proof),
+        )
+        verify_range_wide_batch_bound(batch, root, randbelow=counter_randbelow())
+        self.assertEqual(batch, snapshot)
+
+
+class ProveWideRangeBatchBoundTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def entry(self, value=5, lower=0, upper=15, context=b"ctx", blinding=1234):
+        commitment, r = pedersen_commit(
+            value, lower, upper, blinding=blinding,
+            prime=self.PRIME, generator=self.G, h=self.H,
+        )
+        proof = prove_range_wide(
+            commitment, value, r, context, randbelow=counter_randbelow()
+        )
+        return WideRangeBatchEntry(commitment, proof, context)
+
+    def honest_entries(self):
+        return [
+            self.entry(value=5, context=b"a"),
+            self.entry(value=7, context=b"b"),
+            self.entry(value=0, context=b"c"),
+        ]
+
+    # ---- round trip ----------------------------------------------------------
+
+    def test_constructed_batch_passes_verify_once(self):
+        entries = self.honest_entries()
+        batch, root = prove_range_wide_batch_bound(
+            entries, randbelow=counter_randbelow()
+        )
+        self.assertTrue(
+            verify_range_wide_batch_bound(
+                batch, root, randbelow=counter_randbelow()
+            )
+        )
+        self.assertTrue(verify_range_wide_batch_bound(batch, root))
+
+    def test_single_item_odd_even_and_duplicates(self):
+        only = [self.entry()]
+        batch, root = prove_range_wide_batch_bound(
+            only, randbelow=counter_randbelow()
+        )
+        self.assertEqual(batch.leaf_count, 1)
+        self.assertEqual(batch.entries, tuple(only))
+        self.assertTrue(
+            verify_range_wide_batch_bound(
+                batch, root, randbelow=counter_randbelow()
+            )
+        )
+
+        pair = [self.entry(value=0), self.entry(value=7)]
+        ebatch, eroot = prove_range_wide_batch_bound(
+            pair, randbelow=counter_randbelow()
+        )
+        self.assertEqual(ebatch.leaf_count, 2)
+        self.assertTrue(
+            verify_range_wide_batch_bound(
+                ebatch, eroot, randbelow=counter_randbelow()
+            )
+        )
+
+        dup = [only[0], only[0], only[0]]
+        dbatch, droot = prove_range_wide_batch_bound(
+            dup, randbelow=counter_randbelow()
+        )
+        self.assertEqual(dbatch.leaf_count, 3)
+        self.assertEqual(dbatch.entries, (only[0], only[0], only[0]))
+        self.assertTrue(
+            verify_range_wide_batch_bound(
+                dbatch, droot, randbelow=counter_randbelow()
+            )
+        )
+
+    def test_full_proof_covers_every_position_from_zero(self):
+        batch, _ = prove_range_wide_batch_bound(
+            self.honest_entries(), randbelow=counter_randbelow()
+        )
+        self.assertEqual(batch.leaf_count, 3)
+        self.assertEqual(batch.proof.leaf_count, 3)
+        self.assertEqual(batch.proof.indices, (0, 1, 2))
+        self.assertEqual(batch.proof.siblings, ())
+
+    def test_order_preserved(self):
+        entries = self.honest_entries()
+        reordered = [entries[2], entries[0], entries[1]]
+        batch, _ = prove_range_wide_batch_bound(
+            reordered, randbelow=counter_randbelow()
+        )
+        self.assertEqual(batch.entries, tuple(reordered))
+
+    # ---- compatibility and determinism --------------------------------------
+
+    def test_equals_manual_construction_byte_for_byte(self):
+        entries = self.honest_entries()
+        batch, root = prove_range_wide_batch_bound(
+            entries, randbelow=counter_randbelow()
+        )
+        leaves = [bound_wide_range_leaf(entry) for entry in entries]
+        manual_root = merkle_root(leaves)
+        manual_proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        manual_batch = BoundWideRangeBatch(tuple(entries), len(entries), manual_proof)
+        self.assertEqual(root, manual_root)
+        self.assertEqual(batch, manual_batch)
+        self.assertEqual(dataclasses.asdict(batch), dataclasses.asdict(manual_batch))
+
+    def test_repeated_construction_is_byte_identical(self):
+        entries = self.honest_entries()
+        batch, root = prove_range_wide_batch_bound(
+            entries, randbelow=counter_randbelow()
+        )
+        batch2, root2 = prove_range_wide_batch_bound(
+            list(entries), randbelow=counter_randbelow()
+        )
+        self.assertEqual(batch, batch2)
+        self.assertEqual(root, root2)
+        self.assertEqual(batch.proof, batch2.proof)
+
+    # ---- input hygiene -------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        entries = self.honest_entries()
+        snapshot = [dataclasses.replace(entry) for entry in entries]
+        prove_range_wide_batch_bound(entries, randbelow=counter_randbelow())
+        self.assertEqual(entries, snapshot)
+        self.assertIsInstance(entries, list)
+
+    # ---- rejections ----------------------------------------------------------
+
+    def test_empty_batch_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            prove_range_wide_batch_bound([], randbelow=counter_randbelow())
+        with self.assertRaises(ValueError):
+            prove_range_wide_batch_bound((), randbelow=counter_randbelow())
+
+    def test_type_errors(self):
+        good = self.honest_entries()
+        for bad in (b"abc", "abc", 123, None, {good[0]}, 4.5):
+            with self.assertRaises(TypeError):
+                prove_range_wide_batch_bound(bad, randbelow=counter_randbelow())
+        with self.assertRaises(TypeError):
+            prove_range_wide_batch_bound(iter(good), randbelow=counter_randbelow())
+        # a RangeBatchEntry is not a WideRangeBatchEntry
+        commitment, r = pedersen_commit(
+            5, 0, 10, blinding=1, prime=self.PRIME, generator=self.G, h=self.H
+        )
+        foreign = RangeBatchEntry(commitment, RangeProof((), (), ()), b"x")
+        with self.assertRaises(TypeError):
+            prove_range_wide_batch_bound([foreign], randbelow=counter_randbelow())
+        with self.assertRaises(TypeError):
+            prove_range_wide_batch_bound(
+                [good[0], 1], randbelow=counter_randbelow()
+            )
+        proof = good[0].proof
+        cases = [
+            WideRangeBatchEntry("c", proof, b""),
+            WideRangeBatchEntry(
+                dataclasses.replace(good[0].commitment, element=True),
+                proof,
+                b"",
+            ),
+            WideRangeBatchEntry(good[0].commitment, proof, "c"),
+            WideRangeBatchEntry(good[0].commitment, "p", b""),
+            WideRangeBatchEntry(
+                good[0].commitment,
+                WideRangeProof(list(proof.commitments), proof.challenges, proof.responses),
+                b"",
+            ),
+            WideRangeBatchEntry(
+                good[0].commitment,
+                WideRangeProof(
+                    proof.commitments,
+                    proof.challenges[:-1] + ((proof.challenges[-1][0], True),),
+                    proof.responses,
+                ),
+                b"",
+            ),
+        ]
+        for bad_entry in cases:
+            with self.assertRaises(TypeError):
+                prove_range_wide_batch_bound(
+                    [bad_entry], randbelow=counter_randbelow()
+                )
+            with self.assertRaises(TypeError):
+                prove_range_wide_batch_bound(
+                    [good[1], bad_entry], randbelow=counter_randbelow()
+                )
+
+    def test_non_callable_randbelow_raises_type_error(self):
+        entries = self.honest_entries()
+        with self.assertRaises(TypeError):
+            prove_range_wide_batch_bound(entries, randbelow=7)
+        with self.assertRaises(TypeError):
+            prove_range_wide_batch_bound(b"x", randbelow=7)
+
+    def test_inner_batch_failure_raises_value_error(self):
+        good = self.honest_entries()
+        proof = good[0].proof
+        last_pair = proof.responses[-1]
+        tampered = dataclasses.replace(
+            good[0],
+            proof=dataclasses.replace(
+                proof,
+                responses=proof.responses[:-1]
+                + ((last_pair[0], last_pair[1] + 1),),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            prove_range_wide_batch_bound(
+                [tampered], randbelow=counter_randbelow()
+            )
+
+    def test_rejections_are_deterministic(self):
+        good = self.honest_entries()
+        proof = good[0].proof
+        last_pair = proof.responses[-1]
+        tampered = dataclasses.replace(
+            good[0],
+            proof=dataclasses.replace(
+                proof,
+                responses=proof.responses[:-1]
+                + ((last_pair[0], last_pair[1] + 1),),
+            ),
+        )
+        for _ in range(3):
+            with self.assertRaises(ValueError):
+                prove_range_wide_batch_bound(
+                    [tampered], randbelow=counter_randbelow()
+                )
+
+    def test_random_source_exceptions_pass_through_unchanged(self):
+        class Boom(Exception):
+            pass
+
+        def boom(_):
+            raise Boom()
+
+        with self.assertRaises(Boom):
+            prove_range_wide_batch_bound(
+                self.honest_entries(), randbelow=boom
+            )
+
+        def non_integer(_):
+            return "x"
+
+        with self.assertRaises(TypeError):
+            prove_range_wide_batch_bound(
+                self.honest_entries(), randbelow=non_integer
+            )
+
+        def out_of_range(_):
+            return 10**18
+
+        with self.assertRaises(ValueError):
+            prove_range_wide_batch_bound(
+                self.honest_entries(), randbelow=out_of_range
+            )
 
 
 class RegionProofTest(unittest.TestCase):
@@ -4726,6 +5467,33 @@ def bound_range_leaf(entry: RangeBatchEntry) -> bytes:
     for sequence in (entry.proof.t, entry.proof.e, entry.proof.s):
         items.append(str(len(sequence)).encode("ascii"))
         items += [str(value).encode("ascii") for value in sequence]
+    return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+
+def bound_wide_range_leaf(entry: WideRangeBatchEntry) -> bytes:
+    items = [b"zkregion/wrb/v1"]
+    commitment = entry.commitment
+    items += [
+        str(value).encode("ascii")
+        for value in (
+            commitment.element,
+            commitment.lower,
+            commitment.upper,
+            commitment.prime,
+            commitment.generator,
+            commitment.h,
+        )
+    ]
+    items.append(entry.context)
+    items.append(str(len(entry.proof.commitments)).encode("ascii"))
+    items += [str(value).encode("ascii") for value in entry.proof.commitments]
+    for pairs in (entry.proof.challenges, entry.proof.responses):
+        items.append(str(len(pairs)).encode("ascii"))
+        items += [
+            str(value).encode("ascii")
+            for pair in pairs
+            for value in pair
+        ]
     return b"".join(len(item).to_bytes(4, "big") + item for item in items)
 
 

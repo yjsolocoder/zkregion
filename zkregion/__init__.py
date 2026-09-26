@@ -48,6 +48,7 @@ BoundRegionReplayGuard /
 BoundRangeReplayGuard /
 BoundWideRangeReplayGuard /
 WideRangeReplayGuard /
+WideRangeBatchReplayGuard /
 BoundConsistencyReplayGuard /
 BoundConsistencyChainReplayGuard /
 ReplayBinding / ReplayGuard / SQLiteReplayStore /
@@ -165,6 +166,7 @@ __all__ = [
     "SingleKeyBoundReplayGuard",
     "SingleKeyEntryReplayGuard",
     "WideRangeBatchEntry",
+    "WideRangeBatchReplayGuard",
     "WideRangeProof",
     "WideRangeReplayGuard",
     "commit",
@@ -5790,6 +5792,7 @@ _BOUND_REGION_CONTAINS_REPLAY_DOMAIN = b"zr/brcbr/v1"
 _BOUND_WIDE_RANGE_REPLAY_DOMAIN = b"zr/bwrr/v1"
 _MERKLE_INCLUSION_ENTRY_REPLAY_DOMAIN = b"zr/mirr/v1"
 _WIDE_RANGE_REPLAY_DOMAIN = b"zr/wrr/v1"
+_WIDE_RANGE_BATCH_REPLAY_DOMAIN = b"zr/wrbr/v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -18436,6 +18439,295 @@ class WideRangeReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_range_wide(entry.commitment, entry.proof, entry.context):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# A WideRangeBatchReplayGuard binds a whole non-empty batch of
+# WideRangeBatchEntry items to one session id. Without a store the
+# pending/claimed/consumed states are local to the guard instance, while an
+# SQLiteReplayStore keeps pending, claimed and consumed ids in the store
+# under b"zr/wrbr/v1", shared across instances, processes and restarts.
+# bind_once registers a pending binding, check claims the id atomically,
+# recomputes the digest, checks the expiry, delegates the batch verification
+# to verify_range_wide_batch with randbelow passed through unchanged and
+# consumes the id only on full success; every rejection leaves the id
+# untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || S(entries, L) || F(E)
+# )
+#   D = b"zr/wrbr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   L(e) = the existing complete wide range batch outer leaf raw bytes for e
+#          (_bound_wide_range_leaf, the b"zkregion/wrb/v1" outer encoding)
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+
+
+def _wide_range_batch_replay_encodable(entries: Sequence[WideRangeBatchEntry]) -> bool:
+    """The S-framed batch length must fit in an unsigned 64-bit integer.
+
+    The outer ``S`` sequence writes the batch count with ``U`` (eight-byte
+    unsigned big-endian). Each entry is framed as the existing complete wide
+    range batch outer leaf, whose integers are encoded as decimal ASCII with
+    the sign kept, so every integer field frames for any value and no
+    per-entry encodability rule is needed.
+    """
+    return 0 <= len(entries) <= _UINT64_MAX
+
+
+def _wide_range_batch_replay_digest(
+    entries: Sequence[WideRangeBatchEntry],
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the wide-range-batch replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``S(entries, L)`` and
+    ``F(E)``; ``L(entry)`` is the existing complete wide range batch outer
+    leaf raw bytes (:func:`_bound_wide_range_leaf`) and the entries keep
+    their batch order (duplicates included).
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_WIDE_RANGE_BATCH_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    # S(entries, L) = F(U(|entries|)) || Σ F(L(entry))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(entries))))
+    for entry in entries:
+        transcript.update(_frame_length_prefixed(_bound_wide_range_leaf(entry)))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+class WideRangeBatchReplayGuard:
+    """Single-use replay protection for a batch of :class:`WideRangeBatchEntry`.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole non-empty batch of
+    :class:`WideRangeBatchEntry` items — the same sequence shape accepted by
+    :func:`verify_range_wide_batch`, kept in the given order with duplicates
+    preserved — to a session id; :meth:`check` accepts an equal pending
+    binding exactly once, recomputing the binding digest, checking the
+    expiry and delegating to :func:`verify_range_wide_batch` with the random
+    source passed through unchanged, and then marks the id consumed. The
+    digest frames the batch under
+    ``SHA-256(F(D) || F(session_id) || S(entries, L) || F(E))`` with domain
+    ``b"zr/wrbr/v1"`` (which doubles as the store row-key domain), where
+    ``L(entry)`` is the existing complete wide range batch outer leaf raw
+    bytes (the same bytes :func:`_bound_wide_range_leaf` builds for
+    :func:`verify_range_wide_batch_bound` under ``b"zkregion/wrb/v1"``); the
+    F / U / S framing and the E expiry encoding are reused byte for byte
+    from the other batch replay guards. By default both the pending and the
+    consumed state live on this guard instance and are never shared between
+    instances; passing an :class:`SQLiteReplayStore` as ``store`` instead
+    keeps the state in that store under the ``b"zr/wrbr/v1"`` key domain,
+    so batch guards attached to the same store namespace share pending,
+    claimed and consumed ids across independent instances, processes and
+    process restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim taken
+    before the digest/expiry work and the delegated batch verification (the
+    in-instance registry lock, or the store's short transaction and unique
+    claim token); the claim is per-id registry state rather than a global
+    lock, so a batch being verified under one id never serializes checks or
+    binds of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None
+            if store is None
+            else store._view(_WIDE_RANGE_BATCH_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        entries: Sequence[WideRangeBatchEntry],
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to the batch.
+
+        Returns the frozen :class:`ReplayBinding`. ``entries`` must be a
+        non-string, non-empty sequence of :class:`WideRangeBatchEntry`
+        objects following the same sequence and nested type rules as
+        :func:`verify_range_wide_batch`: every entry's
+        :class:`PedersenCommitment` six integer fields, its
+        :class:`WideRangeProof` tuple fields of non-``bool`` integers at
+        every nesting level and its ``context`` are type-checked; entries
+        are kept in the given order with duplicates preserved and no item
+        dropped. ``session_id`` must be non-empty ``bytes`` and
+        ``expires_at`` must be either ``None`` or a non-``bool`` unsigned
+        64-bit Unix-second timestamp; the ``U``-framed batch length must
+        fit in uint64. A session id that is already pending, being checked
+        or consumed raises :class:`ValueError`. Wrong argument or nested
+        field types (including ``bool`` integers) raise :class:`TypeError`;
+        an empty batch or empty id, an out-of-uint64 expiry or batch length
+        or a rebind raise :class:`ValueError`. Inputs are never mutated.
+        """
+        items = _check_wide_range_batch_entries_types(entries)
+        _check_bytes(session_id, "session_id")
+        if not items:
+            raise ValueError("entries must not be empty")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _wide_range_batch_replay_encodable(items):
+            raise ValueError("batch length must be an unsigned 64-bit integer")
+        binding = ReplayBinding(
+            session_id,
+            _wide_range_batch_replay_digest(items, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entries: Sequence[WideRangeBatchEntry],
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+        randbelow: Callable[[int], int] = secrets.randbelow,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id
+        at most one can return ``True``. The digest is recomputed over the
+        presented ``entries`` in their given order; for a binding with an
+        expiry, ``now >= expires_at`` makes the check fail (``now``
+        defaults to the current Unix seconds and must otherwise be a
+        non-``bool`` uint64). Only then is the batch handed to
+        :func:`verify_range_wide_batch` with ``randbelow`` passed through
+        unchanged, under that function's sequence, structure and
+        randomness contract: it is called once per structurally valid
+        wide-range OR sub-branch as ``randbelow(prime - 1)``, a
+        non-callable source or a non-integer result raises
+        :class:`TypeError` and a coefficient outside ``[0, prime - 1)``
+        raises :class:`ValueError`.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, an empty batch or
+        :func:`verify_range_wide_batch` returning ``False``) returns
+        ``False``, releases the claim and leaves the registration pending,
+        so a rejected id can succeed on a later attempt. An exception
+        escaping the delegated verification (such as the
+        :class:`TypeError` / :class:`ValueError` raised by a bad
+        ``randbelow``) or a database error likewise restores the claim
+        first and then propagates unchanged, leaving the id usable. With a
+        store backend, only the holder of the current claim token can
+        consume the id (an expired claim may be taken over by a later
+        equal ``check``); a stale token neither consumes nor restores
+        anything. Verification runs without any lock or transaction held,
+        so other ids are never serialized. Argument type errors
+        (including a non-callable ``randbelow``) raise :class:`TypeError`;
+        an out-of-range ``now`` raises :class:`ValueError`. Inputs are
+        never mutated.
+        """
+        items = _check_wide_range_batch_entries_types(entries)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if not callable(randbelow):
+            raise TypeError("randbelow must be callable")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _wide_range_batch_replay_encodable(items):
+            return False  # an oversized batch
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(items, binding, session_id, current, randbelow)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _wide_range_batch_replay_digest(items, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_range_wide_batch(items, randbelow=randbelow):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entries: Sequence[WideRangeBatchEntry],
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+        randbelow: Callable[[int], int],
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over and issued a fresh random token); verification runs with
+        no transaction held; only the token returned by the winning claim
+        can consume the id, and every rejection or escaped error restores
+        the id to pending with that same token. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _wide_range_batch_replay_digest(entries, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_range_wide_batch(entries, randbelow=randbelow):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

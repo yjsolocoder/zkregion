@@ -35,6 +35,10 @@ from . import (
     MerkleMultiBatchEntry,
     MerkleMultiProof,
     MultiSchnorrEntry,
+    OpeningBatchEntry,
+    OpeningReplayGuard,
+    PedersenOpeningBatchEntry,
+    PedersenOpeningReplayGuard,
     RangeBatchEntry,
     RangeBatchReplayGuard,
     RangeProof,
@@ -46,6 +50,7 @@ from . import (
     RegionReplayGuard,
     RegionWideBatchEntry,
     RegionWideBatchReplayGuard,
+    RegionWideProof,
     RegionWideReplayGuard,
     ReplayBinding,
     ReplayGuard,
@@ -1282,6 +1287,15 @@ def main() -> int:
         print("no error (unexpected)")
     except TypeError:
         print("TypeError")
+    bool_rwr_entry = dataclasses.replace(
+        wide_entry, x_commitment=dataclasses.replace(wx, lower=True)
+    )
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_rwr.bind_once(bool_rwr_entry, b"region-wide-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
 
     print()
     print("per-instance replay protection for wide 2-D region entry batches (bind once, check once):")
@@ -1331,6 +1345,23 @@ def main() -> int:
     print("  wrong batch type: ", end="")
     try:
         fresh_rwbr.bind_once("not-a-batch", b"region-wide-batch-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_rwbr_entry = dataclasses.replace(
+        wide_entry,
+        proof=RegionWideProof(
+            WideRangeProof(
+                wide_entry.proof.x_proof.commitments,
+                ((True, False),) + wide_entry.proof.x_proof.challenges[1:],
+                wide_entry.proof.x_proof.responses,
+            ),
+            wide_entry.proof.y_proof,
+        ),
+    )
+    print("  boolean posing as a nested proof integer: ", end="")
+    try:
+        fresh_rwbr.bind_once([bool_rwbr_entry], b"region-wide-batch-session-7")
         print("no error (unexpected)")
     except TypeError:
         print("TypeError")
@@ -1392,6 +1423,20 @@ def main() -> int:
     print("  wrong batch type: ", end="")
     try:
         fresh_brwr.bind_once("not-a-batch", wide_bound_root, b"bound-region-wide-session-5")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_brwr_entry = dataclasses.replace(
+        wide_entry, x_commitment=dataclasses.replace(wx, lower=True)
+    )
+    bool_brwr_batch = dataclasses.replace(
+        wide_bound, entries=(bool_brwr_entry,) + wide_bound.entries[1:]
+    )
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_brwr.bind_once(
+            bool_brwr_batch, wide_bound_root, b"bound-region-wide-session-6"
+        )
         print("no error (unexpected)")
     except TypeError:
         print("TypeError")
@@ -1815,6 +1860,200 @@ def main() -> int:
         persist_bwr_c = BoundWideRangeReplayGuard(store=reopened)
         print(f"  after restart the consumed id is still rejected: "
               f"{not persist_bwr_c.check(wr_bound, wr_outer_root, persist_bwr_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
+
+    print()
+    print("per-instance replay protection for hash-commitment opening entries (bind once, check once):")
+    opening_commitment, opening_nonce = commit(b"opening-payload", nonce=b"zkregion-opening-demo")
+    opening_entry = OpeningBatchEntry(opening_commitment, b"opening-payload", opening_nonce)
+    org = OpeningReplayGuard()
+    org_binding = org.bind_once(opening_entry, b"opening-session-1", expires_at=10**12)
+    print(f"  session_id={org_binding.session_id!r}  digest={org_binding.digest.hex()[:32]}…  "
+          f"expires_at={org_binding.expires_at}")
+    print(f"  valid first check accepted: {org.check(opening_entry, org_binding, now=100)}")
+    print(f"  replay rejected: {not org.check(opening_entry, org_binding, now=101)}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        org.bind_once(opening_entry, b"opening-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    other_org = OpeningReplayGuard()
+    other_org_binding = other_org.bind_once(opening_entry, b"opening-session-2")
+    swapped_opening_entry = OpeningBatchEntry(opening_commitment, b"other", opening_nonce)
+    print(f"  replaced entry rejected without consuming the id: "
+          f"{not other_org.check(swapped_opening_entry, other_org_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_org.check(opening_entry, other_org_binding, now=1)}")
+    foreign_org = OpeningReplayGuard()
+    foreign_org_binding = foreign_org.bind_once(opening_entry, b"opening-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_org.check(opening_entry, foreign_org_binding, now=1)}")
+    fresh_org = OpeningReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_org.bind_once(opening_entry, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_org.bind_once(opening_entry, b"opening-session-4", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong entry type: ", end="")
+    try:
+        fresh_org.bind_once("not-an-entry", b"opening-session-5")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_org_entry = OpeningBatchEntry(opening_commitment, b"opening-payload", True)
+    print("  boolean posing as a bytes field: ", end="")
+    try:
+        fresh_org.bind_once(bool_org_entry, b"opening-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("concurrent checks of one opening id (at most one winner):")
+    race_org = OpeningReplayGuard()
+    race_org_binding = race_org.bind_once(opening_entry, b"opening-race", expires_at=10**12)
+    race_org_results = []
+    race_org_lock = threading.Lock()
+
+    def race_org_attempt():
+        outcome = race_org.check(opening_entry, race_org_binding, now=100)
+        with race_org_lock:
+            race_org_results.append(outcome)
+
+    race_org_threads = [threading.Thread(target=race_org_attempt) for _ in range(8)]
+    for thread in race_org_threads:
+        thread.start()
+    for thread in race_org_threads:
+        thread.join()
+    race_org_wins = sum(race_org_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_org_wins} succeeded, {len(race_org_results) - race_org_wins} rejected")
+
+    print()
+    print("SQLite-backed opening replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_org_a = OpeningReplayGuard(store=store)
+        persist_org_binding = persist_org_a.bind_once(
+            opening_entry, b"opening-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_org_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_org_a.check(opening_entry, persist_org_binding, now=100)}")
+        persist_org_b = OpeningReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_org_b.check(opening_entry, persist_org_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_org_c = OpeningReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_org_c.check(opening_entry, persist_org_binding, now=100)}")
+        reopened.close()
+
+    print()
+    print("per-instance replay protection for Pedersen opening entries (bind once, check once):")
+    po_commitment, po_blinding = pedersen_commit(40, 0, 100, blinding=1000)
+    po_entry = PedersenOpeningBatchEntry(po_commitment, 40, po_blinding)
+    porg = PedersenOpeningReplayGuard()
+    porg_binding = porg.bind_once(po_entry, b"pedersen-opening-session-1", expires_at=10**12)
+    print(f"  session_id={porg_binding.session_id!r}  digest={porg_binding.digest.hex()[:32]}…  "
+          f"expires_at={porg_binding.expires_at}")
+    print(f"  valid first check accepted: {porg.check(po_entry, porg_binding, now=100)}")
+    print(f"  replay rejected: {not porg.check(po_entry, porg_binding, now=101)}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        porg.bind_once(po_entry, b"pedersen-opening-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    other_porg = PedersenOpeningReplayGuard()
+    other_porg_binding = other_porg.bind_once(po_entry, b"pedersen-opening-session-2")
+    swapped_po_entry = PedersenOpeningBatchEntry(po_commitment, 41, po_blinding)
+    print(f"  replaced entry rejected without consuming the id: "
+          f"{not other_porg.check(swapped_po_entry, other_porg_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_porg.check(po_entry, other_porg_binding, now=1)}")
+    foreign_porg = PedersenOpeningReplayGuard()
+    foreign_porg_binding = foreign_porg.bind_once(po_entry, b"pedersen-opening-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_porg.check(po_entry, foreign_porg_binding, now=1)}")
+    fresh_porg = PedersenOpeningReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_porg.bind_once(po_entry, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_porg.bind_once(po_entry, b"pedersen-opening-session-4", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong entry type: ", end="")
+    try:
+        fresh_porg.bind_once("not-an-entry", b"pedersen-opening-session-5")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_po_entry = dataclasses.replace(po_entry, value=True)
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_porg.bind_once(bool_po_entry, b"pedersen-opening-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("concurrent checks of one Pedersen opening id (at most one winner):")
+    race_porg = PedersenOpeningReplayGuard()
+    race_porg_binding = race_porg.bind_once(po_entry, b"pedersen-opening-race", expires_at=10**12)
+    race_porg_results = []
+    race_porg_lock = threading.Lock()
+
+    def race_porg_attempt():
+        outcome = race_porg.check(po_entry, race_porg_binding, now=100)
+        with race_porg_lock:
+            race_porg_results.append(outcome)
+
+    race_porg_threads = [threading.Thread(target=race_porg_attempt) for _ in range(8)]
+    for thread in race_porg_threads:
+        thread.start()
+    for thread in race_porg_threads:
+        thread.join()
+    race_porg_wins = sum(race_porg_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_porg_wins} succeeded, {len(race_porg_results) - race_porg_wins} rejected")
+
+    print()
+    print("SQLite-backed Pedersen opening replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_porg_a = PedersenOpeningReplayGuard(store=store)
+        persist_porg_binding = persist_porg_a.bind_once(
+            po_entry, b"pedersen-opening-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_porg_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_porg_a.check(po_entry, persist_porg_binding, now=100)}")
+        persist_porg_b = PedersenOpeningReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_porg_b.check(po_entry, persist_porg_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_porg_c = PedersenOpeningReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_porg_c.check(po_entry, persist_porg_binding, now=100)}")
         reopened.close()
     return 0
 

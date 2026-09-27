@@ -35,8 +35,10 @@ from . import (
     MerkleInclusionBatchReplayGuard,
     MerkleInclusionEntryReplayGuard,
     MerkleMultiBatchEntry,
+    MerkleMultiBatchReplayGuard,
     MerkleMultiEntryReplayGuard,
     MerkleMultiProof,
+    MerkleMultiReplayGuard,
     MultiSchnorrEntry,
     OpeningBatchEntry,
     OpeningBatchReplayGuard,
@@ -68,6 +70,7 @@ from . import (
     SingleKeyBatchGuard,
     SingleKeyBoundBatch,
     SingleKeyBoundReplayGuard,
+    SingleKeyEntryReplayGuard,
     WideRangeBatchEntry,
     WideRangeBatchReplayGuard,
     WideRangeProof,
@@ -2484,6 +2487,15 @@ def main() -> int:
         print("no error (unexpected)")
     except TypeError:
         print("TypeError")
+    print("  boolean posing as a bytes field: ", end="")
+    try:
+        fresh_obr.bind_once(
+            [OpeningBatchEntry(obr_entries[0].commitment, b"opening-batch-alpha", True)],
+            b"opening-batch-session-9",
+        )
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
 
     print()
     print("concurrent checks of one hash-opening batch id (at most one winner):")
@@ -2633,6 +2645,15 @@ def main() -> int:
         print("no error (unexpected)")
     except TypeError:
         print("TypeError")
+    print("  float posing as an integer field: ", end="")
+    try:
+        fresh_pobr.bind_once(
+            [PedersenOpeningBatchEntry(pobr_entries[0].commitment, 42.0, 2000)],
+            b"pedersen-opening-batch-session-9",
+        )
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
 
     print()
     print("concurrent checks of one Pedersen-opening batch id (at most one winner):")
@@ -2690,6 +2711,342 @@ def main() -> int:
         persist_pobr_c = PedersenOpeningBatchReplayGuard(store=reopened)
         print(f"  after restart the consumed id is still rejected: "
               f"{not persist_pobr_c.check(persist_pobr_entries, persist_pobr_binding, now=100)}")
+        reopened.close()
+
+    print()
+    print("per-instance replay protection for compact multi-inclusion proofs (bind once, check once):")
+    mmr_leaves = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon"]
+    mmr_root = merkle_root(mmr_leaves)
+    mmr_indices = (0, 2, 4)
+    mmr_proof = prove_multi_inclusion(mmr_leaves, mmr_indices)
+    mmr_entries = tuple((index, mmr_leaves[index]) for index in mmr_indices)
+    mmr = MerkleMultiReplayGuard()
+    mmr_binding = mmr.bind_once(
+        mmr_entries, mmr_root, mmr_proof, b"multi-inclusion-session-1", expires_at=10**12
+    )
+    print(f"  session_id={mmr_binding.session_id!r}  digest={mmr_binding.digest.hex()[:32]}…  "
+          f"expires_at={mmr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{mmr.check(mmr_entries, mmr_root, mmr_proof, mmr_binding, now=100)}")
+    print(f"  replay rejected: "
+          f"{not mmr.check(mmr_entries, mmr_root, mmr_proof, mmr_binding, now=101)}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        mmr.bind_once(mmr_entries, mmr_root, mmr_proof, b"multi-inclusion-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    other_mmr_indices = (1, 3)
+    other_mmr_proof = prove_multi_inclusion(mmr_leaves, other_mmr_indices)
+    other_mmr_entries = tuple((index, mmr_leaves[index]) for index in other_mmr_indices)
+    other_mmr = MerkleMultiReplayGuard()
+    other_mmr_binding = other_mmr.bind_once(
+        other_mmr_entries, mmr_root, other_mmr_proof, b"multi-inclusion-session-2"
+    )
+    print(f"  rebound entry rejected without consuming the id: "
+          f"{not other_mmr.check(mmr_entries, mmr_root, mmr_proof, other_mmr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mmr.check(other_mmr_entries, mmr_root, other_mmr_proof, other_mmr_binding, now=1)}")
+    foreign_mmr = MerkleMultiReplayGuard()
+    foreign_mmr_binding = foreign_mmr.bind_once(
+        mmr_entries, mmr_root, mmr_proof, b"multi-inclusion-session-3"
+    )
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mmr.check(mmr_entries, mmr_root, mmr_proof, foreign_mmr_binding, now=1)}")
+    print(f"  that id was not consumed and still verifies on its own guard: "
+          f"{foreign_mmr.check(mmr_entries, mmr_root, mmr_proof, foreign_mmr_binding, now=1)}")
+    fresh_mmr = MerkleMultiReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_mmr.bind_once(mmr_entries, mmr_root, mmr_proof, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_mmr.bind_once(
+            mmr_entries, mmr_root, mmr_proof, b"multi-inclusion-session-4", expires_at=1 << 64
+        )
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong entries type: ", end="")
+    try:
+        fresh_mmr.bind_once("not-an-entry", mmr_root, mmr_proof, b"multi-inclusion-session-5")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_mmr_entries = ((True, mmr_leaves[0]),) + mmr_entries[1:]
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_mmr.bind_once(
+            bool_mmr_entries, mmr_root, mmr_proof, b"multi-inclusion-session-6"
+        )
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("per-instance replay protection for compact multi-inclusion batches (bind once, check once):")
+    mmb_items = [
+        MerkleMultiBatchEntry(mmr_entries, mmr_proof, mmr_root),
+        MerkleMultiBatchEntry(
+            ((1, mmr_leaves[1]),), prove_multi_inclusion(mmr_leaves, (1,)), mmr_root
+        ),
+    ]
+    mmb = MerkleMultiBatchReplayGuard()
+    mmb_binding = mmb.bind_once(mmb_items, b"multi-inclusion-batch-session-1", expires_at=10**12)
+    print(f"  session_id={mmb_binding.session_id!r}  digest={mmb_binding.digest.hex()[:32]}…  "
+          f"expires_at={mmb_binding.expires_at}")
+    print(f"  valid first check accepted: {mmb.check(mmb_items, mmb_binding, now=100)}")
+    print(f"  replay rejected: {not mmb.check(mmb_items, mmb_binding, now=101)}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        mmb.bind_once(mmb_items, b"multi-inclusion-batch-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    other_mmb = MerkleMultiBatchReplayGuard()
+    other_mmb_binding = other_mmb.bind_once(mmb_items[::-1], b"multi-inclusion-batch-session-2")
+    print(f"  rebound batch rejected without consuming the id: "
+          f"{not other_mmb.check(mmb_items, other_mmb_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mmb.check(mmb_items[::-1], other_mmb_binding, now=1)}")
+    foreign_mmb = MerkleMultiBatchReplayGuard()
+    foreign_mmb_binding = foreign_mmb.bind_once(mmb_items, b"multi-inclusion-batch-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mmb.check(mmb_items, foreign_mmb_binding, now=1)}")
+    print(f"  that id was not consumed and still verifies on its own guard: "
+          f"{foreign_mmb.check(mmb_items, foreign_mmb_binding, now=1)}")
+    fresh_mmb = MerkleMultiBatchReplayGuard()
+    print("  empty batch: ", end="")
+    try:
+        fresh_mmb.bind_once([], b"multi-inclusion-batch-session-4")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  empty session id: ", end="")
+    try:
+        fresh_mmb.bind_once(mmb_items, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_mmb.bind_once(mmb_items, b"multi-inclusion-batch-session-5", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong batch type: ", end="")
+    try:
+        fresh_mmb.bind_once("not-a-batch", b"multi-inclusion-batch-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_mmb_items = [
+        MerkleMultiBatchEntry(
+            mmr_entries,
+            MerkleMultiProof(True, mmr_proof.indices, mmr_proof.siblings),
+            mmr_root,
+        ),
+    ]
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_mmb.bind_once(bool_mmb_items, b"multi-inclusion-batch-session-7")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("per-instance replay protection for same-key single signature entries (bind once, check once):")
+    sker_entry = SchnorrBatchEntry(
+        b"sker-alpha", prover.prove(b"sker-alpha", context=b"sker"), context=b"sker"
+    )
+    sker = SingleKeyEntryReplayGuard(prover.public_key)
+    sker_binding = sker.bind_once(
+        sker_entry, b"single-key-entry-session-1", expires_at=10**12
+    )
+    print(f"  session_id={sker_binding.session_id!r}  digest={sker_binding.digest.hex()[:32]}…  "
+          f"expires_at={sker_binding.expires_at}")
+    print(f"  valid first check accepted: {sker.check(sker_entry, sker_binding, now=100)}")
+    print(f"  replay rejected: {not sker.check(sker_entry, sker_binding, now=101)}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        sker.bind_once(sker_entry, b"single-key-entry-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    other_sker_entry = SchnorrBatchEntry(
+        b"sker-beta", prover.prove(b"sker-beta", context=b"sker"), context=b"sker"
+    )
+    other_sker = SingleKeyEntryReplayGuard(prover.public_key)
+    other_sker_binding = other_sker.bind_once(
+        other_sker_entry, b"single-key-entry-session-2"
+    )
+    print(f"  replaced entry rejected without consuming the id: "
+          f"{not other_sker.check(sker_entry, other_sker_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_sker.check(other_sker_entry, other_sker_binding, now=1)}")
+    foreign_sker = SingleKeyEntryReplayGuard(prover.public_key)
+    foreign_sker_binding = foreign_sker.bind_once(
+        sker_entry, b"single-key-entry-session-3"
+    )
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_sker.check(sker_entry, foreign_sker_binding, now=1)}")
+    print(f"  that id was not consumed and still verifies on its own guard: "
+          f"{foreign_sker.check(sker_entry, foreign_sker_binding, now=1)}")
+    fresh_sker = SingleKeyEntryReplayGuard(prover.public_key)
+    print("  empty session id: ", end="")
+    try:
+        fresh_sker.bind_once(sker_entry, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_sker.bind_once(sker_entry, b"single-key-entry-session-4", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong entry type: ", end="")
+    try:
+        fresh_sker.bind_once("not-an-entry", b"single-key-entry-session-5")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_sker_entry = dataclasses.replace(
+        sker_entry, proof=SchnorrProof(sker_entry.proof.commitment, True)
+    )
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_sker.bind_once(bool_sker_entry, b"single-key-entry-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("concurrent checks of one id per compact multi-inclusion and same-key entry guard (at most one winner each):")
+    race_mmr = MerkleMultiReplayGuard()
+    race_mmr_binding = race_mmr.bind_once(
+        mmr_entries, mmr_root, mmr_proof, b"multi-inclusion-race", expires_at=10**12
+    )
+    race_mmr_results = []
+    race_mmr_lock = threading.Lock()
+
+    def race_mmr_attempt():
+        outcome = race_mmr.check(
+            mmr_entries, mmr_root, mmr_proof, race_mmr_binding, now=100
+        )
+        with race_mmr_lock:
+            race_mmr_results.append(outcome)
+
+    race_mmr_threads = [threading.Thread(target=race_mmr_attempt) for _ in range(8)]
+    for thread in race_mmr_threads:
+        thread.start()
+    for thread in race_mmr_threads:
+        thread.join()
+    race_mmr_wins = sum(race_mmr_results)
+    print(f"  compact multi-inclusion proof, 8 overlapping checks of the same id: "
+          f"{race_mmr_wins} succeeded, {len(race_mmr_results) - race_mmr_wins} rejected")
+    race_mmb = MerkleMultiBatchReplayGuard()
+    race_mmb_binding = race_mmb.bind_once(
+        mmb_items, b"multi-inclusion-batch-race", expires_at=10**12
+    )
+    race_mmb_results = []
+    race_mmb_lock = threading.Lock()
+
+    def race_mmb_attempt():
+        outcome = race_mmb.check(mmb_items, race_mmb_binding, now=100)
+        with race_mmb_lock:
+            race_mmb_results.append(outcome)
+
+    race_mmb_threads = [threading.Thread(target=race_mmb_attempt) for _ in range(8)]
+    for thread in race_mmb_threads:
+        thread.start()
+    for thread in race_mmb_threads:
+        thread.join()
+    race_mmb_wins = sum(race_mmb_results)
+    print(f"  compact multi-inclusion batch, 8 overlapping checks of the same id: "
+          f"{race_mmb_wins} succeeded, {len(race_mmb_results) - race_mmb_wins} rejected")
+    race_sker = SingleKeyEntryReplayGuard(prover.public_key)
+    race_sker_binding = race_sker.bind_once(
+        sker_entry, b"single-key-entry-race", expires_at=10**12
+    )
+    race_sker_results = []
+    race_sker_lock = threading.Lock()
+
+    def race_sker_attempt():
+        outcome = race_sker.check(sker_entry, race_sker_binding, now=100)
+        with race_sker_lock:
+            race_sker_results.append(outcome)
+
+    race_sker_threads = [threading.Thread(target=race_sker_attempt) for _ in range(8)]
+    for thread in race_sker_threads:
+        thread.start()
+    for thread in race_sker_threads:
+        thread.join()
+    race_sker_wins = sum(race_sker_results)
+    print(f"  same-key single entry, 8 overlapping checks of the same id: "
+          f"{race_sker_wins} succeeded, {len(race_sker_results) - race_sker_wins} rejected")
+
+    print()
+    print("SQLite-backed compact multi-inclusion and same-key entry replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_mmr_a = MerkleMultiReplayGuard(store=store)
+        persist_mmr_binding = persist_mmr_a.bind_once(
+            mmr_entries, mmr_root, mmr_proof, b"multi-inclusion-persist", expires_at=10**12
+        )
+        print(f"  compact multi-inclusion proof session_id={persist_mmr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_mmr_a.check(mmr_entries, mmr_root, mmr_proof, persist_mmr_binding, now=100)}")
+        persist_mmr_b = MerkleMultiReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_mmr_b.check(mmr_entries, mmr_root, mmr_proof, persist_mmr_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_mmr_c = MerkleMultiReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_mmr_c.check(mmr_entries, mmr_root, mmr_proof, persist_mmr_binding, now=100)}")
+        reopened.close()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_mmb_a = MerkleMultiBatchReplayGuard(store=store)
+        persist_mmb_binding = persist_mmb_a.bind_once(
+            mmb_items, b"multi-inclusion-batch-persist", expires_at=10**12
+        )
+        print(f"  compact multi-inclusion batch session_id={persist_mmb_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_mmb_a.check(mmb_items, persist_mmb_binding, now=100)}")
+        persist_mmb_b = MerkleMultiBatchReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_mmb_b.check(mmb_items, persist_mmb_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_mmb_c = MerkleMultiBatchReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_mmb_c.check(mmb_items, persist_mmb_binding, now=100)}")
+        reopened.close()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_sker_a = SingleKeyEntryReplayGuard(prover.public_key, store=store)
+        persist_sker_binding = persist_sker_a.bind_once(
+            sker_entry, b"single-key-entry-persist", expires_at=10**12
+        )
+        print(f"  same-key single entry session_id={persist_sker_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_sker_a.check(sker_entry, persist_sker_binding, now=100)}")
+        persist_sker_b = SingleKeyEntryReplayGuard(prover.public_key, store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_sker_b.check(sker_entry, persist_sker_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_sker_c = SingleKeyEntryReplayGuard(prover.public_key, store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_sker_c.check(sker_entry, persist_sker_binding, now=100)}")
         reopened.close()
     return 0
 

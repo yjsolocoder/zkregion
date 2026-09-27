@@ -29,10 +29,13 @@ from . import (
     MerkleConsistencyChain,
     MerkleConsistencyChainBatchReplayGuard,
     MerkleConsistencyChainReplayGuard,
+    MerkleConsistencyEntryReplayGuard,
     MerkleConsistencyReplayGuard,
     MerkleInclusionBatchEntry,
     MerkleInclusionBatchReplayGuard,
+    MerkleInclusionEntryReplayGuard,
     MerkleMultiBatchEntry,
+    MerkleMultiEntryReplayGuard,
     MerkleMultiProof,
     MultiSchnorrEntry,
     OpeningBatchEntry,
@@ -2067,6 +2070,332 @@ def main() -> int:
         persist_porg_c = PedersenOpeningReplayGuard(store=reopened)
         print(f"  after restart the consumed id is still rejected: "
               f"{not persist_porg_c.check(porg_entry, persist_porg_binding, now=100)}")
+        reopened.close()
+
+    print()
+    print("per-instance replay protection for single-leaf inclusion entries (bind once, check once):")
+    se_inclusion_entry = MerkleInclusionBatchEntry(b"gamma", prove_inclusion(leaves, 2), root)
+    mirr = MerkleInclusionEntryReplayGuard()
+    mirr_binding = mirr.bind_once(se_inclusion_entry, b"inclusion-entry-session-1", expires_at=10**12)
+    print(f"  session_id={mirr_binding.session_id!r}  digest={mirr_binding.digest.hex()[:32]}…  "
+          f"expires_at={mirr_binding.expires_at}")
+    print(f"  valid first check accepted: {mirr.check(se_inclusion_entry, mirr_binding, now=100)}")
+    print(f"  replay rejected: {not mirr.check(se_inclusion_entry, mirr_binding, now=101)}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        mirr.bind_once(se_inclusion_entry, b"inclusion-entry-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    other_mirr = MerkleInclusionEntryReplayGuard()
+    other_mirr_entry = MerkleInclusionBatchEntry(b"delta", prove_inclusion(leaves, 3), root)
+    other_mirr_binding = other_mirr.bind_once(other_mirr_entry, b"inclusion-entry-session-2")
+    print(f"  replaced entry rejected without consuming the id: "
+          f"{not other_mirr.check(se_inclusion_entry, other_mirr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mirr.check(other_mirr_entry, other_mirr_binding, now=1)}")
+    foreign_mirr = MerkleInclusionEntryReplayGuard()
+    foreign_mirr_binding = foreign_mirr.bind_once(se_inclusion_entry, b"inclusion-entry-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mirr.check(se_inclusion_entry, foreign_mirr_binding, now=1)}")
+    print(f"  that id was not consumed and still verifies on its own guard: "
+          f"{foreign_mirr.check(se_inclusion_entry, foreign_mirr_binding, now=1)}")
+    fresh_mirr = MerkleInclusionEntryReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_mirr.bind_once(se_inclusion_entry, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_mirr.bind_once(se_inclusion_entry, b"inclusion-entry-session-4", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong entry type: ", end="")
+    try:
+        fresh_mirr.bind_once("not-an-entry", b"inclusion-entry-session-5")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_mirr_entry = dataclasses.replace(
+        se_inclusion_entry, proof=dataclasses.replace(se_inclusion_entry.proof, index=True)
+    )
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_mirr.bind_once(bool_mirr_entry, b"inclusion-entry-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("per-instance replay protection for compact multi-inclusion entries (bind once, check once):")
+    se_multi_indices = (0, 2, 4)
+    se_multi_entry = MerkleMultiBatchEntry(
+        tuple((index, leaves[index]) for index in se_multi_indices),
+        prove_multi_inclusion(leaves, se_multi_indices),
+        root,
+    )
+    mmer = MerkleMultiEntryReplayGuard()
+    mmer_binding = mmer.bind_once(se_multi_entry, b"multi-entry-session-1", expires_at=10**12)
+    print(f"  session_id={mmer_binding.session_id!r}  digest={mmer_binding.digest.hex()[:32]}…  "
+          f"expires_at={mmer_binding.expires_at}")
+    print(f"  valid first check accepted: {mmer.check(se_multi_entry, mmer_binding, now=100)}")
+    print(f"  replay rejected: {not mmer.check(se_multi_entry, mmer_binding, now=101)}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        mmer.bind_once(se_multi_entry, b"multi-entry-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    other_mmer = MerkleMultiEntryReplayGuard()
+    other_mmer_indices = (1, 3)
+    other_mmer_entry = MerkleMultiBatchEntry(
+        tuple((index, leaves[index]) for index in other_mmer_indices),
+        prove_multi_inclusion(leaves, other_mmer_indices),
+        root,
+    )
+    other_mmer_binding = other_mmer.bind_once(other_mmer_entry, b"multi-entry-session-2")
+    print(f"  replaced entry rejected without consuming the id: "
+          f"{not other_mmer.check(se_multi_entry, other_mmer_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mmer.check(other_mmer_entry, other_mmer_binding, now=1)}")
+    foreign_mmer = MerkleMultiEntryReplayGuard()
+    foreign_mmer_binding = foreign_mmer.bind_once(se_multi_entry, b"multi-entry-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mmer.check(se_multi_entry, foreign_mmer_binding, now=1)}")
+    print(f"  that id was not consumed and still verifies on its own guard: "
+          f"{foreign_mmer.check(se_multi_entry, foreign_mmer_binding, now=1)}")
+    fresh_mmer = MerkleMultiEntryReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_mmer.bind_once(se_multi_entry, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_mmer.bind_once(se_multi_entry, b"multi-entry-session-4", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong entry type: ", end="")
+    try:
+        fresh_mmer.bind_once("not-an-entry", b"multi-entry-session-5")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_mmer_entry = dataclasses.replace(
+        se_multi_entry, proof=dataclasses.replace(se_multi_entry.proof, leaf_count=True)
+    )
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_mmer.bind_once(bool_mmer_entry, b"multi-entry-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("per-instance replay protection for single consistency entries (bind once, check once):")
+    se_consistency_entry = MerkleConsistencyBatchEntry(
+        merkle_root(leaves[:2]), root, prove_consistency(leaves, 2)
+    )
+    mcer = MerkleConsistencyEntryReplayGuard()
+    mcer_binding = mcer.bind_once(se_consistency_entry, b"consistency-entry-session-1", expires_at=10**12)
+    print(f"  session_id={mcer_binding.session_id!r}  digest={mcer_binding.digest.hex()[:32]}…  "
+          f"expires_at={mcer_binding.expires_at}")
+    print(f"  valid first check accepted: {mcer.check(se_consistency_entry, mcer_binding, now=100)}")
+    print(f"  replay rejected: {not mcer.check(se_consistency_entry, mcer_binding, now=101)}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        mcer.bind_once(se_consistency_entry, b"consistency-entry-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    other_mcer = MerkleConsistencyEntryReplayGuard()
+    other_mcer_entry = MerkleConsistencyBatchEntry(
+        merkle_root(leaves[:3]), root, prove_consistency(leaves, 3)
+    )
+    other_mcer_binding = other_mcer.bind_once(other_mcer_entry, b"consistency-entry-session-2")
+    print(f"  replaced entry rejected without consuming the id: "
+          f"{not other_mcer.check(se_consistency_entry, other_mcer_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_mcer.check(other_mcer_entry, other_mcer_binding, now=1)}")
+    foreign_mcer = MerkleConsistencyEntryReplayGuard()
+    foreign_mcer_binding = foreign_mcer.bind_once(se_consistency_entry, b"consistency-entry-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_mcer.check(se_consistency_entry, foreign_mcer_binding, now=1)}")
+    print(f"  that id was not consumed and still verifies on its own guard: "
+          f"{foreign_mcer.check(se_consistency_entry, foreign_mcer_binding, now=1)}")
+    fresh_mcer = MerkleConsistencyEntryReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_mcer.bind_once(se_consistency_entry, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_mcer.bind_once(se_consistency_entry, b"consistency-entry-session-4", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong entry type: ", end="")
+    try:
+        fresh_mcer.bind_once("not-an-entry", b"consistency-entry-session-5")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_mcer_entry = dataclasses.replace(
+        se_consistency_entry, proof=dataclasses.replace(se_consistency_entry.proof, old_count=True)
+    )
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_mcer.bind_once(bool_mcer_entry, b"consistency-entry-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("concurrent checks of one id per single-entry guard (at most one winner each):")
+    race_mirr = MerkleInclusionEntryReplayGuard()
+    race_mirr_binding = race_mirr.bind_once(
+        se_inclusion_entry, b"inclusion-entry-race", expires_at=10**12
+    )
+    race_mirr_results = []
+    race_mirr_lock = threading.Lock()
+
+    def race_mirr_attempt():
+        outcome = race_mirr.check(se_inclusion_entry, race_mirr_binding, now=100)
+        with race_mirr_lock:
+            race_mirr_results.append(outcome)
+
+    race_mirr_threads = [threading.Thread(target=race_mirr_attempt) for _ in range(8)]
+    for thread in race_mirr_threads:
+        thread.start()
+    for thread in race_mirr_threads:
+        thread.join()
+    race_mirr_wins = sum(race_mirr_results)
+    print(f"  inclusion entry, 8 overlapping checks of the same id: "
+          f"{race_mirr_wins} succeeded, {len(race_mirr_results) - race_mirr_wins} rejected")
+    race_mmer = MerkleMultiEntryReplayGuard()
+    race_mmer_binding = race_mmer.bind_once(
+        se_multi_entry, b"multi-entry-race", expires_at=10**12
+    )
+    race_mmer_results = []
+    race_mmer_lock = threading.Lock()
+
+    def race_mmer_attempt():
+        outcome = race_mmer.check(se_multi_entry, race_mmer_binding, now=100)
+        with race_mmer_lock:
+            race_mmer_results.append(outcome)
+
+    race_mmer_threads = [threading.Thread(target=race_mmer_attempt) for _ in range(8)]
+    for thread in race_mmer_threads:
+        thread.start()
+    for thread in race_mmer_threads:
+        thread.join()
+    race_mmer_wins = sum(race_mmer_results)
+    print(f"  multi-inclusion entry, 8 overlapping checks of the same id: "
+          f"{race_mmer_wins} succeeded, {len(race_mmer_results) - race_mmer_wins} rejected")
+    race_mcer = MerkleConsistencyEntryReplayGuard()
+    race_mcer_binding = race_mcer.bind_once(
+        se_consistency_entry, b"consistency-entry-race", expires_at=10**12
+    )
+    race_mcer_results = []
+    race_mcer_lock = threading.Lock()
+
+    def race_mcer_attempt():
+        outcome = race_mcer.check(se_consistency_entry, race_mcer_binding, now=100)
+        with race_mcer_lock:
+            race_mcer_results.append(outcome)
+
+    race_mcer_threads = [threading.Thread(target=race_mcer_attempt) for _ in range(8)]
+    for thread in race_mcer_threads:
+        thread.start()
+    for thread in race_mcer_threads:
+        thread.join()
+    race_mcer_wins = sum(race_mcer_results)
+    print(f"  consistency entry, 8 overlapping checks of the same id: "
+          f"{race_mcer_wins} succeeded, {len(race_mcer_results) - race_mcer_wins} rejected")
+
+    print()
+    print("SQLite-backed single-entry replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_mirr_a = MerkleInclusionEntryReplayGuard(store=store)
+        persist_mirr_binding = persist_mirr_a.bind_once(
+            se_inclusion_entry, b"inclusion-entry-persist", expires_at=10**12
+        )
+        print(f"  inclusion entry session_id={persist_mirr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_mirr_a.check(se_inclusion_entry, persist_mirr_binding, now=100)}")
+        persist_mirr_b = MerkleInclusionEntryReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_mirr_b.check(se_inclusion_entry, persist_mirr_binding, now=100)}")
+        local_mirr = MerkleInclusionEntryReplayGuard()
+        local_mirr_binding = local_mirr.bind_once(
+            se_inclusion_entry, b"inclusion-entry-persist", expires_at=10**12
+        )
+        print(f"  in-memory instance shares nothing and accepts the same id: "
+              f"{local_mirr.check(se_inclusion_entry, local_mirr_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_mirr_c = MerkleInclusionEntryReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_mirr_c.check(se_inclusion_entry, persist_mirr_binding, now=100)}")
+        reopened.close()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_mmer_a = MerkleMultiEntryReplayGuard(store=store)
+        persist_mmer_binding = persist_mmer_a.bind_once(
+            se_multi_entry, b"multi-entry-persist", expires_at=10**12
+        )
+        print(f"  multi-inclusion entry session_id={persist_mmer_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_mmer_a.check(se_multi_entry, persist_mmer_binding, now=100)}")
+        persist_mmer_b = MerkleMultiEntryReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_mmer_b.check(se_multi_entry, persist_mmer_binding, now=100)}")
+        local_mmer = MerkleMultiEntryReplayGuard()
+        local_mmer_binding = local_mmer.bind_once(
+            se_multi_entry, b"multi-entry-persist", expires_at=10**12
+        )
+        print(f"  in-memory instance shares nothing and accepts the same id: "
+              f"{local_mmer.check(se_multi_entry, local_mmer_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_mmer_c = MerkleMultiEntryReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_mmer_c.check(se_multi_entry, persist_mmer_binding, now=100)}")
+        reopened.close()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_mcer_a = MerkleConsistencyEntryReplayGuard(store=store)
+        persist_mcer_binding = persist_mcer_a.bind_once(
+            se_consistency_entry, b"consistency-entry-persist", expires_at=10**12
+        )
+        print(f"  consistency entry session_id={persist_mcer_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_mcer_a.check(se_consistency_entry, persist_mcer_binding, now=100)}")
+        persist_mcer_b = MerkleConsistencyEntryReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_mcer_b.check(se_consistency_entry, persist_mcer_binding, now=100)}")
+        local_mcer = MerkleConsistencyEntryReplayGuard()
+        local_mcer_binding = local_mcer.bind_once(
+            se_consistency_entry, b"consistency-entry-persist", expires_at=10**12
+        )
+        print(f"  in-memory instance shares nothing and accepts the same id: "
+              f"{local_mcer.check(se_consistency_entry, local_mcer_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_mcer_c = MerkleConsistencyEntryReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_mcer_c.check(se_consistency_entry, persist_mcer_binding, now=100)}")
         reopened.close()
     return 0
 

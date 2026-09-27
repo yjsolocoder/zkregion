@@ -23,6 +23,7 @@ from . import (
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
+    BoundWideRangeReplayGuard,
     MerkleConsistencyBatchEntry,
     MerkleConsistencyBatchReplayGuard,
     MerkleConsistencyChain,
@@ -57,6 +58,10 @@ from . import (
     SingleKeyBatchGuard,
     SingleKeyBoundBatch,
     SingleKeyBoundReplayGuard,
+    WideRangeBatchEntry,
+    WideRangeBatchReplayGuard,
+    WideRangeProof,
+    WideRangeReplayGuard,
     commit,
     commit_coordinate,
     merkle_root,
@@ -66,6 +71,8 @@ from . import (
     prove_inclusion,
     prove_multi_inclusion,
     prove_range,
+    prove_range_wide,
+    prove_range_wide_batch_bound,
     prove_region,
     prove_region_wide,
     prove_region_wide_batch_bound,
@@ -1530,6 +1537,284 @@ def main() -> int:
         persist_brwr_c = BoundRegionWideReplayGuard(store=reopened)
         print(f"  after restart the consumed id is still rejected: "
               f"{not persist_brwr_c.check(wide_bound, wide_bound_root, persist_brwr_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
+
+    print()
+    print("wide range proofs, batch entries and a bound complete batch (public entry points):")
+    wr_lower, wr_upper = 0, (1 << 24) - 1
+    wr_entries = []
+    for wr_value in (40, 100000):
+        wr_commitment, wr_blinding = pedersen_commit(
+            wr_value, wr_lower, wr_upper, blinding=31000 + wr_value
+        )
+        wr_proof = prove_range_wide(
+            wr_commitment, wr_value, wr_blinding, b"wide-range-demo",
+            randbelow=counter_randbelow(),
+        )
+        wr_entries.append(WideRangeBatchEntry(wr_commitment, wr_proof, b"wide-range-demo"))
+    wr_entry = wr_entries[0]
+    wr_bound, wr_outer_root = prove_range_wide_batch_bound(
+        wr_entries, randbelow=counter_randbelow()
+    )
+    print(f"  declared range [{wr_lower}, {wr_upper}]  "
+          f"{len(wr_entries)} non-empty batch entries")
+    print(f"  single entry context={wr_entry.context!r}  "
+          f"bit commitments per proof={len(wr_entry.proof.commitments)}")
+    print(f"  complete batch plus outer Merkle root from the public constructor: "
+          f"{wr_outer_root.hex()[:32]}…")
+
+    print()
+    print("concurrent checks of one wide range id (at most one winner):")
+    race_wr = WideRangeReplayGuard()
+    race_wr_binding = race_wr.bind_once(
+        wr_entry, b"wide-range-race", expires_at=10**12
+    )
+    print(f"  session_id={race_wr_binding.session_id!r}  "
+          f"digest={race_wr_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_wr_binding.expires_at}")
+    race_wr_results = []
+    race_wr_lock = threading.Lock()
+
+    def race_wr_attempt():
+        outcome = race_wr.check(wr_entry, race_wr_binding, now=100)
+        with race_wr_lock:
+            race_wr_results.append(outcome)
+
+    race_wr_threads = [threading.Thread(target=race_wr_attempt) for _ in range(8)]
+    for thread in race_wr_threads:
+        thread.start()
+    for thread in race_wr_threads:
+        thread.join()
+    race_wr_wins = sum(race_wr_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_wr_wins} succeeded, {len(race_wr_results) - race_wr_wins} rejected")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        race_wr.bind_once(wr_entry, b"wide-range-race")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    fresh_wr = WideRangeReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_wr.bind_once(wr_entry, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_wr.bind_once(wr_entry, b"wide-range-session-1", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong entry type: ", end="")
+    try:
+        fresh_wr.bind_once("not-an-entry", b"wide-range-session-2")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_wr_entry = dataclasses.replace(
+        wr_entry, commitment=dataclasses.replace(wr_entry.commitment, lower=True)
+    )
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_wr.bind_once(bool_wr_entry, b"wide-range-session-3")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("SQLite-backed wide range replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_wr_a = WideRangeReplayGuard(store=store)
+        persist_wr_binding = persist_wr_a.bind_once(
+            wr_entry, b"wide-range-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_wr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_wr_a.check(wr_entry, persist_wr_binding, now=100)}")
+        persist_wr_b = WideRangeReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_wr_b.check(wr_entry, persist_wr_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_wr_c = WideRangeReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_wr_c.check(wr_entry, persist_wr_binding, now=100)}")
+        reopened.close()
+
+    print()
+    print("concurrent checks of one wide range batch id (at most one winner):")
+    race_wbr = WideRangeBatchReplayGuard()
+    race_wbr_binding = race_wbr.bind_once(
+        wr_entries, b"wide-range-batch-race", expires_at=10**12
+    )
+    print(f"  session_id={race_wbr_binding.session_id!r}  "
+          f"digest={race_wbr_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_wbr_binding.expires_at}")
+    race_wbr_results = []
+    race_wbr_lock = threading.Lock()
+
+    def race_wbr_attempt():
+        outcome = race_wbr.check(
+            wr_entries, race_wbr_binding, now=100, randbelow=counter_randbelow()
+        )
+        with race_wbr_lock:
+            race_wbr_results.append(outcome)
+
+    race_wbr_threads = [threading.Thread(target=race_wbr_attempt) for _ in range(8)]
+    for thread in race_wbr_threads:
+        thread.start()
+    for thread in race_wbr_threads:
+        thread.join()
+    race_wbr_wins = sum(race_wbr_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_wbr_wins} succeeded, {len(race_wbr_results) - race_wbr_wins} rejected")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        race_wbr.bind_once(wr_entries, b"wide-range-batch-race")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    fresh_wbr = WideRangeBatchReplayGuard()
+    print("  empty batch: ", end="")
+    try:
+        fresh_wbr.bind_once([], b"wide-range-batch-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  empty session id: ", end="")
+    try:
+        fresh_wbr.bind_once(wr_entries, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_wbr.bind_once(wr_entries, b"wide-range-batch-session-2", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong batch type: ", end="")
+    try:
+        fresh_wbr.bind_once("not-a-batch", b"wide-range-batch-session-3")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_wbr_entry = dataclasses.replace(
+        wr_entry, proof=WideRangeProof(
+            wr_entry.proof.commitments,
+            ((True, False),) + wr_entry.proof.challenges[1:],
+            wr_entry.proof.responses,
+        )
+    )
+    print("  boolean posing as a nested proof integer: ", end="")
+    try:
+        fresh_wbr.bind_once([bool_wbr_entry], b"wide-range-batch-session-4")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("concurrent checks of one bound wide range batch id (at most one winner):")
+    race_bwr = BoundWideRangeReplayGuard()
+    race_bwr_binding = race_bwr.bind_once(
+        wr_bound, wr_outer_root, b"bound-wide-range-race", expires_at=10**12
+    )
+    print(f"  session_id={race_bwr_binding.session_id!r}  "
+          f"digest={race_bwr_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_bwr_binding.expires_at}")
+    race_bwr_results = []
+    race_bwr_lock = threading.Lock()
+
+    def race_bwr_attempt():
+        outcome = race_bwr.check(
+            wr_bound, wr_outer_root, race_bwr_binding,
+            now=100, randbelow=counter_randbelow(),
+        )
+        with race_bwr_lock:
+            race_bwr_results.append(outcome)
+
+    race_bwr_threads = [threading.Thread(target=race_bwr_attempt) for _ in range(8)]
+    for thread in race_bwr_threads:
+        thread.start()
+    for thread in race_bwr_threads:
+        thread.join()
+    race_bwr_wins = sum(race_bwr_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_bwr_wins} succeeded, {len(race_bwr_results) - race_bwr_wins} rejected")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        race_bwr.bind_once(wr_bound, wr_outer_root, b"bound-wide-range-race")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    fresh_bwr = BoundWideRangeReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_bwr.bind_once(wr_bound, wr_outer_root, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_bwr.bind_once(
+            wr_bound, wr_outer_root, b"bound-wide-range-session-1", expires_at=1 << 64
+        )
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong batch type: ", end="")
+    try:
+        fresh_bwr.bind_once("not-a-batch", wr_outer_root, b"bound-wide-range-session-2")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("SQLite-backed wide range batch replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_wbr_a = WideRangeBatchReplayGuard(store=store)
+        persist_wbr_binding = persist_wbr_a.bind_once(
+            wr_entries, b"wide-range-batch-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_wbr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_wbr_a.check(wr_entries, persist_wbr_binding, now=100, randbelow=counter_randbelow())}")
+        persist_wbr_b = WideRangeBatchReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_wbr_b.check(wr_entries, persist_wbr_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_wbr_c = WideRangeBatchReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_wbr_c.check(wr_entries, persist_wbr_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
+
+    print()
+    print("SQLite-backed bound wide range batch replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_bwr_a = BoundWideRangeReplayGuard(store=store)
+        persist_bwr_binding = persist_bwr_a.bind_once(
+            wr_bound, wr_outer_root, b"bound-wide-range-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_bwr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_bwr_a.check(wr_bound, wr_outer_root, persist_bwr_binding, now=100, randbelow=counter_randbelow())}")
+        persist_bwr_b = BoundWideRangeReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_bwr_b.check(wr_bound, wr_outer_root, persist_bwr_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_bwr_c = BoundWideRangeReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_bwr_c.check(wr_bound, wr_outer_root, persist_bwr_binding, now=100, randbelow=counter_randbelow())}")
         reopened.close()
     return 0
 

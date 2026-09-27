@@ -39,8 +39,10 @@ from . import (
     MerkleMultiProof,
     MultiSchnorrEntry,
     OpeningBatchEntry,
+    OpeningBatchReplayGuard,
     OpeningReplayGuard,
     PedersenOpeningBatchEntry,
+    PedersenOpeningBatchReplayGuard,
     PedersenOpeningReplayGuard,
     RangeBatchEntry,
     RangeBatchReplayGuard,
@@ -2397,6 +2399,282 @@ def main() -> int:
         print(f"  after restart the consumed id is still rejected: "
               f"{not persist_mcer_c.check(se_consistency_entry, persist_mcer_binding, now=100)}")
         reopened.close()
+
+    print()
+    print("per-instance replay protection for hash-commitment opening batches (bind once, check once):")
+    obr_specs = (
+        (b"obr-alpha", b"zkregion-demo-obr-01"),
+        (b"obr-beta", b"zkregion-demo-obr-02"),
+        (b"obr-gamma", b"zkregion-demo-obr-03"),
+    )
+    obr_entries = []
+    for obr_value, obr_nonce_seed in obr_specs:
+        obr_commitment, obr_nonce = commit(obr_value, nonce=obr_nonce_seed)
+        obr_entries.append(OpeningBatchEntry(obr_commitment, obr_value, obr_nonce))
+    print(f"  batch: {len(obr_entries)} entries  all openings verify: "
+          f"{all(verify_opening(e.commitment, e.value, e.nonce) for e in obr_entries)}")
+    obr = OpeningBatchReplayGuard()
+    obr_binding = obr.bind_once(
+        obr_entries, b"hash-opening-batch-session-1", expires_at=10**12
+    )
+    print(f"  session_id={obr_binding.session_id!r}  digest={obr_binding.digest.hex()[:32]}…  "
+          f"expires_at={obr_binding.expires_at}")
+    print(f"  valid first check accepted: {obr.check(obr_entries, obr_binding, now=100)}")
+    print(f"  replay rejected: {not obr.check(obr_entries, obr_binding, now=101)}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        obr.bind_once(obr_entries, b"hash-opening-batch-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    obr_alt_specs = (
+        (b"obr-delta", b"zkregion-demo-obr-04"),
+        (b"obr-epsilon", b"zkregion-demo-obr-05"),
+    )
+    obr_alt_entries = []
+    for obr_value, obr_nonce_seed in obr_alt_specs:
+        obr_commitment, obr_nonce = commit(obr_value, nonce=obr_nonce_seed)
+        obr_alt_entries.append(OpeningBatchEntry(obr_commitment, obr_value, obr_nonce))
+    other_obr = OpeningBatchReplayGuard()
+    other_obr_binding = other_obr.bind_once(
+        obr_alt_entries, b"hash-opening-batch-session-2"
+    )
+    obr_swapped = obr_alt_entries[::-1]
+    print(f"  replaced batch rejected without consuming the id: "
+          f"{not other_obr.check(obr_swapped, other_obr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_obr.check(obr_alt_entries, other_obr_binding, now=1)}")
+    foreign_obr = OpeningBatchReplayGuard()
+    foreign_obr_binding = foreign_obr.bind_once(
+        obr_entries, b"hash-opening-batch-session-3"
+    )
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_obr.check(obr_entries, foreign_obr_binding, now=1)}")
+    print(f"  that id was not consumed and still verifies on its own guard: "
+          f"{foreign_obr.check(obr_entries, foreign_obr_binding, now=1)}")
+    fresh_obr = OpeningBatchReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_obr.bind_once(obr_entries, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  empty batch: ", end="")
+    try:
+        fresh_obr.bind_once([], b"hash-opening-batch-session-4")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_obr.bind_once(
+            obr_entries, b"hash-opening-batch-session-5", expires_at=1 << 64
+        )
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong batch type: ", end="")
+    try:
+        fresh_obr.bind_once("not-a-batch", b"hash-opening-batch-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_obr_entry = dataclasses.replace(obr_entries[0], value=True)
+    print("  boolean posing as a bytes field: ", end="")
+    try:
+        fresh_obr.bind_once(
+            [bool_obr_entry, *obr_entries[1:]], b"hash-opening-batch-session-7"
+        )
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("concurrent checks of one hash-opening batch id (at most one winner):")
+    race_obr = OpeningBatchReplayGuard()
+    race_obr_binding = race_obr.bind_once(
+        obr_entries, b"hash-opening-batch-race", expires_at=10**12
+    )
+    print(f"  session_id={race_obr_binding.session_id!r}  "
+          f"digest={race_obr_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_obr_binding.expires_at}")
+    race_obr_results = []
+    race_obr_lock = threading.Lock()
+
+    def race_obr_attempt():
+        outcome = race_obr.check(obr_entries, race_obr_binding, now=100)
+        with race_obr_lock:
+            race_obr_results.append(outcome)
+
+    race_obr_threads = [threading.Thread(target=race_obr_attempt) for _ in range(8)]
+    for thread in race_obr_threads:
+        thread.start()
+    for thread in race_obr_threads:
+        thread.join()
+    race_obr_wins = sum(race_obr_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_obr_wins} succeeded, {len(race_obr_results) - race_obr_wins} rejected")
+
+    print()
+    print("SQLite-backed hash-opening batch replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_obr_a = OpeningBatchReplayGuard(store=store)
+        persist_obr_binding = persist_obr_a.bind_once(
+            obr_entries, b"hash-opening-batch-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_obr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_obr_a.check(obr_entries, persist_obr_binding, now=100)}")
+        persist_obr_b = OpeningBatchReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_obr_b.check(obr_entries, persist_obr_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_obr_c = OpeningBatchReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_obr_c.check(obr_entries, persist_obr_binding, now=100)}")
+        reopened.close()
+
+    print()
+    print("per-instance replay protection for Pedersen opening batches (bind once, check once):")
+    pobr_specs = ((40, 1000), (10, 1001), (90, 1002))
+    pobr_entries = []
+    for pobr_value, pobr_blinding in pobr_specs:
+        pobr_commitment, pobr_actual_blinding = pedersen_commit(
+            pobr_value, 0, 100, blinding=pobr_blinding
+        )
+        pobr_entries.append(
+            PedersenOpeningBatchEntry(pobr_commitment, pobr_value, pobr_actual_blinding)
+        )
+    print(f"  batch: {len(pobr_entries)} entries  all openings verify: "
+          f"{all(verify_pedersen_opening(e.commitment, e.value, e.blinding) for e in pobr_entries)}")
+    pobr = PedersenOpeningBatchReplayGuard()
+    pobr_binding = pobr.bind_once(
+        pobr_entries, b"pedersen-opening-batch-session-1", expires_at=10**12
+    )
+    print(f"  session_id={pobr_binding.session_id!r}  digest={pobr_binding.digest.hex()[:32]}…  "
+          f"expires_at={pobr_binding.expires_at}")
+    print(f"  valid first check accepted: {pobr.check(pobr_entries, pobr_binding, now=100)}")
+    print(f"  replay rejected: {not pobr.check(pobr_entries, pobr_binding, now=101)}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        pobr.bind_once(pobr_entries, b"pedersen-opening-batch-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    pobr_alt_specs = ((25, 2000), (75, 2001))
+    pobr_alt_entries = []
+    for pobr_value, pobr_blinding in pobr_alt_specs:
+        pobr_commitment, pobr_actual_blinding = pedersen_commit(
+            pobr_value, 0, 100, blinding=pobr_blinding
+        )
+        pobr_alt_entries.append(
+            PedersenOpeningBatchEntry(pobr_commitment, pobr_value, pobr_actual_blinding)
+        )
+    other_pobr = PedersenOpeningBatchReplayGuard()
+    other_pobr_binding = other_pobr.bind_once(
+        pobr_alt_entries, b"pedersen-opening-batch-session-2"
+    )
+    pobr_swapped = pobr_alt_entries[::-1]
+    print(f"  replaced batch rejected without consuming the id: "
+          f"{not other_pobr.check(pobr_swapped, other_pobr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_pobr.check(pobr_alt_entries, other_pobr_binding, now=1)}")
+    foreign_pobr = PedersenOpeningBatchReplayGuard()
+    foreign_pobr_binding = foreign_pobr.bind_once(
+        pobr_entries, b"pedersen-opening-batch-session-3"
+    )
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_pobr.check(pobr_entries, foreign_pobr_binding, now=1)}")
+    print(f"  that id was not consumed and still verifies on its own guard: "
+          f"{foreign_pobr.check(pobr_entries, foreign_pobr_binding, now=1)}")
+    fresh_pobr = PedersenOpeningBatchReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_pobr.bind_once(pobr_entries, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  empty batch: ", end="")
+    try:
+        fresh_pobr.bind_once([], b"pedersen-opening-batch-session-4")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_pobr.bind_once(
+            pobr_entries, b"pedersen-opening-batch-session-5", expires_at=1 << 64
+        )
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong batch type: ", end="")
+    try:
+        fresh_pobr.bind_once("not-a-batch", b"pedersen-opening-batch-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_pobr_entry = dataclasses.replace(pobr_entries[0], value=True)
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_pobr.bind_once(
+            [bool_pobr_entry, *pobr_entries[1:]], b"pedersen-opening-batch-session-7"
+        )
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("concurrent checks of one Pedersen-opening batch id (at most one winner):")
+    race_pobr = PedersenOpeningBatchReplayGuard()
+    race_pobr_binding = race_pobr.bind_once(
+        pobr_entries, b"pedersen-opening-batch-race", expires_at=10**12
+    )
+    print(f"  session_id={race_pobr_binding.session_id!r}  "
+          f"digest={race_pobr_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_pobr_binding.expires_at}")
+    race_pobr_results = []
+    race_pobr_lock = threading.Lock()
+
+    def race_pobr_attempt():
+        outcome = race_pobr.check(pobr_entries, race_pobr_binding, now=100)
+        with race_pobr_lock:
+            race_pobr_results.append(outcome)
+
+    race_pobr_threads = [threading.Thread(target=race_pobr_attempt) for _ in range(8)]
+    for thread in race_pobr_threads:
+        thread.start()
+    for thread in race_pobr_threads:
+        thread.join()
+    race_pobr_wins = sum(race_pobr_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_pobr_wins} succeeded, {len(race_pobr_results) - race_pobr_wins} rejected")
+
+    print()
+    print("SQLite-backed Pedersen-opening batch replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_pobr_a = PedersenOpeningBatchReplayGuard(store=store)
+        persist_pobr_binding = persist_pobr_a.bind_once(
+            pobr_entries, b"pedersen-opening-batch-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_pobr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_pobr_a.check(pobr_entries, persist_pobr_binding, now=100)}")
+        persist_pobr_b = PedersenOpeningBatchReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_pobr_b.check(pobr_entries, persist_pobr_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_pobr_c = PedersenOpeningBatchReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_pobr_c.check(pobr_entries, persist_pobr_binding, now=100)}")
+        reopened.close()
+
     return 0
 
 

@@ -23,6 +23,7 @@ from . import (
     BoundRangeReplayGuard,
     BoundSchnorrBatch,
     BoundSchnorrReplayGuard,
+    BoundWideRangeReplayGuard,
     MerkleConsistencyBatchEntry,
     MerkleConsistencyBatchReplayGuard,
     MerkleConsistencyChain,
@@ -57,6 +58,9 @@ from . import (
     SingleKeyBatchGuard,
     SingleKeyBoundBatch,
     SingleKeyBoundReplayGuard,
+    WideRangeBatchEntry,
+    WideRangeBatchReplayGuard,
+    WideRangeReplayGuard,
     commit,
     commit_coordinate,
     merkle_root,
@@ -66,6 +70,8 @@ from . import (
     prove_inclusion,
     prove_multi_inclusion,
     prove_range,
+    prove_range_wide,
+    prove_range_wide_batch_bound,
     prove_region,
     prove_region_wide,
     prove_region_wide_batch_bound,
@@ -1530,6 +1536,323 @@ def main() -> int:
         persist_brwr_c = BoundRegionWideReplayGuard(store=reopened)
         print(f"  after restart the consumed id is still rejected: "
               f"{not persist_brwr_c.check(wide_bound, wide_bound_root, persist_brwr_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
+
+    print()
+    print("per-instance replay protection for wide range entries (bind once, check once):")
+    wr_lower, wr_upper = 0, 255
+    wr_commitment, wr_blinding = pedersen_commit(40, wr_lower, wr_upper, blinding=1234)
+    wr_proof = prove_range_wide(
+        wr_commitment, 40, wr_blinding, b"wide-range-demo",
+        randbelow=counter_randbelow(),
+    )
+    wr_entry = WideRangeBatchEntry(wr_commitment, wr_proof, b"wide-range-demo")
+    wr_commitment2, wr_blinding2 = pedersen_commit(7, wr_lower, wr_upper, blinding=777)
+    wr_proof2 = prove_range_wide(
+        wr_commitment2, 7, wr_blinding2, b"wide-range-demo",
+        randbelow=counter_randbelow(),
+    )
+    wr_entry2 = WideRangeBatchEntry(wr_commitment2, wr_proof2, b"wide-range-demo")
+    wr_entries = [wr_entry, wr_entry2]
+    print(f"  entry: range [{wr_lower}, {wr_upper}]  context={wr_entry.context!r}")
+    wrr = WideRangeReplayGuard()
+    wrr_binding = wrr.bind_once(wr_entry, b"wide-range-session-1", expires_at=10**12)
+    print(f"  session_id={wrr_binding.session_id!r}  digest={wrr_binding.digest.hex()[:32]}…  "
+          f"expires_at={wrr_binding.expires_at}")
+    print(f"  valid first check accepted: {wrr.check(wr_entry, wrr_binding, now=100)}")
+    print(f"  replay rejected: {not wrr.check(wr_entry, wrr_binding, now=101)}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        wrr.bind_once(wr_entry, b"wide-range-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    other_wrr = WideRangeReplayGuard()
+    other_wrr_binding = other_wrr.bind_once(wr_entry, b"wide-range-session-2")
+    swapped_wr_entry = dataclasses.replace(wr_entry, context=b"other")
+    print(f"  replaced entry rejected without consuming the id: "
+          f"{not other_wrr.check(swapped_wr_entry, other_wrr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_wrr.check(wr_entry, other_wrr_binding, now=1)}")
+    foreign_wrr = WideRangeReplayGuard()
+    foreign_wrr_binding = foreign_wrr.bind_once(wr_entry, b"wide-range-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_wrr.check(wr_entry, foreign_wrr_binding, now=1)}")
+    fresh_wrr = WideRangeReplayGuard()
+    fresh_wrr.bind_once(wr_entry, b"wide-range-pending")
+    print("  rebind of a pending id: ", end="")
+    try:
+        fresh_wrr.bind_once(wr_entry, b"wide-range-pending")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  empty session id: ", end="")
+    try:
+        fresh_wrr.bind_once(wr_entry, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_wrr.bind_once(wr_entry, b"wide-range-session-4", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    bool_wr_entry = dataclasses.replace(
+        wr_entry,
+        commitment=dataclasses.replace(wr_entry.commitment, element=True),
+    )
+    print("  bool used as integer: ", end="")
+    try:
+        fresh_wrr.bind_once(bool_wr_entry, b"wide-range-session-5")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    print("  wrong entry type: ", end="")
+    try:
+        fresh_wrr.bind_once("not-an-entry", b"wide-range-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("per-instance replay protection for wide range entry batches (bind once, check once):")
+    wrbr = WideRangeBatchReplayGuard()
+    wrbr_binding = wrbr.bind_once(wr_entries, b"wide-range-batch-session-1", expires_at=10**12)
+    print(f"  batch: {len(wr_entries)} entries  session_id={wrbr_binding.session_id!r}  "
+          f"digest={wrbr_binding.digest.hex()[:32]}…  expires_at={wrbr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{wrbr.check(wr_entries, wrbr_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not wrbr.check(wr_entries, wrbr_binding, now=101, randbelow=counter_randbelow())}")
+    other_wrbr = WideRangeBatchReplayGuard()
+    other_wrbr_binding = other_wrbr.bind_once(wr_entries, b"wide-range-batch-session-2")
+    print(f"  reordered batch rejected without consuming the id: "
+          f"{not other_wrbr.check(wr_entries[::-1], other_wrbr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_wrbr.check(wr_entries, other_wrbr_binding, now=1, randbelow=counter_randbelow())}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        wrbr.bind_once(wr_entries, b"wide-range-batch-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    foreign_wrbr = WideRangeBatchReplayGuard()
+    foreign_wrbr_binding = foreign_wrbr.bind_once(wr_entries, b"wide-range-batch-session-3")
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_wrbr.check(wr_entries, foreign_wrbr_binding, now=1)}")
+    fresh_wrbr = WideRangeBatchReplayGuard()
+    print("  empty batch: ", end="")
+    try:
+        fresh_wrbr.bind_once([], b"wide-range-batch-session-4")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  empty session id: ", end="")
+    try:
+        fresh_wrbr.bind_once(wr_entries, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_wrbr.bind_once(wr_entries, b"wide-range-batch-session-5", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  bool used as integer: ", end="")
+    try:
+        fresh_wrbr.bind_once([bool_wr_entry], b"wide-range-batch-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    print("  wrong batch type: ", end="")
+    try:
+        fresh_wrbr.bind_once("not-a-batch", b"wide-range-batch-session-7")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("per-instance replay protection for bound wide range batches (bind once, check once):")
+    wr_bound, wr_root = prove_range_wide_batch_bound(
+        wr_entries, randbelow=counter_randbelow()
+    )
+    print(f"  entries={len(wr_entries)}  complete index coverage 0..{len(wr_entries) - 1}")
+    bwrr = BoundWideRangeReplayGuard()
+    bwrr_binding = bwrr.bind_once(
+        wr_bound, wr_root, b"bound-wide-range-session-1", expires_at=10**12
+    )
+    print(f"  session_id={bwrr_binding.session_id!r}  digest={bwrr_binding.digest.hex()[:32]}…  "
+          f"expires_at={bwrr_binding.expires_at}")
+    print(f"  valid first check accepted: "
+          f"{bwrr.check(wr_bound, wr_root, bwrr_binding, now=100, randbelow=counter_randbelow())}")
+    print(f"  replay rejected: "
+          f"{not bwrr.check(wr_bound, wr_root, bwrr_binding, now=101, randbelow=counter_randbelow())}")
+    other_bwrr = BoundWideRangeReplayGuard()
+    other_bwrr_binding = other_bwrr.bind_once(
+        wr_bound, wr_root, b"bound-wide-range-session-2"
+    )
+    wrong_wr_root = prove_range_wide_batch_bound(
+        wr_entries[:1], randbelow=counter_randbelow()
+    )[1]
+    print(f"  wrong root rejected without consuming the id: "
+          f"{not other_bwrr.check(wr_bound, wrong_wr_root, other_bwrr_binding, now=1)}")
+    print(f"  rejected id stays pending and later verifies: "
+          f"{other_bwrr.check(wr_bound, wr_root, other_bwrr_binding, now=1, randbelow=counter_randbelow())}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        bwrr.bind_once(wr_bound, wr_root, b"bound-wide-range-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    foreign_bwrr = BoundWideRangeReplayGuard()
+    foreign_bwrr_binding = foreign_bwrr.bind_once(
+        wr_bound, wr_root, b"bound-wide-range-session-3"
+    )
+    print(f"  binding from another guard instance rejected: "
+          f"{not other_bwrr.check(wr_bound, wr_root, foreign_bwrr_binding, now=1)}")
+    fresh_bwrr = BoundWideRangeReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_bwrr.bind_once(wr_bound, wr_root, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_bwrr.bind_once(
+            wr_bound, wr_root, b"bound-wide-range-session-4", expires_at=1 << 64
+        )
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  bool used as integer: ", end="")
+    try:
+        fresh_bwrr.bind_once(
+            dataclasses.replace(wr_bound, leaf_count=True), wr_root,
+            b"bound-wide-range-session-5",
+        )
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    print("  wrong batch type: ", end="")
+    try:
+        fresh_bwrr.bind_once("not-a-batch", wr_root, b"bound-wide-range-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("concurrent checks of wide range replay ids (at most one winner):")
+
+    def run_wide_range_race(label, attempt):
+        race_results = []
+        race_lock = threading.Lock()
+
+        def race_attempt():
+            outcome = attempt()
+            with race_lock:
+                race_results.append(outcome)
+
+        threads = [threading.Thread(target=race_attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        wins = sum(race_results)
+        print(f"  {label}: {wins} succeeded, {len(race_results) - wins} rejected")
+
+    race_wrr = WideRangeReplayGuard()
+    race_wrr_binding = race_wrr.bind_once(
+        wr_entry, b"wide-range-race", expires_at=10**12
+    )
+    run_wide_range_race(
+        "single entry overlapping checks of the same id",
+        lambda: race_wrr.check(wr_entry, race_wrr_binding, now=100),
+    )
+    race_wrbr = WideRangeBatchReplayGuard()
+    race_wrbr_binding = race_wrbr.bind_once(
+        wr_entries, b"wide-range-batch-race", expires_at=10**12
+    )
+    run_wide_range_race(
+        "entry batch overlapping checks of the same id",
+        lambda: race_wrbr.check(
+            wr_entries, race_wrbr_binding, now=100, randbelow=counter_randbelow()
+        ),
+    )
+    race_bwrr = BoundWideRangeReplayGuard()
+    race_bwrr_binding = race_bwrr.bind_once(
+        wr_bound, wr_root, b"bound-wide-range-batch-race", expires_at=10**12
+    )
+    run_wide_range_race(
+        "bound batch overlapping checks of the same id",
+        lambda: race_bwrr.check(
+            wr_bound, wr_root, race_bwrr_binding,
+            now=100, randbelow=counter_randbelow(),
+        ),
+    )
+
+    print()
+    print("SQLite-backed wide range replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_wrr_a = WideRangeReplayGuard(store=store)
+        persist_wrr_binding = persist_wrr_a.bind_once(
+            wr_entry, b"wide-range-persist", expires_at=10**12
+        )
+        print(f"  single entry  session_id={persist_wrr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_wrr_a.check(wr_entry, persist_wrr_binding, now=100)}")
+        persist_wrr_b = WideRangeReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_wrr_b.check(wr_entry, persist_wrr_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_wrr_c = WideRangeReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_wrr_c.check(wr_entry, persist_wrr_binding, now=100)}")
+        reopened.close()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_wrbr_a = WideRangeBatchReplayGuard(store=store)
+        persist_wrbr_binding = persist_wrbr_a.bind_once(
+            wr_entries, b"wide-range-batch-persist", expires_at=10**12
+        )
+        print(f"  entry batch  session_id={persist_wrbr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_wrbr_a.check(wr_entries, persist_wrbr_binding, now=100, randbelow=counter_randbelow())}")
+        persist_wrbr_b = WideRangeBatchReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_wrbr_b.check(wr_entries, persist_wrbr_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_wrbr_c = WideRangeBatchReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_wrbr_c.check(wr_entries, persist_wrbr_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_bwrr_a = BoundWideRangeReplayGuard(store=store)
+        persist_bwrr_binding = persist_bwrr_a.bind_once(
+            wr_bound, wr_root, b"bound-wide-range-batch-persist", expires_at=10**12
+        )
+        print(f"  bound batch  session_id={persist_bwrr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_bwrr_a.check(wr_bound, wr_root, persist_bwrr_binding, now=100, randbelow=counter_randbelow())}")
+        persist_bwrr_b = BoundWideRangeReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_bwrr_b.check(wr_bound, wr_root, persist_bwrr_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_bwrr_c = BoundWideRangeReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_bwrr_c.check(wr_bound, wr_root, persist_bwrr_binding, now=100, randbelow=counter_randbelow())}")
         reopened.close()
     return 0
 

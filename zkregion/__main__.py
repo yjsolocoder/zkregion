@@ -1430,6 +1430,111 @@ def main() -> int:
         print(f"  after restart the consumed id is still rejected: "
               f"{not persist_c.check(wide_entry, persist_binding, now=100)}")
         reopened.close()
+
+    print()
+    print("concurrent checks of one wide-region batch id (at most one winner):")
+    race_rwbr = RegionWideBatchReplayGuard()
+    race_rwbr_binding = race_rwbr.bind_once(
+        wide_entries, b"region-wide-batch-race", expires_at=10**12
+    )
+    print(f"  session_id={race_rwbr_binding.session_id!r}  "
+          f"digest={race_rwbr_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_rwbr_binding.expires_at}")
+    race_rwbr_results = []
+    race_rwbr_lock = threading.Lock()
+
+    def race_rwbr_attempt():
+        outcome = race_rwbr.check(
+            wide_entries, race_rwbr_binding, now=100, randbelow=counter_randbelow()
+        )
+        with race_rwbr_lock:
+            race_rwbr_results.append(outcome)
+
+    race_rwbr_threads = [threading.Thread(target=race_rwbr_attempt) for _ in range(8)]
+    for thread in race_rwbr_threads:
+        thread.start()
+    for thread in race_rwbr_threads:
+        thread.join()
+    race_rwbr_wins = sum(race_rwbr_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_rwbr_wins} succeeded, {len(race_rwbr_results) - race_rwbr_wins} rejected")
+
+    print()
+    print("concurrent checks of one bound wide-region batch id (at most one winner):")
+    race_brwr = BoundRegionWideReplayGuard()
+    race_brwr_binding = race_brwr.bind_once(
+        wide_bound, wide_bound_root, b"bound-region-wide-race", expires_at=10**12
+    )
+    print(f"  session_id={race_brwr_binding.session_id!r}  "
+          f"digest={race_brwr_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_brwr_binding.expires_at}")
+    race_brwr_results = []
+    race_brwr_lock = threading.Lock()
+
+    def race_brwr_attempt():
+        outcome = race_brwr.check(
+            wide_bound, wide_bound_root, race_brwr_binding,
+            now=100, randbelow=counter_randbelow(),
+        )
+        with race_brwr_lock:
+            race_brwr_results.append(outcome)
+
+    race_brwr_threads = [threading.Thread(target=race_brwr_attempt) for _ in range(8)]
+    for thread in race_brwr_threads:
+        thread.start()
+    for thread in race_brwr_threads:
+        thread.join()
+    race_brwr_wins = sum(race_brwr_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_brwr_wins} succeeded, {len(race_brwr_results) - race_brwr_wins} rejected")
+
+    print()
+    print("SQLite-backed wide-region batch replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_rwbr_a = RegionWideBatchReplayGuard(store=store)
+        persist_rwbr_binding = persist_rwbr_a.bind_once(
+            wide_entries, b"region-wide-batch-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_rwbr_binding.session_id!r}  "
+              f"digest={persist_rwbr_binding.digest.hex()[:32]}…  "
+              f"expires_at={persist_rwbr_binding.expires_at}")
+        print(f"  valid first check accepted: "
+              f"{persist_rwbr_a.check(wide_entries, persist_rwbr_binding, now=100, randbelow=counter_randbelow())}")
+        persist_rwbr_b = RegionWideBatchReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_rwbr_b.check(wide_entries, persist_rwbr_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_rwbr_c = RegionWideBatchReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_rwbr_c.check(wide_entries, persist_rwbr_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
+
+    print()
+    print("SQLite-backed bound wide-region batch replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_brwr_a = BoundRegionWideReplayGuard(store=store)
+        persist_brwr_binding = persist_brwr_a.bind_once(
+            wide_bound, wide_bound_root, b"bound-region-wide-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_brwr_binding.session_id!r}  "
+              f"digest={persist_brwr_binding.digest.hex()[:32]}…  "
+              f"expires_at={persist_brwr_binding.expires_at}")
+        print(f"  valid first check accepted: "
+              f"{persist_brwr_a.check(wide_bound, wide_bound_root, persist_brwr_binding, now=100, randbelow=counter_randbelow())}")
+        persist_brwr_b = BoundRegionWideReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_brwr_b.check(wide_bound, wide_bound_root, persist_brwr_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_brwr_c = BoundRegionWideReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_brwr_c.check(wide_bound, wide_bound_root, persist_brwr_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
     return 0
 
 

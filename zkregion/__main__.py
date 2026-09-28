@@ -718,93 +718,411 @@ def main() -> int:
 
     print()
     print("per-instance replay protection (bind once, check once):")
-    guard = ReplayGuard()
-    replay_entry = MultiSchnorrEntry(
-        prover.public_key, b"spend", prover.prove(b"spend", context=b"session"),
-        b"session",
+    sig_entry = MultiSchnorrEntry(
+        prover.public_key,
+        b"sig-instance",
+        prover.prove(b"sig-instance", context=b"sig-instance"),
+        b"sig-instance",
     )
-    binding = guard.bind_once(replay_entry, b"session-id-1", expires_at=10**12)
+    guard = ReplayGuard()
+    binding = guard.bind_once(sig_entry, b"signature-session-1", expires_at=10**12)
     print(f"  digest={binding.digest.hex()[:32]}…  expires_at={binding.expires_at}")
-    print(f"  valid first check accepted: {guard.check(replay_entry, binding, now=100)}")
-    print(f"  replay rejected: {not guard.check(replay_entry, binding, now=101)}")
+    print(f"  valid first check accepted: {guard.check(sig_entry, binding, now=100)}")
+    print(f"  replay rejected: {not guard.check(sig_entry, binding, now=101)}")
     print(f"  consumed id cannot be rebound: ", end="")
     try:
-        guard.bind_once(replay_entry, b"session-id-1")
+        guard.bind_once(sig_entry, b"signature-session-1")
         print("no error (unexpected)")
     except ValueError:
         print("ValueError")
     pending = ReplayGuard()
-    pending_binding = pending.bind_once(replay_entry, b"session-id-2", expires_at=1000)
+    pending_binding = pending.bind_once(sig_entry, b"signature-session-2", expires_at=1000)
     print(f"  expired binding (now >= expires_at) rejected: "
-          f"{not pending.check(replay_entry, pending_binding, now=1000)}")
+          f"{not pending.check(sig_entry, pending_binding, now=1000)}")
     print(f"  rejected id stays pending and later verifies: "
-          f"{pending.check(replay_entry, pending_binding, now=999)}")
-    wrong_proof = dataclasses.replace(replay_entry, proof=SchnorrProof(
-        replay_entry.proof.commitment, replay_entry.proof.response + 1,
+          f"{pending.check(sig_entry, pending_binding, now=999)}")
+    wrong_proof = dataclasses.replace(sig_entry, proof=SchnorrProof(
+        sig_entry.proof.commitment, sig_entry.proof.response + 1,
     ))
     other = ReplayGuard()
-    other_binding = other.bind_once(wrong_proof, b"session-id-3")
+    other_binding = other.bind_once(wrong_proof, b"signature-session-3")
     print(f"  bad proof rejected without consuming the id: "
           f"{not other.check(wrong_proof, other_binding)}")
-    fresh_binding = ReplayGuard().bind_once(replay_entry, b"x")
+    fresh_binding = ReplayGuard().bind_once(sig_entry, b"x")
     print(f"  binding from another guard instance rejected: "
-          f"{not other.check(replay_entry, fresh_binding)}")
+          f"{not other.check(sig_entry, fresh_binding)}")
     timeless_guard = ReplayGuard()
-    timeless_binding = timeless_guard.bind_once(replay_entry, b"session-id-4")
+    timeless_binding = timeless_guard.bind_once(sig_entry, b"signature-session-4")
     print(f"  binding without expiry (expires_at=None) accepted at any now: "
-          f"{timeless_guard.check(replay_entry, timeless_binding, now=(1 << 64) - 1)}")
+          f"{timeless_guard.check(sig_entry, timeless_binding, now=(1 << 64) - 1)}")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        ReplayGuard().bind_once(
+            sig_entry, b"signature-session-5", expires_at=1 << 64
+        )
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong entry type: ", end="")
+    try:
+        ReplayGuard().bind_once("not-an-entry", b"signature-session-6")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
 
     print()
     print("per-instance replay protection for multi-key Schnorr batches (bind once, check once):")
+    sbr_prover = SchnorrProver(secret=0x5162, randbelow=counter_randbelow())
+    sbr_peer = SchnorrProver(
+        secret=8889, prime=104729, generator=5, randbelow=counter_randbelow()
+    )
+    sbr_local = [
+        MultiSchnorrEntry(
+            sbr_prover.public_key,
+            b"sbr-alpha",
+            sbr_prover.prove(b"sbr-alpha", context=b"sbr-batch"),
+            b"sbr-batch",
+        ),
+        MultiSchnorrEntry(
+            sbr_peer.public_key,
+            b"sbr-beta",
+            sbr_peer.prove(b"sbr-beta", context=b"sbr-batch"),
+            b"sbr-batch", 104729, 5,
+        ),
+    ]
     sbr = SchnorrBatchReplayGuard()
-    sbr_binding = sbr.bind_once(multi_batch, b"schnorr-batch-session-1", expires_at=10**12)
+    sbr_binding = sbr.bind_once(sbr_local, b"schnorr-batch-session-1", expires_at=10**12)
     print(f"  digest={sbr_binding.digest.hex()[:32]}…  expires_at={sbr_binding.expires_at}")
     print(f"  valid first check accepted: "
-          f"{sbr.check(multi_batch, sbr_binding, now=100, randbelow=counter_randbelow())}")
+          f"{sbr.check(sbr_local, sbr_binding, now=100, randbelow=counter_randbelow())}")
     print(f"  replay rejected: "
-          f"{not sbr.check(multi_batch, sbr_binding, now=101, randbelow=counter_randbelow())}")
+          f"{not sbr.check(sbr_local, sbr_binding, now=101, randbelow=counter_randbelow())}")
     other_sbr = SchnorrBatchReplayGuard()
-    other_sbr_binding = other_sbr.bind_once(multi_batch, b"schnorr-batch-session-2")
+    other_sbr_binding = other_sbr.bind_once(sbr_local, b"schnorr-batch-session-2")
     print(f"  reordered batch rejected without consuming the id: "
-          f"{not other_sbr.check(multi_batch[::-1], other_sbr_binding, now=1)}")
+          f"{not other_sbr.check(sbr_local[::-1], other_sbr_binding, now=1)}")
     print(f"  rejected id stays pending and later verifies: "
-          f"{other_sbr.check(multi_batch, other_sbr_binding, now=1, randbelow=counter_randbelow())}")
+          f"{other_sbr.check(sbr_local, other_sbr_binding, now=1, randbelow=counter_randbelow())}")
     try:
-        sbr.bind_once(multi_batch, b"schnorr-batch-session-1")
+        sbr.bind_once(sbr_local, b"schnorr-batch-session-1")
     except ValueError:
         print("  rebind of a consumed id rejected: True")
     else:
         print("  rebind of a consumed id rejected: False")
     foreign_sbr = SchnorrBatchReplayGuard()
-    foreign_sbr_binding = foreign_sbr.bind_once(multi_batch, b"schnorr-batch-session-3")
+    foreign_sbr_binding = foreign_sbr.bind_once(sbr_local, b"schnorr-batch-session-3")
     print(f"  binding from another guard instance rejected: "
-          f"{not other_sbr.check(multi_batch, foreign_sbr_binding, now=1)}")
+          f"{not other_sbr.check(sbr_local, foreign_sbr_binding, now=1)}")
+    print("  empty batch: ", end="")
+    try:
+        SchnorrBatchReplayGuard().bind_once([], b"schnorr-batch-session-4")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    bool_sbr_entry = dataclasses.replace(
+        sbr_local[0],
+        proof=SchnorrProof(sbr_local[0].proof.commitment, True),
+    )
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        SchnorrBatchReplayGuard().bind_once(
+            [bool_sbr_entry], b"schnorr-batch-session-5"
+        )
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
 
     print()
     print("per-instance replay protection for same-key Schnorr batches (bind once, check once):")
-    skbr = SingleKeyBatchGuard(prover.public_key)
-    skbr_binding = skbr.bind_once(batch, b"single-key-batch-session-1", expires_at=10**12)
+    skbr_prover = SchnorrProver(secret=0x5163, randbelow=counter_randbelow())
+    skbr_local = [
+        SchnorrBatchEntry(
+            b"skbr-alpha",
+            skbr_prover.prove(b"skbr-alpha", context=b"skbr-batch"),
+            context=b"skbr-batch",
+        ),
+        SchnorrBatchEntry(
+            b"skbr-beta",
+            skbr_prover.prove(b"skbr-beta", context=b"skbr-batch"),
+            context=b"skbr-batch",
+        ),
+    ]
+    skbr = SingleKeyBatchGuard(skbr_prover.public_key)
+    skbr_binding = skbr.bind_once(skbr_local, b"single-key-batch-session-1", expires_at=10**12)
     print(f"  digest={skbr_binding.digest.hex()[:32]}…  expires_at={skbr_binding.expires_at}")
     print(f"  valid first check accepted: "
-          f"{skbr.check(batch, skbr_binding, now=100, randbelow=counter_randbelow())}")
+          f"{skbr.check(skbr_local, skbr_binding, now=100, randbelow=counter_randbelow())}")
     print(f"  replay rejected: "
-          f"{not skbr.check(batch, skbr_binding, now=101, randbelow=counter_randbelow())}")
-    other_skbr = SingleKeyBatchGuard(prover.public_key)
-    other_skbr_binding = other_skbr.bind_once(batch, b"single-key-batch-session-2")
+          f"{not skbr.check(skbr_local, skbr_binding, now=101, randbelow=counter_randbelow())}")
+    other_skbr = SingleKeyBatchGuard(skbr_prover.public_key)
+    other_skbr_binding = other_skbr.bind_once(skbr_local, b"single-key-batch-session-2")
     print(f"  reordered batch rejected without consuming the id: "
-          f"{not other_skbr.check(batch[::-1], other_skbr_binding, now=1)}")
+          f"{not other_skbr.check(skbr_local[::-1], other_skbr_binding, now=1)}")
     print(f"  rejected id stays pending and later verifies: "
-          f"{other_skbr.check(batch, other_skbr_binding, now=1, randbelow=counter_randbelow())}")
+          f"{other_skbr.check(skbr_local, other_skbr_binding, now=1, randbelow=counter_randbelow())}")
     try:
-        skbr.bind_once(batch, b"single-key-batch-session-1")
+        skbr.bind_once(skbr_local, b"single-key-batch-session-1")
     except ValueError:
         print("  rebind of a consumed id rejected: True")
     else:
         print("  rebind of a consumed id rejected: False")
     wrong_key_skbr = SingleKeyBatchGuard(SchnorrProver(secret=0xC0FFEE).public_key)
-    wrong_key_binding = wrong_key_skbr.bind_once(batch, b"single-key-batch-session-3")
+    wrong_key_binding = wrong_key_skbr.bind_once(skbr_local, b"single-key-batch-session-3")
     print(f"  batch under the wrong key rejected without consuming the id: "
-          f"{not wrong_key_skbr.check(batch, wrong_key_binding, now=1, randbelow=counter_randbelow())}")
+          f"{not wrong_key_skbr.check(skbr_local, wrong_key_binding, now=1, randbelow=counter_randbelow())}")
+    print("  empty session id: ", end="")
+    try:
+        SingleKeyBatchGuard(skbr_prover.public_key).bind_once(skbr_local, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong batch type: ", end="")
+    try:
+        SingleKeyBatchGuard(skbr_prover.public_key).bind_once(
+            "not-a-batch", b"single-key-batch-session-4"
+        )
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("concurrent checks of one signature entry id (at most one winner):")
+    race_sig_prover = SchnorrProver(secret=0x5164, randbelow=counter_randbelow())
+    race_sig_entry = MultiSchnorrEntry(
+        race_sig_prover.public_key,
+        b"sig-race",
+        race_sig_prover.prove(b"sig-race", context=b"sig-race"),
+        b"sig-race",
+    )
+    race_sig = ReplayGuard()
+    race_sig_binding = race_sig.bind_once(
+        race_sig_entry, b"signature-entry-race", expires_at=10**12
+    )
+    print(f"  session_id={race_sig_binding.session_id!r}  "
+          f"digest={race_sig_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_sig_binding.expires_at}")
+    race_sig_results = []
+    race_sig_lock = threading.Lock()
+
+    def race_sig_attempt():
+        outcome = race_sig.check(race_sig_entry, race_sig_binding, now=100)
+        with race_sig_lock:
+            race_sig_results.append(outcome)
+
+    race_sig_threads = [threading.Thread(target=race_sig_attempt) for _ in range(8)]
+    for thread in race_sig_threads:
+        thread.start()
+    for thread in race_sig_threads:
+        thread.join()
+    race_sig_wins = sum(race_sig_results)
+    print(f"  {race_sig_wins} succeeded, {len(race_sig_results) - race_sig_wins} rejected")
+    race_sig_snapshot = dataclasses.replace(race_sig_entry)
+    race_sig_post = race_sig.check(race_sig_entry, race_sig_binding, now=100)
+    print(f"  rejected call returns {race_sig_post} and leaves the entry unchanged: "
+          f"{race_sig_snapshot == race_sig_entry}")
+
+    print()
+    print("concurrent checks of one multi-key signature batch id (at most one winner):")
+    race_sbr_prover = SchnorrProver(secret=0x5165, randbelow=counter_randbelow())
+    race_sbr_peer = SchnorrProver(
+        secret=8890, prime=104729, generator=5, randbelow=counter_randbelow()
+    )
+    race_sbr_entries = [
+        MultiSchnorrEntry(
+            race_sbr_prover.public_key,
+            b"sbr-race-alpha",
+            race_sbr_prover.prove(b"sbr-race-alpha", context=b"sbr-race"),
+            b"sbr-race",
+        ),
+        MultiSchnorrEntry(
+            race_sbr_peer.public_key,
+            b"sbr-race-beta",
+            race_sbr_peer.prove(b"sbr-race-beta", context=b"sbr-race"),
+            b"sbr-race", 104729, 5,
+        ),
+    ]
+    race_sbr = SchnorrBatchReplayGuard()
+    race_sbr_binding = race_sbr.bind_once(
+        race_sbr_entries, b"multi-key-signature-batch-race", expires_at=10**12
+    )
+    print(f"  session_id={race_sbr_binding.session_id!r}  "
+          f"digest={race_sbr_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_sbr_binding.expires_at}")
+    race_sbr_results = []
+    race_sbr_lock = threading.Lock()
+
+    def race_sbr_attempt():
+        outcome = race_sbr.check(
+            race_sbr_entries, race_sbr_binding, now=100,
+            randbelow=counter_randbelow(),
+        )
+        with race_sbr_lock:
+            race_sbr_results.append(outcome)
+
+    race_sbr_threads = [threading.Thread(target=race_sbr_attempt) for _ in range(8)]
+    for thread in race_sbr_threads:
+        thread.start()
+    for thread in race_sbr_threads:
+        thread.join()
+    race_sbr_wins = sum(race_sbr_results)
+    print(f"  {race_sbr_wins} succeeded, {len(race_sbr_results) - race_sbr_wins} rejected")
+    race_sbr_snapshot = list(race_sbr_entries)
+    race_sbr_post = race_sbr.check(
+        race_sbr_entries, race_sbr_binding, now=100, randbelow=counter_randbelow()
+    )
+    print(f"  rejected call returns {race_sbr_post} and leaves the batch unchanged: "
+          f"{race_sbr_snapshot == race_sbr_entries}")
+
+    print()
+    print("concurrent checks of one same-key signature batch id (at most one winner):")
+    race_skbr_prover = SchnorrProver(secret=0x5166, randbelow=counter_randbelow())
+    race_skbr_entries = [
+        SchnorrBatchEntry(
+            b"skbr-race-alpha",
+            race_skbr_prover.prove(b"skbr-race-alpha", context=b"skbr-race"),
+            context=b"skbr-race",
+        ),
+        SchnorrBatchEntry(
+            b"skbr-race-beta",
+            race_skbr_prover.prove(b"skbr-race-beta", context=b"skbr-race"),
+            context=b"skbr-race",
+        ),
+    ]
+    race_skbr = SingleKeyBatchGuard(race_skbr_prover.public_key)
+    race_skbr_binding = race_skbr.bind_once(
+        race_skbr_entries, b"same-key-signature-batch-race", expires_at=10**12
+    )
+    print(f"  session_id={race_skbr_binding.session_id!r}  "
+          f"digest={race_skbr_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_skbr_binding.expires_at}")
+    race_skbr_results = []
+    race_skbr_lock = threading.Lock()
+
+    def race_skbr_attempt():
+        outcome = race_skbr.check(
+            race_skbr_entries, race_skbr_binding, now=100,
+            randbelow=counter_randbelow(),
+        )
+        with race_skbr_lock:
+            race_skbr_results.append(outcome)
+
+    race_skbr_threads = [threading.Thread(target=race_skbr_attempt) for _ in range(8)]
+    for thread in race_skbr_threads:
+        thread.start()
+    for thread in race_skbr_threads:
+        thread.join()
+    race_skbr_wins = sum(race_skbr_results)
+    print(f"  {race_skbr_wins} succeeded, {len(race_skbr_results) - race_skbr_wins} rejected")
+    race_skbr_snapshot = list(race_skbr_entries)
+    race_skbr_post = race_skbr.check(
+        race_skbr_entries, race_skbr_binding, now=100, randbelow=counter_randbelow()
+    )
+    print(f"  rejected call returns {race_skbr_post} and leaves the batch unchanged: "
+          f"{race_skbr_snapshot == race_skbr_entries}")
+
+    print()
+    print("SQLite-backed signature entry replay state shared across instances and restarts:")
+    persist_sig_prover = SchnorrProver(secret=0x5167, randbelow=counter_randbelow())
+    persist_sig_entry = MultiSchnorrEntry(
+        persist_sig_prover.public_key,
+        b"sig-persist",
+        persist_sig_prover.prove(b"sig-persist", context=b"sig-persist"),
+        b"sig-persist",
+    )
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_sig_a = ReplayGuard(store=store)
+        persist_sig_binding = persist_sig_a.bind_once(
+            persist_sig_entry, b"signature-entry-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_sig_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_sig_a.check(persist_sig_entry, persist_sig_binding, now=100)}")
+        persist_sig_b = ReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_sig_b.check(persist_sig_entry, persist_sig_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_sig_c = ReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_sig_c.check(persist_sig_entry, persist_sig_binding, now=100)}")
+        reopened.close()
+
+    print()
+    print("SQLite-backed multi-key signature batch replay state shared across instances and restarts:")
+    persist_sbr_prover = SchnorrProver(secret=0x5168, randbelow=counter_randbelow())
+    persist_sbr_peer = SchnorrProver(
+        secret=8891, prime=104729, generator=5, randbelow=counter_randbelow()
+    )
+    persist_sbr_entries = [
+        MultiSchnorrEntry(
+            persist_sbr_prover.public_key,
+            b"sbr-persist-alpha",
+            persist_sbr_prover.prove(b"sbr-persist-alpha", context=b"sbr-persist"),
+            b"sbr-persist",
+        ),
+        MultiSchnorrEntry(
+            persist_sbr_peer.public_key,
+            b"sbr-persist-beta",
+            persist_sbr_peer.prove(b"sbr-persist-beta", context=b"sbr-persist"),
+            b"sbr-persist", 104729, 5,
+        ),
+    ]
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_sbr_a = SchnorrBatchReplayGuard(store=store)
+        persist_sbr_binding = persist_sbr_a.bind_once(
+            persist_sbr_entries, b"multi-key-signature-batch-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_sbr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_sbr_a.check(persist_sbr_entries, persist_sbr_binding, now=100, randbelow=counter_randbelow())}")
+        persist_sbr_b = SchnorrBatchReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_sbr_b.check(persist_sbr_entries, persist_sbr_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_sbr_c = SchnorrBatchReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_sbr_c.check(persist_sbr_entries, persist_sbr_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
+
+    print()
+    print("SQLite-backed same-key signature batch replay state shared across instances and restarts:")
+    persist_skbr_prover = SchnorrProver(secret=0x5169, randbelow=counter_randbelow())
+    persist_skbr_entries = [
+        SchnorrBatchEntry(
+            b"skbr-persist-alpha",
+            persist_skbr_prover.prove(b"skbr-persist-alpha", context=b"skbr-persist"),
+            context=b"skbr-persist",
+        ),
+        SchnorrBatchEntry(
+            b"skbr-persist-beta",
+            persist_skbr_prover.prove(b"skbr-persist-beta", context=b"skbr-persist"),
+            context=b"skbr-persist",
+        ),
+    ]
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_skbr_a = SingleKeyBatchGuard(persist_skbr_prover.public_key, store=store)
+        persist_skbr_binding = persist_skbr_a.bind_once(
+            persist_skbr_entries, b"same-key-signature-batch-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_skbr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_skbr_a.check(persist_skbr_entries, persist_skbr_binding, now=100, randbelow=counter_randbelow())}")
+        persist_skbr_b = SingleKeyBatchGuard(persist_skbr_prover.public_key, store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_skbr_b.check(persist_skbr_entries, persist_skbr_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_skbr_c = SingleKeyBatchGuard(persist_skbr_prover.public_key, store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_skbr_c.check(persist_skbr_entries, persist_skbr_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
 
     print()
     print("per-instance replay protection for range proofs (bind once, check once):")

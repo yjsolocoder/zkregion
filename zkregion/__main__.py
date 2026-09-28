@@ -92,6 +92,7 @@ from . import (
     prove_range_wide,
     prove_range_wide_batch_bound,
     prove_region,
+    prove_region_batch_bound,
     prove_region_contains_bound,
     prove_region_wide,
     prove_region_wide_batch_bound,
@@ -1179,34 +1180,70 @@ def main() -> int:
 
     print()
     print("per-instance replay protection for region batches (bind once, check once):")
+    rgbr_region = Region(0, 100, 0, 100)
+    rgbr_entries = []
+    for rgbr_x, rgbr_y, rgbr_x_seed, rgbr_y_seed in (
+        (15, 85, 301234, 311234),
+        (85, 15, 301235, 311235),
+        (60, 40, 301236, 311236),
+    ):
+        rgbr_xc, rgbr_xc_r = pedersen_commit(
+            rgbr_x, 0, 100, blinding=rgbr_x_seed
+        )
+        rgbr_yc, rgbr_yc_r = pedersen_commit(
+            rgbr_y, 0, 100, blinding=rgbr_y_seed
+        )
+        rgbr_bp = prove_region(
+            rgbr_xc, rgbr_yc, rgbr_x, rgbr_y,
+            rgbr_xc_r, rgbr_yc_r, rgbr_region, context=b"rgbr-instance",
+            randbelow=counter_randbelow(),
+        )
+        rgbr_entries.append(
+            RegionBatchEntry(rgbr_xc, rgbr_yc, rgbr_region, rgbr_bp, b"rgbr-instance")
+        )
     rgbr = RegionBatchReplayGuard()
-    rgbr_binding = rgbr.bind_once(batch_entries, b"region-batch-session-1", expires_at=10**12)
+    rgbr_binding = rgbr.bind_once(rgbr_entries, b"region-batch-session-1", expires_at=10**12)
     print(f"  digest={rgbr_binding.digest.hex()[:32]}…  expires_at={rgbr_binding.expires_at}")
     print(f"  valid first check accepted: "
-          f"{rgbr.check(batch_entries, rgbr_binding, now=100, randbelow=counter_randbelow())}")
+          f"{rgbr.check(rgbr_entries, rgbr_binding, now=100, randbelow=counter_randbelow())}")
     print(f"  replay rejected: "
-          f"{not rgbr.check(batch_entries, rgbr_binding, now=101, randbelow=counter_randbelow())}")
+          f"{not rgbr.check(rgbr_entries, rgbr_binding, now=101, randbelow=counter_randbelow())}")
     other_rgbr = RegionBatchReplayGuard()
-    other_rgbr_binding = other_rgbr.bind_once(batch_entries, b"region-batch-session-2")
+    other_rgbr_binding = other_rgbr.bind_once(rgbr_entries, b"region-batch-session-2")
     print(f"  reordered batch rejected without consuming the id: "
-          f"{not other_rgbr.check(batch_entries[::-1], other_rgbr_binding, now=1)}")
+          f"{not other_rgbr.check(rgbr_entries[::-1], other_rgbr_binding, now=1)}")
     print(f"  rejected id stays pending and later verifies: "
-          f"{other_rgbr.check(batch_entries, other_rgbr_binding, now=1, randbelow=counter_randbelow())}")
+          f"{other_rgbr.check(rgbr_entries, other_rgbr_binding, now=1, randbelow=counter_randbelow())}")
     try:
-        rgbr.bind_once(batch_entries, b"region-batch-session-1")
+        rgbr.bind_once(rgbr_entries, b"region-batch-session-1")
     except ValueError:
         print("  rebind of a consumed id rejected: True")
     else:
         print("  rebind of a consumed id rejected: False")
     foreign_rgbr = RegionBatchReplayGuard()
-    foreign_rgbr_binding = foreign_rgbr.bind_once(batch_entries, b"region-batch-session-3")
+    foreign_rgbr_binding = foreign_rgbr.bind_once(rgbr_entries, b"region-batch-session-3")
     print(f"  binding from another guard instance rejected: "
-          f"{not other_rgbr.check(batch_entries, foreign_rgbr_binding, now=1)}")
+          f"{not other_rgbr.check(rgbr_entries, foreign_rgbr_binding, now=1)}")
 
     print()
     print("per-instance replay protection for region proofs (bind once, check once):")
+    rg_region = Region(0, 100, 0, 100)
+    rg_entries = []
+    for rg_x, rg_y, rg_x_seed, rg_y_seed in (
+        (25, 75, 321234, 331234),
+        (75, 25, 321235, 331235),
+    ):
+        rg_xc, rg_xc_r = pedersen_commit(rg_x, 0, 100, blinding=rg_x_seed)
+        rg_yc, rg_yc_r = pedersen_commit(rg_y, 0, 100, blinding=rg_y_seed)
+        rg_bp = prove_region(
+            rg_xc, rg_yc, rg_x, rg_y, rg_xc_r, rg_yc_r, rg_region,
+            context=b"rg-instance", randbelow=counter_randbelow(),
+        )
+        rg_entries.append(
+            RegionBatchEntry(rg_xc, rg_yc, rg_region, rg_bp, b"rg-instance")
+        )
     region_guard = RegionReplayGuard()
-    region_replay_entry = batch_entries[0]
+    region_replay_entry = rg_entries[0]
     region_binding = region_guard.bind_once(
         region_replay_entry, b"region-session-1", expires_at=10**12
     )
@@ -1216,7 +1253,7 @@ def main() -> int:
     print(f"  replay rejected: "
           f"{not region_guard.check(region_replay_entry, region_binding, now=101)}")
     other_region = RegionReplayGuard()
-    bound_entry = batch_entries[1]
+    bound_entry = rg_entries[1]
     other_region_binding = other_region.bind_once(bound_entry, b"region-session-2")
     forged_region_entry = dataclasses.replace(
         bound_entry,
@@ -1231,23 +1268,42 @@ def main() -> int:
 
     print()
     print("per-instance replay protection for bound region batches (bind once, check once):")
+    brg_region = Region(0, 100, 0, 100)
+    brg_entries = []
+    for brg_x, brg_y, brg_x_seed, brg_y_seed in (
+        (30, 70, 341234, 351234),
+        (90, 10, 341235, 351235),
+    ):
+        brg_xc, brg_xc_r = pedersen_commit(brg_x, 0, 100, blinding=brg_x_seed)
+        brg_yc, brg_yc_r = pedersen_commit(brg_y, 0, 100, blinding=brg_y_seed)
+        brg_bp = prove_region(
+            brg_xc, brg_yc, brg_x, brg_y, brg_xc_r, brg_yc_r,
+            brg_region, context=b"brg-instance", randbelow=counter_randbelow(),
+        )
+        brg_entries.append(
+            RegionBatchEntry(brg_xc, brg_yc, brg_region, brg_bp, b"brg-instance")
+        )
+    brg_leaves = [bound_region_leaf(entry) for entry in brg_entries]
+    brg_root = merkle_root(brg_leaves)
+    brg_multi = prove_multi_inclusion(brg_leaves, tuple(range(len(brg_entries))))
+    brg_bound = BoundRegionBatch(tuple(brg_entries), len(brg_entries), brg_multi)
     brg = BoundRegionReplayGuard()
-    brg_binding = brg.bind_once(region_bound, region_root, b"bound-region-session-1", expires_at=10**12)
+    brg_binding = brg.bind_once(brg_bound, brg_root, b"bound-region-session-1", expires_at=10**12)
     print(f"  digest={brg_binding.digest.hex()[:32]}…  expires_at={brg_binding.expires_at}")
     print(f"  valid first check accepted: "
-          f"{brg.check(region_bound, region_root, brg_binding, now=100, randbelow=counter_randbelow())}")
+          f"{brg.check(brg_bound, brg_root, brg_binding, now=100, randbelow=counter_randbelow())}")
     print(f"  replay rejected: "
-          f"{not brg.check(region_bound, region_root, brg_binding, now=101, randbelow=counter_randbelow())}")
+          f"{not brg.check(brg_bound, brg_root, brg_binding, now=101, randbelow=counter_randbelow())}")
     other_brg = BoundRegionReplayGuard()
-    other_brg_binding = other_brg.bind_once(region_bound, region_root, b"bound-region-session-2")
+    other_brg_binding = other_brg.bind_once(brg_bound, brg_root, b"bound-region-session-2")
     print(f"  wrong root rejected without consuming the id: "
-          f"{not other_brg.check(region_bound, merkle_root(region_leaves[:1]), other_brg_binding, now=1)}")
+          f"{not other_brg.check(brg_bound, merkle_root(brg_leaves[:1]), other_brg_binding, now=1)}")
     print(f"  rejected id stays pending and later verifies: "
-          f"{other_brg.check(region_bound, region_root, other_brg_binding, now=1, randbelow=counter_randbelow())}")
+          f"{other_brg.check(brg_bound, brg_root, other_brg_binding, now=1, randbelow=counter_randbelow())}")
     foreign_brg = BoundRegionReplayGuard()
-    foreign_binding = foreign_brg.bind_once(region_bound, region_root, b"bound-region-session-3")
+    foreign_binding = foreign_brg.bind_once(brg_bound, brg_root, b"bound-region-session-3")
     print(f"  binding from another guard instance rejected: "
-          f"{not other_brg.check(region_bound, region_root, foreign_binding, now=1)}")
+          f"{not other_brg.check(brg_bound, brg_root, foreign_binding, now=1)}")
 
     print()
     print("per-instance replay protection for bound range batches (bind once, check once):")
@@ -4134,6 +4190,313 @@ def main() -> int:
         persist_brr_c = BoundRangeReplayGuard(store=reopened)
         print(f"  after restart the consumed id is still rejected: "
               f"{not persist_brr_c.check(persist_brr_bound, persist_brr_root, persist_brr_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
+
+    print()
+    print("concurrent checks of one region-proof id per guard (at most one winner):")
+    race_rg_region = Region(0, 100, 0, 100)
+    race_rg_xc, race_rg_xc_r = pedersen_commit(20, 0, 100, blinding=401234)
+    race_rg_yc, race_rg_yc_r = pedersen_commit(80, 0, 100, blinding=411234)
+    race_rg_entry = RegionBatchEntry(
+        race_rg_xc,
+        race_rg_yc,
+        race_rg_region,
+        prove_region(
+            race_rg_xc, race_rg_yc, 20, 80,
+            race_rg_xc_r, race_rg_yc_r, race_rg_region,
+            context=b"rg-race", randbelow=counter_randbelow(),
+        ),
+        b"rg-race",
+    )
+    race_rg = RegionReplayGuard()
+    race_rg_binding = race_rg.bind_once(
+        race_rg_entry, b"region-proof-race", expires_at=10**12
+    )
+    race_rg_results = []
+    race_rg_lock = threading.Lock()
+
+    def race_rg_attempt():
+        outcome = race_rg.check(race_rg_entry, race_rg_binding, now=100)
+        with race_rg_lock:
+            race_rg_results.append(outcome)
+
+    race_rg_threads = [threading.Thread(target=race_rg_attempt) for _ in range(8)]
+    for thread in race_rg_threads:
+        thread.start()
+    for thread in race_rg_threads:
+        thread.join()
+    print(f"  region proof guard session_id={race_rg_binding.session_id!r}")
+    print(f"  {sum(race_rg_results)} succeeded, "
+          f"{len(race_rg_results) - sum(race_rg_results)} rejected")
+    race_rg_snapshot = dataclasses.replace(race_rg_entry)
+    race_rg_post = race_rg.check(race_rg_entry, race_rg_binding, now=100)
+    print(f"  rejected call returns {race_rg_post} and leaves the entry unchanged: "
+          f"{race_rg_snapshot == race_rg_entry}")
+    print("  empty session id: ", end="")
+    try:
+        RegionReplayGuard().bind_once(race_rg_entry, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        RegionReplayGuard().bind_once(
+            race_rg_entry, b"region-proof-race-error-1", expires_at=1 << 64
+        )
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+
+    race_rgbr_entries = []
+    for race_rgbr_x, race_rgbr_y, race_rgbr_x_seed, race_rgbr_y_seed in (
+        (35, 65, 421234, 431234),
+        (65, 35, 421235, 431235),
+    ):
+        race_rgbr_xc, race_rgbr_xc_r = pedersen_commit(
+            race_rgbr_x, 0, 100, blinding=race_rgbr_x_seed
+        )
+        race_rgbr_yc, race_rgbr_yc_r = pedersen_commit(
+            race_rgbr_y, 0, 100, blinding=race_rgbr_y_seed
+        )
+        race_rgbr_bp = prove_region(
+            race_rgbr_xc, race_rgbr_yc, race_rgbr_x, race_rgbr_y,
+            race_rgbr_xc_r, race_rgbr_yc_r, race_rg_region,
+            context=b"rgbr-race", randbelow=counter_randbelow(),
+        )
+        race_rgbr_entries.append(
+            RegionBatchEntry(
+                race_rgbr_xc, race_rgbr_yc, race_rg_region,
+                race_rgbr_bp, b"rgbr-race",
+            )
+        )
+    race_rgbr = RegionBatchReplayGuard()
+    race_rgbr_binding = race_rgbr.bind_once(
+        race_rgbr_entries, b"region-batch-race", expires_at=10**12
+    )
+    race_rgbr_results = []
+    race_rgbr_lock = threading.Lock()
+
+    def race_rgbr_attempt():
+        outcome = race_rgbr.check(
+            race_rgbr_entries, race_rgbr_binding, now=100,
+            randbelow=counter_randbelow(),
+        )
+        with race_rgbr_lock:
+            race_rgbr_results.append(outcome)
+
+    race_rgbr_threads = [threading.Thread(target=race_rgbr_attempt) for _ in range(8)]
+    for thread in race_rgbr_threads:
+        thread.start()
+    for thread in race_rgbr_threads:
+        thread.join()
+    print(f"  region batch guard session_id={race_rgbr_binding.session_id!r}")
+    print(f"  {sum(race_rgbr_results)} succeeded, "
+          f"{len(race_rgbr_results) - sum(race_rgbr_results)} rejected")
+    race_rgbr_snapshot = list(race_rgbr_entries)
+    race_rgbr_post = race_rgbr.check(
+        race_rgbr_entries, race_rgbr_binding, now=100,
+        randbelow=counter_randbelow(),
+    )
+    print(f"  rejected call returns {race_rgbr_post} and leaves the batch unchanged: "
+          f"{race_rgbr_snapshot == race_rgbr_entries}")
+    print("  empty batch: ", end="")
+    try:
+        RegionBatchReplayGuard().bind_once([], b"region-batch-race-error-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    race_rgbr_bool_entry = dataclasses.replace(
+        race_rgbr_entries[0], region=Region(
+            True, race_rg_region.max_x,
+            race_rg_region.min_y, race_rg_region.max_y,
+        )
+    )
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        RegionBatchReplayGuard().bind_once(
+            [race_rgbr_bool_entry], b"region-batch-race-error-2"
+        )
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    race_brg_entries = []
+    for race_brg_x, race_brg_y, race_brg_x_seed, race_brg_y_seed in (
+        (45, 55, 441234, 451234),
+        (5, 95, 441235, 451235),
+    ):
+        race_brg_xc, race_brg_xc_r = pedersen_commit(
+            race_brg_x, 0, 100, blinding=race_brg_x_seed
+        )
+        race_brg_yc, race_brg_yc_r = pedersen_commit(
+            race_brg_y, 0, 100, blinding=race_brg_y_seed
+        )
+        race_brg_bp = prove_region(
+            race_brg_xc, race_brg_yc, race_brg_x, race_brg_y,
+            race_brg_xc_r, race_brg_yc_r, race_rg_region,
+            context=b"brg-race", randbelow=counter_randbelow(),
+        )
+        race_brg_entries.append(
+            RegionBatchEntry(
+                race_brg_xc, race_brg_yc, race_rg_region,
+                race_brg_bp, b"brg-race",
+            )
+        )
+    race_brg_bound, race_brg_root = prove_region_batch_bound(
+        race_brg_entries, randbelow=counter_randbelow()
+    )
+    race_brg = BoundRegionReplayGuard()
+    race_brg_binding = race_brg.bind_once(
+        race_brg_bound, race_brg_root, b"bound-region-race", expires_at=10**12
+    )
+    race_brg_results = []
+    race_brg_lock = threading.Lock()
+
+    def race_brg_attempt():
+        outcome = race_brg.check(
+            race_brg_bound, race_brg_root, race_brg_binding,
+            now=100, randbelow=counter_randbelow(),
+        )
+        with race_brg_lock:
+            race_brg_results.append(outcome)
+
+    race_brg_threads = [threading.Thread(target=race_brg_attempt) for _ in range(8)]
+    for thread in race_brg_threads:
+        thread.start()
+    for thread in race_brg_threads:
+        thread.join()
+    print(f"  bound region batch guard session_id={race_brg_binding.session_id!r}")
+    print(f"  {sum(race_brg_results)} succeeded, "
+          f"{len(race_brg_results) - sum(race_brg_results)} rejected")
+    race_brg_snapshot = dataclasses.replace(race_brg_bound)
+    race_brg_root_snapshot = bytes(race_brg_root)
+    race_brg_post = race_brg.check(
+        race_brg_bound, race_brg_root, race_brg_binding,
+        now=100, randbelow=counter_randbelow(),
+    )
+    print(f"  rejected call returns {race_brg_post} and leaves the batch and root unchanged: "
+          f"{race_brg_snapshot == race_brg_bound and race_brg_root_snapshot == race_brg_root}")
+
+    print()
+    print("SQLite-backed region replay state shared across instances and restarts:")
+    persist_rg_region = Region(0, 100, 0, 100)
+    persist_rg_xc, persist_rg_xc_r = pedersen_commit(22, 0, 100, blinding=461234)
+    persist_rg_yc, persist_rg_yc_r = pedersen_commit(78, 0, 100, blinding=471234)
+    persist_rg_entry = RegionBatchEntry(
+        persist_rg_xc,
+        persist_rg_yc,
+        persist_rg_region,
+        prove_region(
+            persist_rg_xc, persist_rg_yc, 22, 78,
+            persist_rg_xc_r, persist_rg_yc_r, persist_rg_region,
+            context=b"rg-persist", randbelow=counter_randbelow(),
+        ),
+        b"rg-persist",
+    )
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_rg_a = RegionReplayGuard(store=store)
+        persist_rg_binding = persist_rg_a.bind_once(
+            persist_rg_entry, b"region-proof-persist", expires_at=10**12
+        )
+        print(f"  region proof guard session_id={persist_rg_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_rg_a.check(persist_rg_entry, persist_rg_binding, now=100)}")
+        persist_rg_b = RegionReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_rg_b.check(persist_rg_entry, persist_rg_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_rg_c = RegionReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_rg_c.check(persist_rg_entry, persist_rg_binding, now=100)}")
+        reopened.close()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_rgbr_entries = []
+        for persist_x, persist_y, persist_x_seed, persist_y_seed in (
+            (33, 67, 481234, 491234),
+            (77, 23, 481235, 491235),
+        ):
+            persist_xc, persist_xc_r = pedersen_commit(
+                persist_x, 0, 100, blinding=persist_x_seed
+            )
+            persist_yc, persist_yc_r = pedersen_commit(
+                persist_y, 0, 100, blinding=persist_y_seed
+            )
+            persist_bp = prove_region(
+                persist_xc, persist_yc, persist_x, persist_y,
+                persist_xc_r, persist_yc_r, persist_rg_region,
+                context=b"rgbr-persist", randbelow=counter_randbelow(),
+            )
+            persist_rgbr_entries.append(
+                RegionBatchEntry(
+                    persist_xc, persist_yc, persist_rg_region,
+                    persist_bp, b"rgbr-persist",
+                )
+            )
+        persist_rgbr_a = RegionBatchReplayGuard(store=store)
+        persist_rgbr_binding = persist_rgbr_a.bind_once(
+            persist_rgbr_entries, b"region-batch-persist", expires_at=10**12
+        )
+        print(f"  region batch guard session_id={persist_rgbr_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_rgbr_a.check(persist_rgbr_entries, persist_rgbr_binding, now=100, randbelow=counter_randbelow())}")
+        persist_rgbr_b = RegionBatchReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_rgbr_b.check(persist_rgbr_entries, persist_rgbr_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_rgbr_c = RegionBatchReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_rgbr_c.check(persist_rgbr_entries, persist_rgbr_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_brg_entries = []
+        for persist_x, persist_y, persist_x_seed, persist_y_seed in (
+            (44, 56, 501234, 511234),
+            (12, 88, 501235, 511235),
+        ):
+            persist_xc, persist_xc_r = pedersen_commit(
+                persist_x, 0, 100, blinding=persist_x_seed
+            )
+            persist_yc, persist_yc_r = pedersen_commit(
+                persist_y, 0, 100, blinding=persist_y_seed
+            )
+            persist_bp = prove_region(
+                persist_xc, persist_yc, persist_x, persist_y,
+                persist_xc_r, persist_yc_r, persist_rg_region,
+                context=b"brg-persist", randbelow=counter_randbelow(),
+            )
+            persist_brg_entries.append(
+                RegionBatchEntry(
+                    persist_xc, persist_yc, persist_rg_region,
+                    persist_bp, b"brg-persist",
+                )
+            )
+        persist_brg_bound, persist_brg_root = prove_region_batch_bound(
+            persist_brg_entries, randbelow=counter_randbelow()
+        )
+        persist_brg_a = BoundRegionReplayGuard(store=store)
+        persist_brg_binding = persist_brg_a.bind_once(
+            persist_brg_bound, persist_brg_root,
+            b"bound-region-persist", expires_at=10**12,
+        )
+        print(f"  bound region batch guard session_id={persist_brg_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_brg_a.check(persist_brg_bound, persist_brg_root, persist_brg_binding, now=100, randbelow=counter_randbelow())}")
+        persist_brg_b = BoundRegionReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_brg_b.check(persist_brg_bound, persist_brg_root, persist_brg_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_brg_c = BoundRegionReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_brg_c.check(persist_brg_bound, persist_brg_root, persist_brg_binding, now=100, randbelow=counter_randbelow())}")
         reopened.close()
     return 0
 

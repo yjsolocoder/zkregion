@@ -89,6 +89,7 @@ from . import (
     prove_inclusion,
     prove_multi_inclusion,
     prove_range,
+    prove_range_batch_bound,
     prove_range_wide,
     prove_range_wide_batch_bound,
     prove_region,
@@ -1268,6 +1269,302 @@ def main() -> int:
     foreign_brr_binding = foreign_brr.bind_once(range_bound, range_root, b"bound-range-session-3")
     print(f"  binding from another guard instance rejected: "
           f"{not other_brr.check(range_bound, range_root, foreign_brr_binding, now=1)}")
+
+    print()
+    print("range proofs, batch entries and a bound complete batch (public entry points):")
+    rp_lower, rp_upper = 0, 100
+    rp_entries = []
+    for rp_value in (10, 40, 90):
+        rp_commitment, rp_blinding = pedersen_commit(
+            rp_value, rp_lower, rp_upper, blinding=41000 + rp_value
+        )
+        rp_proof = prove_range(
+            rp_commitment, rp_value, rp_blinding, b"range-guard-demo",
+            randbelow=counter_randbelow(),
+        )
+        rp_entries.append(RangeBatchEntry(rp_commitment, rp_proof, b"range-guard-demo"))
+    rp_entry = rp_entries[0]
+    rp_bound, rp_outer_root = prove_range_batch_bound(
+        rp_entries, randbelow=counter_randbelow()
+    )
+    print(f"  declared range [{rp_lower}, {rp_upper}]  "
+          f"{len(rp_entries)} non-empty batch entries")
+    print(f"  single entry context={rp_entry.context!r}  "
+          f"branches per proof={len(rp_entry.proof.t)}")
+    print(f"  complete batch plus outer Merkle root from the public constructor: "
+          f"{rp_outer_root.hex()[:32]}…")
+
+    print()
+    print("concurrent checks of one range proof id (at most one winner):")
+    race_rp = RangeReplayGuard()
+    race_rp_binding = race_rp.bind_once(
+        rp_entry, b"range-proof-race", expires_at=10**12
+    )
+    print(f"  session_id={race_rp_binding.session_id!r}  "
+          f"digest={race_rp_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_rp_binding.expires_at}")
+    race_rp_results = []
+    race_rp_lock = threading.Lock()
+
+    def race_rp_attempt():
+        outcome = race_rp.check(rp_entry, race_rp_binding, now=100)
+        with race_rp_lock:
+            race_rp_results.append(outcome)
+
+    race_rp_threads = [threading.Thread(target=race_rp_attempt) for _ in range(8)]
+    for thread in race_rp_threads:
+        thread.start()
+    for thread in race_rp_threads:
+        thread.join()
+    race_rp_wins = sum(race_rp_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_rp_wins} succeeded, {len(race_rp_results) - race_rp_wins} rejected")
+    race_rp_snapshot = dataclasses.replace(rp_entry)
+    race_rp_post = race_rp.check(rp_entry, race_rp_binding, now=100)
+    print(f"  rejected call returns {race_rp_post} and leaves the entry unchanged: "
+          f"{race_rp_snapshot == rp_entry}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        race_rp.bind_once(rp_entry, b"range-proof-race")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    fresh_rp = RangeReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_rp.bind_once(rp_entry, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_rp.bind_once(rp_entry, b"range-proof-session-1", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong entry type: ", end="")
+    try:
+        fresh_rp.bind_once("not-an-entry", b"range-proof-session-2")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_rp_entry = dataclasses.replace(
+        rp_entry, commitment=dataclasses.replace(rp_entry.commitment, lower=True)
+    )
+    print("  boolean posing as an integer field: ", end="")
+    try:
+        fresh_rp.bind_once(bool_rp_entry, b"range-proof-session-3")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("SQLite-backed range proof replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_rp_a = RangeReplayGuard(store=store)
+        persist_rp_binding = persist_rp_a.bind_once(
+            rp_entry, b"range-proof-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_rp_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_rp_a.check(rp_entry, persist_rp_binding, now=100)}")
+        persist_rp_b = RangeReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_rp_b.check(rp_entry, persist_rp_binding, now=100)}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_rp_c = RangeReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_rp_c.check(rp_entry, persist_rp_binding, now=100)}")
+        reopened.close()
+
+    print()
+    print("concurrent checks of one range batch id (at most one winner):")
+    race_rpb = RangeBatchReplayGuard()
+    race_rpb_binding = race_rpb.bind_once(
+        rp_entries, b"range-batch-race", expires_at=10**12
+    )
+    print(f"  session_id={race_rpb_binding.session_id!r}  "
+          f"digest={race_rpb_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_rpb_binding.expires_at}")
+    race_rpb_results = []
+    race_rpb_lock = threading.Lock()
+
+    def race_rpb_attempt():
+        outcome = race_rpb.check(
+            rp_entries, race_rpb_binding, now=100, randbelow=counter_randbelow()
+        )
+        with race_rpb_lock:
+            race_rpb_results.append(outcome)
+
+    race_rpb_threads = [threading.Thread(target=race_rpb_attempt) for _ in range(8)]
+    for thread in race_rpb_threads:
+        thread.start()
+    for thread in race_rpb_threads:
+        thread.join()
+    race_rpb_wins = sum(race_rpb_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_rpb_wins} succeeded, {len(race_rpb_results) - race_rpb_wins} rejected")
+    race_rpb_snapshot = list(rp_entries)
+    race_rpb_post = race_rpb.check(
+        rp_entries, race_rpb_binding, now=100, randbelow=counter_randbelow()
+    )
+    print(f"  rejected call returns {race_rpb_post} and leaves the batch unchanged: "
+          f"{race_rpb_snapshot == rp_entries}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        race_rpb.bind_once(rp_entries, b"range-batch-race")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    fresh_rpb = RangeBatchReplayGuard()
+    print("  empty batch: ", end="")
+    try:
+        fresh_rpb.bind_once([], b"range-batch-session-1")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  empty session id: ", end="")
+    try:
+        fresh_rpb.bind_once(rp_entries, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_rpb.bind_once(rp_entries, b"range-batch-session-2", expires_at=1 << 64)
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong batch type: ", end="")
+    try:
+        fresh_rpb.bind_once("not-a-batch", b"range-batch-session-3")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+    bool_rpb_entry = dataclasses.replace(
+        rp_entry, proof=RangeProof(
+            rp_entry.proof.t,
+            rp_entry.proof.e,
+            rp_entry.proof.s[:-1] + (True,),
+        )
+    )
+    print("  boolean posing as a nested proof integer: ", end="")
+    try:
+        fresh_rpb.bind_once([bool_rpb_entry], b"range-batch-session-4")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("concurrent checks of one bound range batch id (at most one winner):")
+    race_brp = BoundRangeReplayGuard()
+    race_brp_binding = race_brp.bind_once(
+        rp_bound, rp_outer_root, b"bound-range-batch-race", expires_at=10**12
+    )
+    print(f"  session_id={race_brp_binding.session_id!r}  "
+          f"digest={race_brp_binding.digest.hex()[:32]}…  "
+          f"expires_at={race_brp_binding.expires_at}")
+    race_brp_results = []
+    race_brp_lock = threading.Lock()
+
+    def race_brp_attempt():
+        outcome = race_brp.check(
+            rp_bound, rp_outer_root, race_brp_binding,
+            now=100, randbelow=counter_randbelow(),
+        )
+        with race_brp_lock:
+            race_brp_results.append(outcome)
+
+    race_brp_threads = [threading.Thread(target=race_brp_attempt) for _ in range(8)]
+    for thread in race_brp_threads:
+        thread.start()
+    for thread in race_brp_threads:
+        thread.join()
+    race_brp_wins = sum(race_brp_results)
+    print(f"  8 overlapping checks of the same id: "
+          f"{race_brp_wins} succeeded, {len(race_brp_results) - race_brp_wins} rejected")
+    race_brp_snapshot = dataclasses.replace(rp_bound)
+    race_brp_root_snapshot = bytes(rp_outer_root)
+    race_brp_post = race_brp.check(
+        rp_bound, rp_outer_root, race_brp_binding,
+        now=100, randbelow=counter_randbelow(),
+    )
+    print(f"  rejected call returns {race_brp_post} and leaves the batch and root unchanged: "
+          f"{race_brp_snapshot == rp_bound and race_brp_root_snapshot == rp_outer_root}")
+    print("  consumed id cannot be rebound: ", end="")
+    try:
+        race_brp.bind_once(rp_bound, rp_outer_root, b"bound-range-batch-race")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    fresh_brp = BoundRangeReplayGuard()
+    print("  empty session id: ", end="")
+    try:
+        fresh_brp.bind_once(rp_bound, rp_outer_root, b"")
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  expiry beyond uint64: ", end="")
+    try:
+        fresh_brp.bind_once(
+            rp_bound, rp_outer_root, b"bound-range-batch-session-1", expires_at=1 << 64
+        )
+        print("no error (unexpected)")
+    except ValueError:
+        print("ValueError")
+    print("  wrong batch type: ", end="")
+    try:
+        fresh_brp.bind_once("not-a-batch", rp_outer_root, b"bound-range-batch-session-2")
+        print("no error (unexpected)")
+    except TypeError:
+        print("TypeError")
+
+    print()
+    print("SQLite-backed range batch replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_rpb_a = RangeBatchReplayGuard(store=store)
+        persist_rpb_binding = persist_rpb_a.bind_once(
+            rp_entries, b"range-batch-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_rpb_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_rpb_a.check(rp_entries, persist_rpb_binding, now=100, randbelow=counter_randbelow())}")
+        persist_rpb_b = RangeBatchReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_rpb_b.check(rp_entries, persist_rpb_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_rpb_c = RangeBatchReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_rpb_c.check(rp_entries, persist_rpb_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
+
+    print()
+    print("SQLite-backed bound range batch replay state shared across instances and restarts:")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store_path = os.path.join(tmp_dir, "replay.db")
+        store = SQLiteReplayStore(store_path)
+        persist_brp_a = BoundRangeReplayGuard(store=store)
+        persist_brp_binding = persist_brp_a.bind_once(
+            rp_bound, rp_outer_root, b"bound-range-batch-persist", expires_at=10**12
+        )
+        print(f"  session_id={persist_brp_binding.session_id!r}")
+        print(f"  valid first check accepted: "
+              f"{persist_brp_a.check(rp_bound, rp_outer_root, persist_brp_binding, now=100, randbelow=counter_randbelow())}")
+        persist_brp_b = BoundRangeReplayGuard(store=store)
+        print(f"  second instance rejects the consumed id: "
+              f"{not persist_brp_b.check(rp_bound, rp_outer_root, persist_brp_binding, now=100, randbelow=counter_randbelow())}")
+        store.close()
+        reopened = SQLiteReplayStore(store_path)
+        persist_brp_c = BoundRangeReplayGuard(store=reopened)
+        print(f"  after restart the consumed id is still rejected: "
+              f"{not persist_brp_c.check(rp_bound, rp_outer_root, persist_brp_binding, now=100, randbelow=counter_randbelow())}")
+        reopened.close()
 
     print()
     print("per-instance replay protection for bound Schnorr batches (bind once, check once):")

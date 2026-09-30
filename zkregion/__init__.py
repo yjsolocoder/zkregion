@@ -21,6 +21,8 @@ BoundWideRangeBatch / prove_range_wide_batch_bound /
 verify_range_wide_batch_bound /
 prove_region / verify_region / region_contains_committed /
 RegionWideProof / prove_region_wide / verify_region_wide /
+RegionProofBundle / encode_region_proof_bundle /
+decode_region_proof_bundle / verify_region_proof_bundle /
 RegionWideBatchEntry / verify_region_wide_batch /
 BoundRegionWideBatch / prove_region_wide_batch_bound /
 verify_region_wide_batch_bound /
@@ -161,6 +163,7 @@ __all__ = [
     "RegionContainsEntry",
     "RegionContainsReplayGuard",
     "RegionProof",
+    "RegionProofBundle",
     "RegionReplayGuard",
     "RegionWideBatchEntry",
     "RegionWideBatchReplayGuard",
@@ -184,6 +187,8 @@ __all__ = [
     "WideRangeReplayGuard",
     "commit",
     "commit_coordinate",
+    "decode_region_proof_bundle",
+    "encode_region_proof_bundle",
     "merkle_root",
     "pedersen_commit",
     "prove_consistency",
@@ -237,6 +242,7 @@ __all__ = [
     "verify_region_bound",
     "verify_region_contains_batch",
     "verify_region_contains_bound",
+    "verify_region_proof_bundle",
     "verify_region_wide",
     "verify_region_wide_batch",
     "verify_region_wide_batch_bound",
@@ -2697,6 +2703,550 @@ def verify_region_wide(
         proof.y_proof,
         _region_sub_context(b"y", context, region, x_commitment, y_commitment),
     )
+
+
+# ---------------------------------------------------------------------------
+# Canonical binary envelope for cross-process region proof transport
+#
+# A RegionProofBundle freezes the five verification-relevant objects (both
+# PedersenCommitment objects, the Region, the external context and the
+# RegionProof / RegionWideProof) into a self-describing byte string. The wire
+# format is versioned and proof-type tagged; every integer (including
+# arbitrary-precision and negative group fields and region bounds), byte
+# string, tuple and nested structure is unambiguously length-prefixed, so the
+# payload can be rebuilt field-for-field without any out-of-band schema.
+#
+# Layout (all integers in the framing headers are unsigned big-endian):
+#
+#   magic (4) || version (1) || proof_type (1)
+#   frame(x_commitment) || frame(y_commitment) || frame(region)
+#   frame(context) || frame(proof)
+#
+# frame(x) = uint32be(len(body)) || body. Integers use a sign-prefixed
+# shortest big-endian body (1 = non-negative, 255 = negative, then the
+# shortest big-endian magnitude, so zero encodes as 01 00). Structured
+# bodies carry an explicit tuple cardinality; the one-byte proof-type tag
+# in the header makes RegionProof and RegionWideProof byte-distinguishable,
+# and the proof body is always the two axis sub-proofs in (x, y) order.
+
+_BUNDLE_MAGIC = b"zrgn"
+_BUNDLE_VERSION = 1
+_BUNDLE_PROOF_TYPE_REGION = 1
+_BUNDLE_PROOF_TYPE_REGION_WIDE = 2
+_INT_SIGN_POSITIVE = 1
+_INT_SIGN_NEGATIVE = 255
+
+
+@dataclass(frozen=True)
+class RegionProofBundle:
+    """A versioned, canonical binary envelope for one region proof.
+
+    Fields, in the fixed wire order: ``x_commitment`` / ``y_commitment``
+    (:class:`PedersenCommitment`), ``region`` (:class:`Region`),
+    ``context`` (``bytes``) and ``proof`` (a :class:`RegionProof` or
+    :class:`RegionWideProof`). Bundles are positional construction
+    arguments, compare by value and are immutable; construction performs no
+    validation — use :func:`encode_region_proof_bundle` /
+    :func:`verify_region_proof_bundle` to check.
+    """
+
+    x_commitment: PedersenCommitment
+    y_commitment: PedersenCommitment
+    region: Region
+    context: bytes
+    proof: RegionProof | RegionWideProof
+
+
+def _bundle_frame(body: bytes) -> bytes:
+    """One length-prefixed envelope item: four-byte big-endian length plus body."""
+    return len(body).to_bytes(4, "big") + body
+
+
+def _bundle_int(value: int) -> bytes:
+    """Canonical signed arbitrary-precision integer body (no length frame)."""
+    sign = _INT_SIGN_POSITIVE if value >= 0 else _INT_SIGN_NEGATIVE
+    magnitude = abs(value)
+    return bytes((sign,)) + magnitude.to_bytes(
+        max(1, (magnitude.bit_length() + 7) // 8), "big"
+    )
+
+
+def _bundle_tuple(items: Sequence[bytes]) -> bytes:
+    """A tuple body: four-byte cardinality followed by the framed items."""
+    body = len(items).to_bytes(4, "big")
+    for item in items:
+        body += _bundle_frame(item)
+    return body
+
+
+def _bundle_commitment(commitment: PedersenCommitment) -> bytes:
+    """A PedersenCommitment body: its six integer fields, in field order."""
+    return _bundle_tuple(
+        [
+            _bundle_int(getattr(commitment, name))
+            for name in ("element", "lower", "upper", "prime", "generator", "h")
+        ]
+    )
+
+
+def _bundle_region(region: Region) -> bytes:
+    """A Region body: its four bounds in field order (min_x, max_x, min_y, max_y)."""
+    return _bundle_tuple(
+        [
+            _bundle_int(getattr(region, name))
+            for name in ("min_x", "max_x", "min_y", "max_y")
+        ]
+    )
+
+
+def _bundle_range_proof(proof: RangeProof) -> bytes:
+    """A RangeProof body: three integer tuples ``(t, e, s)``, in field order."""
+    return _bundle_tuple(
+        [
+            _bundle_tuple([_bundle_int(item) for item in proof.t]),
+            _bundle_tuple([_bundle_int(item) for item in proof.e]),
+            _bundle_tuple([_bundle_int(item) for item in proof.s]),
+        ]
+    )
+
+
+def _bundle_wide_range_proof(proof: WideRangeProof) -> bytes:
+    """A WideRangeProof body: commitments plus challenge/response integer pairs."""
+    return _bundle_tuple(
+        [
+            _bundle_tuple([_bundle_int(item) for item in proof.commitments]),
+            _bundle_tuple(
+                [
+                    _bundle_tuple([_bundle_int(pair[0]), _bundle_int(pair[1])])
+                    for pair in proof.challenges
+                ]
+            ),
+            _bundle_tuple(
+                [
+                    _bundle_tuple([_bundle_int(pair[0]), _bundle_int(pair[1])])
+                    for pair in proof.responses
+                ]
+            ),
+        ]
+    )
+
+
+def _bundle_proof(proof: RegionProof | RegionWideProof) -> tuple[int, bytes]:
+    """Return ``(proof_type_tag, proof body)`` for the bundle payload.
+
+    The proof body is a two-item tuple (the x then the y axis sub-proof);
+    the type tag lives in the envelope header next to the format version.
+    """
+    if isinstance(proof, RegionProof):
+        body = _bundle_tuple(
+            [
+                _bundle_range_proof(proof.x_proof),
+                _bundle_range_proof(proof.y_proof),
+            ]
+        )
+        return _BUNDLE_PROOF_TYPE_REGION, body
+    body = _bundle_tuple(
+        [
+            _bundle_wide_range_proof(proof.x_proof),
+            _bundle_wide_range_proof(proof.y_proof),
+        ]
+    )
+    return _BUNDLE_PROOF_TYPE_REGION_WIDE, body
+
+
+def _bundle_check_int(value: object, name: str) -> None:
+    """Bundle integers are non-bool ints, like the rest of the public API."""
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise TypeError(f"{name} must be an integer")
+
+
+def _bundle_check_commitment(commitment: object, name: str) -> None:
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError(f"{name} must be a PedersenCommitment")
+    for field_name in ("element", "lower", "upper", "prime", "generator", "h"):
+        _bundle_check_int(getattr(commitment, field_name), f"{name} {field_name}")
+
+
+def _bundle_check_region(region: object, *, enforce_order: bool) -> None:
+    if not isinstance(region, Region):
+        raise TypeError("region must be a Region")
+    for field_name in ("min_x", "max_x", "min_y", "max_y"):
+        _bundle_check_int(getattr(region, field_name), f"region {field_name}")
+    if enforce_order and (
+        region.min_x > region.max_x or region.min_y > region.max_y
+    ):
+        raise ValueError("region bounds must satisfy min <= max on each axis")
+
+
+def _bundle_check_range_proof(proof: object, name: str) -> None:
+    if not isinstance(proof, RangeProof):
+        raise TypeError(f"{name} must be a RangeProof")
+    for field_name in ("t", "e", "s"):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(f"{name} {field_name} must be a tuple of integers")
+        for position, item in enumerate(field):
+            _bundle_check_int(item, f"{name} {field_name}[{position}]")
+
+
+def _bundle_check_wide_range_proof(proof: object, name: str) -> None:
+    if not isinstance(proof, WideRangeProof):
+        raise TypeError(f"{name} must be a WideRangeProof")
+    if not isinstance(proof.commitments, tuple):
+        raise TypeError(f"{name} commitments must be a tuple of integers")
+    for position, item in enumerate(proof.commitments):
+        _bundle_check_int(item, f"{name} commitments[{position}]")
+    for field_name in ("challenges", "responses"):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(f"{name} {field_name} must be a tuple of integer pairs")
+        for index, pair in enumerate(field):
+            if not isinstance(pair, tuple):
+                raise TypeError(
+                    f"{name} {field_name} must be a tuple of integer pairs"
+                )
+            if len(pair) != 2:
+                raise TypeError(
+                    f"{name} {field_name}[{index}] must be an integer pair"
+                )
+            _bundle_check_int(pair[0], f"{name} {field_name}[{index}][0]")
+            _bundle_check_int(pair[1], f"{name} {field_name}[{index}][1]")
+
+
+def encode_region_proof_bundle(bundle: RegionProofBundle) -> bytes:
+    """Encode a :class:`RegionProofBundle` into its canonical byte envelope.
+
+    The same bundle object always encodes to the same byte string. The
+    output starts with the four-byte magic ``b"zrgn"``, a one-byte format
+    version and a one-byte proof-type tag, followed by the five fields in
+    fixed order (``x_commitment``, ``y_commitment``, ``region``,
+    ``context``, ``proof``); each item is length-prefixed with a four-byte
+    big-endian header. Arbitrary-precision integers (including negative
+    bounds) carry a sign byte and a shortest big-endian magnitude; tuples
+    carry an explicit cardinality. The function returns ``bytes`` only and
+    never writes to the file system or a database.
+
+    A wrong object or field type (including a ``bool`` integer, a
+    non-tuple proof field, a wide-proof pair that is not a two-tuple, or a
+    proof that is neither a :class:`RegionProof` nor a
+    :class:`RegionWideProof`) raises :class:`TypeError`. A region with
+    ``min > max`` on an axis cannot be built through the public
+    :class:`Region` constructor; if such an object is forged bypassing the
+    constructor, it is rejected with :class:`ValueError`.
+    """
+    if not isinstance(bundle, RegionProofBundle):
+        raise TypeError("bundle must be a RegionProofBundle")
+    _bundle_check_commitment(bundle.x_commitment, "x_commitment")
+    _bundle_check_commitment(bundle.y_commitment, "y_commitment")
+    _bundle_check_region(bundle.region, enforce_order=True)
+    if not isinstance(bundle.context, bytes):
+        raise TypeError("context must be bytes")
+    proof = bundle.proof
+    if isinstance(proof, RegionProof):
+        _bundle_check_range_proof(proof.x_proof, "proof x_proof")
+        _bundle_check_range_proof(proof.y_proof, "proof y_proof")
+    elif isinstance(proof, RegionWideProof):
+        _bundle_check_wide_range_proof(proof.x_proof, "proof x_proof")
+        _bundle_check_wide_range_proof(proof.y_proof, "proof y_proof")
+    else:
+        raise TypeError("proof must be a RegionProof or RegionWideProof")
+    proof_type, proof_body = _bundle_proof(proof)
+    out = bytearray()
+    out += _BUNDLE_MAGIC
+    out += bytes((_BUNDLE_VERSION, proof_type))
+    out += _bundle_frame(_bundle_commitment(bundle.x_commitment))
+    out += _bundle_frame(_bundle_commitment(bundle.y_commitment))
+    out += _bundle_frame(_bundle_region(bundle.region))
+    out += _bundle_frame(bundle.context)
+    out += _bundle_frame(proof_body)
+    return bytes(out)
+
+
+class _BundleReader:
+    """Cursor over the envelope payload with strict bounds checking.
+
+    Every read validates its length prefix and element type before
+    returning; any truncation, overflow, cardinality or tag mismatch raises
+    :class:`ValueError`. The whole envelope must be consumed exactly.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        self._data = data
+        self._offset = 0
+
+    def take(self, size: int) -> bytes:
+        if size < 0 or self._offset + size > len(self._data):
+            raise ValueError("truncated region proof bundle payload")
+        chunk = self._data[self._offset : self._offset + size]
+        self._offset += size
+        return chunk
+
+    def byte(self, what: str) -> int:
+        return self.take(1)[0]
+
+    def expect(self, expected: bytes, what: str) -> None:
+        actual = self.take(len(expected))
+        if actual != expected:
+            raise ValueError(f"invalid {what}")
+
+    def uint32(self) -> int:
+        return int.from_bytes(self.take(4), "big")
+
+    def frame(self, what: str) -> bytes:
+        length = self.uint32()
+        return self.take(length)
+
+    def at_end(self) -> bool:
+        return self._offset == len(self._data)
+
+    def int_value(self, what: str) -> int:
+        body = self.frame(what)
+        if len(body) < 2:
+            raise ValueError(f"{what} integer is too short")
+        sign = body[0]
+        if sign not in (_INT_SIGN_POSITIVE, _INT_SIGN_NEGATIVE):
+            raise ValueError(f"{what} integer has an unknown sign byte")
+        magnitude = int.from_bytes(body[1:], "big")
+        # Canonical shortest form: no leading zero magnitude bytes and no
+        # negative zero.
+        if body[1] == 0 and len(body) > 2:
+            raise ValueError(f"{what} integer is not in canonical form")
+        if sign == _INT_SIGN_NEGATIVE and magnitude == 0:
+            raise ValueError(f"{what} integer uses a non-canonical negative zero")
+        return -magnitude if sign == _INT_SIGN_NEGATIVE else magnitude
+
+    def tuple_cardinality(self, what: str) -> int:
+        return int.from_bytes(self.take(4), "big")
+
+    def integer_tuple(self, what: str) -> tuple[int, ...]:
+        body = self.frame(what)
+        inner = _BundleReader(body)
+        count = inner.tuple_cardinality(what)
+        items = [inner.int_value(f"{what}[{i}]") for i in range(count)]
+        if not inner.at_end():
+            raise ValueError(f"{what} tuple has trailing data")
+        return tuple(items)
+
+    def commitment(self, what: str) -> PedersenCommitment:
+        body = self.frame(what)
+        inner = _BundleReader(body)
+        count = inner.tuple_cardinality(what)
+        if count != 6:
+            raise ValueError(f"{what} commitment must have exactly six fields")
+        values = [
+            inner.int_value(f"{what} {name}")
+            for name in ("element", "lower", "upper", "prime", "generator", "h")
+        ]
+        if not inner.at_end():
+            raise ValueError(f"{what} commitment has trailing data")
+        element, lower, upper, prime, generator, h = values
+        if prime <= 3:
+            raise ValueError(f"{what} prime must be greater than 3")
+        if not 1 < generator < prime:
+            raise ValueError(f"{what} generator must satisfy 1 < generator < prime")
+        if not 1 < h < prime:
+            raise ValueError(f"{what} h must satisfy 1 < h < prime")
+        if not 0 < element < prime:
+            raise ValueError(f"{what} element must satisfy 0 < element < prime")
+        if lower > upper:
+            raise ValueError(f"{what} lower must not exceed upper")
+        if upper - lower >= prime - 1:
+            raise ValueError(f"{what} range width must be smaller than prime - 1")
+        return PedersenCommitment(*values)
+
+    def region(self) -> Region:
+        body = self.frame("region")
+        inner = _BundleReader(body)
+        count = inner.tuple_cardinality("region")
+        if count != 4:
+            raise ValueError("region must have exactly four bounds")
+        min_x, max_x, min_y, max_y = (
+            inner.int_value(f"region {name}")
+            for name in ("min_x", "max_x", "min_y", "max_y")
+        )
+        if not inner.at_end():
+            raise ValueError("region has trailing data")
+        return Region(min_x=min_x, max_x=max_x, min_y=min_y, max_y=max_y)
+
+    def range_proof(self, what: str) -> RangeProof:
+        body = self.frame(what)
+        inner = _BundleReader(body)
+        count = inner.tuple_cardinality(what)
+        if count != 3:
+            raise ValueError(f"{what} range proof must have exactly three fields")
+        t = inner.integer_tuple(f"{what} t")
+        e = inner.integer_tuple(f"{what} e")
+        s = inner.integer_tuple(f"{what} s")
+        if not inner.at_end():
+            raise ValueError(f"{what} range proof has trailing data")
+        size = len(t)
+        if not (1 <= size <= _MAX_RANGE_VALUES) or not (
+            len(e) == size and len(s) == size
+        ):
+            raise ValueError(
+                f"{what} range proof fields must be equal-length tuples of "
+                f"1..{_MAX_RANGE_VALUES} integers"
+            )
+        return RangeProof(t=t, e=e, s=s)
+
+    def wide_range_proof(self, what: str) -> WideRangeProof:
+        body = self.frame(what)
+        inner = _BundleReader(body)
+        count = inner.tuple_cardinality(what)
+        if count != 3:
+            raise ValueError(f"{what} wide range proof must have three fields")
+        commitments = inner.integer_tuple(f"{what} commitments")
+        pairs: dict[str, list[tuple[int, int]]] = {}
+        for field_name in ("challenges", "responses"):
+            pair_body = inner.frame(f"{what} {field_name}")
+            pair_reader = _BundleReader(pair_body)
+            pair_count = pair_reader.tuple_cardinality(f"{what} {field_name}")
+            decoded_pairs: list[tuple[int, int]] = []
+            for index in range(pair_count):
+                item_body = pair_reader.frame(f"{what} {field_name}[{index}]")
+                item_reader = _BundleReader(item_body)
+                item_count = item_reader.tuple_cardinality(
+                    f"{what} {field_name}[{index}]"
+                )
+                if item_count != 2:
+                    raise ValueError(
+                        f"{what} {field_name}[{index}] must be an integer pair"
+                    )
+                first = item_reader.int_value(f"{what} {field_name}[{index}][0]")
+                second = item_reader.int_value(f"{what} {field_name}[{index}][1]")
+                if not item_reader.at_end():
+                    raise ValueError(
+                        f"{what} {field_name}[{index}] has trailing data"
+                    )
+                decoded_pairs.append((first, second))
+            if not pair_reader.at_end():
+                raise ValueError(f"{what} {field_name} has trailing data")
+            pairs[field_name] = decoded_pairs
+        if not inner.at_end():
+            raise ValueError(f"{what} wide range proof has trailing data")
+        width = len(commitments)
+        if not (
+            1 <= width <= _MAX_WIDE_RANGE_BITS
+            and len(pairs["challenges"]) == width
+            and len(pairs["responses"]) == width
+        ):
+            raise ValueError(
+                f"{what} wide range proof must hold 1..{_MAX_WIDE_RANGE_BITS} "
+                "matching bit entries"
+            )
+        return WideRangeProof(
+            commitments=commitments,
+            challenges=tuple(pairs["challenges"]),
+            responses=tuple(pairs["responses"]),
+        )
+
+    def proof(self, tag: int) -> RegionProof | RegionWideProof:
+        body = self.frame("proof")
+        inner = _BundleReader(body)
+        count = inner.tuple_cardinality("proof")
+        if count != 2:
+            raise ValueError("proof must have exactly two axis sub-proofs")
+        if tag == _BUNDLE_PROOF_TYPE_REGION:
+            x_proof = inner.range_proof("region proof x_proof")
+            y_proof = inner.range_proof("region proof y_proof")
+            if not inner.at_end():
+                raise ValueError("region proof has trailing data")
+            return RegionProof(x_proof=x_proof, y_proof=y_proof)
+        if tag == _BUNDLE_PROOF_TYPE_REGION_WIDE:
+            x_proof = inner.wide_range_proof("region wide proof x_proof")
+            y_proof = inner.wide_range_proof("region wide proof y_proof")
+            if not inner.at_end():
+                raise ValueError("region wide proof has trailing data")
+            return RegionWideProof(x_proof=x_proof, y_proof=y_proof)
+        raise ValueError("unknown region proof bundle proof type")
+
+
+def decode_region_proof_bundle(data: bytes) -> RegionProofBundle:
+    """Decode a canonical envelope back into a :class:`RegionProofBundle`.
+
+    ``data`` must be exactly the output of
+    :func:`encode_region_proof_bundle`: the magic, a known format version
+    and proof-type tag, and the five fields in their fixed order with
+    valid length prefixes, tuple cardinalities and integer sign bytes.
+    The payload must be consumed completely with no trailing bytes. A
+    truncated input, an out-of-bounds length, an unknown version or proof
+    type, a non-canonical integer, an illegal region or an unexpected
+    nested proof shape raises :class:`ValueError`; a non-``bytes`` input
+    raises :class:`TypeError`. A decoded bundle compares equal field-for-
+    field to the original and a :class:`RegionProof` payload can never be
+    rebuilt as a :class:`RegionWideProof` (or vice versa).
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    reader = _BundleReader(data)
+    reader.expect(_BUNDLE_MAGIC, "region proof bundle magic")
+    version = reader.byte("format version")
+    if version != _BUNDLE_VERSION:
+        raise ValueError("unknown region proof bundle format version")
+    tag = reader.byte("proof type")
+    if tag not in (
+        _BUNDLE_PROOF_TYPE_REGION,
+        _BUNDLE_PROOF_TYPE_REGION_WIDE,
+    ):
+        raise ValueError("unknown region proof bundle proof type")
+    x_commitment = reader.commitment("x_commitment")
+    y_commitment = reader.commitment("y_commitment")
+    region = reader.region()
+    context = reader.frame("context")
+    proof = reader.proof(tag)
+    if not reader.at_end():
+        raise ValueError("trailing data after region proof bundle payload")
+    return RegionProofBundle(
+        x_commitment=x_commitment,
+        y_commitment=y_commitment,
+        region=region,
+        context=context,
+        proof=proof,
+    )
+
+
+def verify_region_proof_bundle(bundle: RegionProofBundle) -> bool:
+    """Verify the proof carried by a :class:`RegionProofBundle`.
+
+    Verification follows the existing single-proof semantics exactly,
+    dispatching on the ``proof`` type: :class:`RegionProof` is checked with
+    :func:`verify_region` and :class:`RegionWideProof` with
+    :func:`verify_region_wide`, using only the two
+    :class:`PedersenCommitment` objects, the :class:`Region` and the
+    ``context`` — never coordinates or blinding factors. A wrong object or
+    field type (including a proof of neither region-proof type) raises
+    :class:`TypeError`; every other failure — a declared range mismatch,
+    a context mismatch, swapped axes or commitments, a tampered proof or a
+    failed verification equation — returns ``False``. Encoding and then
+    decoding a bundle preserves the verification verdict.
+    """
+    if not isinstance(bundle, RegionProofBundle):
+        raise TypeError("bundle must be a RegionProofBundle")
+    _bundle_check_commitment(bundle.x_commitment, "x_commitment")
+    _bundle_check_commitment(bundle.y_commitment, "y_commitment")
+    # Types only: illegal interval values are decided (False) by the
+    # delegated single-proof verifiers, never raised here.
+    _bundle_check_region(bundle.region, enforce_order=False)
+    if not isinstance(bundle.context, bytes):
+        raise TypeError("context must be bytes")
+    proof = bundle.proof
+    if isinstance(proof, RegionProof):
+        return verify_region(
+            bundle.x_commitment,
+            bundle.y_commitment,
+            bundle.region,
+            proof,
+            bundle.context,
+        )
+    if isinstance(proof, RegionWideProof):
+        return verify_region_wide(
+            bundle.x_commitment,
+            bundle.y_commitment,
+            bundle.region,
+            proof,
+            bundle.context,
+        )
+    raise TypeError("proof must be a RegionProof or RegionWideProof")
 
 
 # ---------------------------------------------------------------------------

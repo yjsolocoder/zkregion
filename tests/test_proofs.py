@@ -69,6 +69,7 @@ from zkregion import (
     RegionContainsEntry,
     RegionContainsReplayGuard,
     RegionProof,
+    RegionProofBundle,
     RegionReplayGuard,
     RegionWideBatchEntry,
     RegionWideBatchReplayGuard,
@@ -92,6 +93,8 @@ from zkregion import (
     WideRangeReplayGuard,
     commit,
     commit_coordinate,
+    decode_region_proof_bundle,
+    encode_region_proof_bundle,
     merkle_root,
     pedersen_commit,
     prove_consistency,
@@ -139,6 +142,7 @@ from zkregion import (
     verify_region_bound,
     verify_region_contains_batch,
     verify_region_contains_bound,
+    verify_region_proof_bundle,
     verify_region_wide,
     verify_region_wide_batch,
     verify_region_wide_batch_bound,
@@ -27817,6 +27821,531 @@ class MerkleConsistencyChainBatchReplayGuardTest(unittest.TestCase):
             )
         )
         store.close()
+
+
+class RegionProofBundleTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def commit(self, value, lower, upper, blinding, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    def narrow(
+        self,
+        x=40,
+        y=60,
+        region=None,
+        context=b"ctx",
+        x_blinding=1234,
+        y_blinding=4321,
+    ):
+        region = Region(0, 100, 0, 100) if region is None else region
+        x_commitment, x_r = self.commit(x, region.min_x, region.max_x, x_blinding)
+        y_commitment, y_r = self.commit(y, region.min_y, region.max_y, y_blinding)
+        proof = prove_region(
+            x_commitment, y_commitment, x, y, x_r, y_r, region, context,
+            randbelow=counter_randbelow(),
+        )
+        return RegionProofBundle(x_commitment, y_commitment, region, context, proof)
+
+    def wide(
+        self,
+        x=40,
+        y=60,
+        region=None,
+        context=b"wide-ctx",
+        x_blinding=1234,
+        y_blinding=4321,
+    ):
+        region = Region(0, 255, -2048, 2047) if region is None else region
+        x_commitment, x_r = self.commit(x, region.min_x, region.max_x, x_blinding)
+        y_commitment, y_r = self.commit(y, region.min_y, region.max_y, y_blinding)
+        proof = prove_region_wide(
+            x_commitment, y_commitment, x, y, x_r, y_r, region, context,
+            randbelow=counter_randbelow(),
+        )
+        return RegionProofBundle(x_commitment, y_commitment, region, context, proof)
+
+    # ---- round trip ---------------------------------------------------------
+
+    def test_narrow_bundle_round_trip(self):
+        bundle = self.narrow()
+        raw = encode_region_proof_bundle(bundle)
+        self.assertIsInstance(raw, bytes)
+        decoded = decode_region_proof_bundle(raw)
+        self.assertEqual(decoded, bundle)
+        self.assertIsInstance(decoded.proof, RegionProof)
+        self.assertTrue(verify_region_proof_bundle(bundle))
+        self.assertTrue(verify_region_proof_bundle(decoded))
+
+    def test_wide_bundle_round_trip(self):
+        bundle = self.wide()
+        raw = encode_region_proof_bundle(bundle)
+        decoded = decode_region_proof_bundle(raw)
+        self.assertEqual(decoded, bundle)
+        self.assertIsInstance(decoded.proof, RegionWideProof)
+        self.assertTrue(verify_region_proof_bundle(bundle))
+        self.assertTrue(verify_region_proof_bundle(decoded))
+
+    def test_default_group_parameters_round_trip(self):
+        region = Region(0, 100, 0, 100)
+        x_commitment, x_r = pedersen_commit(40, 0, 100, blinding=987654321)
+        y_commitment, y_r = pedersen_commit(60, 0, 100, blinding=123456789)
+        proof = prove_region(
+            x_commitment, y_commitment, 40, 60, x_r, y_r, region, b"demo"
+        )
+        bundle = RegionProofBundle(x_commitment, y_commitment, region, b"demo", proof)
+        decoded = decode_region_proof_bundle(encode_region_proof_bundle(bundle))
+        self.assertEqual(decoded, bundle)
+        self.assertTrue(verify_region_proof_bundle(decoded))
+
+    def test_negative_bounds_and_empty_context_round_trip(self):
+        region = Region(-100, -50, -30, -10)
+        x_commitment, x_r = self.commit(-75, -100, -50, 1234)
+        y_commitment, y_r = self.commit(-20, -30, -10, 4321)
+        proof = prove_region(
+            x_commitment, y_commitment, -75, -20, x_r, y_r, region, b"",
+            randbelow=counter_randbelow(),
+        )
+        bundle = RegionProofBundle(x_commitment, y_commitment, region, b"", proof)
+        raw = encode_region_proof_bundle(bundle)
+        decoded = decode_region_proof_bundle(raw)
+        self.assertEqual(decoded, bundle)
+        self.assertEqual(decoded.context, b"")
+        self.assertTrue(verify_region_proof_bundle(decoded))
+
+    def test_arbitrary_precision_integers_round_trip(self):
+        prime = 2**255 - 19
+        huge = 10**40
+        x_commitment = PedersenCommitment(
+            element=1, lower=-huge, upper=-huge, prime=prime,
+            generator=3, h=pow(3, 2, prime),
+        )
+        y_commitment = PedersenCommitment(
+            element=1, lower=1 << 300, upper=(1 << 300) + 1, prime=prime,
+            generator=3, h=pow(3, 2, prime),
+        )
+        region = Region(-huge, -huge, 1 << 300, (1 << 300) + 1)
+        proof = RegionProof(
+            x_proof=RangeProof((1,), (0,), (0,)),
+            y_proof=RangeProof((1,), (0,), (0,)),
+        )
+        bundle = RegionProofBundle(x_commitment, y_commitment, region, b"big", proof)
+        decoded = decode_region_proof_bundle(encode_region_proof_bundle(bundle))
+        self.assertEqual(decoded, bundle)
+
+    def test_encode_is_deterministic(self):
+        bundle = self.narrow()
+        self.assertEqual(
+            encode_region_proof_bundle(bundle),
+            encode_region_proof_bundle(bundle),
+        )
+        # equal field values, independently constructed objects
+        self.assertEqual(
+            encode_region_proof_bundle(self.narrow()),
+            encode_region_proof_bundle(self.narrow()),
+        )
+
+    def test_re_encoding_is_byte_identical(self):
+        for bundle in (self.narrow(), self.wide()):
+            raw = encode_region_proof_bundle(bundle)
+            self.assertEqual(
+                encode_region_proof_bundle(decode_region_proof_bundle(raw)), raw
+            )
+
+    def test_header_carries_magic_version_and_proof_type(self):
+        narrow_raw = encode_region_proof_bundle(self.narrow())
+        self.assertEqual(narrow_raw[:6], b"zrgn" + bytes((1, 1)))
+        wide_raw = encode_region_proof_bundle(self.wide())
+        self.assertEqual(wide_raw[:6], b"zrgn" + bytes((1, 2)))
+
+    def test_bundle_is_frozen_and_value_compared(self):
+        bundle = self.narrow()
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            bundle.context = b"other"
+        self.assertEqual(bundle, self.narrow())
+
+    # ---- decode failures ----------------------------------------------------
+
+    def test_every_truncation_rejected(self):
+        raw = encode_region_proof_bundle(self.narrow())
+        self.assertGreater(len(raw), 100)
+        for cut in range(0, len(raw)):
+            with self.assertRaises(ValueError):
+                decode_region_proof_bundle(raw[:cut])
+
+    def test_trailing_data_rejected(self):
+        raw = encode_region_proof_bundle(self.narrow())
+        for extra in (b"\x00", b"ab", b"\xff" * 8):
+            with self.assertRaises(ValueError):
+                decode_region_proof_bundle(raw + extra)
+            with self.assertRaises(ValueError):
+                decode_region_proof_bundle(extra + raw)
+
+    def test_bad_magic_version_and_proof_type_rejected(self):
+        raw = bytearray(encode_region_proof_bundle(self.narrow()))
+        raw[0] = ord("X")
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(raw))
+        raw = bytearray(encode_region_proof_bundle(self.narrow()))
+        raw[4] = 0
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(raw))
+        raw[4] = 2
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(raw))
+        raw = bytearray(encode_region_proof_bundle(self.narrow()))
+        raw[5] = 0
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(raw))
+        raw[5] = 3
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(raw))
+        raw[5] = 255
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(raw))
+
+    def test_proof_types_are_not_interchangeable(self):
+        narrow_raw = bytearray(encode_region_proof_bundle(self.narrow()))
+        narrow_raw[5] = 2
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(narrow_raw))
+        wide_raw = bytearray(encode_region_proof_bundle(self.wide()))
+        wide_raw[5] = 1
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(wide_raw))
+
+    def test_decode_requires_bytes(self):
+        raw = encode_region_proof_bundle(self.narrow())
+        for bad in (bytearray(raw), memoryview(raw), str(raw), 123, None, [raw]):
+            with self.assertRaises(TypeError):
+                decode_region_proof_bundle(bad)
+
+    def test_single_byte_tampering_never_yields_original_valid_bundle(self):
+        for bundle in (self.narrow(), self.wide()):
+            raw = encode_region_proof_bundle(bundle)
+            for index in range(len(raw)):
+                tampered = bytearray(raw)
+                tampered[index] ^= 0xFF
+                try:
+                    decoded = decode_region_proof_bundle(bytes(tampered))
+                except ValueError:
+                    continue
+                self.assertNotEqual(decoded, bundle, index)
+                self.assertFalse(
+                    verify_region_proof_bundle(decoded),
+                    f"tampered byte {index} verified",
+                )
+
+    def test_non_canonical_integers_rejected(self):
+        raw = bytearray(encode_region_proof_bundle(self.narrow()))
+        # header (6) + first frame length (4) + commitment tuple count (4);
+        # the first framed integer starts at offset 14.
+        pos = 14
+        length = int.from_bytes(raw[pos:pos + 4], "big")
+        mutated = bytearray(raw)
+        # insert a leading zero byte in the magnitude and grow both the
+        # integer frame and the surrounding commitment frame by one
+        mutated[6:10] = (
+            int.from_bytes(mutated[6:10], "big") + 1
+        ).to_bytes(4, "big")
+        mutated[pos:pos + 4] = (length + 1).to_bytes(4, "big")
+        mutated[pos + 5:pos + 5] = b"\x00"
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(mutated))
+        # negative zero: lower=0 is framed as uint32(2) 0x01 0x00
+        marker = bytes((0, 0, 0, 2, 1, 0))
+        zero_pos = bytes(raw).find(marker)
+        self.assertGreaterEqual(zero_pos, 0)
+        mutated = bytearray(raw)
+        mutated[zero_pos + 4] = 255
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(mutated))
+        # unknown sign byte
+        mutated = bytearray(raw)
+        mutated[zero_pos + 4] = 7
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(mutated))
+
+    def test_invalid_commitment_field_values_rejected(self):
+        prime = self.PRIME
+        good = dict(
+            element=1, lower=0, upper=100, prime=prime, generator=3, h=5
+        )
+        bad_cases = (
+            dict(element=0),
+            dict(element=prime),
+            dict(prime=3),
+            dict(generator=1),
+            dict(generator=prime),
+            dict(h=1),
+            dict(h=prime),
+            dict(lower=101),
+        )
+        for overrides in bad_cases:
+            values = dict(good)
+            values.update(overrides)
+            bundle = self.narrow()
+            object.__setattr__(
+                bundle, "x_commitment", PedersenCommitment(**values)
+            )
+            with self.assertRaises(ValueError):
+                decode_region_proof_bundle(
+                    encode_region_proof_bundle(bundle)
+                )
+
+    def test_inverted_commitment_range_rejected(self):
+        bundle = self.narrow()
+        bad_commitment = PedersenCommitment(
+            element=1, lower=100, upper=0, prime=self.PRIME, generator=3, h=5
+        )
+        object.__setattr__(bundle, "x_commitment", bad_commitment)
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(encode_region_proof_bundle(bundle))
+
+    def test_malformed_tuple_cardinalities_rejected(self):
+        raw = encode_region_proof_bundle(self.narrow())
+
+        def flip_uint32(blob, offset, value):
+            mutated = bytearray(blob)
+            mutated[offset:offset + 4] = value.to_bytes(4, "big")
+            return bytes(mutated)
+
+        # commitment field count 6 -> 5 (offset inside first frame body)
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(flip_uint32(raw, 10, 5))
+        # region bound count 4 -> 3: locate the region frame as the third
+        # top-level field; simplest is to tamper with the wide proof's axis
+        # sub-proof count from 2 to 1
+        wide_raw = encode_region_proof_bundle(self.wide())
+        proof_len = int.from_bytes(wide_raw[-4:], "big")
+        proof_start = len(wide_raw) - 4
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(
+                flip_uint32(wide_raw, proof_start + 4, 1)
+            )
+
+    def test_malformed_range_proof_shape_rejected(self):
+        good_bundle = self.narrow()
+        good = good_bundle.proof.x_proof
+        self.assertGreater(len(good.t), 1)
+        cases = (
+            (good.t[:-1], good.e, good.s),
+            (good.t, good.e[:-1], good.s),
+            (good.t, good.e, good.s[:-1]),
+            ((), (), ()),
+        )
+        for t, e, s in cases:
+            bundle = self.narrow()
+            bad_proof = RegionProof(
+                x_proof=RangeProof(t, e, s), y_proof=bundle.proof.y_proof
+            )
+            object.__setattr__(bundle, "proof", bad_proof)
+            with self.assertRaises(ValueError):
+                decode_region_proof_bundle(encode_region_proof_bundle(bundle))
+
+    def test_malformed_wide_proof_shape_rejected(self):
+        bundle = self.wide()
+        good = bundle.proof.x_proof
+        # a three-item pair is an illegal proof shape
+        bad_pairs = tuple((a, b, c) for a, (b, c) in zip((0,) * len(good.challenges), good.challenges))
+        bad_subproof = WideRangeProof(
+            commitments=good.commitments,
+            challenges=bad_pairs,
+            responses=good.responses,
+        )
+        bad_proof = RegionWideProof(x_proof=bad_subproof, y_proof=bundle.proof.y_proof)
+        object.__setattr__(bundle, "proof", bad_proof)
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(bundle)
+        # mismatched bit-entry counts are rejected at decode (encode accepts
+        # the integers, the envelope parser enforces the shape)
+        bundle = self.wide()
+        bad_subproof = WideRangeProof(
+            commitments=good.commitments[:-1],
+            challenges=good.challenges,
+            responses=good.responses,
+        )
+        bad_proof = RegionWideProof(x_proof=bad_subproof, y_proof=bundle.proof.y_proof)
+        object.__setattr__(bundle, "proof", bad_proof)
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(encode_region_proof_bundle(bundle))
+
+    # ---- encode / verify type errors ----------------------------------------
+
+    def test_encode_rejects_wrong_object_and_field_types(self):
+        good = self.narrow()
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(object())
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(object(), good.y_commitment, good.region, b"c", good.proof)
+            )
+        bool_commitment = PedersenCommitment(True, 0, 100, self.PRIME, 3, 5)
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(bool_commitment, good.y_commitment, good.region, b"c", good.proof)
+            )
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(good.x_commitment, good.y_commitment, object(), b"c", good.proof)
+            )
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(good.x_commitment, good.y_commitment, good.region, "c", good.proof)
+            )
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(good.x_commitment, good.y_commitment, good.region, b"c", object())
+            )
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(
+                    good.x_commitment, good.y_commitment, good.region, b"c",
+                    RangeProof((1,), (0,), (0,)),
+                )
+            )
+        bad_subproof = RangeProof([1], (0,), (0,))
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(
+                    good.x_commitment, good.y_commitment, good.region, b"c",
+                    RegionProof(bad_subproof, good.proof.y_proof),
+                )
+            )
+        bool_subproof = RangeProof((True,), (0,), (0,))
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(
+                    good.x_commitment, good.y_commitment, good.region, b"c",
+                    RegionProof(bool_subproof, good.proof.y_proof),
+                )
+            )
+        wide_good = self.wide()
+        bad_wide = WideRangeProof(
+            [1] * len(wide_good.proof.x_proof.commitments),
+            wide_good.proof.x_proof.challenges,
+            wide_good.proof.x_proof.responses,
+        )
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(
+                    wide_good.x_commitment, wide_good.y_commitment, wide_good.region,
+                    b"c", RegionWideProof(bad_wide, wide_good.proof.y_proof),
+                )
+            )
+
+    def test_encode_rejects_illegal_region(self):
+        bundle = self.narrow()
+        bad_region = object.__new__(Region)
+        for name, value in (
+            ("min_x", 101), ("max_x", 100), ("min_y", 0), ("max_y", 100)
+        ):
+            object.__setattr__(bad_region, name, value)
+        object.__setattr__(bundle, "region", bad_region)
+        with self.assertRaises(ValueError):
+            encode_region_proof_bundle(bundle)
+        # Region construction itself refuses inverted axes
+        with self.assertRaises(ValueError):
+            Region(101, 100, 0, 100)
+
+    def test_verify_type_errors(self):
+        good = self.narrow()
+        with self.assertRaises(TypeError):
+            verify_region_proof_bundle(object())
+        with self.assertRaises(TypeError):
+            verify_region_proof_bundle(
+                RegionProofBundle(good.x_commitment, good.y_commitment, good.region, b"c", object())
+            )
+        with self.assertRaises(TypeError):
+            verify_region_proof_bundle(
+                RegionProofBundle(object(), good.y_commitment, good.region, b"c", good.proof)
+            )
+        with self.assertRaises(TypeError):
+            verify_region_proof_bundle(
+                RegionProofBundle(good.x_commitment, good.y_commitment, object(), b"c", good.proof)
+            )
+        with self.assertRaises(TypeError):
+            verify_region_proof_bundle(
+                RegionProofBundle(good.x_commitment, good.y_commitment, good.region, 7, good.proof)
+            )
+
+    # ---- verify False semantics ---------------------------------------------
+
+    def test_verify_rejects_context_mismatch(self):
+        bundle = self.narrow()
+        object.__setattr__(bundle, "context", b"other")
+        self.assertFalse(verify_region_proof_bundle(bundle))
+
+    def test_verify_rejects_swapped_commitments(self):
+        bundle = self.narrow()
+        original_x = bundle.x_commitment
+        original_y = bundle.y_commitment
+        object.__setattr__(bundle, "x_commitment", original_y)
+        object.__setattr__(bundle, "y_commitment", original_x)
+        self.assertFalse(verify_region_proof_bundle(bundle))
+
+    def test_verify_rejects_swapped_axes(self):
+        bundle = self.narrow()
+        swapped = RegionProof(
+            x_proof=bundle.proof.y_proof, y_proof=bundle.proof.x_proof
+        )
+        object.__setattr__(bundle, "proof", swapped)
+        self.assertFalse(verify_region_proof_bundle(bundle))
+
+    def test_verify_rejects_wrong_region_bounds(self):
+        bundle = self.narrow()
+        object.__setattr__(bundle, "region", Region(0, 99, 0, 100))
+        self.assertFalse(verify_region_proof_bundle(bundle))
+
+    def test_verify_returns_false_for_forged_inverted_region(self):
+        # Bypassing the Region constructor cannot turn an invalid interval
+        # into an exception: value problems stay False, types raise.
+        bundle = self.narrow()
+        inverted = object.__new__(Region)
+        for name, value in (
+            ("min_x", 101), ("max_x", 100), ("min_y", 0), ("max_y", 100)
+        ):
+            object.__setattr__(inverted, name, value)
+        object.__setattr__(bundle, "region", inverted)
+        self.assertFalse(verify_region_proof_bundle(bundle))
+
+    def test_verify_rejects_tampered_proof(self):
+        bundle = self.narrow()
+        t = bundle.proof.x_proof.t
+        tampered_t = t[:-1] + (t[-1] ^ 1,)
+        tampered = RegionProof(
+            x_proof=RangeProof(tampered_t, bundle.proof.x_proof.e, bundle.proof.x_proof.s),
+            y_proof=bundle.proof.y_proof,
+        )
+        object.__setattr__(bundle, "proof", tampered)
+        self.assertFalse(verify_region_proof_bundle(bundle))
+
+    def test_verify_wide_rejects_context_mismatch_and_swaps(self):
+        bundle = self.wide()
+        object.__setattr__(bundle, "context", b"other")
+        self.assertFalse(verify_region_proof_bundle(bundle))
+        bundle = self.wide()
+        swapped = RegionWideProof(
+            x_proof=bundle.proof.y_proof, y_proof=bundle.proof.x_proof
+        )
+        object.__setattr__(bundle, "proof", swapped)
+        self.assertFalse(verify_region_proof_bundle(bundle))
+        bundle = self.wide()
+        object.__setattr__(bundle, "region", Region(0, 255, -2048, 2046))
+        self.assertFalse(verify_region_proof_bundle(bundle))
+
+    def test_round_trip_preserves_verification_failure(self):
+        bundle = self.narrow()
+        object.__setattr__(bundle, "context", b"other")
+        raw = encode_region_proof_bundle(bundle)
+        decoded = decode_region_proof_bundle(raw)
+        self.assertEqual(decoded, bundle)
+        self.assertFalse(verify_region_proof_bundle(decoded))
 
 
 if __name__ == "__main__":

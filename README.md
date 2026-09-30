@@ -1315,6 +1315,10 @@ python3 -m zkregion
 - `prove_region_contains_bound(entries) -> tuple[BoundRegionContainsBatch, bytes]` — 顶层构造 Merkle 承诺的规范区域判定完整批：`entries` 沿用 `verify_region_contains_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，输入不变；每项外层叶逐字节复用 `_bound_region_contains_leaf` 编码，域分隔、长度帧、十进制 ASCII 整数约定、字段顺序及 Merkle 哈希规则不变；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖从零开始的全部位置、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_region_contains_bound(batch, root) is True`，单项、奇偶批与重复项均确定，重复构造逐字节一致；全批或任一嵌套字段错型（含用 `bool` 冒充整数与后项错型）抛 `TypeError`，空批、U 成帧批次数越出 uint64 或 `verify_region_contains_batch` 返回 `False`（开合不符、声明区间与区域边界不一致或坐标越出矩形）抛 `ValueError`
 - `RegionProof(x_proof, y_proof)` — 不可变区域证明对象，两字段均为 `RangeProof`
 - `RegionWideProof(x_proof, y_proof)` — 不可变宽区间版区域证明对象，两字段分别为 x 轴与 y 轴的 `WideRangeProof`（两轴位宽可各自不同）；可位置构造、按值相等且不可变
+- `RegionProofBundle(x_commitment, y_commitment, region, context, proof)` — 跨进程传递的规范化二进制信封数据类，字段按 `x_commitment`、`y_commitment`、`region`、`context`、`proof` 固定次序承载；`proof` 仅接受 `RegionProof` 或 `RegionWideProof`；冻结、可位置构造、按值相等，构造时不做校验
+- `encode_region_proof_bundle(bundle) -> bytes` — 对同一对象稳定输出同一字节串；输出依次为四字节魔数 `b"zrgn"`、一字节格式版本、一字节证明类型标签，随后按固定字段次序承载五个字段，每个字段前置四字节大端长度前缀；整数（含负数与任意精度）使用符号字节加最短大端绝对值编码，元组显式承载四字节基数；承诺六字段、Region 四边界、`RangeProof`/`WideRangeProof` 的递归元组结构无歧义编码；只返回 `bytes`，不写文件或数据库；对象或字段类型错误（含 `bool` 整数、非元组证明字段、宽证明对不是二元组、既非 `RegionProof` 也非 `RegionWideProof` 的 proof）抛 `TypeError`；区域倒置（`min > max`，公共 `Region` 构造器本身已拒绝）抛 `ValueError`
+- `decode_region_proof_bundle(data) -> RegionProofBundle` — 只接受 `bytes`（非 `bytes` 抛 `TypeError`），逐层核对魔数、版本、证明类型、长度前缀、元组基数、整数规范形与嵌套结构，完整消费载荷且无尾随数据后按字段次序重建与原对象逐字段相等的信封；截断、越界、未知版本或类型、非规范整数、非法字段值（含不合法的承诺群参数与声明区间、区域 min > max）、非法证明形状、尾随数据一律抛 `ValueError`，失败不返回部分对象；头部的证明类型标签决定解释方式，`RegionProof` 与 `RegionWideProof` 载荷不能互换解释
+- `verify_region_proof_bundle(bundle) -> bool` — 按 `proof` 类型分发：`RegionProof` 沿用 `verify_region`、`RegionWideProof` 沿用 `verify_region_wide` 的既有单条验证语义，只使用两个 `PedersenCommitment`、`Region` 与 `context`，不读取坐标或盲因子；声明范围、context 不符、坐标轴互换、proof 篡改或验证等式失败返回 `False`；对象或任一字段类型错误（含两类之外的 proof）仍抛 `TypeError`；编码后解码保持验证结论，字节篡改无法恢复成原信封并通过验证
 - `verify_region_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 区域证明的批量验证，按 `(prime, generator, h)` 分组做一次随机线性组合
 - `RegionBatchEntry(x_commitment, y_commitment, region, proof, context=b"")` — 不可变批量验证条目，字段次序与 `verify_region` 入参一致
 - `SchnorrProver(secret, *, prime, generator, randbelow)`
@@ -1776,6 +1780,20 @@ h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
 ```
 
 其中位 `0` 分支以比特承诺 `C_i` 为基点、位 `1` 分支以 `C_i * generator**(-1)` 为基点，与 `verify_range_wide_batch` 完全一致；每个群只做这一次多指数等式而不逐子分支做布尔汇总。篡改响应或挑战份额都会改变重算公告与转录挑战，在逐条阶段即返回 `False`。随机源不可调用或返回非整数抛 `TypeError`，系数返回值超出 `[0, prime - 1)` 抛 `ValueError`；换承诺、换区域、换上下文、交换两轴（含交换子证明或交换承诺）、替换任一子证明或任何结构非法一律返回 `False` 且不抛异常。固定随机源下结果可重复，入口不改写任何输入，不引入落盘或持久化。这里的随机线性组合只供演示。
+
+### 跨进程区域证明二进制信封
+
+`RegionProofBundle(x_commitment, y_commitment, region, context, proof)` 把单条验证所需的五个对象冻结为一个可跨进程传递的信封，字段次序固定为 `x_commitment`、`y_commitment`、`region`、`context`、`proof`，其中 `proof` 只允许是 `RegionProof` 或 `RegionWideProof`。信封为冻结数据类、可位置构造、按值相等，构造时不做任何校验；`encode_region_proof_bundle(bundle) -> bytes` 只返回 `bytes`，不写文件或数据库，且对同一对象稳定输出同一字节串。
+
+字节布局自描述且无歧义。头部固定为四字节魔数 `b"zrgn"`、一字节格式版本（当前为 `1`）与一字节证明类型标签（`1` = `RegionProof`，`2` = `RegionWideProof`）；随后按字段次序承载五个字段，**每个字段体前置四字节无符号大端长度前缀**：
+
+- **整数**（承诺六字段、Region 四边界及证明元组中的任意精度整数，含负数）体首为符号字节（`1` 非负、`255` 负），随后为绝对值的最短大端表示（零编码为 `01 00`，拒绝前导零字节与负零），不依赖带外位宽即可无歧义重建；
+- **元组**体首为四字节大端基数，随后逐项长度成帧；
+- **承诺**体为六元组（`element`、`lower`、`upper`、`prime`、`generator`、`h`，数据类字段序）；**Region** 体为四元组（`min_x`、`max_x`、`min_y`、`max_y`）；
+- **`context`** 为原始 `bytes` 字段体；
+- **proof** 体为固定二元组（x 轴子证明、y 轴子证明）。`RangeProof` 子证明体为 `(t, e, s)` 三个整数元组；`WideRangeProof` 子证明体为 `commitments` 整数元组与 `challenges`、`responses` 两个整数对元组（每对内为两个整数的二元组）。类型区分只由头部标签决定，`RegionProof` 载荷不会被解释为 `RegionWideProof`，反之亦然。
+
+`decode_region_proof_bundle(data)` 只接受 `bytes`（否则抛 `TypeError`），按同一游标逐层核对魔数、版本、类型标签、长度前缀、元组基数、元素类型与整数规范形，并校验非法字段值（承诺群参数与声明区间、区域 `min <= max`）与非法证明形状（`RangeProof` 三字段等长且长度在 1..256；`WideRangeProof` 三组条目数一致且位宽在 1..24、每对恰含两个整数）；载荷必须被完整消费，任何尾随字节都拒绝。截断、越界长度、未知版本或类型、非规范整数、非法字段值、非法区间、非法证明形状、尾随数据一律抛 `ValueError`，失败不返回部分对象；重建对象与原对象逐字段相等。`verify_region_proof_bundle(bundle)` 按 `proof` 类型分发到 `verify_region` 或 `verify_region_wide`，沿用既有单条验证语义，只使用两个承诺、Region 与 context，不读取坐标或盲因子；声明范围或 context 不符、坐标轴互换、proof 篡改或验证等式失败返回 `False`，对象或字段类型错误仍抛 `TypeError`。编码后解码保持验证结论；篡改后的字节要么无法解码，要么重建出不同信封且验证不通过。
 
 ### Merkle 承诺的宽区间二维区域证明完整批验
 

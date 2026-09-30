@@ -69,6 +69,7 @@ from zkregion import (
     RegionContainsEntry,
     RegionContainsReplayGuard,
     RegionProof,
+    RegionProofBundle,
     RegionReplayGuard,
     RegionWideBatchEntry,
     RegionWideBatchReplayGuard,
@@ -92,6 +93,8 @@ from zkregion import (
     WideRangeReplayGuard,
     commit,
     commit_coordinate,
+    decode_region_proof_bundle,
+    encode_region_proof_bundle,
     merkle_root,
     pedersen_commit,
     prove_consistency,
@@ -139,6 +142,7 @@ from zkregion import (
     verify_region_bound,
     verify_region_contains_batch,
     verify_region_contains_bound,
+    verify_region_proof_bundle,
     verify_region_wide,
     verify_region_wide_batch,
     verify_region_wide_batch_bound,
@@ -40051,3 +40055,551 @@ class BoundRegionWideReplayGuardTest(unittest.TestCase):
             thread.join()
         self.assertEqual(sum(results), 1)
         store.close()
+
+
+def _bundle_framed_take(buf, pos):
+    """Return (tag, body_start, end) for one TLV record at pos."""
+    tag = buf[pos]
+    length = int.from_bytes(buf[pos + 1 : pos + 5], "big")
+    body = pos + 5
+    return tag, body, body + length
+
+
+def _bundle_signed_int(value):
+    """Test-local mirror of the envelope signed-integer payload."""
+    if value < 0:
+        sign = b"\x01"
+        magnitude = -value
+    else:
+        sign = b"\x00"
+        magnitude = value
+    raw = magnitude.to_bytes(max(1, (magnitude.bit_length() + 7) // 8), "big")
+    return sign + len(raw).to_bytes(4, "big") + raw
+
+
+class RegionProofBundleTest(unittest.TestCase):
+    def _region_material(self):
+        region = Region(0, 7, 0, 3)
+        x_commitment, _ = pedersen_commit(3, 0, 7, blinding=12345)
+        y_commitment, _ = pedersen_commit(2, 0, 3, blinding=23456)
+        proof = prove_region(
+            x_commitment,
+            y_commitment,
+            3,
+            2,
+            12345,
+            23456,
+            region,
+            b"ctx",
+            randbelow=counter_randbelow(),
+        )
+        bundle = RegionProofBundle(
+            x_commitment, y_commitment, region, b"ctx", proof
+        )
+        return x_commitment, y_commitment, region, proof, bundle
+
+    def _wide_region_material(self):
+        region = Region(0, 7, 0, 15)
+        x_commitment, _ = pedersen_commit(3, 0, 7, blinding=34567)
+        y_commitment, _ = pedersen_commit(9, 0, 15, blinding=45678)
+        proof = prove_region_wide(
+            x_commitment,
+            y_commitment,
+            3,
+            9,
+            34567,
+            45678,
+            region,
+            b"wide",
+            randbelow=counter_randbelow(),
+        )
+        bundle = RegionProofBundle(
+            x_commitment, y_commitment, region, b"wide", proof
+        )
+        return x_commitment, y_commitment, region, proof, bundle
+
+    def test_bundle_is_frozen_positional_and_value_equal(self):
+        xc, yc, region, proof, bundle = self._region_material()
+        self.assertEqual(
+            bundle,
+            RegionProofBundle(
+                x_commitment=xc,
+                y_commitment=yc,
+                region=region,
+                context=b"ctx",
+                proof=proof,
+            ),
+        )
+        self.assertTrue(dataclasses.is_dataclass(bundle))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            bundle.context = b"other"
+
+    def test_encode_returns_bytes_with_header(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = encode_region_proof_bundle(bundle)
+        self.assertIsInstance(raw, bytes)
+        self.assertEqual(raw[:4], b"zrpb")
+        self.assertEqual(raw[4], 1)
+        self.assertEqual(raw[5], 1)
+
+    def test_encode_is_stable_for_the_same_object(self):
+        _, _, _, _, bundle = self._region_material()
+        self.assertEqual(
+            encode_region_proof_bundle(bundle),
+            encode_region_proof_bundle(bundle),
+        )
+
+    def test_round_trip_region_proof_rebuilds_equal_fields(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = encode_region_proof_bundle(bundle)
+        decoded = decode_region_proof_bundle(raw)
+        self.assertEqual(decoded, bundle)
+        self.assertIsInstance(decoded.proof, RegionProof)
+        self.assertEqual(
+            encode_region_proof_bundle(decoded), raw
+        )
+
+    def test_round_trip_wide_region_proof_rebuilds_equal_fields(self):
+        _, _, _, _, bundle = self._wide_region_material()
+        raw = encode_region_proof_bundle(bundle)
+        self.assertEqual(raw[5], 2)
+        decoded = decode_region_proof_bundle(raw)
+        self.assertEqual(decoded, bundle)
+        self.assertIsInstance(decoded.proof, RegionWideProof)
+        self.assertEqual(encode_region_proof_bundle(decoded), raw)
+
+    def test_round_trip_empty_context_negative_bounds(self):
+        region = Region(-8, -1, -4, -1)
+        x_commitment, _ = pedersen_commit(-3, -8, -1, blinding=54321)
+        y_commitment, _ = pedersen_commit(-2, -4, -1, blinding=65432)
+        proof = prove_region(
+            x_commitment,
+            y_commitment,
+            -3,
+            -2,
+            54321,
+            65432,
+            region,
+            b"",
+            randbelow=counter_randbelow(),
+        )
+        bundle = RegionProofBundle(x_commitment, y_commitment, region, b"", proof)
+        decoded = decode_region_proof_bundle(encode_region_proof_bundle(bundle))
+        self.assertEqual(decoded, bundle)
+
+    def test_round_trip_arbitrary_precision_signed_integers(self):
+        big_prime = (1 << 521) - 1
+        x_commitment = PedersenCommitment(
+            element=-(1 << 400) + 17,
+            lower=-(10 ** 100),
+            upper=10 ** 100,
+            prime=big_prime,
+            generator=3,
+            h=9,
+        )
+        y_commitment = PedersenCommitment(
+            element=(1 << 401) - 5,
+            lower=-(10 ** 100),
+            upper=10 ** 100,
+            prime=big_prime,
+            generator=3,
+            h=9,
+        )
+        region = Region(-(10 ** 100), 10 ** 100, -(10 ** 100), 10 ** 100)
+        proof = RegionProof(
+            RangeProof((-(1 << 300),), (0,), (1 << 256,)),
+            RangeProof((1 << 350,), (-(1 << 99),), (7,)),
+        )
+        bundle = RegionProofBundle(x_commitment, y_commitment, region, b"big", proof)
+        decoded = decode_region_proof_bundle(encode_region_proof_bundle(bundle))
+        self.assertEqual(decoded, bundle)
+
+    def test_field_order_is_preserved(self):
+        xc, yc, region, proof, bundle = self._region_material()
+        decoded = decode_region_proof_bundle(encode_region_proof_bundle(bundle))
+        self.assertEqual(decoded.x_commitment, xc)
+        self.assertEqual(decoded.y_commitment, yc)
+        self.assertEqual(decoded.region, region)
+        self.assertEqual(decoded.context, b"ctx")
+        self.assertEqual(decoded.proof, proof)
+        # swapping the two commitments changes the envelope and does not
+        # decode back to the same object
+        swapped = RegionProofBundle(yc, xc, region, b"ctx", proof)
+        self.assertNotEqual(
+            encode_region_proof_bundle(swapped),
+            encode_region_proof_bundle(bundle),
+        )
+        self.assertEqual(
+            decode_region_proof_bundle(encode_region_proof_bundle(swapped)),
+            swapped,
+        )
+
+    def test_verify_accepts_honest_region_bundle(self):
+        _, _, _, _, bundle = self._region_material()
+        self.assertTrue(verify_region_proof_bundle(bundle))
+        self.assertTrue(
+            verify_region_proof_bundle(
+                decode_region_proof_bundle(encode_region_proof_bundle(bundle))
+            )
+        )
+
+    def test_verify_accepts_honest_wide_region_bundle(self):
+        _, _, _, _, bundle = self._wide_region_material()
+        self.assertTrue(verify_region_proof_bundle(bundle))
+        self.assertTrue(
+            verify_region_proof_bundle(
+                decode_region_proof_bundle(encode_region_proof_bundle(bundle))
+            )
+        )
+
+    def test_verify_rejects_context_region_axis_and_commitment_mismatch(self):
+        xc, yc, region, proof, bundle = self._region_material()
+        self.assertFalse(
+            verify_region_proof_bundle(
+                RegionProofBundle(xc, yc, region, b"other", proof)
+            )
+        )
+        other_region = Region(0, 7, 0, 4)
+        self.assertFalse(
+            verify_region_proof_bundle(
+                RegionProofBundle(xc, yc, other_region, b"ctx", proof)
+            )
+        )
+        swapped_axes = RegionProof(
+            x_proof=proof.y_proof, y_proof=proof.x_proof
+        )
+        self.assertFalse(
+            verify_region_proof_bundle(
+                RegionProofBundle(xc, yc, region, b"ctx", swapped_axes)
+            )
+        )
+        self.assertFalse(
+            verify_region_proof_bundle(
+                RegionProofBundle(yc, xc, region, b"ctx", proof)
+            )
+        )
+
+    def test_round_trip_preserves_false_verification_conclusion(self):
+        xc, yc, region, proof, _ = self._region_material()
+        swapped = RegionProof(
+            x_proof=proof.y_proof, y_proof=proof.x_proof
+        )
+        bundle = RegionProofBundle(xc, yc, region, b"ctx", swapped)
+        self.assertFalse(verify_region_proof_bundle(bundle))
+        decoded = decode_region_proof_bundle(encode_region_proof_bundle(bundle))
+        self.assertEqual(decoded, bundle)
+        self.assertFalse(verify_region_proof_bundle(decoded))
+
+    def test_encode_type_errors(self):
+        xc, yc, region, proof, _ = self._region_material()
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle("not a bundle")
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle("x", yc, region, b"ctx", proof)
+            )
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(xc, yc, region, b"ctx", "not a proof")
+            )
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(xc, yc, region, b"ctx", proof.x_proof)
+            )
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(xc, yc, region, bytearray(b"ctx"), proof)
+            )
+        # RegionProof slots cannot hold WideRangeProof sub-proofs
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(
+                    xc,
+                    yc,
+                    region,
+                    b"ctx",
+                    RegionProof(x_proof=proof.x_proof, y_proof=object()),
+                )
+            )
+        bad_commitment = dataclasses.replace(xc, element=True)
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(bad_commitment, yc, region, b"ctx", proof)
+            )
+
+    def test_verify_type_errors(self):
+        xc, yc, region, proof, _ = self._region_material()
+        with self.assertRaises(TypeError):
+            verify_region_proof_bundle("not a bundle")
+        with self.assertRaises(TypeError):
+            verify_region_proof_bundle(
+                RegionProofBundle("x", yc, region, b"ctx", proof)
+            )
+        with self.assertRaises(TypeError):
+            verify_region_proof_bundle(
+                RegionProofBundle(xc, yc, region, b"ctx", 42)
+            )
+        with self.assertRaises(TypeError):
+            verify_region_proof_bundle(
+                RegionProofBundle(xc, yc, "region", b"ctx", proof)
+            )
+
+    def test_decode_rejects_non_bytes(self):
+        for bad in (bytearray(b"zrpb"), "zrpb", None, 123, [b"zrpb"], memoryview(b"zrpb")):
+            with self.assertRaises(TypeError):
+                decode_region_proof_bundle(bad)
+
+    def _top_records(self, raw):
+        records = []
+        pos = 6
+        for _ in range(5):
+            tag, body, end = _bundle_framed_take(raw, pos)
+            records.append((tag, pos, body, end))
+            pos = end
+        return records
+
+    def test_decode_rejects_every_truncated_prefix(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = encode_region_proof_bundle(bundle)
+        for cut in range(len(raw)):
+            with self.assertRaises(ValueError):
+                decode_region_proof_bundle(raw[:cut])
+
+    def test_decode_rejects_trailing_data(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = encode_region_proof_bundle(bundle)
+        for extra in (b"\x00", b"\xff", b"zrpb", b"\x00" * 100):
+            with self.assertRaises(ValueError):
+                decode_region_proof_bundle(raw + extra)
+
+    def test_decode_rejects_bad_magic_version_and_proof_type(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = bytearray(encode_region_proof_bundle(bundle))
+        bad_magic = bytearray(raw)
+        bad_magic[0] = ord("Z")
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(bad_magic))
+        bad_version = bytearray(raw)
+        bad_version[4] = 0
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(bad_version))
+        bad_version[4] = 2
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(bad_version))
+        bad_type = bytearray(raw)
+        bad_type[5] = 0
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(bad_type))
+        bad_type[5] = 3
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(bad_type))
+
+    def test_decode_rejects_unexpected_record_tag(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = bytearray(encode_region_proof_bundle(bundle))
+        records = self._top_records(bytes(raw))
+        tag_pos = records[0][1]
+        self.assertEqual(raw[tag_pos], 0x01)
+        raw[tag_pos] = 0x02
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(raw))
+
+    def test_decode_rejects_length_running_past_payload(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = bytearray(encode_region_proof_bundle(bundle))
+        records = self._top_records(bytes(raw))
+        tag_pos = records[0][1]
+        raw[tag_pos + 1 : tag_pos + 5] = (0xFFFFFFFF).to_bytes(4, "big")
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(raw))
+
+    def _replace_top_record(self, raw, index, new_payload):
+        records = self._top_records(raw)
+        tag, _, _, _ = records[index]
+        frame = bytes([tag]) + len(new_payload).to_bytes(4, "big") + new_payload
+        start = records[index][1]
+        end = records[index][3]
+        return raw[:start] + frame + raw[end:]
+
+    def test_decode_rejects_non_minimal_integer_encoding(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = encode_region_proof_bundle(bundle)
+        tag, pos, body, end = self._top_records(raw)[0]
+        self.assertEqual(tag, 0x01)
+        sign = raw[body]
+        length = int.from_bytes(raw[body + 1 : body + 5], "big")
+        magnitude = raw[body + 5 : body + 5 + length]
+        # prepend a zero byte inside the same PEDERSEN payload -> non-minimal
+        rest = raw[body + 5 + length : end]
+        new_payload = (
+            bytes([sign])
+            + (length + 1).to_bytes(4, "big")
+            + b"\x00"
+            + magnitude
+            + rest
+        )
+        mutated = self._replace_top_record(raw, 0, new_payload)
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(mutated)
+
+    def test_decode_rejects_invalid_sign_byte(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = bytearray(encode_region_proof_bundle(bundle))
+        body = self._top_records(bytes(raw))[0][2]
+        raw[body] = 2
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(raw))
+
+    def test_decode_rejects_negative_zero(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = bytearray(encode_region_proof_bundle(bundle))
+        # the region's first bound is zero: sign byte 0 on a one-byte 0x00
+        region_body = self._top_records(bytes(raw))[2][2]
+        self.assertEqual(bytes(raw[region_body:region_body + 6]), b"\x00\x00\x00\x00\x01\x00")
+        raw[region_body] = 1
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(raw))
+
+    def test_decode_rejects_inverted_region_rebuilt_from_wire(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = encode_region_proof_bundle(bundle)
+        # encode a region whose min_y (5th..8th framed ints) exceeds max_y
+        bounds = (0, 7, 5, 3)
+        new_payload = b"".join(_bundle_signed_int(v) for v in bounds)
+        mutated = self._replace_top_record(raw, 2, new_payload)
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(mutated)
+
+    def test_decode_rejects_outer_proof_tuple_arity_not_two(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = bytearray(encode_region_proof_bundle(bundle))
+        proof_body = self._top_records(bytes(raw))[4][2]
+        self.assertEqual(int.from_bytes(raw[proof_body:proof_body + 2], "big"), 2)
+        for arity in (0, 1, 3):
+            mutated = bytearray(raw)
+            mutated[proof_body:proof_body + 2] = arity.to_bytes(2, "big")
+            with self.assertRaises(ValueError):
+                decode_region_proof_bundle(bytes(mutated))
+
+    def test_decode_rejects_wide_pair_arity_not_two(self):
+        _, _, _, _, bundle = self._wide_region_material()
+        raw = bytes(encode_region_proof_bundle(bundle))
+        proof_body = self._top_records(raw)[4][2]
+        # outer proof tuple: arity then two WideRangeProof records
+        pos = proof_body + 2
+        _, wide_body, wide_end = _bundle_framed_take(raw, pos)
+        # WideRangeProof payload: commitments TUPLE record, then challenges
+        _, _, commitments_end = _bundle_framed_take(raw, wide_body)
+        _, challenges_body, _ = _bundle_framed_take(raw, commitments_end)
+        # challenges tuple: arity then the first integer-pair TUPLE record
+        _, pair_body, _ = _bundle_framed_take(raw, challenges_body + 2)
+        self.assertEqual(int.from_bytes(raw[pair_body:pair_body + 2], "big"), 2)
+        mutated = bytearray(raw)
+        for arity in (1, 3):
+            mutated[pair_body:pair_body + 2] = arity.to_bytes(2, "big")
+            with self.assertRaises(ValueError):
+                decode_region_proof_bundle(bytes(mutated))
+
+    def test_proof_types_cannot_be_cross_interpreted(self):
+        _, _, _, _, narrow = self._region_material()
+        _, _, _, _, wide = self._wide_region_material()
+        narrow_raw = bytearray(encode_region_proof_bundle(narrow))
+        narrow_raw[5] = 2
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(narrow_raw))
+        wide_raw = bytearray(encode_region_proof_bundle(wide))
+        wide_raw[5] = 1
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(wide_raw))
+
+    def test_decode_rejects_inner_proof_record_tag_mismatch(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = bytearray(encode_region_proof_bundle(bundle))
+        pos = raw.index(b"\x20")  # first RangeProof record tag
+        raw[pos] = 0x21
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(bytes(raw))
+
+    def test_encode_rejects_nested_wrong_types(self):
+        xc, yc, region, proof, _ = self._region_material()
+        # a RegionWideProof cannot carry RangeProof sub-proofs
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(
+                    xc,
+                    yc,
+                    region,
+                    b"ctx",
+                    RegionWideProof(
+                        x_proof=proof.x_proof, y_proof=proof.y_proof
+                    ),
+                )
+            )
+        # tuple fields must actually be tuples, and bool is not an int
+        bad_narrow = RangeProof([1], [0], [1])
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(
+                    xc,
+                    yc,
+                    region,
+                    b"ctx",
+                    RegionProof(x_proof=bad_narrow, y_proof=proof.y_proof),
+                )
+            )
+        bad_wide = WideRangeProof((True,), ((0, 0),), ((0, 0),))
+        with self.assertRaises(TypeError):
+            encode_region_proof_bundle(
+                RegionProofBundle(
+                    xc,
+                    yc,
+                    region,
+                    b"ctx",
+                    RegionWideProof(x_proof=bad_wide, y_proof=bad_wide),
+                )
+            )
+
+    def test_decode_failure_returns_no_partial_object(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = encode_region_proof_bundle(bundle)
+        bad_magic = b"XXXX" + raw[4:]
+        for mutated in (raw[:-1], raw + b"\x00", bad_magic):
+            with self.assertRaises(ValueError):
+                decode_region_proof_bundle(mutated)
+
+    def test_every_single_byte_tamper_is_rejected(self):
+        _, _, _, _, bundle = self._region_material()
+        raw = encode_region_proof_bundle(bundle)
+        replacements = (0x00, 0xFF)
+        for pos in range(len(raw)):
+            for value in replacements:
+                if value == raw[pos]:
+                    continue
+                mutated = bytearray(raw)
+                mutated[pos] = value
+                try:
+                    decoded = decode_region_proof_bundle(bytes(mutated))
+                except ValueError:
+                    continue
+                self.assertFalse(
+                    verify_region_proof_bundle(decoded),
+                    f"tamper at {pos} -> {value} verified",
+                )
+
+    def test_every_single_byte_tamper_rejected_for_wide_bundle(self):
+        _, _, _, _, bundle = self._wide_region_material()
+        raw = encode_region_proof_bundle(bundle)
+        for pos in range(len(raw)):
+            value = raw[pos] ^ 0x5A
+            if value == raw[pos]:
+                continue
+            mutated = bytearray(raw)
+            mutated[pos] = value
+            try:
+                decoded = decode_region_proof_bundle(bytes(mutated))
+            except ValueError:
+                continue
+            self.assertFalse(
+                verify_region_proof_bundle(decoded),
+                f"wide tamper at {pos} verified",
+            )

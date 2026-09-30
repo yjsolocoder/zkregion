@@ -1315,6 +1315,10 @@ python3 -m zkregion
 - `prove_region_contains_bound(entries) -> tuple[BoundRegionContainsBatch, bytes]` — 顶层构造 Merkle 承诺的规范区域判定完整批：`entries` 沿用 `verify_region_contains_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，输入不变；每项外层叶逐字节复用 `_bound_region_contains_leaf` 编码，域分隔、长度帧、十进制 ASCII 整数约定、字段顺序及 Merkle 哈希规则不变；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖从零开始的全部位置、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_region_contains_bound(batch, root) is True`，单项、奇偶批与重复项均确定，重复构造逐字节一致；全批或任一嵌套字段错型（含用 `bool` 冒充整数与后项错型）抛 `TypeError`，空批、U 成帧批次数越出 uint64 或 `verify_region_contains_batch` 返回 `False`（开合不符、声明区间与区域边界不一致或坐标越出矩形）抛 `ValueError`
 - `RegionProof(x_proof, y_proof)` — 不可变区域证明对象，两字段均为 `RangeProof`
 - `RegionWideProof(x_proof, y_proof)` — 不可变宽区间版区域证明对象，两字段分别为 x 轴与 y 轴的 `WideRangeProof`（两轴位宽可各自不同）；可位置构造、按值相等且不可变
+- `RegionProofBundle(x_commitment, y_commitment, region, context, proof)` — 跨进程传递二维区域证明的不可变信封，字段按 `x_commitment`、`y_commitment`、`region`、`context`、`proof` 顺序承载；`proof` 只接受 `RegionProof` 或 `RegionWideProof`，其余四字段类型同 `verify_region` 入参；可位置构造、按值相等且不可变，构造时不做校验
+- `encode_region_proof_bundle(bundle) -> bytes` — 把信封序列化为规范化二进制字节串：同一对象稳定输出同一字节串；字节串携带固定魔数、格式版本（uint8）与证明类型（uint8，1 = `RegionProof`、2 = `RegionWideProof`），随后按字段顺序承载两份承诺、区域、`context` 与证明，每项为「uint8 记录标签 + uint32 大端长度 + 载荷」自成帧记录；承诺六字段与区域四边界按数据类字段顺序逐个为「符号字节 + uint32 大端幅度长度 + 最短无符号大端幅度」的任意精度有符号整数（零编码为一个 `0x00` 幅度字节），`context` 为原始字节；`RegionProof` 载荷为两个（先 x 后 y）`RangeProof` 记录，各含 `t`/`e`/`s` 三个整数元组，`RegionWideProof` 载荷为两个 `WideRangeProof` 记录，各含 `commitments` 整数元组与 `challenges`/`responses` 两个整数二元组元组，元组均以 uint16 基数前缀按元组顺序无歧义承载递归结构；函数为纯函数，只返回 `bytes`，不写文件或数据库；对象或任一层字段错型（含用 `bool` 冒充整数、`context` 不是 `bytes`、`proof` 既非 `RegionProof` 也非 `RegionWideProof`）抛 `TypeError`
+- `decode_region_proof_bundle(data) -> RegionProofBundle` — 只接受 `bytes`（`bytearray`/`str` 等抛 `TypeError`），逐层核对魔数、版本、证明类型、记录标签、uint32 长度前缀、uint16 元组基数、整数符号与最短编码以及 `RangeProof`/`WideRangeProof` 的递归证明形状（证明类型固定形状，两类证明不能互换解释），完整消费载荷（无尾随数据）后重建字段值与原对象相等的信封；截断、越界长度或基数、未知版本或证明类型、非法字段值（含非最短整数编码、重建 `Region` 时非法区间）、非法证明形状或尾随数据一律抛 `ValueError`，失败不返回部分对象
+- `verify_region_proof_bundle(bundle) -> bool` — 按 `proof` 类型沿用现有单条验证语义：`RegionProof` 调 `verify_region`、`RegionWideProof` 调 `verify_region_wide`；只使用两个 `PedersenCommitment`、`Region`、`context` 与 `proof`，不读取坐标或盲因子；声明范围或 context 不符、坐标轴或承诺互换、proof 篡改或验证等式失败返回 `False`，对象或字段类型错误（含 `proof` 两类皆非）抛 `TypeError`；编码后解码保持验证结论，字节篡改无法恢复成原信封并通过验证，也无法把 `RegionProof` 载荷解释为 `RegionWideProof`
 - `verify_region_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 区域证明的批量验证，按 `(prime, generator, h)` 分组做一次随机线性组合
 - `RegionBatchEntry(x_commitment, y_commitment, region, proof, context=b"")` — 不可变批量验证条目，字段次序与 `verify_region` 入参一致
 - `SchnorrProver(secret, *, prime, generator, randbelow)`
@@ -1797,6 +1801,23 @@ h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
 空批、计数或索引不符、错误根、叶字节被篡改或内层批验拒绝一律返回 `False`；`root` 不是 `bytes` 等错型抛 `TypeError`。入口不改写任何输入。
 
 `prove_region_wide_batch_bound(entries, *, randbelow=secrets.randbelow) -> (batch, root)` 是规范构造入口：`entries` 沿用 `verify_region_wide_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项（保序留重），不改写输入；每项按上述同一叶编码成叶（即验根时重算的同一份叶），以全索引 `tuple(range(n))` 调 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖从零开始的全部位置、`siblings` 为空），返回批与该批编码叶的 `merkle_root`。构造结果一次通过 `verify_region_wide_batch_bound(batch, root)`，单条目、奇偶批与重复项都给确定结果；同一份输入重复构造所得的批、根与证明逐字节一致。构造预检失败抛 `TypeError`，空批、批次数越出 uint64 或内层 `verify_region_wide_batch` 不通过抛 `ValueError`；`randbelow` 原样透传，随机源自身异常按既有边界原样抛出。既有宽区间与旧二维区域行为全部不变，不新增落盘口径。
+
+### 跨进程区域证明的规范化二进制信封
+
+`RegionProofBundle(x_commitment, y_commitment, region, context, proof)` 把单条 `verify_region` / `verify_region_wide` 所需的五个值冻结成一个不可变信封，字段次序即验证入参次序，`proof` 只允许 `RegionProof` 或 `RegionWideProof`。信封不做任何 I/O：`encode_region_proof_bundle(bundle)` 只返回 `bytes`，不写文件或数据库，解码方用 `decode_region_proof_bundle(data)` 重建，用 `verify_region_proof_bundle(bundle)` 验证。
+
+编码对同一对象稳定输出同一字节串，布局自前向后为：
+
+```
+魔数 b"zrpb" | 版本 uint8(=1) | 证明类型 uint8(1=RegionProof, 2=RegionWideProof)
+x_commitment 记录 | y_commitment 记录 | region 记录 | context 记录 | proof 记录
+```
+
+每条记录均自成帧：`uint8 记录标签 + uint32 大端载荷长度 + 恰好该长度的载荷`。承诺记录按 `element`、`lower`、`upper`、`prime`、`generator`、`h` 的字段顺序承载六个任意精度有符号整数，区域记录按 `min_x`、`max_x`、`min_y`、`max_y` 承载四个；每个整数为一个符号字节（`0` 非负、`1` 为负）、uint32 大端幅度长度与最短无符号大端幅度（零恰为一个 `0x00` 幅度字节），因此负边界与大整数无歧义。`context` 记录载荷为原始字节。证明记录载荷以 uint16 基数固定为 2（先 x 后 y）展开两条子证明记录：`RegionProof` 的子证明为 `RangeProof` 记录，依次是 `t`、`e`、`s` 三个整数元组；`RegionWideProof` 的子证明为 `WideRangeProof` 记录，依次是 `commitments` 整数元组与 `challenges`、`responses` 两个「二元组的元组」；每个元组以 uint16 基数前缀按元组顺序递归承载。
+
+`decode_region_proof_bundle` 只接受 `bytes`：先核对魔数、版本与证明类型（未知版本或类型即拒绝），再按字段顺序逐层核对记录标签、长度前缀、元组基数、整数符号与最短编码，并严格按头部证明类型解释递归证明形状——`RegionProof` 与 `RegionWideProof` 不能互换解释；载荷必须被完整消费，任何尾随字节都拒绝。截断、越界长度或基数、非法字段值（含重建 `Region` 时发现非法区间）、非法证明形状或尾随数据抛 `ValueError`，非 `bytes` 输入与编码/验证时的错误对象或字段类型（含 `bool` 整数、非 `bytes` 的 `context`、两类皆非的 `proof`）抛 `TypeError`；失败不返回部分对象。
+
+重建出的信封字段值与原对象相等，故编码后解码保持验证结论。`verify_region_proof_bundle` 不读取坐标或盲因子，只使用两个承诺、区域、`context` 与 `proof`，按证明类型原样委托 `verify_region` 或 `verify_region_wide`：声明范围或 context 不符、坐标轴或承诺互换、proof 被篡改或验证等式失败一律返回 `False`。字节篡改要么无法通过解码，要么重建为不同对象后验证失败；把 `RegionProof` 载荷的类型标记改成宽区间类型也无法被解释成 `RegionWideProof`。
 
 ### Fiat-Shamir 转录
 

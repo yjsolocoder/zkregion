@@ -142,6 +142,7 @@ __all__ = [
     "MerkleMultiBatchReplayGuard",
     "MerkleMultiEntryReplayGuard",
     "MerkleMultiProof",
+    "MerkleMultiProofBundle",
     "MerkleMultiReplayGuard",
     "MerkleProof",
     "MultiSchnorrEntry",
@@ -187,7 +188,9 @@ __all__ = [
     "WideRangeReplayGuard",
     "commit",
     "commit_coordinate",
+    "decode_merkle_multi_proof_bundle",
     "decode_region_proof_bundle",
+    "encode_merkle_multi_proof_bundle",
     "encode_region_proof_bundle",
     "merkle_root",
     "pedersen_commit",
@@ -222,6 +225,7 @@ __all__ = [
     "verify_inclusion",
     "verify_inclusion_batch",
     "verify_inclusion_batch_bound",
+    "verify_merkle_multi_proof_bundle",
     "verify_multi_inclusion",
     "verify_multi_inclusion_batch",
     "verify_multi_inclusion_batch_bound",
@@ -4995,6 +4999,222 @@ def prove_multi_inclusion_batch_bound(
         proof=proof,
     )
     return batch, root
+
+
+# ---------------------------------------------------------------------------
+# Transportable multi-inclusion proof bundles
+#
+# A MerkleMultiProofBundle freezes everything a verifier needs to re-check a
+# MerkleMultiProof without the full leaf set: the Merkle root, the proof
+# itself and the proven (index, leaf) entries in the exact order of
+# proof.indices. encode_merkle_multi_proof_bundle maps a bundle to a
+# canonical, self-delimiting byte string under its own domain (magic
+# b"zrmm", format version 1) so bundles can leave the process and be
+# decoded and verified elsewhere; decode_merkle_multi_proof_bundle accepts
+# only that canonical form and rebuilds an equal bundle, and
+# verify_merkle_multi_proof_bundle re-runs the existing multi-inclusion
+# rules on the decoded value. Integers reuse the bundle integer body (sign
+# byte plus shortest big-endian magnitude), tuples carry an explicit
+# cardinality and every item is length-prefixed, so the encoding is
+# deterministic and unambiguous and the same bundle always maps to the same
+# bytes.
+
+_MERKLE_MULTI_BUNDLE_MAGIC = b"zrmm"
+_MERKLE_MULTI_BUNDLE_VERSION = 1
+
+
+@dataclass(frozen=True)
+class MerkleMultiProofBundle:
+    """A versioned, canonical binary envelope for one multi-inclusion proof.
+
+    Fields, in the fixed wire order: ``root`` (``bytes``), ``proof``
+    (:class:`MerkleMultiProof`) and ``entries`` (a tuple of ``(index,
+    leaf)`` pairs, one per entry of ``proof.indices``, in the same
+    strictly increasing index order). Bundles are positional construction
+    arguments, compare by value and are immutable; construction performs no
+    validation — use :func:`encode_merkle_multi_proof_bundle` /
+    :func:`verify_merkle_multi_proof_bundle` to check.
+    """
+
+    root: bytes
+    proof: MerkleMultiProof
+    entries: tuple[tuple[int, bytes], ...]
+
+
+def _merkle_multi_check_proof(proof: object) -> None:
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("proof must be a MerkleMultiProof")
+    _bundle_check_int(proof.leaf_count, "proof leaf_count")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for position, index in enumerate(proof.indices):
+        _bundle_check_int(index, f"proof indices[{position}]")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for position, sibling in enumerate(proof.siblings):
+        if not isinstance(sibling, bytes):
+            raise TypeError(f"proof siblings[{position}] must be bytes")
+
+
+def _merkle_multi_check_entries(entries: object) -> None:
+    if not isinstance(entries, tuple):
+        raise TypeError("entries must be a tuple of (index, leaf) pairs")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, tuple) or len(entry) != 2:
+            raise TypeError(f"entries[{position}] must be an (index, leaf) pair")
+        index, leaf = entry
+        _bundle_check_int(index, f"entries[{position}] index")
+        if not isinstance(leaf, bytes):
+            raise TypeError(f"entries[{position}] leaf must be bytes")
+
+
+def encode_merkle_multi_proof_bundle(bundle: MerkleMultiProofBundle) -> bytes:
+    """Encode a :class:`MerkleMultiProofBundle` into its canonical byte envelope.
+
+    The same bundle object always encodes to the same byte string. The
+    output starts with the four-byte magic ``b"zrmm"`` and a one-byte
+    format version, followed by the three fields in fixed order (``root``,
+    ``proof``, ``entries``); each item is length-prefixed with a four-byte
+    big-endian header, integers carry a sign byte and a shortest big-endian
+    magnitude and tuples carry an explicit cardinality. The function
+    returns ``bytes`` only and never writes to the file system or a
+    database.
+
+    A wrong object or field type (including a ``bool`` integer, a
+    non-tuple ``indices``/``siblings``/``entries`` field, an entry that is
+    not an ``(index, leaf)`` pair or a non-bytes leaf or sibling) raises
+    :class:`TypeError`. Only types are checked: a bundle whose proof is
+    semantically inconsistent (misordered or mismatched indices, a wrong
+    leaf count, siblings that do not rebuild the root) still encodes, and
+    the failure is reported by :func:`verify_merkle_multi_proof_bundle`.
+    """
+    if not isinstance(bundle, MerkleMultiProofBundle):
+        raise TypeError("bundle must be a MerkleMultiProofBundle")
+    if not isinstance(bundle.root, bytes):
+        raise TypeError("root must be bytes")
+    _merkle_multi_check_proof(bundle.proof)
+    _merkle_multi_check_entries(bundle.entries)
+    proof = bundle.proof
+    proof_body = _bundle_tuple(
+        [
+            _bundle_int(proof.leaf_count),
+            _bundle_tuple([_bundle_int(index) for index in proof.indices]),
+            _bundle_tuple(list(proof.siblings)),
+        ]
+    )
+    entries_body = _bundle_tuple(
+        [
+            _bundle_tuple([_bundle_int(index), leaf])
+            for index, leaf in bundle.entries
+        ]
+    )
+    out = bytearray()
+    out += _MERKLE_MULTI_BUNDLE_MAGIC
+    out += bytes((_MERKLE_MULTI_BUNDLE_VERSION,))
+    out += _bundle_frame(bundle.root)
+    out += _bundle_frame(proof_body)
+    out += _bundle_frame(entries_body)
+    return bytes(out)
+
+
+def _merkle_multi_read_bytes_tuple(reader: _BundleReader, what: str) -> tuple[bytes, ...]:
+    body = reader.frame(what)
+    inner = _BundleReader(body)
+    count = inner.tuple_cardinality(what)
+    items = tuple(inner.frame(f"{what}[{position}]") for position in range(count))
+    if not inner.at_end():
+        raise ValueError(f"{what} tuple has trailing data")
+    return items
+
+
+def _merkle_multi_decode_proof(reader: _BundleReader) -> MerkleMultiProof:
+    body = reader.frame("proof")
+    inner = _BundleReader(body)
+    count = inner.tuple_cardinality("proof")
+    if count != 3:
+        raise ValueError("proof must have exactly three fields")
+    leaf_count = inner.int_value("proof leaf_count")
+    indices = inner.integer_tuple("proof indices")
+    siblings = _merkle_multi_read_bytes_tuple(inner, "proof siblings")
+    if not inner.at_end():
+        raise ValueError("proof has trailing data")
+    return MerkleMultiProof(
+        leaf_count=leaf_count,
+        indices=indices,
+        siblings=siblings,
+    )
+
+
+def _merkle_multi_decode_entries(
+    reader: _BundleReader,
+) -> tuple[tuple[int, bytes], ...]:
+    body = reader.frame("entries")
+    inner = _BundleReader(body)
+    count = inner.tuple_cardinality("entries")
+    entries: list[tuple[int, bytes]] = []
+    for position in range(count):
+        entry_body = inner.frame(f"entries[{position}]")
+        entry_reader = _BundleReader(entry_body)
+        entry_count = entry_reader.tuple_cardinality(f"entries[{position}]")
+        if entry_count != 2:
+            raise ValueError(f"entries[{position}] must be an (index, leaf) pair")
+        index = entry_reader.int_value(f"entries[{position}] index")
+        leaf = entry_reader.frame(f"entries[{position}] leaf")
+        if not entry_reader.at_end():
+            raise ValueError(f"entries[{position}] has trailing data")
+        entries.append((index, leaf))
+    if not inner.at_end():
+        raise ValueError("entries has trailing data")
+    return tuple(entries)
+
+
+def decode_merkle_multi_proof_bundle(data: bytes) -> MerkleMultiProofBundle:
+    """Decode a canonical envelope back into a :class:`MerkleMultiProofBundle`.
+
+    ``data`` must be exactly the output of
+    :func:`encode_merkle_multi_proof_bundle`: the magic, a known format
+    version and the three fields in their fixed order with valid length
+    prefixes, tuple cardinalities and integer sign bytes. The payload must
+    be consumed completely with no trailing bytes. A truncated input, an
+    out-of-bounds length, an unknown version, a non-canonical integer or an
+    unexpected nested shape raises :class:`ValueError`; a non-``bytes``
+    input raises :class:`TypeError`. A decoded bundle compares equal
+    field-for-field to the original, and a bundle that is representable but
+    whose proof does not verify still decodes — the verdict is left to
+    :func:`verify_merkle_multi_proof_bundle`.
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    reader = _BundleReader(data)
+    reader.expect(_MERKLE_MULTI_BUNDLE_MAGIC, "merkle multi proof bundle magic")
+    version = reader.byte("format version")
+    if version != _MERKLE_MULTI_BUNDLE_VERSION:
+        raise ValueError("unknown merkle multi proof bundle format version")
+    root = reader.frame("root")
+    proof = _merkle_multi_decode_proof(reader)
+    entries = _merkle_multi_decode_entries(reader)
+    if not reader.at_end():
+        raise ValueError("trailing data after merkle multi proof bundle payload")
+    return MerkleMultiProofBundle(root=root, proof=proof, entries=entries)
+
+
+def verify_merkle_multi_proof_bundle(bundle: MerkleMultiProofBundle) -> bool:
+    """Verify the proof carried by a :class:`MerkleMultiProofBundle`.
+
+    Verification reuses the existing multi-inclusion rules exactly: the
+    bundle's ``entries``, ``proof`` and ``root`` are handed to
+    :func:`verify_multi_inclusion`, which checks the root and leaf digests,
+    the index ordering and range, the leaf count, the sibling digests and
+    that every sibling is consumed. A wrong object or field type raises
+    :class:`TypeError`; every semantic failure — empty, duplicated or
+    misordered indices, entries that do not match ``proof.indices``, an
+    out-of-range index, a tampered leaf, root or sibling, or a proof
+    spliced together from a different tree — returns ``False``. Encoding
+    and then decoding a bundle preserves the verification verdict.
+    """
+    if not isinstance(bundle, MerkleMultiProofBundle):
+        raise TypeError("bundle must be a MerkleMultiProofBundle")
+    return verify_multi_inclusion(bundle.entries, bundle.proof, bundle.root)
 
 
 # ---------------------------------------------------------------------------

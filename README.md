@@ -1,6 +1,6 @@
 # zkregion
 
-面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含证明、量化区间的 Pedersen 陷门承诺及其上的 Schnorr OR 非交互区间证明与按位分解的宽区间非交互证明、二维矩形区域成员非交互证明，以及量化整数坐标下的矩形区域判定。
+面向区域成员关系的承诺与交互式证明原语。提供哈希承诺、素域乘法群上的 Schnorr 交互证明、确定性 SHA-256 Merkle 包含证明、量化区间的 Pedersen 陷门承诺及其上的 Schnorr OR 非交互区间证明与按位分解的宽区间非交互证明、二维矩形区域与闭凸多边形区域成员非交互证明，以及量化整数坐标下的区域判定。
 
 ## 环境
 
@@ -418,6 +418,22 @@ region_proof = prove_region(
 )
 assert verify_region(x_commitment, y_commitment, region, region_proof, context=b"session-1")
 assert not verify_region(x_commitment, y_commitment, region, region_proof, context=b"other")
+
+# 闭凸多边形区域成员非交互证明：顶点按边界顺序给出，旋转或反向会规范化为同一序列
+from zkregion import (
+    ConvexPolygonRegion,
+    prove_convex_polygon,
+    verify_convex_polygon,
+)
+
+polygon = ConvexPolygonRegion(((0, 0), (4, 0), (0, 4)))  # x >= 0, y >= 0, x + y <= 4
+px_commitment, px_blinding = pedersen_commit(2, polygon.min_x, polygon.max_x)
+py_commitment, py_blinding = pedersen_commit(1, polygon.min_y, polygon.max_y)
+polygon_proof = prove_convex_polygon(
+    px_commitment, py_commitment, 2, 1, px_blinding, py_blinding, polygon,
+    context=b"session-1",
+)
+assert verify_convex_polygon(px_commitment, py_commitment, polygon, polygon_proof, context=b"session-1")
 
 # 二维区域证明的批量验证（按 (prime, generator, h) 分组做随机线性组合）
 from zkregion import RegionBatchEntry, verify_region_batch
@@ -1333,6 +1349,10 @@ python3 -m zkregion
 - `prove_range_batch_bound(entries, *, randbelow=secrets.randbelow) -> tuple[BoundRangeBatch, bytes]` — 顶层构造 Merkle 承诺的规范区间证明完整批：`entries` 沿用 `verify_range_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，输入不变；每项外层叶逐字节复用 `_bound_range_leaf` 编码，既有域、长度帧、字段顺序及 Merkle 哈希规则不变；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖每片叶、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_range_bound(batch, root) is True`，单项、奇偶批与重复项均确定，与旧手工构造逐字节兼容；`randbelow` 原样透传给 `verify_range_batch`；全批或任一嵌套字段错型（含后项错型与 `bool` 计数）抛 `TypeError`，空批、U 成帧批次数越出 uint64 或 `verify_range_batch` 返回 `False`（内层证明无效）抛 `ValueError`
 - `prove_region(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionProof` — 生成二维矩形区域成员非交互证明
 - `verify_region(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证区域成员证明，无需坐标或盲因子
+- `ConvexPolygonRegion(vertices)` — 不可变闭凸多边形区域：`vertices` 为按边界顺序给出的二维非 `bool` 整数二元组序列（须为非 `bytes`/`bytearray`/`str` 序列，顶点必须是恰好两个整数的普通元组；外层序列、顶点或坐标类型错误，含用 `bool` 冒充整数，抛 `TypeError`）；少于三个顶点、顶点重复、相邻三点（循环意义下）共线、自交或凹多边形抛 `ValueError`；旋转或反向表示同一边界时规范化为同一顶点序列（始于字典序最小顶点，取第二顶点字典序较小的方向），可位置/关键字构造、按值相等、可哈希、冻结；暴露 `min_x`/`max_x`/`min_y`/`max_y` 闭合整数包围盒与 `contains(x, y)`（边界与顶点属于区域，坐标非非 `bool` 整数抛 `TypeError`）
+- `ConvexPolygonRegionProof(x_proof, y_proof, edge_proofs)` — 不可变凸多边形成员证明：前两字段为 `RangeProof`（两轴包围盒区间证明），`edge_proofs` 为按规范顶点序每条边一个的 `WideRangeProof` 元组；可位置构造、按值相等、冻结，构造时不做任何校验
+- `prove_convex_polygon(x_commitment, y_commitment, x, y, x_blinding, y_blinding, polygon, context=b"", *, randbelow=secrets.randbelow) -> ConvexPolygonRegionProof` — 生成闭凸多边形区域成员非交互证明：两承诺须使用同一组 `(prime, generator, h)`，声明区间须分别恰为多边形的闭合整数包围盒 `(polygon.min_x, polygon.max_x)` 与 `(polygon.min_y, polygon.max_y)`；先校验两承诺开合，再确认点属于闭多边形（含边与顶点）。每条边的有向叉积偏移由两个承诺同态组合出的边承诺承载，以 `prove_range_wide` 证明其非负（边偏移跨度须适配位宽 `1 <= k <= 24` 的宽区间），包围盒每轴至多 256 个整数；对象、字段或随机源类型错误（含 `bool` 与非 `bytes` context）抛 `TypeError`，参数或区间不匹配、开合失败、点在多边形外、边偏移跨度过大或随机值越界抛 `ValueError`；合格输入生成不透明证明，同一公开输入与相同随机源生成逐字节一致的证明，输入不被改写
+- `verify_convex_polygon(x_commitment, y_commitment, polygon, proof, context=b"") -> bool` — 只凭两个承诺、凸多边形、证明与 context 验证，无需坐标或盲因子；证明绑定多边形规范顶点序、两承诺的群参数与区间字段、轴分配和 context，换点承诺、交换两轴、改多边形（同一多边形的旋转/反向表示除外，其规范序相同）、改 context、改证明任一字段或伪造证明均返回 `False`；对象或嵌套字段错型（含 `bool` 与非 `bytes` context）抛 `TypeError`，其余语义失败一律返回 `False` 而不抛 `ValueError`，输入不被改写
 - `prove_region_wide(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionWideProof` — 按位分解的宽区间版二维矩形区域成员非交互证明：两轴承诺的声明区间须分别恰为 `(region.min_x, region.max_x)` 与 `(region.min_y, region.max_y)`，生成前先逐轴按 `verify_pedersen_opening` 同一开合校验口径重算比对，两轴都通过后才生成子证明；每轴区间个数与位宽沿用 `prove_range_wide` 的同一套约束（恰含 `2**k` 个整数、`1 <= k <= 24`），两轴位宽可各自不同；子证明逐轴原样复用 `prove_range_wide`，比特顺序、加权绑定与挑战口径一概不改，派生上下文沿用二维区域证明的既有绑定（轴标签、区域四边界、外部上下文与两份承诺均在其中）；开合不符、坐标越界、区间与区域不匹配或位宽约束不满足一律抛 `ValueError`，任一层字段错型（含用 `bool` 冒充整数、上下文不是字节串）或随机源不可调用抛 `TypeError`，随机源返回非整数抛 `TypeError`、抽取值越界抛 `ValueError`；同一组入参在相同随机源下重复生成逐字节一致，随机源可注入且原样透传，输入不被改写
 - `verify_region_wide(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证宽区间版区域成员证明，只需两个承诺、区域与证明，无需坐标或盲因子；两轴承诺声明区间须恰为区域对应轴上下界，子证明逐轴以 `verify_range_wide` 同一口径核对；任一层字段错型（含用 `bool` 冒充整数、上下文不是字节串）抛唯一的 `TypeError`，换区域、换上下文、换任一承诺、交换两轴、替换任一子证明、非法结构或位宽越界一律返回 `False` 且不抛异常，输入不被改写
 - `RegionWideBatchEntry(x_commitment, y_commitment, region, proof, context=b"")` — 不可变宽区间二维区域批验条目，字段次序与 `verify_region_wide` 入参一致（两承诺、`Region`、`RegionWideProof`、`bytes` 上下文）；可位置构造、按值相等且不可变，构造时不做任何校验
@@ -1789,6 +1809,27 @@ h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
 每条轴的子证明在派生 context 下进行，派生 context 按以下项目逐项前置四字节无符号大端长度拼接：域 `b"zkregion/region/v1"`、轴标签 `b"x"` 或 `b"y"`、外部 `context`、Region 四边界（`min_x`、`max_x`、`min_y`、`max_y`）、x 承诺六字段、y 承诺六字段（均按数据类字段顺序）；整数编码为十进制 ASCII。因此证明同时绑定区域、外部 context、两个承诺与轴分配——更换区域、context、承诺或交换两轴（含交换子证明、交换承诺）都验证失败。
 
 `context` 只接受 `bytes`，所有整数拒绝 `bool`；承诺、区域、证明对象或其字段、数值类型错误抛 `TypeError`。生成时区间不匹配、开合无效或轴区间超过 256 个整数抛 `ValueError`；验证时上述非类型错误、结构非法、篡改或绑定不符一律返回 `False`。入口均不改写输入。
+
+### 闭凸多边形区域成员非交互证明
+
+`ConvexPolygonRegion` 接受按边界顺序给出的二维整数顶点（顺、逆时针均可），在构造时完成类型与几何校验并规范化：少于三个顶点、重复顶点、相邻三点共线、自交（含非相邻边相交，逐条线段检查）或凹多边形抛 `ValueError`；旋转或反向表示同一边界时规范化为同一序列——始于字典序最小顶点，两种方向中取第二顶点字典序较小者——因此相等且同哈希。边与顶点都属于区域。
+
+证明分两层。第一层是两条轴上的普通区间证明，把承诺点钉在多边形的闭合整数包围盒内，两个承诺的声明区间须分别恰为包围盒的 x、y 上下界。第二层对每条边证明有向叉积偏移非负：以内侧遍历方向（规范序为逆时针）的边 `(dx, dy)` 与起点 `(x0, y0)` 定义
+
+```
+f_e = dx*(y - y0) - dy*(x - x0)
+```
+
+点在边的内侧（含支撑线）当且仅当 `f_e >= 0`。`f_e` 是两个坐标承诺消息的线性组合，故边承诺可由公开元素同态组合而无需坐标：
+
+```
+D_e = C_y**dx * C_x**(-dy) * g**(-K_e) (mod prime)
+K_e = dx*(y0 - lower_y) - dy*(x0 - lower_x)
+```
+
+`D_e` 即对 `f_e`（盲因子为 `dx*r_y - dy*r_x`）的 Pedersen 承诺，声明区间为 `[0, 2**k - 1]`，其中 `2**k - 1` 不小于 `f_e` 在包围盒上的最大值（线性函数在角点取最大），`1 <= k <= 24`；对其调用 `prove_range_wide` 即证明 `f_e >= 0`。验证方仅凭两个承诺、多边形与证明即可重算全部 `D_e`、上界与位宽。每条边的子证明派生 context 在公共转录（域 `b"zkregion/convex-polygon/v1"`、外部 context、规范顶点序、两个承诺各六字段）后追加边序号，因此证明绑定多边形规范顶点序、两承诺的群与区间字段、轴分配和 context；换点承诺、交换两轴、改多边形、改 context、调换或篡改边子证明都验证失败。
+
+验证方不接触坐标值或盲因子。生成时类型错误（含 `bool`、非 `bytes` context、不可调用随机源）抛 `TypeError`，群参数或区间不匹配、开合失败、点在多边形外、边偏移跨度超出宽区间上限或随机值越界抛 `ValueError`；验证时类型错误抛 `TypeError`，其余语义失败只返回 `False`。入口均不改写输入，也不引入落盘或持久化。
 
 ### 二维区域证明批量验证
 

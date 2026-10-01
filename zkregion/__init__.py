@@ -132,6 +132,8 @@ __all__ = [
     "BoundSchnorrReplayGuard",
     "BoundWideRangeBatch",
     "BoundWideRangeReplayGuard",
+    "ConvexPolygonRegion",
+    "ConvexPolygonRegionProof",
     "MerkleConsistencyBatchEntry",
     "MerkleConsistencyBatchReplayGuard",
     "MerkleConsistencyChain",
@@ -206,6 +208,7 @@ __all__ = [
     "prove_consistency_batch_bound",
     "prove_consistency_chain",
     "prove_consistency_chain_batch_bound",
+    "prove_convex_polygon",
     "prove_inclusion",
     "prove_inclusion_batch_bound",
     "prove_multi_inclusion",
@@ -233,6 +236,7 @@ __all__ = [
     "verify_consistency_chain",
     "verify_consistency_chain_batch",
     "verify_consistency_chain_batch_bound",
+    "verify_convex_polygon",
     "verify_inclusion",
     "verify_inclusion_batch",
     "verify_inclusion_batch_bound",
@@ -3232,6 +3236,610 @@ def region_contains_committed(
     if not verify_pedersen_opening(y_commitment, y, y_blinding):
         return False
     return region.min_x <= x <= region.max_x and region.min_y <= y <= region.max_y
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive convex-polygon region membership proofs
+#
+# The polygon is the closed convex region bounded by its vertices, which are
+# given in boundary order (clockwise or counter-clockwise, either accepted).
+# Membership of a quantized point is proved in two layers:
+#
+# 1. two ordinary range proofs (one per axis) pin the committed point to the
+#    polygon's closed integer bounding box, which the commitments must
+#    declare exactly;
+# 2. one :class:`WideRangeProof` per edge proves the edge's signed cross
+#    product f_e to lie in [0, 2**k), i.e. to be non-negative: the point
+#    lies on the interior side of (or on) the edge's supporting line.
+#
+# The edge cross product is a linear combination of the two coordinate
+# commitments, so a per-edge Pedersen commitment to it is built
+# homomorphically from public data without knowing the coordinates. With an
+# edge (dx, dy) oriented so the interior traversal is counter-clockwise and
+# start vertex P0 = (x0, y0), define
+#
+#     K_e = dx*(y0 - lower_y) - dy*(x0 - lower_x)
+#     D_e = C_y**dx * C_x**(-dy) * g**(-K_e)        (mod prime)
+#
+# which is a Pedersen commitment
+#
+#     D_e = g**f_e * h**r_e
+#     f_e = dx*(y - y0) - dy*(x - x0)
+#     r_e = dx*r_y - dy*r_x
+#
+# f_e is non-negative exactly on the interior side of the edge and zero on
+# its supporting line. Because f_e is linear it attains its maximum over
+# the bounding box at a box corner; call it U_e. The edge commitment is
+# declared over [0, 2**k - 1] with 2**k - 1 >= U_e (k <= 24), and the wide
+# range proof over that declaration shows f_e >= 0 (a negative f_e cannot
+# open inside [0, 2**k) since 2**k is far smaller than prime - 1). The
+# verifier recomputes D_e, U_e and k entirely from public inputs; it never
+# sees the coordinates or blindings.
+#
+# Every sub-proof transcript is derived from one domain-separated context
+# binding the polygon's canonical vertex order, both commitments' group and
+# range fields, the axis assignment and the external context, so a proof
+# cannot be replayed against another polygon, commitment pair, axis order or
+# context.
+
+_CONVEX_POLYGON_DOMAIN = b"zkregion/convex-polygon/v1"
+
+
+@dataclass(frozen=True)
+class ConvexPolygonRegion:
+    """A closed convex polygon over quantized integer coordinates.
+
+    ``vertices`` is a tuple of ``(x, y)`` integer pairs in boundary order;
+    both clockwise and counter-clockwise traversal are accepted and the
+    interior and every edge belong to the region. Rotations and reversals of
+    one boundary describe the same region and are normalized to one canonical
+    vertex sequence (starting at the lexicographically smallest vertex,
+    choosing the orientation whose second vertex is lexicographically
+    smaller).
+
+    Fewer than three vertices, a repeated vertex, three consecutive collinear
+    vertices, a self-intersecting boundary or a concave (reflex) vertex raise
+    :class:`ValueError`. Wrong argument or element types — vertices that are
+    not plain two-element tuples of non-``bool`` integers, or a wrong outer
+    container type — raise :class:`TypeError`.
+    """
+
+    vertices: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        normalized = _normalize_polygon_vertices(self.vertices)
+        object.__setattr__(self, "vertices", normalized)
+
+    @property
+    def min_x(self) -> int:
+        return min(vertex[0] for vertex in self.vertices)
+
+    @property
+    def max_x(self) -> int:
+        return max(vertex[0] for vertex in self.vertices)
+
+    @property
+    def min_y(self) -> int:
+        return min(vertex[1] for vertex in self.vertices)
+
+    @property
+    def max_y(self) -> int:
+        return max(vertex[1] for vertex in self.vertices)
+
+    def contains(self, x: int, y: int) -> bool:
+        """Whether integer point ``(x, y)`` lies in the closed region."""
+        _check_int(x, "x")
+        _check_int(y, "y")
+        if not (self.min_x <= x <= self.max_x and self.min_y <= y <= self.max_y):
+            return False
+        return all(
+            _edge_signed_offset(edge, x, y) >= 0 for edge in self._interior_edges()
+        )
+
+    def _orientation_sign(self) -> int:
+        """Sign of the doubled signed area: positive for CCW order."""
+        total = 0
+        vertices = self.vertices
+        for i, (ax, ay) in enumerate(vertices):
+            bx, by = vertices[(i + 1) % len(vertices)]
+            total += ax * by - bx * ay
+        return 1 if total > 0 else -1
+
+    def _interior_edges(self) -> tuple[tuple[int, int, int, int], ...]:
+        """Edges oriented so the interior lies at non-negative cross product."""
+        sign = self._orientation_sign()
+        vertices = self.vertices
+        edges: list[tuple[int, int, int, int]] = []
+        for i, (ax, ay) in enumerate(vertices):
+            bx, by = vertices[(i + 1) % len(vertices)]
+            # Only the edge components are orientation-flipped; the start
+            # vertex keeps its original coordinates in the cross product.
+            edges.append((sign * (bx - ax), sign * (by - ay), ax, ay))
+        return tuple(edges)
+
+
+def _check_vertex(value: object, position: int) -> tuple[int, int]:
+    """Type-check one vertex as a plain two-element tuple of non-bool ints."""
+    if not isinstance(value, tuple):
+        raise TypeError(f"vertices[{position}] must be a (x, y) tuple")
+    if len(value) != 2:
+        raise TypeError(f"vertices[{position}] must be a (x, y) tuple")
+    x_coord, y_coord = value
+    _check_int(x_coord, f"vertices[{position}] x")
+    _check_int(y_coord, f"vertices[{position}] y")
+    return x_coord, y_coord
+
+
+def _cross_points(
+    first: tuple[int, int],
+    second: tuple[int, int],
+    third: tuple[int, int],
+) -> int:
+    """Cross product ``(second - first) x (third - second)``."""
+    return (second[0] - first[0]) * (third[1] - second[1]) - (
+        second[1] - first[1]
+    ) * (third[0] - second[0])
+
+
+def _on_segment(
+    point: tuple[int, int],
+    first: tuple[int, int],
+    second: tuple[int, int],
+) -> bool:
+    """Whether collinear ``point`` lies on the closed segment first-second."""
+    return (
+        min(first[0], second[0]) <= point[0] <= max(first[0], second[0])
+        and min(first[1], second[1]) <= point[1] <= max(first[1], second[1])
+    )
+
+
+def _segments_intersect(
+    first: tuple[int, int],
+    second: tuple[int, int],
+    third: tuple[int, int],
+    fourth: tuple[int, int],
+) -> bool:
+    """Whether closed segments first-second and third-fourth meet at all."""
+    o1 = _cross_points(first, second, third)
+    o2 = _cross_points(first, second, fourth)
+    o3 = _cross_points(third, fourth, first)
+    o4 = _cross_points(third, fourth, second)
+    if ((o1 > 0 > o2) or (o1 < 0 < o2)) and (
+        (o3 > 0 > o4) or (o3 < 0 < o4)
+    ):
+        return True  # proper crossing
+    if o1 == 0 and _on_segment(third, first, second):
+        return True
+    if o2 == 0 and _on_segment(fourth, first, second):
+        return True
+    if o3 == 0 and _on_segment(first, third, fourth):
+        return True
+    if o4 == 0 and _on_segment(second, third, fourth):
+        return True
+    return False
+
+
+def _boundary_is_simple(
+    vertices: Sequence[tuple[int, int]],
+) -> bool:
+    """Whether non-adjacent boundary edges are pairwise disjoint."""
+    count = len(vertices)
+    for i in range(count):
+        first = vertices[i]
+        second = vertices[(i + 1) % count]
+        for j in range(i + 2, count):
+            # Edges i and j are adjacent when j == i+1 (skipped) or when
+            # they meet across the cyclic seam (i == 0 and j == n - 1).
+            if i == 0 and j == count - 1:
+                continue
+            third = vertices[j]
+            fourth = vertices[(j + 1) % count]
+            if _segments_intersect(first, second, third, fourth):
+                return False
+    return True
+
+
+def _canonical_vertex_order(
+    vertices: Sequence[tuple[int, int]],
+) -> tuple[tuple[int, int], ...]:
+    """Rotate a boundary sequence to its lexicographically smallest vertex."""
+    start = min(range(len(vertices)), key=lambda i: vertices[i])
+    return tuple(vertices[(start + i) % len(vertices)] for i in range(len(vertices)))
+
+
+def _normalize_polygon_vertices(
+    vertices: object,
+) -> tuple[tuple[int, int], ...]:
+    """Type-check, validate and canonicalize a polygon vertex sequence.
+
+    The outer argument must be a non-``bytes`` / ``bytearray`` / ``str``
+    sequence; every vertex must be a plain two-element tuple of non-``bool``
+    integers (wrong types raise :class:`TypeError`). At least three distinct
+    vertices are required, no vertex may repeat, no three consecutive
+    vertices (cyclically) may be collinear, and every turn must have the same
+    strict sign: mixed signs mean a concave or self-intersecting polygon and
+    zero turns mean collinear triples — both raise :class:`ValueError`. The
+    canonical sequence starts at the lexicographically smallest vertex and
+    takes the orientation (rotation versus reversal) whose second vertex is
+    lexicographically smaller, so rotations and reversals of one boundary
+    normalize alike.
+    """
+    if isinstance(vertices, (bytes, bytearray, str)) or not isinstance(
+        vertices, Sequence
+    ):
+        raise TypeError("vertices must be a sequence of (x, y) tuples")
+    checked = tuple(
+        _check_vertex(vertex, position)
+        for position, vertex in enumerate(vertices)
+    )
+    if len(checked) < 3:
+        raise ValueError("polygon must have at least three vertices")
+    if len(set(checked)) != len(checked):
+        raise ValueError("polygon vertices must not repeat")
+    count = len(checked)
+    signs: set[int] = set()
+    for i in range(count):
+        cross = _cross_points(
+            checked[i], checked[(i + 1) % count], checked[(i + 2) % count]
+        )
+        if cross == 0:
+            raise ValueError(
+                "polygon must not have three collinear consecutive vertices"
+            )
+        signs.add(1 if cross > 0 else -1)
+    if len(signs) != 1:
+        raise ValueError("polygon must be convex and must not self-intersect")
+    if not _boundary_is_simple(checked):
+        raise ValueError("polygon must be convex and must not self-intersect")
+    rotated = _canonical_vertex_order(checked)
+    reversed_order = _canonical_vertex_order(tuple(reversed(checked)))
+    if reversed_order[1] < rotated[1]:
+        rotated = reversed_order
+    return rotated
+
+
+def _edge_signed_offset(
+    edge: tuple[int, int, int, int], x: int, y: int
+) -> int:
+    """Signed cross-product offset of ``(x, y)`` from an interior-oriented edge.
+
+    With ``edge = (dx, dy, sx0, sy0)`` (components and start coordinates
+    already multiplied by the orientation sign) the value is
+    ``dx * (y - sy0) - dy * (x - sx0)``; it is non-negative exactly on the
+    interior side of the edge and zero on the edge's supporting line.
+    """
+    dx, dy, start_x, start_y = edge
+    return dx * (y - start_y) - dy * (x - start_x)
+
+
+def _edge_offset_upper(
+    polygon: ConvexPolygonRegion, edge: tuple[int, int, int, int]
+) -> int:
+    """Maximum signed edge offset over integer points of the bounding box.
+
+    The offset is linear in each coordinate, so its maximum over the box is
+    attained at one of the four box corners. The maximum is always positive
+    for a non-degenerate convex polygon (some other vertex sits strictly on
+    the interior side of every edge).
+    """
+    dx, dy, start_x, start_y = edge
+    y_term = max(
+        dx * (polygon.min_y - start_y), dx * (polygon.max_y - start_y)
+    )
+    x_term = max(
+        -dy * (polygon.min_x - start_x), -dy * (polygon.max_x - start_x)
+    )
+    return x_term + y_term
+
+
+def _edge_commitment(
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    edge: tuple[int, int, int, int],
+    upper: int,
+) -> PedersenCommitment:
+    """Build the public per-edge offset commitment.
+
+    ``D_e = C_y**dx * C_x**(-dy) * g**(-K_e) mod prime`` with
+    ``K_e = dx*(y0 - lower_y) - dy*(x0 - lower_x)`` is a Pedersen
+    commitment (in the shared group, declared over ``[0, upper]``) to the
+    edge cross product ``f_e = dx*(y - y0) - dy*(x - x0)`` with blinding
+    ``r_e = dx*r_y - dy*r_x``. Integer edge components are reduced modulo
+    ``prime`` only for exponentiation; the geometry keeps using the
+    unreduced integers.
+    """
+    prime = x_commitment.prime
+    group_order = prime - 1
+    dx, dy, start_x, start_y = edge
+    constant = (
+        dx * (start_y - y_commitment.lower)
+        - dy * (start_x - x_commitment.lower)
+    )
+    element = (
+        pow(y_commitment.element, dx % group_order, prime)
+        * pow(x_commitment.element, (-dy) % group_order, prime)
+        * pow(x_commitment.generator, (-constant) % group_order, prime)
+        % prime
+    )
+    return PedersenCommitment(
+        element=element,
+        lower=0,
+        upper=upper,
+        prime=prime,
+        generator=x_commitment.generator,
+        h=x_commitment.h,
+    )
+
+
+@dataclass(frozen=True)
+class ConvexPolygonRegionProof:
+    """A non-interactive convex-polygon membership proof.
+
+    ``x_proof`` and ``y_proof`` are :class:`RangeProof` objects pinning the
+    x and y commitments to the polygon's bounding box; ``edge_proofs`` holds
+    one :class:`WideRangeProof` per polygon edge in canonical boundary order,
+    each proving the edge cross-product offset to be non-negative. The
+    verifier sees only commitments, polygon and proof — never the
+    coordinates or blinding factors.
+    """
+
+    x_proof: RangeProof
+    y_proof: RangeProof
+    edge_proofs: tuple[WideRangeProof, ...]
+
+
+def _polygon_transcript_items(
+    context: bytes,
+    polygon: ConvexPolygonRegion,
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+) -> list[bytes]:
+    """Shared transcript items: domain, context, vertices, both commitments.
+
+    Item order: the polygon domain separator, the external context, the
+    vertex count, every canonical vertex's x then y coordinate, and the six
+    fields of the x then the y commitment (dataclass field order). Integers
+    are encoded as decimal ASCII.
+    """
+    items: list[bytes] = [_CONVEX_POLYGON_DOMAIN, context]
+    items.append(str(len(polygon.vertices)).encode("ascii"))
+    for vertex in polygon.vertices:
+        items.append(str(vertex[0]).encode("ascii"))
+        items.append(str(vertex[1]).encode("ascii"))
+    for commitment in (x_commitment, y_commitment):
+        items.extend(
+            str(getattr(commitment, name)).encode("ascii")
+            for name in ("element", "lower", "upper", "prime", "generator", "h")
+        )
+    return items
+
+
+def _polygon_sub_context(label: bytes, items: Sequence[bytes]) -> bytes:
+    """Length-prefix a label and shared transcript items into one context."""
+    transcript = bytearray()
+    for item in (label, *items):
+        transcript += len(item).to_bytes(4, "big")
+        transcript += item
+    return bytes(transcript)
+
+
+def prove_convex_polygon(
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    x: int,
+    y: int,
+    x_blinding: int,
+    y_blinding: int,
+    polygon: ConvexPolygonRegion,
+    context: bytes = b"",
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> ConvexPolygonRegionProof:
+    """Prove that the committed quantized point ``(x, y)`` lies in ``polygon``.
+
+    Both commitments must use the same group parameters (``prime``,
+    ``generator`` and ``h``) and must be declared over exactly the polygon's
+    closed integer bounding box — the x commitment over
+    ``[polygon.min_x, polygon.max_x]`` and the y commitment over
+    ``[polygon.min_y, polygon.max_y]``. ``x`` / ``y`` and
+    ``x_blinding`` / ``y_blinding`` must open the two commitments and the
+    point must belong to the closed polygon (its vertices and edges
+    included). The bounding box may contain at most 256 integers per axis
+    and every edge's offset span must fit a wide range proof
+    (``2**k - 1`` with ``1 <= k <= 24``); the verifier learns neither the
+    coordinates nor the blinding factors.
+
+    Wrong object or field types (including a ``bool`` integer), a non-``bytes``
+    context or a non-callable ``randbelow`` raise :class:`TypeError`.
+    Mismatched group parameters or declared ranges, a failed opening, a point
+    outside the polygon, an edge offset span wider than the wide-range limit
+    or an out-of-range draw from ``randbelow`` raise :class:`ValueError`. The
+    same public inputs under the same random source produce an identical
+    proof. Inputs are never mutated.
+    """
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError("x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError("y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    _check_int(x, "x")
+    _check_int(y, "y")
+    _check_int(x_blinding, "x_blinding")
+    _check_int(y_blinding, "y_blinding")
+    if not isinstance(polygon, ConvexPolygonRegion):
+        raise TypeError("polygon must be a ConvexPolygonRegion")
+    _check_bytes(context, "context")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if (
+        x_commitment.prime != y_commitment.prime
+        or x_commitment.generator != y_commitment.generator
+        or x_commitment.h != y_commitment.h
+    ):
+        raise ValueError("both commitments must use the same group parameters")
+    if (x_commitment.lower, x_commitment.upper) != (polygon.min_x, polygon.max_x):
+        raise ValueError("x commitment range must equal the polygon x bounding box")
+    if (y_commitment.lower, y_commitment.upper) != (polygon.min_y, polygon.max_y):
+        raise ValueError("y commitment range must equal the polygon y bounding box")
+    if not verify_pedersen_opening(x_commitment, x, x_blinding):
+        raise ValueError("x commitment does not open at (x, x_blinding)")
+    if not verify_pedersen_opening(y_commitment, y, y_blinding):
+        raise ValueError("y commitment does not open at (y, y_blinding)")
+    if not polygon.contains(x, y):
+        raise ValueError("point must lie inside the polygon")
+    if (polygon.max_x - polygon.min_x + 1) > _MAX_RANGE_VALUES:
+        raise ValueError(
+            f"x bounding box must contain at most {_MAX_RANGE_VALUES} integers"
+        )
+    if (polygon.max_y - polygon.min_y + 1) > _MAX_RANGE_VALUES:
+        raise ValueError(
+            f"y bounding box must contain at most {_MAX_RANGE_VALUES} integers"
+        )
+    prime = x_commitment.prime
+    items = _polygon_transcript_items(context, polygon, x_commitment, y_commitment)
+    x_proof = prove_range(
+        x_commitment,
+        x,
+        x_blinding,
+        _polygon_sub_context(b"bbox-x", items),
+        randbelow=randbelow,
+    )
+    y_proof = prove_range(
+        y_commitment,
+        y,
+        y_blinding,
+        _polygon_sub_context(b"bbox-y", items),
+        randbelow=randbelow,
+    )
+    edges = polygon._interior_edges()
+    edge_proofs: list[WideRangeProof] = []
+    for edge_index, edge in enumerate(edges):
+        offset_upper = _edge_offset_upper(polygon, edge)
+        # An edge flush with the bounding box attains offset 0 only; pad to
+        # the smallest admissible wide range (2 integers).
+        width = max(1, offset_upper.bit_length())
+        if width > _MAX_WIDE_RANGE_BITS:
+            raise ValueError(
+                "edge offset span must fit a wide range of at most "
+                f"2**{_MAX_WIDE_RANGE_BITS} integers"
+            )
+        edge_upper = (1 << width) - 1
+        edge_commitment = _edge_commitment(
+            x_commitment, y_commitment, edge, edge_upper
+        )
+        offset = _edge_signed_offset(edge, x, y)
+        if offset < 0:
+            raise ValueError("point must lie inside the polygon")
+        dx, dy, _, _ = edge
+        edge_blinding = (dx * y_blinding - dy * x_blinding) % (prime - 1)
+        if not verify_pedersen_opening(edge_commitment, offset, edge_blinding):
+            # Defensive: the geometric and opening checks above guarantee
+            # this opening; a failure means inconsistent public inputs.
+            raise ValueError("edge offset commitment does not open")
+        edge_items = [*items, str(edge_index).encode("ascii")]
+        edge_proofs.append(
+            prove_range_wide(
+                edge_commitment,
+                offset,
+                edge_blinding,
+                _polygon_sub_context(b"edge", edge_items),
+                randbelow=randbelow,
+            )
+        )
+    return ConvexPolygonRegionProof(
+        x_proof=x_proof,
+        y_proof=y_proof,
+        edge_proofs=tuple(edge_proofs),
+    )
+
+
+def verify_convex_polygon(
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    polygon: ConvexPolygonRegion,
+    proof: ConvexPolygonRegionProof,
+    context: bytes = b"",
+) -> bool:
+    """Verify a :class:`ConvexPolygonRegionProof` against public inputs only.
+
+    The verifier needs just the two commitments, the polygon, the proof and
+    the context — never the coordinates or blinding factors. Type errors
+    (wrong object or field types at any nesting level, including a ``bool``
+    integer or a non-``bytes`` context) raise :class:`TypeError`; every
+    semantic failure — mismatched group parameters or declared ranges, a
+    tampered proof field, a forged proof, a different polygon, commitment or
+    context, or swapped axes — returns ``False``. Inputs are never mutated.
+    """
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError("x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError("y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    if not isinstance(polygon, ConvexPolygonRegion):
+        raise TypeError("polygon must be a ConvexPolygonRegion")
+    if not isinstance(proof, ConvexPolygonRegionProof):
+        raise TypeError("proof must be a ConvexPolygonRegionProof")
+    if not isinstance(proof.x_proof, RangeProof):
+        raise TypeError("proof x_proof must be a RangeProof")
+    if not isinstance(proof.y_proof, RangeProof):
+        raise TypeError("proof y_proof must be a RangeProof")
+    if not isinstance(proof.edge_proofs, tuple):
+        raise TypeError("proof edge_proofs must be a tuple of WideRangeProof")
+    for edge_proof in proof.edge_proofs:
+        if not isinstance(edge_proof, WideRangeProof):
+            raise TypeError("proof edge_proofs entries must be WideRangeProof")
+    _check_bytes(context, "context")
+    if (
+        x_commitment.prime != y_commitment.prime
+        or x_commitment.generator != y_commitment.generator
+        or x_commitment.h != y_commitment.h
+    ):
+        return False
+    if (x_commitment.lower, x_commitment.upper) != (polygon.min_x, polygon.max_x):
+        return False
+    if (y_commitment.lower, y_commitment.upper) != (polygon.min_y, polygon.max_y):
+        return False
+    if len(proof.edge_proofs) != len(polygon.vertices):
+        return False
+    if (polygon.max_x - polygon.min_x + 1) > _MAX_RANGE_VALUES:
+        return False
+    if (polygon.max_y - polygon.min_y + 1) > _MAX_RANGE_VALUES:
+        return False
+    items = _polygon_transcript_items(context, polygon, x_commitment, y_commitment)
+    if not verify_range(
+        x_commitment,
+        proof.x_proof,
+        _polygon_sub_context(b"bbox-x", items),
+    ):
+        return False
+    if not verify_range(
+        y_commitment,
+        proof.y_proof,
+        _polygon_sub_context(b"bbox-y", items),
+    ):
+        return False
+    prime = x_commitment.prime
+    for edge_index, edge in enumerate(polygon._interior_edges()):
+        offset_upper = _edge_offset_upper(polygon, edge)
+        width = max(1, offset_upper.bit_length())
+        if width > _MAX_WIDE_RANGE_BITS:
+            return False
+        edge_upper = (1 << width) - 1
+        if edge_upper >= prime - 1:
+            return False
+        edge_commitment = _edge_commitment(
+            x_commitment, y_commitment, edge, edge_upper
+        )
+        edge_items = [*items, str(edge_index).encode("ascii")]
+        if not verify_range_wide(
+            edge_commitment,
+            proof.edge_proofs[edge_index],
+            _polygon_sub_context(b"edge", edge_items),
+        ):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------

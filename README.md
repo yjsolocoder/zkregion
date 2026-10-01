@@ -354,6 +354,30 @@ range_batch = [
 ]
 assert verify_range_batch(range_batch)
 
+# 稀疏区间集合非交互证明：证明承诺值属于若干闭区间之一（区间按 lower 严格递增、
+# 互不重叠、可留空洞，合计不超过 256 个整数）；验证者得不到命中区间或精确值
+from zkregion import prove_range_set, verify_range_set
+
+intervals = [(0, 10), (20, 30), (90, 100)]
+set_commitment, set_blinding = pedersen_commit(25, 0, 100)
+set_proof = prove_range_set(
+    set_commitment, 25, set_blinding, intervals, context=b"session-1"
+)
+assert verify_range_set(set_commitment, intervals, set_proof, context=b"session-1")
+assert not verify_range_set(set_commitment, intervals, set_proof, context=b"other")
+# 调换区间顺序、改动端点、增删区间都会改变 Fiat-Shamir 转录，验证失败
+assert not verify_range_set(set_commitment, list(reversed(intervals)), set_proof, b"session-1")
+assert not verify_range_set(set_commitment, [(0, 11), (20, 30), (90, 100)], set_proof, b"session-1")
+
+# 稀疏区间集合证明的批量验证（逐条独立校验，顺序与重复项不影响结果，空批次为 False）
+from zkregion import RangeSetBatchEntry, verify_range_set_batch
+
+set_batch = [
+    RangeSetBatchEntry(set_commitment, tuple(intervals), set_proof, b"session-1"),
+    RangeSetBatchEntry(set_commitment, tuple(intervals), set_proof, b"session-1"),
+]
+assert verify_range_set_batch(set_batch)
+
 # Merkle 承诺的区间证明完整批验：整批区间条目先提交到一棵 Merkle 树
 from zkregion import BoundRangeBatch, verify_range_bound
 

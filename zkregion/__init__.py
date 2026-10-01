@@ -20,6 +20,7 @@ WideRangeBatchEntry / verify_range_wide_batch /
 BoundWideRangeBatch / prove_range_wide_batch_bound /
 verify_range_wide_batch_bound /
 prove_region / verify_region / region_contains_committed /
+quantize_coordinate / quantize_region /
 RegionWideProof / prove_region_wide / verify_region_wide /
 RegionProofBundle / encode_region_proof_bundle /
 decode_region_proof_bundle / verify_region_proof_bundle /
@@ -90,6 +91,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import re
 import secrets
 import sqlite3
 import threading
@@ -97,6 +99,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Callable
 
 __all__ = [
@@ -214,6 +217,8 @@ __all__ = [
     "prove_region_wide",
     "prove_region_wide_batch_bound",
     "prove_schnorr_batch_bound",
+    "quantize_coordinate",
+    "quantize_region",
     "region_contains_committed",
     "verify_bound",
     "verify_consistency",
@@ -2331,6 +2336,241 @@ class Region:
 
     def height(self) -> int:
         return self.max_y - self.min_y + 1
+
+
+# ---------------------------------------------------------------------------
+# Deterministic decimal quantization
+#
+# External fixed-point coordinates arrive as integers, finite Decimals or
+# decimal strings. Every conversion is performed as exact decimal integer
+# arithmetic on the significands — never through binary floating point, and
+# never bounded by the Decimal context (its precision or exponent bounds):
+# strings are parsed from raw digits, and an input larger than the active
+# context still quantizes at full precision.
+
+def _check_scale(scale: object) -> int:
+    """Validate the keyword-only ``scale``: a non-``bool`` positive integer."""
+    if isinstance(scale, bool) or not isinstance(scale, int):
+        raise TypeError("scale must be a positive integer")
+    if scale <= 0:
+        raise ValueError("scale must be a positive integer")
+    return scale
+
+
+def _check_quantize_input(value: object, name: str) -> None:
+    """Validate one coordinate or bound argument type.
+
+    Accepted types are non-``bool`` :class:`int`, finite
+    :class:`~decimal.Decimal` and :class:`str`; the string content is parsed
+    by :func:`_decimal_string_fraction` using the finite forms of the
+    Decimal string grammar (optional sign, decimal point, base-10 exponent,
+    PEP 515 underscores and surrounding whitespace; no NaN or infinity).
+    Anything else, including :class:`bool` and binary floats, raises
+    :class:`TypeError`; an empty or otherwise invalid string is left for the
+    parser to reject with :class:`ValueError`.
+    """
+    if isinstance(value, bool):
+        raise TypeError(
+            f"{name} must be a non-bool integer, Decimal or decimal numeric string"
+        )
+    if isinstance(value, int):
+        return
+    if isinstance(value, str):
+        return
+    if isinstance(value, Decimal):
+        if not value.is_finite():
+            raise ValueError(f"{name} must be a finite number")
+        return
+    raise TypeError(
+        f"{name} must be a non-bool integer, Decimal or decimal numeric string"
+    )
+
+
+# The finite forms of the Decimal string grammar: optional sign, digits
+# with a decimal point (PEP 515 underscores allowed between digits), an
+# optional base-10 exponent and optional surrounding whitespace. NaN and
+# infinity are deliberately absent.
+_DECIMAL_STRING_RE = re.compile(
+    r"\s*[+-]?"
+    r"(?:\d(?:_?\d)*(?:\.(?:\d(?:_?\d)*)?)?|\.\d(?:_?\d)*)"
+    r"(?:[eE][+-]?\d(?:_?\d)*)?\s*"
+)
+
+
+def _fraction_from_parts(
+    negative: bool,
+    digits: str,
+    decimal_places: int,
+    exponent: int,
+) -> tuple[int, int]:
+    """Build ``(numerator, denominator)`` from decimal significand parts."""
+    significand = int(digits) if digits else 0
+    if negative:
+        significand = -significand
+    power = exponent - decimal_places
+    if power >= 0:
+        return significand * 10 ** power, 1
+    return significand, 10 ** (-power)
+
+
+def _decimal_string_fraction(text: str, name: str) -> tuple[int, int]:
+    """Parse a finite decimal string into an exact rational fraction.
+
+    Works from the raw digits and exponent, so neither the Decimal context
+    precision nor its exponent bounds can clamp or round the value. An empty
+    or syntactically invalid string, including NaN and infinity, raises
+    :class:`ValueError`.
+    """
+    if _DECIMAL_STRING_RE.fullmatch(text) is None:
+        raise ValueError(f"{name} must be a decimal numeric string")
+    body = text.strip()
+    negative = body[0] == "-"
+    if body[0] in "+-":
+        body = body[1:]
+    exponent = 0
+    exponent_mark = re.search(r"[eE]", body)
+    if exponent_mark is not None:
+        exponent = int(body[exponent_mark.end():].replace("_", ""))
+        body = body[: exponent_mark.start()]
+    if "." in body:
+        whole, fraction = body.split(".", 1)
+        fraction = fraction.replace("_", "")
+    else:
+        whole, fraction = body, ""
+    digits = whole.replace("_", "") + fraction
+    return _fraction_from_parts(negative, digits, len(fraction), exponent)
+
+
+def _quantized_fraction(value: object, name: str) -> tuple[int, int]:
+    """Return ``(numerator, denominator)`` with ``denominator`` a power of 10.
+
+    The fraction equals *value* exactly. Integers use denominator 1; Decimals
+    are read from their exact significand tuple and strings from their raw
+    digits, never rounded and never dependent on the Decimal context. Empty
+    or malformed strings, NaN and infinity raise :class:`ValueError`.
+    """
+    if isinstance(value, int):
+        return value, 1
+    if isinstance(value, str):
+        if not value:
+            raise ValueError(f"{name} must be a non-empty decimal numeric string")
+        return _decimal_string_fraction(value, name)
+    sign, digits, exponent = value.as_tuple()
+    return _fraction_from_parts(
+        sign == 1, "".join(str(d) for d in digits), 0, exponent
+    )
+
+
+def _fraction_quantize_nearest(
+    numerator: int, denominator: int, scale: int
+) -> int:
+    """Nearest lattice integer for ``scale * numerator / denominator``."""
+    scaled_num = numerator * scale
+    if scaled_num >= 0:
+        return (2 * scaled_num + denominator) // (2 * denominator)
+    return -((-2 * scaled_num + denominator) // (2 * denominator))
+
+
+def _fraction_floor(numerator: int, denominator: int, scale: int) -> int:
+    """Greatest lattice integer not greater than ``scale * fraction``."""
+    return (numerator * scale) // denominator
+
+
+def _fraction_ceil(numerator: int, denominator: int, scale: int) -> int:
+    """Least lattice integer not less than ``scale * fraction``."""
+    return -((-numerator * scale) // denominator)
+
+
+def _fraction_le(left: tuple[int, int], right: tuple[int, int]) -> bool:
+    """Exact ``left <= right`` comparison of two rational fractions."""
+    return left[0] * right[1] <= right[0] * left[1]
+
+
+def quantize_coordinate(
+    x: object,
+    y: object,
+    *,
+    scale: object = 10 ** 6,
+) -> tuple[int, int]:
+    """Quantize an external fixed-point coordinate to integer lattice points.
+
+    Each axis is mapped to the nearest multiple of ``1 / scale``:
+    ``round(scale * value)`` with half lattice points rounded away from zero
+    (``0.5`` → ``1``, ``-0.5`` → ``-1``). ``x`` and ``y`` may each be a
+    non-``bool`` integer, a finite :class:`~decimal.Decimal` or a decimal
+    numeric :class:`str`; ``scale`` must be a non-``bool`` positive integer
+    and defaults to ``10**6``. Scaling uses exact decimal integer
+    arithmetic — no binary floating point and no dependence on the Decimal
+    precision context.
+
+    Integers are returned unchanged when ``scale == 1``, and equal inputs
+    always produce equal outputs. Wrong object types (including ``bool`` and
+    :class:`float`) raise :class:`TypeError`; empty strings, malformed
+    numbers, NaN, infinity and a non-positive ``scale`` raise
+    :class:`ValueError`.
+    """
+    _check_quantize_input(x, "x")
+    _check_quantize_input(y, "y")
+    factor = _check_scale(scale)
+    x_numerator, x_denominator = _quantized_fraction(x, "x")
+    y_numerator, y_denominator = _quantized_fraction(y, "y")
+    return (
+        _fraction_quantize_nearest(x_numerator, x_denominator, factor),
+        _fraction_quantize_nearest(y_numerator, y_denominator, factor),
+    )
+
+
+def quantize_region(
+    min_x: object,
+    max_x: object,
+    min_y: object,
+    max_y: object,
+    *,
+    scale: object = 10 ** 6,
+) -> Region:
+    """Quantize an external fixed-point rectangle to an inclusive integer Region.
+
+    Minimum bounds round toward negative infinity and maximum bounds toward
+    positive infinity, so the returned :class:`Region` covers the original
+    rectangle while preserving its inclusive-endpoint semantics: every point
+    inside the original rectangle quantizes into the result. The four bounds
+    may each be a non-``bool`` integer, a finite
+    :class:`~decimal.Decimal` or a decimal numeric :class:`str`; ``scale``
+    must be a non-``bool`` positive integer and defaults to ``10**6``.
+    Scaling uses exact decimal integer arithmetic — no binary floating point
+    and no dependence on the Decimal precision context.
+
+    Integer bounds are returned as the same :class:`Region` when
+    ``scale == 1``, and equal inputs always produce equal outputs. Wrong
+    object types (including ``bool`` and :class:`float`) raise
+    :class:`TypeError`; empty strings, malformed numbers, NaN, infinity, a
+    non-positive ``scale`` or a logical rectangle whose minimum bound
+    exceeds the corresponding maximum bound raise :class:`ValueError`.
+    """
+    for value, name in (
+        (min_x, "min_x"),
+        (max_x, "max_x"),
+        (min_y, "min_y"),
+        (max_y, "max_y"),
+    ):
+        _check_quantize_input(value, name)
+    factor = _check_scale(scale)
+    min_x_fraction = _quantized_fraction(min_x, "min_x")
+    max_x_fraction = _quantized_fraction(max_x, "max_x")
+    min_y_fraction = _quantized_fraction(min_y, "min_y")
+    max_y_fraction = _quantized_fraction(max_y, "max_y")
+    # Check the logical rectangle on the exact decimal values: outward
+    # rounding must not silently repair a rectangle whose minimum bound
+    # exceeds its maximum bound before quantization.
+    if not _fraction_le(min_x_fraction, max_x_fraction):
+        raise ValueError("min_x must not exceed max_x")
+    if not _fraction_le(min_y_fraction, max_y_fraction):
+        raise ValueError("min_y must not exceed max_y")
+    lo_x = _fraction_floor(min_x_fraction[0], min_x_fraction[1], factor)
+    hi_x = _fraction_ceil(max_x_fraction[0], max_x_fraction[1], factor)
+    lo_y = _fraction_floor(min_y_fraction[0], min_y_fraction[1], factor)
+    hi_y = _fraction_ceil(max_y_fraction[0], max_y_fraction[1], factor)
+    return Region(min_x=lo_x, max_x=hi_x, min_y=lo_y, max_y=hi_y)
 
 
 # ---------------------------------------------------------------------------

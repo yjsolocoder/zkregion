@@ -374,6 +374,15 @@ range_proof = prove_multi_inclusion(range_leaves, tuple(range(len(range_leaves))
 bound_range = BoundRangeBatch(tuple(range_batch), len(range_batch), range_proof)
 assert verify_range_bound(bound_range, range_root)
 
+# 十进制定点坐标量化：把外部定点坐标与矩形边界确定地转成证明流程使用的整数
+from zkregion import quantize_coordinate, quantize_region
+
+qx, qy = quantize_coordinate("12.345678", "-7.5")          # -> (12345678, -7500000)
+quantized_region = quantize_region("12.0", "13.0", "-8.0", "-7.0")
+# quantize_coordinate 每轴取最近格点、半格点向远离零方向舍入；
+# quantize_region 最小边界向负无穷、最大边界向正无穷取整，结果覆盖原矩形。
+assert quantized_region.contains(qx, qy)
+
 # 二维区域成员非交互证明：证明承诺的 (x, y) 落在矩形区域内
 from zkregion import RegionProof, prove_region, verify_region
 
@@ -1506,6 +1515,8 @@ python3 -m zkregion
 - `prove_consistency_chain_batch_bound(chains) -> tuple[BoundConsistencyChainBatch, bytes]` — 顶层构造 Merkle 承诺的一致性链完整批：`chains` 沿用 `verify_consistency_chain_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，输入不变；每条链叶逐字节复用 `_bound_consistency_chain_leaf` 编码，既有域、序列与长度帧、字段顺序及 Merkle 哈希规则不变；令 `n = len(chains)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖每片叶、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_consistency_chain_batch_bound(batch, root) is True`，单项、奇偶批与重复链均确定，与旧手工构造逐字节兼容；全批或任一嵌套字段错型（含后项错型、非元组 `roots`/`proofs`/`nodes` 与 `bool` 计数）抛 `TypeError`，空批或 `verify_consistency_chain_batch` 返回 `False` 抛 `ValueError`
 - `MerkleConsistencyChain(roots, proofs)` — 冻结的一致性链对象，`roots` 为 `tuple[bytes, ...]`，`proofs` 为 `tuple[MerkleConsistencyProof, ...]`，可位置构造、按值相等且不可变
 - `Region(min_x, max_x, min_y, max_y)` — 闭区间矩形；`contains(x, y)`
+- `quantize_coordinate(x, y, *, scale=10**6) -> tuple[int, int]` — 公开且确定的十进制坐标量化：`x`/`y` 接受非 `bool` 整数、有限 `Decimal` 或十进制数值字符串（`scale` 仅接受非 `bool` 正整数），缩放按十进制数值以整数运算精确执行（字符串按数字位直接解析），不经过二进制浮点，也不受 Decimal 精度上下文（含指数边界）影响；每轴取最近格点，恰在半格点时向远离零方向舍入（`0.5→1`、`-0.5→-1`）；整数配 `scale=1` 返回原值，同输入恒同输出；坐标对象类型错误或 `scale` 类型错误抛 `TypeError`，空串、非法数值、`NaN`、无穷或 `scale <= 0` 抛 `ValueError`；不返回部分结果
+- `quantize_region(min_x, max_x, min_y, max_y, *, scale=10**6) -> Region` — 公开且确定的十进制矩形边界量化：四个边界接受与 `quantize_coordinate` 相同的输入类型，最小边界向负无穷、最大边界向正无穷取整，结果覆盖原矩形并保持 `Region` 的含端点语义（矩形内任一点量化后仍落在结果 `Region` 中）；同样全程精确十进制整数运算、不依赖浮点与 Decimal 上下文，整数边界配 `scale=1` 返回相同 `Region`；对象或 `scale` 类型错误抛 `TypeError`，空串、非法数值、`NaN`、无穷、`scale <= 0` 或任一最小边界大于对应最大边界（按精确十进制比较后）抛 `ValueError`
 
 ### Merkle 树构造
 

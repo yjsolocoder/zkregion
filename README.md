@@ -374,6 +374,30 @@ range_proof = prove_multi_inclusion(range_leaves, tuple(range(len(range_leaves))
 bound_range = BoundRangeBatch(tuple(range_batch), len(range_batch), range_proof)
 assert verify_range_bound(bound_range, range_root)
 
+# 稀疏区间集合非交互证明：证明承诺值落在若干个互不重叠、可留空洞的闭区间之一
+from zkregion import (
+    RangeSetBatchEntry, prove_range_set, verify_range_set, verify_range_set_batch,
+)
+
+set_commitment, set_blinding = pedersen_commit(42, 0, 100)
+intervals = ((0, 9), (40, 49), (90, 99))  # lower 严格递增、互不重叠、合计 <= 256 个整数
+set_proof = prove_range_set(
+    set_commitment, 42, set_blinding, intervals, context=b"session-1"
+)
+# 验证者只得到承诺、区间列表、证明和 context，无法得知命中区间或精确值
+assert verify_range_set(set_commitment, intervals, set_proof, context=b"session-1")
+assert not verify_range_set(set_commitment, intervals, set_proof, context=b"other")
+assert not verify_range_set(
+    set_commitment, ((0, 9), (41, 49), (90, 99)), set_proof, context=b"session-1"
+)  # 端点被替换
+assert not verify_range_set(
+    set_commitment, ((0, 9), (90, 99), (40, 49)), set_proof, context=b"session-1"
+)  # 区间顺序被交换
+
+set_batch = [RangeSetBatchEntry(intervals, set_commitment, set_proof, b"session-1")]
+assert verify_range_set_batch(set_batch)
+assert not verify_range_set_batch([])
+
 # 十进制定点坐标量化：把外部定点坐标与矩形边界确定地转成证明流程使用的整数
 from zkregion import quantize_coordinate, quantize_region
 

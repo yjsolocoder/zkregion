@@ -14,7 +14,9 @@ verify_pedersen_opening_batch_bound /
 PedersenOpeningBatchReplayGuard /
 BoundPedersenOpeningReplayGuard /
 RangeProof / prove_range /
-verify_range / RangeBatchEntry / verify_range_batch / RegionProof /
+verify_range / RangeBatchEntry / verify_range_batch /
+RangeSetProof / prove_range_set / verify_range_set /
+RangeSetBatchEntry / verify_range_set_batch / RegionProof /
 WideRangeProof / prove_range_wide / verify_range_wide /
 WideRangeBatchEntry / verify_range_wide_batch /
 BoundWideRangeBatch / prove_range_wide_batch_bound /
@@ -160,6 +162,8 @@ __all__ = [
     "RangeBatchReplayGuard",
     "RangeProof",
     "RangeReplayGuard",
+    "RangeSetBatchEntry",
+    "RangeSetProof",
     "Region",
     "RegionBatchEntry",
     "RegionBatchReplayGuard",
@@ -209,6 +213,7 @@ __all__ = [
     "prove_pedersen_opening_batch_bound",
     "prove_range",
     "prove_range_batch_bound",
+    "prove_range_set",
     "prove_range_wide",
     "prove_range_wide_batch_bound",
     "prove_region",
@@ -243,6 +248,8 @@ __all__ = [
     "verify_range",
     "verify_range_batch",
     "verify_range_bound",
+    "verify_range_set",
+    "verify_range_set_batch",
     "verify_range_wide",
     "verify_range_wide_batch",
     "verify_range_wide_batch_bound",
@@ -917,6 +924,533 @@ def verify_range(
         left = pow(h, proof.s[i], prime)
         right = proof.t[i] * pow(offset, proof.e[i], prime) % prime
         if left != right:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive sparse range-set proofs (Schnorr OR over covered points)
+#
+# A sparse, ordered collection of disjoint closed intervals inside the
+# commitment's declared range covers at most 256 integers in total. For each
+# covered value v define D_v = element * generator**(-(v - lower)) mod prime.
+# The commitment opens at v with blinding r exactly when D_v = h**r, so a
+# range-set proof is the same Schnorr OR as the plain range proof, but its
+# branches run over the covered values in interval order rather than over
+# every integer in the declared range: "I know the base-h discrete logarithm
+# of at least one D_v". The verifier sees the interval list (order and bounds
+# are public) but neither the hit interval, the endpoints beyond the public
+# list nor the opening value. The Fiat-Shamir challenge shares sum to the
+# transcript challenge modulo prime.
+
+_RANGE_SET_DOMAIN = b"zkregion/pedersen-range-set/v1"
+
+
+@dataclass(frozen=True)
+class RangeSetProof:
+    """A non-interactive sparse range-set proof over a :class:`PedersenCommitment`.
+
+    ``t`` holds the per-branch announcements, ``e`` the challenge shares and
+    ``s`` the responses; all three are tuples of as many integers as the
+    proven interval list covers in total (at most 256), one branch per
+    covered integer in interval order. The proof reveals neither the opening
+    value, the blinding nor the branch that hits.
+    """
+
+    t: tuple[int, ...]
+    e: tuple[int, ...]
+    s: tuple[int, ...]
+
+
+def _range_set_check_interval_types(intervals: object) -> list[tuple[int, int]]:
+    """Type-check the interval list, returning its raw integer pairs.
+
+    ``intervals`` must be a non-``bytes`` / ``bytearray`` / ``str`` sequence
+    of two-tuples of non-``bool`` integers. A wrong container, a non-tuple
+    pair, a pair of the wrong arity or a non-integer endpoint raises
+    :class:`TypeError`. Nothing structural (emptiness, order, overlap,
+    bounds, total size) is checked here.
+    """
+    if isinstance(intervals, (bytes, bytearray, str)) or not isinstance(
+        intervals, Sequence
+    ):
+        raise TypeError("intervals must be a sequence of (lower, upper) tuples")
+    pairs: list[tuple[int, int]] = []
+    for position, interval in enumerate(intervals):
+        if not isinstance(interval, tuple) or len(interval) != 2:
+            raise TypeError(
+                f"intervals[{position}] must be a (lower, upper) tuple"
+            )
+        lower, upper = interval
+        _check_int(lower, f"intervals[{position}] lower")
+        _check_int(upper, f"intervals[{position}] upper")
+        pairs.append((lower, upper))
+    return pairs
+
+
+def _range_set_normalize_intervals(
+    intervals: object,
+    commitment: PedersenCommitment,
+) -> list[tuple[int, int]]:
+    """Type- and structurally-validate ``intervals`` against ``commitment``.
+
+    Reuses :func:`_range_set_check_interval_types` for the type phase, then
+    enforces a non-empty list of closed intervals whose lowers are strictly
+    increasing with gaps allowed but no overlap, all lying inside the
+    commitment's declared ``[lower, upper]`` range and covering at most 256
+    integers in total. The pairs are copied into a fresh list so inputs are
+    never mutated. Any structural failure raises :class:`ValueError`.
+    """
+    pairs = _range_set_check_interval_types(intervals)
+    if not pairs:
+        raise ValueError("intervals must not be empty")
+    normalized: list[tuple[int, int]] = []
+    total = 0
+    previous_upper: int | None = None
+    for position, (lower, upper) in enumerate(pairs):
+        if lower > upper:
+            raise ValueError(
+                f"intervals[{position}] lower must not exceed upper"
+            )
+        if lower < commitment.lower or upper > commitment.upper:
+            raise ValueError(
+                f"intervals[{position}] must lie within the commitment range"
+            )
+        if previous_upper is not None and lower <= previous_upper:
+            raise ValueError(
+                "intervals must be strictly increasing and non-overlapping"
+            )
+        total += upper - lower + 1
+        if total > _MAX_RANGE_VALUES:
+            raise ValueError(
+                f"intervals must cover at most {_MAX_RANGE_VALUES} integers in total"
+            )
+        previous_upper = upper
+        normalized.append((lower, upper))
+    return normalized
+
+
+def _range_set_offsets(
+    intervals: Sequence[tuple[int, int]],
+    commitment: PedersenCommitment,
+) -> list[int]:
+    """Commitment offsets ``v - lower`` of every covered value, in order."""
+    return [
+        value - commitment.lower
+        for lo, hi in intervals
+        for value in range(lo, hi + 1)
+    ]
+
+
+def _range_set_challenge(
+    commitment: PedersenCommitment,
+    context: bytes,
+    intervals: Sequence[tuple[int, int]],
+    size: int,
+    announcements: tuple[int, ...],
+) -> int:
+    """SHA-256 transcript challenge as a big-endian integer mod ``prime``.
+
+    The transcript is the domain separator, the six commitment fields, the
+    context, the interval count, every interval endpoint in interval order,
+    the total branch count and every announcement ``t_i``; each item is
+    prefixed with its four-byte big-endian length and integers are encoded
+    as decimal ASCII, mirroring :func:`_range_challenge`.
+    """
+    fields = (
+        commitment.element,
+        commitment.lower,
+        commitment.upper,
+        commitment.prime,
+        commitment.generator,
+        commitment.h,
+    )
+    items = [_RANGE_SET_DOMAIN]
+    items.extend(str(field).encode("ascii") for field in fields)
+    items.append(context)
+    items.append(str(len(intervals)).encode("ascii"))
+    for lower, upper in intervals:
+        items.append(str(lower).encode("ascii"))
+        items.append(str(upper).encode("ascii"))
+    items.append(str(size).encode("ascii"))
+    items.extend(str(t_i).encode("ascii") for t_i in announcements)
+    transcript = hashlib.sha256()
+    for item in items:
+        transcript.update(len(item).to_bytes(4, "big"))
+        transcript.update(item)
+    return int.from_bytes(transcript.digest(), "big") % commitment.prime
+
+
+def prove_range_set(
+    commitment: PedersenCommitment,
+    value: int,
+    blinding: int,
+    intervals: Sequence[tuple[int, int]],
+    context: bytes = b"",
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> RangeSetProof:
+    """Prove that ``commitment`` opens at a value covered by ``intervals``.
+
+    ``intervals`` is an ordered list of closed ``(lower, upper)`` integer
+    tuples: lowers strictly increasing, disjoint (gaps allowed), every
+    interval inside the commitment's declared range and at most 256 integers
+    covered in total. ``value`` and ``blinding`` must be a valid opening of
+    ``commitment`` and ``value`` must lie inside one of the intervals; either
+    mismatch raises :class:`ValueError`. The opening is verified with
+    :func:`verify_pedersen_opening` before any proving work happens. The
+    resulting Fiat-Shamir proof binds the interval order and endpoints, the
+    commitment and the ``context``; it reveals neither the hit interval nor
+    the opening value.
+
+    Randomness is drawn from ``randbelow`` (default :func:`secrets.randbelow`)
+    exactly as in :func:`prove_range`; a non-callable source or a draw that
+    is not a non-``bool`` integer raises :class:`TypeError`, an out-of-range
+    draw raises :class:`ValueError`. Wrong object or field types (including
+    malformed interval pairs) raise :class:`TypeError`; every other invalid
+    interval structure raises :class:`ValueError`. Inputs are never mutated.
+    """
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment")
+    _check_commitment_fields(commitment)
+    _check_int(value, "value")
+    _check_int(blinding, "blinding")
+    _check_bytes(context, "context")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    normalized = _range_set_normalize_intervals(intervals, commitment)
+    if not verify_pedersen_opening(commitment, value, blinding):
+        raise ValueError("commitment does not open at (value, blinding)")
+    offsets = _range_set_offsets(normalized, commitment)
+    target = value - commitment.lower
+    if target not in offsets:
+        raise ValueError("value must lie within one of the intervals")
+    index = offsets.index(target)
+    size = len(offsets)
+    prime = commitment.prime
+    generator = commitment.generator
+    h = commitment.h
+
+    def draw(upper: int) -> int:
+        drawn = randbelow(upper)
+        _check_int(drawn, "randbelow return value")
+        if not 0 <= drawn < upper:
+            raise ValueError(f"randbelow must return a value in [0, {upper})")
+        return drawn
+
+    statements = [
+        commitment.element * pow(generator, -offset, prime) % prime
+        for offset in offsets
+    ]
+    t: list[int] = [0] * size
+    e: list[int] = [0] * size
+    s: list[int] = [0] * size
+    for i in range(size):
+        if i == index:
+            continue
+        e[i] = draw(prime)  # challenge share in [0, prime)
+        s[i] = draw(prime - 1) + 1  # non-negative response
+        t[i] = pow(h, s[i], prime) * pow(statements[i], -e[i], prime) % prime
+    k = draw(prime - 1) + 1
+    t[index] = pow(h, k, prime)
+    challenge = _range_set_challenge(
+        commitment, context, normalized, size, tuple(t)
+    )
+    e[index] = (challenge - sum(e)) % prime
+    s[index] = k + e[index] * blinding
+    return RangeSetProof(t=tuple(t), e=tuple(e), s=tuple(s))
+
+
+def _range_set_proof_check_material(
+    commitment: PedersenCommitment,
+    intervals: Sequence[tuple[int, int]],
+    proof: RangeSetProof,
+    context: bytes,
+) -> tuple[int, int, int, list[int], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    """Validate one range-set proof structurally and return batch material.
+
+    This mirrors :func:`verify_range_set` up to (but excluding) the
+    per-branch Schnorr equations: the interval structure, group parameters,
+    tuple lengths, the ``t`` / ``e`` / ``s`` bounds and the challenge sum
+    are checked against the byte-for-byte transcript. The returned tuple is
+    ``(prime, generator, h, offsets, t, e, s)``; ``D_v`` is recomputed by
+    the caller as ``element * generator**(-offset) mod prime``.
+    """
+    normalized = _range_set_normalize_intervals(intervals, commitment)
+    prime = commitment.prime
+    generator = commitment.generator
+    h = commitment.h
+    if prime <= 3 or not 1 < generator < prime or not 1 < h < prime:
+        raise ValueError("invalid commitment group parameters")
+    if not 0 < commitment.element < prime:
+        raise ValueError("commitment element out of range")
+    if commitment.lower > commitment.upper:
+        raise ValueError("commitment lower must not exceed upper")
+    if commitment.upper - commitment.lower >= prime - 1:
+        raise ValueError("commitment range width must be smaller than prime - 1")
+    offsets = _range_set_offsets(normalized, commitment)
+    size = len(offsets)
+    if not (len(proof.t) == len(proof.e) == len(proof.s) == size):
+        raise ValueError("proof fields must have one entry per covered integer")
+    if any(not 1 <= t_i < prime for t_i in proof.t):
+        raise ValueError("proof announcement out of range")
+    if any(not 0 <= e_i < prime for e_i in proof.e):
+        raise ValueError("proof challenge share out of range")
+    if any(s_i < 0 for s_i in proof.s):
+        raise ValueError("proof response must be non-negative")
+    challenge = _range_set_challenge(
+        commitment, context, normalized, size, proof.t
+    )
+    if sum(proof.e) % prime != challenge:
+        raise ValueError("proof challenge shares do not sum to the transcript challenge")
+    return prime, generator, h, offsets, proof.t, proof.e, proof.s
+
+
+def verify_range_set(
+    commitment: PedersenCommitment,
+    intervals: Sequence[tuple[int, int]],
+    proof: RangeSetProof,
+    context: bytes = b"",
+) -> bool:
+    """Verify a :class:`RangeSetProof` against ``commitment`` and ``intervals``.
+
+    Every branch must satisfy the same Schnorr equation as in
+    :func:`verify_range`, ``h**s_i == t_i * D_i**e_i (mod prime)`` with
+    ``D_i = element * generator**(-offset_i)`` the branch statement of the
+    ``i``-th covered integer in interval order; the challenge shares must
+    lie in ``[0, prime)`` and sum to the transcript challenge modulo
+    ``prime``, and the responses must be non-negative. Every branch is
+    checked against the same statement, so the verifier learns neither the
+    hit interval nor the opening value. Type errors (wrong object, a
+    non-sequence interval list, a non-tuple or wrong-arity pair, non-integer
+    endpoints, non-tuple or non-integer proof fields, a non-bytes context)
+    raise :class:`TypeError`; any other invalid structure — an empty,
+    inverted, unordered, overlapping or out-of-bounds interval list, more
+    than 256 covered integers, tampering, a swapped/reordered interval, a
+    swapped commitment or a changed context — returns ``False``. Inputs are
+    never mutated.
+    """
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment")
+    _check_commitment_fields(commitment)
+    _range_set_check_interval_types(intervals)
+    if not isinstance(proof, RangeSetProof):
+        raise TypeError("proof must be a RangeSetProof")
+    for field_name in ("t", "e", "s"):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(f"proof {field_name} must be a tuple of integers")
+        for item in field:
+            _check_int(item, f"proof {field_name} entry")
+    _check_bytes(context, "context")
+    try:
+        (
+            prime,
+            generator,
+            h,
+            offsets,
+            announcements,
+            shares,
+            responses,
+        ) = _range_set_proof_check_material(commitment, intervals, proof, context)
+        statements = [
+            commitment.element * pow(generator, -offset, prime) % prime
+            for offset in offsets
+        ]
+    except ValueError:
+        return False  # invalid structure or generator not invertible modulo prime
+    for i, statement in enumerate(statements):
+        left = pow(h, responses[i], prime)
+        right = announcements[i] * pow(statement, shares[i], prime) % prime
+        if left != right:
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class RangeSetBatchEntry:
+    """One item of a range-set batch verification.
+
+    Fields, in order: ``intervals`` — a tuple of ``(lower, upper)`` integer
+    tuples in the same shape accepted by :func:`verify_range_set`; the
+    :class:`PedersenCommitment`; the :class:`RangeSetProof`; then the
+    ``context`` (empty by default). All four are positional construction
+    arguments; entries compare by value and are immutable.
+    """
+
+    intervals: tuple[tuple[int, int], ...]
+    commitment: PedersenCommitment
+    proof: RangeSetProof
+    context: bytes = b""
+
+
+def _check_range_set_batch_entries_types(
+    entries: object,
+) -> list[RangeSetBatchEntry]:
+    """Validate the range-set-batch ``entries`` argument types.
+
+    Mirrors the type expectations of :func:`verify_range_set` for *every*
+    entry before any verification runs: ``entries`` must be a
+    non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`RangeSetBatchEntry` objects whose ``intervals`` is a sequence of
+    two-tuples of non-``bool`` integers, whose ``commitment`` is a
+    :class:`PedersenCommitment` with non-``bool`` integer fields, whose
+    ``proof`` is a :class:`RangeSetProof` with tuple integer fields and
+    whose ``context`` is ``bytes``. The whole batch is walked (a bad type
+    in a later entry still raises), and the entries are copied into a fresh
+    list so the inputs are never mutated. An empty batch is left to
+    :func:`verify_range_set_batch` to reject with ``False``; structural and
+    value problems are left to the per-entry checks during verification.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(
+        entries, Sequence
+    ):
+        raise TypeError("entries must be a sequence of RangeSetBatchEntry")
+    items: list[RangeSetBatchEntry] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, RangeSetBatchEntry):
+            raise TypeError(
+                f"entries[{position}] must be a RangeSetBatchEntry"
+            )
+        if not isinstance(entry.intervals, tuple):
+            raise TypeError(
+                f"entries[{position}] intervals must be a tuple of "
+                "(lower, upper) tuples"
+            )
+        _range_set_check_interval_types(entry.intervals)
+        commitment = entry.commitment
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(
+                f"entries[{position}] commitment must be a PedersenCommitment"
+            )
+        _check_commitment_fields(commitment)
+        proof = entry.proof
+        if not isinstance(proof, RangeSetProof):
+            raise TypeError(
+                f"entries[{position}] proof must be a RangeSetProof"
+            )
+        for field_name in ("t", "e", "s"):
+            field = getattr(proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"entries[{position}] proof {field_name} must be a tuple "
+                    "of integers"
+                )
+            for item in field:
+                _check_int(
+                    item, f"entries[{position}] proof {field_name} entry"
+                )
+        _check_bytes(entry.context, f"entries[{position}] context")
+        items.append(entry)
+    return items
+
+
+def verify_range_set_batch(
+    entries: Sequence[RangeSetBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a batch of :class:`RangeSetProof` objects with random linear checks.
+
+    ``entries`` must be a non-empty, non-string sequence of
+    :class:`RangeSetBatchEntry`; an empty batch returns ``False`` and lists,
+    tuples, any ordering and duplicate entries are legal. The nested types
+    of the *whole* batch are preflighted first, so a wrong type in any entry
+    — including the last one, and including a ``bool`` passed as an integer
+    or a non-tuple interval pair or proof field — raises :class:`TypeError`;
+    only then are the entries checked one by one and the first invalid entry
+    short-circuits the batch.
+
+    Every entry reuses the established :class:`RangeSetProof` transcript
+    byte for byte: its interval list must be structurally valid against the
+    commitment's declared range and cover at most 256 integers in total, the
+    proof tuple sizes and the ``t`` / ``e`` / ``s`` bounds must match, and
+    the challenge shares must sum to the transcript challenge that binds the
+    interval order and endpoints, the commitment and the context. Those
+    checks stay per entry and are never aggregated.
+
+    Each range-set-proof branch then draws exactly one random coefficient
+    ``a = r + 1`` with ``r = randbelow(prime - 1)``. Branches sharing the
+    same ``(prime, generator, h)`` group are checked together with a single
+    aggregate equation
+
+    ``h**Σ(a*s) == Π(t**a * D_i**(a*e)) (mod prime)``
+
+    where ``D_i = element * generator**(-offset_i)`` is unchanged from
+    :func:`verify_range_set`; per-branch results are never AND-ed together.
+    Type errors — including ``bool`` integers and a non-callable
+    ``randbelow`` or one that returns a non-integer — raise
+    :class:`TypeError`; a coefficient outside ``[0, prime - 1)`` raises
+    :class:`ValueError`. Every other invalid structure, tampering,
+    interval/order/endpoint, commitment or context binding mismatch returns
+    ``False``. Entries are independent; inputs are never mutated.
+    """
+    items = _check_range_set_batch_entries_types(entries)
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not items:
+        return False
+
+    # group -> {"sum": Σ(a*s), "product": Π(t**a * D_i**(a*e))}
+    groups: dict[tuple[int, int, int], dict[str, int]] = {}
+
+    def add_branch(
+        group_key: tuple[int, int, int],
+        t_i: int,
+        e_i: int,
+        s_i: int,
+        statement_i: int,
+    ) -> None:
+        prime, _generator, _h = group_key
+        r = randbelow(prime - 1)
+        if not isinstance(r, int) or isinstance(r, bool):
+            raise TypeError("coefficient source randbelow must return an integer")
+        if not 0 <= r < prime - 1:
+            raise ValueError("coefficient source must satisfy 0 <= r < prime - 1")
+        coefficient = r + 1
+        state = groups.setdefault(group_key, {"sum": 0, "product": 1})
+        state["sum"] += coefficient * s_i
+        state["product"] = (
+            state["product"]
+            * pow(t_i, coefficient, prime)
+            % prime
+            * pow(statement_i, coefficient * e_i, prime)
+            % prime
+        )
+
+    for position, entry in enumerate(items):
+        commitment = entry.commitment
+        proof = entry.proof
+        try:
+            (
+                prime,
+                generator,
+                h,
+                offsets,
+                announcements,
+                shares,
+                responses,
+            ) = _range_set_proof_check_material(
+                commitment, entry.intervals, proof, entry.context
+            )
+            statements = [
+                commitment.element * pow(generator, -offset, prime) % prime
+                for offset in offsets
+            ]
+        except ValueError:
+            return False  # structural/transcript mismatch: short-circuit
+        group_key = (prime, generator, h)
+        for i, statement in enumerate(statements):
+            add_branch(
+                group_key,
+                announcements[i],
+                shares[i],
+                responses[i],
+                statement,
+            )
+
+    for (prime, _generator, _h), state in groups.items():
+        if pow(_h, state["sum"], prime) != state["product"]:
             return False
     return True
 

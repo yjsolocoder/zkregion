@@ -419,6 +419,27 @@ region_proof = prove_region(
 assert verify_region(x_commitment, y_commitment, region, region_proof, context=b"session-1")
 assert not verify_region(x_commitment, y_commitment, region, region_proof, context=b"other")
 
+# 闭凸多边形区域成员非交互证明：验证者只看两个坐标承诺、多边形与证明，
+# 不接触坐标值或盲因子；顶点按边界顺序给出，旋转起点或反向绕行规范化为同一序列
+from zkregion import (
+    ConvexPolygonRegion, ConvexPolygonRegionProof,
+    prove_convex_polygon, verify_convex_polygon,
+)
+
+polygon = ConvexPolygonRegion(((0, 50), (50, 100), (100, 50), (50, 0)))
+x_commitment, x_blinding = pedersen_commit(40, polygon.min_x, polygon.max_x)
+y_commitment, y_blinding = pedersen_commit(60, polygon.min_y, polygon.max_y)
+polygon_proof = prove_convex_polygon(
+    x_commitment, y_commitment, 40, 60, x_blinding, y_blinding,
+    polygon, context=b"session-1",
+)
+assert verify_convex_polygon(x_commitment, y_commitment, polygon, polygon_proof, b"session-1")
+assert not verify_convex_polygon(x_commitment, y_commitment, polygon, polygon_proof, b"other")
+# 同一多边形的旋转 / 反向表示与原表示按值相等
+assert ConvexPolygonRegion(((50, 100), (100, 50), (50, 0), (0, 50))) == polygon
+# 两个承诺须同群参数，声明区间须恰为多边形的闭合整数包围盒；
+# 边界边与顶点属于区域，少于三个顶点、重复顶点、相邻三点共线、自交或凹多边形拒绝构造。
+
 # 二维区域证明的批量验证（按 (prime, generator, h) 分组做随机线性组合）
 from zkregion import RegionBatchEntry, verify_region_batch
 
@@ -2399,7 +2420,7 @@ digest = SHA-256(
 
 ## 限制
 
-`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。区域判定方面，`Region.contains` 只是朴素的坐标比较；与承诺绑定的 `region_contains_committed` 会在判定前按 `verify_pedersen_opening` 的口径逐轴校验开合与声明区间，但同样只是演示级构造，不构成生产级保证。批量验证所用的随机线性组合与默认群一样仅供演示。Pedersen 承诺默认的 `h = g**2 mod prime` 带有公开陷门、破坏绑定性；其上的 Schnorr OR 区间证明与二维区域成员证明同样是演示级构造——区间上限 256 个整数、挑战来自 SHA-256 Fiat-Shamir 转录、群参数与默认 `h` 均未做生产级安全分析，不能用于真实部署。
+`DEFAULT_PRIME` 是梅森素数而非安全素数，`2**127 - 2` 的因子分解不干净，因此这里没有可用的素数阶子群，应答按普通整数计算、不针对群阶取模；安全性只够做协议演示，不足以用于真实部署。区域判定方面，`Region.contains` 只是朴素的坐标比较；与承诺绑定的 `region_contains_committed` 会在判定前按 `verify_pedersen_opening` 的口径逐轴校验开合与声明区间，但同样只是演示级构造，不构成生产级保证。批量验证所用的随机线性组合与默认群一样仅供演示。Pedersen 承诺默认的 `h = g**2 mod prime` 带有公开陷门、破坏绑定性；其上的 Schnorr OR 区间证明与二维区域成员证明（矩形与闭凸多边形两种）同样是演示级构造——区间上限 256 个整数、挑战来自 SHA-256 Fiat-Shamir 转录、群参数与默认 `h` 均未做生产级安全分析，不能用于真实部署。
 
 ## 测试
 

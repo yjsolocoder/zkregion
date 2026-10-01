@@ -1488,6 +1488,10 @@ python3 -m zkregion
 - `verify_multi_inclusion_batch_bound(batch, root) -> bool` — Merkle 承诺的多包含证明完整批验：每项外层叶为 `F(b"zkregion/multi-batch/v1") || F(Q(item))`，其中 `Q(item)` 逐字节复用 `MerkleMultiReplayGuard` 摘要从 `F(root)` 到 `S(proof.siblings, id)` 的连续段（即入参不变的 `_merkle_multi_proof_framing`），按批序成叶、留重，叶摘要沿用 Merkle 规则；先以 `verify_multi_inclusion` 验根（结构/根失败即返回 `False` 且不进内层），根通过后原样调用 `verify_multi_inclusion_batch(batch.entries)`；`root` 须为 `bytes`，全批类型预检，错型抛 `TypeError`，其余无效返回 `False`，输入不变
 - `prove_multi_inclusion_batch_bound(entries) -> tuple[BoundMerkleMultiBatch, bytes]` — 顶层构造 Merkle 承诺的完整多包含证明批：`entries` 沿用 `verify_multi_inclusion_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，构造不改写输入，物品按原顺序转为元组并保留重复项；每项外层叶逐字节复用 `_bound_merkle_multi_leaf` 编码，叶摘要、内部节点及奇数末项复制均沿用现有 SHA-256 Merkle 协议，不改域、不改帧、不重排字段；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖每片叶、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_multi_inclusion_batch_bound(batch, root) is True`，单项、奇偶批与重复项均确定，与旧手工构造逐字节兼容；全批类型预检失败抛 `TypeError`，空批、任一 U 成帧整数（各 `proof.leaf_count`、proof/entry index、批次与各元组序列长度）越出 uint64 或 `verify_multi_inclusion_batch` 返回 `False` 抛 `ValueError`
 - `MerkleMultiProof(leaf_count, indices, siblings)` — 不可变多包含证明对象，`indices` 为 `tuple[int, ...]`，`siblings` 为 `tuple[bytes, ...]`
+- `MerkleMultiProofBundle(root, proof, entries)` — 可独立传输的多叶包含证明规范化二进制信封数据类，字段按 `root`、`proof`、`entries` 固定次序承载；`entries` 为按 `proof.indices` 顺序给出的 `(index, leaf)` 二元组元组；冻结、可位置构造、按值相等，构造时不做校验
+- `encode_merkle_multi_proof_bundle(bundle) -> bytes` — 对同一对象稳定输出同一字节串；输出依次为四字节魔数 `b"zmmp"` 与一字节格式版本，随后按固定字段次序承载 `root`、`proof`、`entries` 三个字段，每个字段前置四字节大端长度前缀；证明体为 `(leaf_count, indices, siblings)` 三元组，每个条目为 `(index, leaf)` 二元组；整数（含越界或负值）使用符号字节加最短大端绝对值编码，元组显式承载四字节基数，字节串原样成帧；只返回 `bytes`，不写文件或数据库；对象或字段类型错误（含 `bool` 整数、非元组的 `indices`/`siblings`/`entries`、条目非二元组）抛 `TypeError`；证明语义不一致（索引乱序或重复、entries 与索引不符、索引越界、`leaf_count` 非正）的信封仍正常编码，留待验证判定
+- `decode_merkle_multi_proof_bundle(data) -> MerkleMultiProofBundle` — 只接受 `bytes`（非 `bytes` 抛 `TypeError`），逐层核对魔数、版本、长度前缀、元组基数与整数规范形，完整消费载荷且无尾随数据后按字段次序重建与原对象逐字段相等的信封；截断、越界长度、未知版本、非规范整数、非法元组形状、尾随数据一律抛 `ValueError`，失败不返回部分对象；可表示但证明不成立的信封仍解码成功
+- `verify_merkle_multi_proof_bundle(bundle) -> bool` — 复用现有多叶包含验证语义：把信封的 `entries`、`proof`、`root` 原样交给 `verify_multi_inclusion`，核对根与摘要长度、严格递增且无重复的 `proof.indices` 与 `leaf_count` 的范围关系、entries 与索引的精确对应以及 siblings 的完整消耗；对象或字段类型错误（含 `bool` 整数、非元组字段）抛 `TypeError`，其余语义不一致——叶或根被篡改、索引重复或乱序、索引越界、entries 数目不符、拼接或截断的 siblings——一律返回 `False`；编码后解码保持验证结论
 - `prove_consistency(leaves, old_count) -> MerkleConsistencyProof` — 生成追加一致性证明，证明新树由前 `old_count` 片旧叶追加所得
 - `verify_consistency(old_root, new_root, proof) -> bool` — 仅凭旧根、新根与证明验证追加一致性
 - `MerkleConsistencyProof(old_count, new_count, nodes)` — 不可变一致性证明对象，`nodes` 为 `tuple[bytes, ...]`
@@ -1794,6 +1798,14 @@ h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
 - **proof** 体为固定二元组（x 轴子证明、y 轴子证明）。`RangeProof` 子证明体为 `(t, e, s)` 三个整数元组；`WideRangeProof` 子证明体为 `commitments` 整数元组与 `challenges`、`responses` 两个整数对元组（每对内为两个整数的二元组）。类型区分只由头部标签决定，`RegionProof` 载荷不会被解释为 `RegionWideProof`，反之亦然。
 
 `decode_region_proof_bundle(data)` 只接受 `bytes`（否则抛 `TypeError`），按同一游标逐层核对魔数、版本、类型标签、长度前缀、元组基数、元素类型与整数规范形，并校验非法字段值（承诺群参数与声明区间、区域 `min <= max`）与非法证明形状（`RangeProof` 三字段等长且长度在 1..256；`WideRangeProof` 三组条目数一致且位宽在 1..24、每对恰含两个整数）；载荷必须被完整消费，任何尾随字节都拒绝。截断、越界长度、未知版本或类型、非规范整数、非法字段值、非法区间、非法证明形状、尾随数据一律抛 `ValueError`，失败不返回部分对象；重建对象与原对象逐字段相等。`verify_region_proof_bundle(bundle)` 按 `proof` 类型分发到 `verify_region` 或 `verify_region_wide`，沿用既有单条验证语义，只使用两个承诺、Region 与 context，不读取坐标或盲因子；声明范围或 context 不符、坐标轴互换、proof 篡改或验证等式失败返回 `False`，对象或字段类型错误仍抛 `TypeError`。编码后解码保持验证结论；篡改后的字节要么无法解码，要么重建出不同信封且验证不通过。
+
+### 可独立传输的 Merkle 多叶包含证明信封
+
+`MerkleMultiProofBundle(root, proof, entries)` 把 `verify_multi_inclusion` 的三个入参冻结为一个可跨进程传递并复验的信封，字段次序固定为 `root`、`proof`、`entries`，其中 `entries` 为按 `proof.indices` 顺序给出的 `(index, leaf)` 二元组元组。信封为冻结数据类、可位置构造、按值相等，构造时不做任何校验；`encode_merkle_multi_proof_bundle(bundle) -> bytes` 只返回 `bytes`，不写文件或数据库，且对同一对象稳定输出同一字节串。
+
+字节布局复用区域证明信封的成帧原语但域分隔独立：头部固定为四字节魔数 `b"zmmp"` 与一字节格式版本（当前为 `1`），随后按字段次序承载三个字段，每个字段体前置四字节无符号大端长度前缀。`root` 为原始 `bytes` 字段体；`proof` 体为三元组（`leaf_count`、`indices`、`siblings`），其中 `indices` 为整数元组、`siblings` 为字节串元组；`entries` 体为元组，每项为 `(index, leaf)` 二元组。整数沿用符号字节加最短大端绝对值的规范形，元组显式承载四字节基数，多叶信封不会被解释为区域证明信封，反之亦然。
+
+`encode_merkle_multi_proof_bundle` 只检查类型：对象或字段类型错误（含 `bool` 整数、非元组的 `indices`/`siblings`/`entries`、条目非二元组）抛 `TypeError`；证明语义不一致（索引乱序或重复、entries 与索引不符、索引越界、`leaf_count` 非正）的信封仍正常编码返回 `bytes`。`decode_merkle_multi_proof_bundle(data)` 只接受 `bytes`（否则抛 `TypeError`），逐层核对魔数、版本、长度前缀、元组基数与整数规范形，载荷必须被完整消费；截断、越界长度、未知版本、非规范整数、非法元组形状、尾随数据一律抛 `ValueError`，失败不返回部分对象；可表示但证明不成立的信封仍解码成功，重建对象与原对象逐字段相等。`verify_merkle_multi_proof_bundle(bundle)` 把 `entries`、`proof`、`root` 原样交给 `verify_multi_inclusion`，沿用既有多叶包含验证语义；对象或字段类型错误抛 `TypeError`，叶或根被篡改、索引重复或乱序、索引越界、entries 数目不符、拼接或截断的 siblings 等语义不一致一律返回 `False`。编码后解码保持验证结论。
 
 ### Merkle 承诺的宽区间二维区域证明完整批验
 

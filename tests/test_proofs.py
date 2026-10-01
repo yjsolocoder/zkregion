@@ -49,6 +49,7 @@ from zkregion import (
     MerkleMultiBatchReplayGuard,
     MerkleMultiEntryReplayGuard,
     MerkleMultiProof,
+    MerkleMultiProofBundle,
     MerkleProof,
     MultiSchnorrEntry,
     OpeningBatchEntry,
@@ -93,7 +94,9 @@ from zkregion import (
     WideRangeReplayGuard,
     commit,
     commit_coordinate,
+    decode_merkle_multi_proof_bundle,
     decode_region_proof_bundle,
+    encode_merkle_multi_proof_bundle,
     encode_region_proof_bundle,
     merkle_root,
     pedersen_commit,
@@ -122,6 +125,7 @@ from zkregion import (
     verify_inclusion,
     verify_inclusion_batch,
     verify_inclusion_batch_bound,
+    verify_merkle_multi_proof_bundle,
     verify_multi_inclusion,
     verify_multi_inclusion_batch,
     verify_multi_inclusion_batch_bound,
@@ -28346,6 +28350,412 @@ class RegionProofBundleTest(unittest.TestCase):
         decoded = decode_region_proof_bundle(raw)
         self.assertEqual(decoded, bundle)
         self.assertFalse(verify_region_proof_bundle(decoded))
+
+
+class MerkleMultiProofBundleTest(unittest.TestCase):
+    LEAVES = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon"]
+
+    def bundle(self, indices=(1, 3), leaves=None):
+        leaves = self.LEAVES if leaves is None else leaves
+        proof = prove_multi_inclusion(leaves, indices)
+        entries = tuple((index, leaves[index]) for index in indices)
+        return MerkleMultiProofBundle(
+            root=merkle_root(leaves), proof=proof, entries=entries
+        )
+
+    @staticmethod
+    def _proof_offset(raw):
+        # magic(4) + version(1) + framed root
+        root_length = int.from_bytes(raw[5:9], "big")
+        return 9 + root_length
+
+    # ---- round trip -----------------------------------------------------
+
+    def test_round_trip_for_every_subset(self):
+        # exhaustive over all non-empty subsets of a 5-leaf (odd) tree
+        for mask in range(1, 1 << len(self.LEAVES)):
+            indices = tuple(i for i in range(len(self.LEAVES)) if mask & (1 << i))
+            bundle = self.bundle(indices)
+            raw = encode_merkle_multi_proof_bundle(bundle)
+            self.assertIsInstance(raw, bytes)
+            decoded = decode_merkle_multi_proof_bundle(raw)
+            self.assertEqual(decoded, bundle)
+            self.assertIsInstance(decoded.proof, MerkleMultiProof)
+            self.assertTrue(verify_merkle_multi_proof_bundle(bundle), indices)
+            self.assertTrue(verify_merkle_multi_proof_bundle(decoded), indices)
+
+    def test_round_trip_across_tree_sizes(self):
+        for size in range(1, 10):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            for indices in ((0,), (size - 1,), tuple(sorted({0, size - 1})), tuple(range(size))):
+                bundle = self.bundle(indices, leaves)
+                decoded = decode_merkle_multi_proof_bundle(
+                    encode_merkle_multi_proof_bundle(bundle)
+                )
+                self.assertEqual(decoded, bundle)
+                self.assertTrue(
+                    verify_merkle_multi_proof_bundle(decoded),
+                    f"size={size} indices={indices}",
+                )
+
+    def test_single_leaf_tree(self):
+        bundle = self.bundle((0,), [b"only"])
+        self.assertEqual(bundle.proof.siblings, ())
+        decoded = decode_merkle_multi_proof_bundle(
+            encode_merkle_multi_proof_bundle(bundle)
+        )
+        self.assertEqual(decoded, bundle)
+        self.assertTrue(verify_merkle_multi_proof_bundle(decoded))
+
+    def test_encode_is_deterministic(self):
+        bundle = self.bundle()
+        self.assertEqual(
+            encode_merkle_multi_proof_bundle(bundle),
+            encode_merkle_multi_proof_bundle(bundle),
+        )
+        # equal field values, independently constructed objects
+        self.assertEqual(
+            encode_merkle_multi_proof_bundle(self.bundle()),
+            encode_merkle_multi_proof_bundle(self.bundle()),
+        )
+
+    def test_re_encoding_is_byte_identical(self):
+        raw = encode_merkle_multi_proof_bundle(self.bundle())
+        self.assertEqual(
+            encode_merkle_multi_proof_bundle(decode_merkle_multi_proof_bundle(raw)),
+            raw,
+        )
+
+    def test_header_carries_magic_and_version(self):
+        raw = encode_merkle_multi_proof_bundle(self.bundle())
+        self.assertEqual(raw[:5], b"zmmp" + bytes((1,)))
+
+    def test_envelope_is_not_a_region_proof_envelope(self):
+        raw = encode_merkle_multi_proof_bundle(self.bundle())
+        with self.assertRaises(ValueError):
+            decode_region_proof_bundle(raw)
+
+    def test_bundle_is_frozen_and_value_compared(self):
+        bundle = self.bundle()
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            bundle.root = b"\x00" * 32
+        self.assertEqual(bundle, self.bundle())
+        self.assertNotEqual(bundle, self.bundle((0, 2)))
+
+    # ---- encode type errors ----------------------------------------------
+
+    def test_encode_type_errors(self):
+        good = self.bundle()
+        proof = good.proof
+        with self.assertRaises(TypeError):
+            encode_merkle_multi_proof_bundle(object())
+        with self.assertRaises(TypeError):
+            encode_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle("root", proof, good.entries)
+            )
+        with self.assertRaises(TypeError):
+            encode_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle(bytearray(good.root), proof, good.entries)
+            )
+        with self.assertRaises(TypeError):
+            encode_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle(good.root, object(), good.entries)
+            )
+        bad_proofs = (
+            MerkleMultiProof(True, proof.indices, proof.siblings),
+            MerkleMultiProof(5, list(proof.indices), proof.siblings),
+            MerkleMultiProof(5, (1, True), proof.siblings),
+            MerkleMultiProof(5, (1, 3.0), proof.siblings),
+            MerkleMultiProof(5, proof.indices, list(proof.siblings)),
+            MerkleMultiProof(5, proof.indices, proof.siblings + ("x",)),
+        )
+        for bad_proof in bad_proofs:
+            with self.assertRaises(TypeError):
+                encode_merkle_multi_proof_bundle(
+                    MerkleMultiProofBundle(good.root, bad_proof, good.entries)
+                )
+        bad_entries = (
+            list(good.entries),
+            ((1, b"beta"), [3, b"delta"]),
+            ((1, b"beta"), (3, b"delta", b"extra")),
+            ((1, b"beta"), (3,)),
+            ((True, b"beta"), (3, b"delta")),
+            ((1, "beta"), (3, b"delta")),
+            ((1, b"beta"), (3, bytearray(b"delta"))),
+        )
+        for entries in bad_entries:
+            with self.assertRaises(TypeError):
+                encode_merkle_multi_proof_bundle(
+                    MerkleMultiProofBundle(good.root, proof, entries)
+                )
+
+    def test_encode_accepts_semantically_inconsistent_bundles(self):
+        good = self.bundle()
+        inconsistent_proofs = (
+            MerkleMultiProof(5, (3, 1), ()),      # misordered indices
+            MerkleMultiProof(5, (1, 1), ()),      # duplicate indices
+            MerkleMultiProof(5, (1, 5), ()),      # index out of range
+            MerkleMultiProof(5, (-1, 3), ()),     # negative index
+            MerkleMultiProof(0, (1, 3), ()),      # zero leaf_count
+            MerkleMultiProof(-2, (1, 3), ()),     # negative leaf_count
+            MerkleMultiProof(5, (), ()),          # empty indices
+        )
+        for proof in inconsistent_proofs:
+            raw = encode_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle(good.root, proof, good.entries)
+            )
+            self.assertIsInstance(raw, bytes)
+        # entries that do not match proof.indices still encode
+        for entries in ((), good.entries[:1], good.entries + ((4, b"epsilon"),)):
+            raw = encode_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle(good.root, good.proof, entries)
+            )
+            self.assertIsInstance(raw, bytes)
+
+    # ---- decode failures --------------------------------------------------
+
+    def test_decode_type_errors(self):
+        raw = encode_merkle_multi_proof_bundle(self.bundle())
+        for bad in (bytearray(raw), memoryview(raw), str(raw), 123, None, [raw]):
+            with self.assertRaises(TypeError):
+                decode_merkle_multi_proof_bundle(bad)
+
+    def test_decode_rejects_bad_magic_and_version(self):
+        raw = bytearray(encode_merkle_multi_proof_bundle(self.bundle()))
+        raw[0] = ord("X")
+        with self.assertRaises(ValueError):
+            decode_merkle_multi_proof_bundle(bytes(raw))
+        raw = bytearray(encode_merkle_multi_proof_bundle(self.bundle()))
+        raw[4] = 0
+        with self.assertRaises(ValueError):
+            decode_merkle_multi_proof_bundle(bytes(raw))
+        raw[4] = 2
+        with self.assertRaises(ValueError):
+            decode_merkle_multi_proof_bundle(bytes(raw))
+
+    def test_every_truncation_rejected(self):
+        raw = encode_merkle_multi_proof_bundle(self.bundle())
+        self.assertGreater(len(raw), 100)
+        for cut in range(len(raw)):
+            with self.assertRaises(ValueError):
+                decode_merkle_multi_proof_bundle(raw[:cut])
+
+    def test_trailing_data_rejected(self):
+        raw = encode_merkle_multi_proof_bundle(self.bundle())
+        for extra in (b"\x00", b"ab", b"\xff" * 8):
+            with self.assertRaises(ValueError):
+                decode_merkle_multi_proof_bundle(raw + extra)
+            with self.assertRaises(ValueError):
+                decode_merkle_multi_proof_bundle(extra + raw)
+
+    def test_non_canonical_integers_rejected(self):
+        raw = bytearray(encode_merkle_multi_proof_bundle(self.bundle()))
+        proof_len_at = self._proof_offset(raw)
+        body_at = proof_len_at + 4
+        leaf_count_len_at = body_at + 4  # skip the proof tuple cardinality
+        sign_at = leaf_count_len_at + 4
+        # insert a leading zero byte in the magnitude and grow both the
+        # integer frame and the surrounding proof frame by one
+        mutated = bytearray(raw)
+        mutated[proof_len_at:proof_len_at + 4] = (
+            int.from_bytes(mutated[proof_len_at:proof_len_at + 4], "big") + 1
+        ).to_bytes(4, "big")
+        leaf_count_len = int.from_bytes(
+            mutated[leaf_count_len_at:leaf_count_len_at + 4], "big"
+        )
+        mutated[leaf_count_len_at:leaf_count_len_at + 4] = (
+            leaf_count_len + 1
+        ).to_bytes(4, "big")
+        mutated[sign_at + 1:sign_at + 1] = b"\x00"
+        with self.assertRaises(ValueError):
+            decode_merkle_multi_proof_bundle(bytes(mutated))
+        # negative zero
+        mutated = bytearray(raw)
+        mutated[sign_at] = 255
+        mutated[sign_at + 1] = 0
+        with self.assertRaises(ValueError):
+            decode_merkle_multi_proof_bundle(bytes(mutated))
+        # unknown sign byte
+        mutated = bytearray(raw)
+        mutated[sign_at] = 7
+        with self.assertRaises(ValueError):
+            decode_merkle_multi_proof_bundle(bytes(mutated))
+
+    def test_malformed_tuple_cardinalities_rejected(self):
+        raw = encode_merkle_multi_proof_bundle(self.bundle())
+        proof_len_at = self._proof_offset(raw)
+        body_at = proof_len_at + 4
+
+        def flip_uint32(blob, offset, value):
+            mutated = bytearray(blob)
+            mutated[offset:offset + 4] = value.to_bytes(4, "big")
+            return bytes(mutated)
+
+        # proof field count 3 -> 4
+        with self.assertRaises(ValueError):
+            decode_merkle_multi_proof_bundle(flip_uint32(raw, body_at, 4))
+        # indices tuple cardinality 2 -> 99
+        leaf_count_len_at = body_at + 4
+        leaf_count_len = int.from_bytes(
+            raw[leaf_count_len_at:leaf_count_len_at + 4], "big"
+        )
+        indices_cardinality_at = leaf_count_len_at + 4 + leaf_count_len + 4
+        with self.assertRaises(ValueError):
+            decode_merkle_multi_proof_bundle(
+                flip_uint32(raw, indices_cardinality_at, 99)
+            )
+        # entry pair cardinality 2 -> 3: the entries frame follows the proof
+        proof_len = int.from_bytes(raw[proof_len_at:proof_len_at + 4], "big")
+        entries_at = proof_len_at + 4 + proof_len
+        first_entry_cardinality_at = entries_at + 4 + 4 + 4
+        with self.assertRaises(ValueError):
+            decode_merkle_multi_proof_bundle(
+                flip_uint32(raw, first_entry_cardinality_at, 3)
+            )
+
+    def test_unverifiable_bundle_still_decodes(self):
+        good = self.bundle()
+        cases = [
+            MerkleMultiProofBundle(
+                good.root, MerkleMultiProof(5, (3, 1), ()),
+                ((3, b"gamma"), (1, b"beta")),
+            ),
+            MerkleMultiProofBundle(
+                good.root, MerkleMultiProof(5, (1, 1), ()),
+                ((1, b"beta"), (1, b"beta")),
+            ),
+            MerkleMultiProofBundle(
+                good.root, MerkleMultiProof(0, (1, 3), ()), good.entries
+            ),
+            MerkleMultiProofBundle(good.root, good.proof, ()),
+            MerkleMultiProofBundle(good.root, good.proof, good.entries[:1]),
+            MerkleMultiProofBundle(
+                good.root, good.proof, good.entries + ((4, b"epsilon"),)
+            ),
+        ]
+        for bundle in cases:
+            decoded = decode_merkle_multi_proof_bundle(
+                encode_merkle_multi_proof_bundle(bundle)
+            )
+            self.assertEqual(decoded, bundle)
+            self.assertFalse(verify_merkle_multi_proof_bundle(decoded))
+
+    # ---- verify type errors ----------------------------------------------
+
+    def test_verify_type_errors(self):
+        good = self.bundle()
+        proof = good.proof
+        with self.assertRaises(TypeError):
+            verify_merkle_multi_proof_bundle(object())
+        with self.assertRaises(TypeError):
+            verify_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle(7, proof, good.entries)
+            )
+        with self.assertRaises(TypeError):
+            verify_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle(good.root, (1, 3), good.entries)
+            )
+        with self.assertRaises(TypeError):
+            verify_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle(
+                    good.root,
+                    MerkleMultiProof(True, proof.indices, proof.siblings),
+                    good.entries,
+                )
+            )
+        with self.assertRaises(TypeError):
+            verify_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle(
+                    good.root,
+                    MerkleMultiProof(5, [1, 3], proof.siblings),
+                    good.entries,
+                )
+            )
+        with self.assertRaises(TypeError):
+            verify_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle(good.root, proof, list(good.entries))
+            )
+        with self.assertRaises(TypeError):
+            verify_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle(
+                    good.root, proof, ((1, b"beta"), (True, b"delta"))
+                )
+            )
+        with self.assertRaises(TypeError):
+            verify_merkle_multi_proof_bundle(
+                MerkleMultiProofBundle(
+                    good.root, proof, ((1, b"beta"), (3, "delta"))
+                )
+            )
+
+    # ---- verify False semantics -------------------------------------------
+
+    def test_verify_shape_errors_return_false(self):
+        good = self.bundle()
+        root, proof, entries = good.root, good.proof, good.entries
+        false_bundles = (
+            # empty or mismatched entries
+            MerkleMultiProofBundle(root, proof, ()),
+            MerkleMultiProofBundle(root, proof, entries[:1]),
+            MerkleMultiProofBundle(root, proof, entries + ((4, b"epsilon"),)),
+            MerkleMultiProofBundle(root, proof, ((1, b"beta"), (2, b"gamma"))),
+            MerkleMultiProofBundle(root, proof, (entries[1], entries[0])),
+            # malformed proof fields
+            MerkleMultiProofBundle(root, MerkleMultiProof(0, (1, 3), proof.siblings), entries),
+            MerkleMultiProofBundle(root, MerkleMultiProof(-2, (1, 3), proof.siblings), entries),
+            MerkleMultiProofBundle(root, MerkleMultiProof(5, (), proof.siblings), entries),
+            MerkleMultiProofBundle(root, MerkleMultiProof(5, (3, 1), proof.siblings), entries),
+            MerkleMultiProofBundle(root, MerkleMultiProof(5, (1, 1), proof.siblings), entries),
+            MerkleMultiProofBundle(root, MerkleMultiProof(5, (1, 5), proof.siblings), entries),
+            MerkleMultiProofBundle(root, MerkleMultiProof(5, (-1, 3), proof.siblings), entries),
+            # digest length errors
+            MerkleMultiProofBundle(root[:-1], proof, entries),
+            MerkleMultiProofBundle(root + b"\x00", proof, entries),
+            # sibling count mismatch in either direction
+            MerkleMultiProofBundle(root, MerkleMultiProof(5, (1, 3), proof.siblings[:-1]), entries),
+            MerkleMultiProofBundle(root, MerkleMultiProof(5, (1, 3), proof.siblings + (root,)), entries),
+        )
+        for bundle in false_bundles:
+            self.assertFalse(verify_merkle_multi_proof_bundle(bundle), bundle)
+
+    def test_verify_tampering_fails(self):
+        good = self.bundle()
+        root, proof = good.root, good.proof
+        # tampered leaf
+        self.assertFalse(verify_merkle_multi_proof_bundle(
+            MerkleMultiProofBundle(root, proof, ((1, b"beta"), (3, b"other")))
+        ))
+        # flipped sibling digest
+        flipped = MerkleMultiProof(
+            5, (1, 3), proof.siblings[:-1] + (proof.siblings[-1][::-1],)
+        )
+        self.assertFalse(verify_merkle_multi_proof_bundle(
+            MerkleMultiProofBundle(root, flipped, good.entries)
+        ))
+        # root of a different tree
+        self.assertFalse(verify_merkle_multi_proof_bundle(
+            MerkleMultiProofBundle(merkle_root(self.LEAVES[:4]), proof, good.entries)
+        ))
+        # a proof for a different subset must not validate these entries
+        other = prove_multi_inclusion(self.LEAVES, (1, 2))
+        self.assertFalse(verify_merkle_multi_proof_bundle(
+            MerkleMultiProofBundle(root, other, good.entries)
+        ))
+        # siblings spliced from a different proof
+        spliced = MerkleMultiProof(5, (1, 3), other.siblings)
+        self.assertFalse(verify_merkle_multi_proof_bundle(
+            MerkleMultiProofBundle(root, spliced, good.entries)
+        ))
+
+    def test_round_trip_preserves_verification_failure(self):
+        good = self.bundle()
+        bundle = MerkleMultiProofBundle(
+            good.root, good.proof, ((1, b"beta"), (3, b"other"))
+        )
+        raw = encode_merkle_multi_proof_bundle(bundle)
+        decoded = decode_merkle_multi_proof_bundle(raw)
+        self.assertEqual(decoded, bundle)
+        self.assertFalse(verify_merkle_multi_proof_bundle(decoded))
 
 
 if __name__ == "__main__":

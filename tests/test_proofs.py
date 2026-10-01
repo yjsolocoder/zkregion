@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import threading
 import unittest
+from decimal import Decimal, localcontext
 
 from zkregion import (
     DEFAULT_GENERATOR,
@@ -100,6 +101,8 @@ from zkregion import (
     encode_region_proof_bundle,
     merkle_root,
     pedersen_commit,
+    quantize_coordinate,
+    quantize_region,
     prove_consistency,
     prove_consistency_chain,
     prove_inclusion,
@@ -40990,3 +40993,282 @@ class BoundRegionWideReplayGuardTest(unittest.TestCase):
             thread.join()
         self.assertEqual(sum(results), 1)
         store.close()
+
+
+class QuantizeCoordinateTest(unittest.TestCase):
+    def test_nearest_with_default_scale(self):
+        cases = {
+            ("1.5", "-2.25"): (1500000, -2250000),
+            ("2.4", "2.6"): (2400000, 2600000),
+            ("-2.4", "-2.6"): (-2400000, -2600000),
+            ("100", "-100"): (100000000, -100000000),
+            ("0", "-0"): (0, 0),
+            ("1e3", "0.5000005"): (1000000000, 500001),
+        }
+        for (x, y), expected in cases.items():
+            self.assertEqual(quantize_coordinate(x, y), expected)
+
+    def test_half_grid_rounds_away_from_zero(self):
+        self.assertEqual(quantize_coordinate("0.0000005", "-0.0000005"), (1, -1))
+        self.assertEqual(
+            quantize_coordinate("0.0000004999", "-0.0000004999"), (0, 0)
+        )
+        self.assertEqual(quantize_coordinate("0.05", "-0.05", scale=10), (1, -1))
+        self.assertEqual(quantize_coordinate("0.5", "-0.5", scale=1), (1, -1))
+
+    def test_input_types_agree(self):
+        self.assertEqual(
+            quantize_coordinate(Decimal("3.141593"), Decimal("-0.0")),
+            quantize_coordinate("3.141593", "0"),
+        )
+        self.assertEqual(quantize_coordinate(7, -3, scale=1), (7, -3))
+        self.assertEqual(
+            quantize_coordinate(7, "-3.5", scale=2),
+            quantize_coordinate("7", Decimal("-3.5"), scale=2),
+        )
+
+    def test_integer_identity_at_scale_one(self):
+        for x, y in [(5, -9), (0, 0), (10**20, -(10**20))]:
+            self.assertEqual(quantize_coordinate(x, y, scale=1), (x, y))
+
+    def test_deterministic(self):
+        self.assertEqual(
+            quantize_coordinate("1.234", "5.678"),
+            quantize_coordinate("1.234", "5.678"),
+        )
+
+    def test_independent_of_decimal_context(self):
+        value = "123456789012345678901234567890.123456789"
+        expected = (
+            123456789012345678901234567890123457,
+            -123456789012345678901234567890123457,
+        )
+        with localcontext() as ctx:
+            ctx.prec = 1
+            low = quantize_coordinate(value, "-" + value)
+        with localcontext() as ctx:
+            ctx.prec = 60
+            high = quantize_coordinate(Decimal(value), Decimal("-" + value))
+        self.assertEqual(low, expected)
+        self.assertEqual(high, expected)
+
+    def test_type_errors(self):
+        for bad in (True, False, 1.5, 0.0, None, [1], object()):
+            with self.assertRaises(TypeError):
+                quantize_coordinate(bad, 0)
+            with self.assertRaises(TypeError):
+                quantize_coordinate(0, bad)
+
+    def test_value_errors(self):
+        for bad in ("", "   ", "abc", "1.2.3", "NaN", "-sNaN",
+                    "Infinity", "-inf", "0x1", "1,000"):
+            with self.assertRaises(ValueError):
+                quantize_coordinate(bad, "0")
+            with self.assertRaises(ValueError):
+                quantize_coordinate("0", bad)
+
+    def test_scale_errors(self):
+        for bad in (0, -1, -10**6):
+            with self.assertRaises(ValueError):
+                quantize_coordinate(0, 0, scale=bad)
+        for bad in (True, False, 1.0, Decimal("1"), "1"):
+            with self.assertRaises(TypeError):
+                quantize_coordinate(0, 0, scale=bad)
+
+
+class QuantizeRegionTest(unittest.TestCase):
+    def test_outer_rounding(self):
+        region = quantize_region("-1.5", "2.5", "0.1", "0.9")
+        self.assertEqual(
+            region, Region(-1500000, 2500000, 100000, 900000)
+        )
+
+    def test_boundaries_expand_outward_at_half_step(self):
+        region = quantize_region(
+            "1.0000005", "2.0000005", "-1.0000005", "-0.0000005"
+        )
+        self.assertEqual(region, Region(1000000, 2000001, -1000001, 0))
+
+    def test_exact_lattice_boundaries_stay_fixed(self):
+        self.assertEqual(
+            quantize_region("1.000001", "2.999999", "-1.000001", "-0.000001"),
+            Region(1000001, 2999999, -1000001, -1),
+        )
+
+    def test_quantized_region_covers_rectangle(self):
+        region = quantize_region("-1.5", "2.5", "0.1", "0.9")
+        self.assertTrue(
+            region.contains(*quantize_coordinate("-1.49", "0.88"))
+        )
+        self.assertFalse(
+            region.contains(*quantize_coordinate("-1.51", "0.88"))
+        )
+        self.assertFalse(
+            region.contains(*quantize_coordinate("-1.49", "0.91"))
+        )
+
+    def test_integer_identity_and_degenerate(self):
+        self.assertEqual(
+            quantize_region(-3, 4, 0, 10, scale=1), Region(-3, 4, 0, 10)
+        )
+        self.assertEqual(
+            quantize_region("1.5", "1.5", "0", "0"),
+            Region(1500000, 1500000, 0, 0),
+        )
+
+    def test_input_types_agree(self):
+        self.assertEqual(
+            quantize_region(Decimal("-1.5"), Decimal("2.5"), 0, "1"),
+            quantize_region("-1.5", "2.5", "0", 1),
+        )
+
+    def test_independent_of_decimal_context(self):
+        value = "123456789012345678901234567890.123456789"
+        expected = Region(
+            123456789012345678901234567890123456,
+            123456789012345678901234567890123457,
+            -123456789012345678901234567890123457,
+            -123456789012345678901234567890123456,
+        )
+        with localcontext() as ctx:
+            ctx.prec = 1
+            low = quantize_region(value, value, "-" + value, "-" + value)
+        with localcontext() as ctx:
+            ctx.prec = 60
+            d = Decimal(value)
+            high = quantize_region(d, d, -d, -d)
+        self.assertEqual(low, expected)
+        self.assertEqual(high, expected)
+
+    def test_ordering_value_errors(self):
+        for args in (("2", "1", "0", "0"), ("0", "0", "2", "1"),
+                     ("0.9", "0.1", "0", "0"), ("0", "0", "0.9", "0.1")):
+            with self.assertRaises(ValueError):
+                quantize_region(*args)
+
+    def test_bound_type_and_value_errors(self):
+        for bad in (True, False, 1.5, 0.0, None, object()):
+            with self.assertRaises(TypeError):
+                quantize_region(bad, 1, 0, 1)
+        for bad in ("", "   ", "abc", "NaN", "Infinity"):
+            with self.assertRaises(ValueError):
+                quantize_region(bad, "1", "0", "1")
+        with self.assertRaises(TypeError):
+            quantize_region("1", "2", object(), "4")
+
+
+class QuantizedProofIntegrationTest(unittest.TestCase):
+    CONTEXT = b"geo-fence/test"
+
+    def test_region_proof_round_trip(self):
+        region = quantize_region("-2.5", "3.5", "-1.5", "2.5", scale=10)
+        for x, y in (
+            quantize_coordinate("2.35", "1.05", scale=10),
+            quantize_coordinate("-2.45", "-1.45", scale=10),
+            quantize_coordinate("0.0", "-0", scale=10),
+            quantize_coordinate("0.05", "-0.05", scale=10),
+        ):
+            xc, xb = pedersen_commit(x, region.min_x, region.max_x)
+            yc, yb = pedersen_commit(y, region.min_y, region.max_y)
+            proof = prove_region(xc, yc, x, y, xb, yb, region, self.CONTEXT)
+            self.assertTrue(
+                verify_region(xc, yc, region, proof, self.CONTEXT)
+            )
+            self.assertFalse(
+                verify_region(yc, xc, region, proof, self.CONTEXT)
+            )
+            self.assertFalse(
+                verify_region(xc, yc, region, proof, b"other")
+            )
+            other = quantize_region(
+                "-2.5", "3.0", "-1.5", "2.5", scale=10
+            )
+            self.assertFalse(
+                verify_region(xc, yc, other, proof, self.CONTEXT)
+            )
+
+    def test_wide_region_proof_round_trip(self):
+        region = quantize_region(
+            "-2.097152", "2.097151", "-1.048576", "1.048575"
+        )
+        x, y = quantize_coordinate("0.5", "-0.0000005")
+        xc, xb = pedersen_commit(x, region.min_x, region.max_x)
+        yc, yb = pedersen_commit(y, region.min_y, region.max_y)
+        proof = prove_region_wide(
+            xc, yc, x, y, xb, yb, region, self.CONTEXT
+        )
+        self.assertTrue(
+            verify_region_wide(xc, yc, region, proof, self.CONTEXT)
+        )
+        self.assertFalse(
+            verify_region_wide(yc, xc, region, proof, self.CONTEXT)
+        )
+        self.assertFalse(
+            verify_region_wide(xc, yc, region, proof, b"other")
+        )
+        other = quantize_region(
+            "-2.097152", "2.097150", "-1.048576", "1.048575"
+        )
+        self.assertFalse(
+            verify_region_wide(xc, yc, other, proof, self.CONTEXT)
+        )
+
+    def test_quantized_equals_handbuilt_integer_entry(self):
+        def draw(n):
+            return 7 % n
+
+        quantized_region = quantize_region(
+            "-2.097152", "2.097151", "-1.048576", "1.048575"
+        )
+        qx, qy = quantize_coordinate("1.25", "-0.5")
+        literal_region = Region(-2097152, 2097151, -1048576, 1048575)
+        lx, ly = 1250000, -500000
+        self.assertEqual(quantized_region, literal_region)
+        self.assertEqual((qx, qy), (lx, ly))
+
+        nonce = b"0123456789abcdef" * 2
+        self.assertEqual(
+            commit_coordinate(qx, qy, nonce=nonce),
+            commit_coordinate(lx, ly, nonce=nonce),
+        )
+
+        def build(region, x, y):
+            xc, xb = pedersen_commit(
+                x, region.min_x, region.max_x, blinding=111111
+            )
+            yc, yb = pedersen_commit(
+                y, region.min_y, region.max_y, blinding=222222
+            )
+            proof = prove_region_wide(
+                xc, yc, x, y, xb, yb, region, b"sess", randbelow=draw
+            )
+            return RegionWideBatchEntry(xc, yc, region, proof, b"sess")
+
+        q_entry = build(quantized_region, qx, qy)
+        l_entry = build(literal_region, lx, ly)
+        self.assertEqual(q_entry, l_entry)
+        self.assertTrue(verify_region_wide_batch([q_entry, l_entry]))
+
+        q_bound, q_root = prove_region_wide_batch_bound(
+            [q_entry], randbelow=draw
+        )
+        l_bound, l_root = prove_region_wide_batch_bound(
+            [l_entry], randbelow=draw
+        )
+        self.assertEqual(q_bound, l_bound)
+        self.assertEqual(q_root, l_root)
+        self.assertTrue(verify_region_wide_batch_bound(q_bound, q_root))
+
+        q_guard, l_guard = (
+            RegionWideReplayGuard(),
+            RegionWideReplayGuard(),
+        )
+        q_binding = q_guard.bind_once(
+            q_entry, b"session", expires_at=2_000_000_000
+        )
+        l_binding = l_guard.bind_once(
+            l_entry, b"session", expires_at=2_000_000_000
+        )
+        self.assertEqual(q_binding, l_binding)
+        self.assertTrue(q_guard.check(q_entry, q_binding, now=1))
+        self.assertFalse(q_guard.check(q_entry, q_binding, now=1))

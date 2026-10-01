@@ -84,6 +84,11 @@ BoundConsistencyChainBatch /
 prove_consistency_chain_batch_bound /
 verify_consistency_chain_batch_bound /
 BoundConsistencyChainReplayGuard.
+
+Coordinate quantization: quantize_coordinate / quantize_region map
+external fixed-point coordinates (integers, Decimals or decimal numeric
+strings) exactly onto the integer lattice under a decimal scale, without
+binary floating point and independent of the Decimal context.
 """
 
 from __future__ import annotations
@@ -97,6 +102,7 @@ import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Callable
 
 __all__ = [
@@ -153,6 +159,8 @@ __all__ = [
     "PedersenOpeningBatchEntry",
     "PedersenOpeningBatchReplayGuard",
     "PedersenOpeningReplayGuard",
+    "quantize_coordinate",
+    "quantize_region",
     "RangeBatchEntry",
     "RangeBatchReplayGuard",
     "RangeProof",
@@ -2331,6 +2339,162 @@ class Region:
 
     def height(self) -> int:
         return self.max_y - self.min_y + 1
+
+
+# ---------------------------------------------------------------------------
+# Decimal coordinate quantization
+#
+# External fixed-point coordinates (integers, Decimals or decimal numeric
+# strings) are mapped onto the integer lattice used by every commitment and
+# proof above. Scaling is done in exact decimal arithmetic on integer digit
+# tuples: no binary floating point is involved and the result never depends
+# on the Decimal context precision or rounding.
+
+
+def _coerce_quantized(value: object, name: str) -> tuple[int, int, int]:
+    """Coerce one quantizer input into an exact decimal triple.
+
+    Returns ``(sign, significand, frac_digits)`` where the represented
+    number equals ``(-1)**sign * significand / 10**frac_digits``. Accepts
+    non-bool integers, finite :class:`Decimal` values and decimal numeric
+    strings. Booleans, binary floats and every other type raise
+    :class:`TypeError`; malformed, non-finite or non-numeric strings raise
+    :class:`ValueError`.
+    """
+    if isinstance(value, bool):
+        raise TypeError(f"{name} must be a non-bool integer, Decimal or numeric string")
+    if isinstance(value, int):
+        return (1 if value < 0 else 0, abs(value), 0)
+    if isinstance(value, Decimal):
+        number = value
+    elif isinstance(value, str):
+        if not value or not value.strip():
+            raise ValueError(f"{name} must be a non-empty decimal numeric string")
+        try:
+            number = Decimal(value.strip())
+        except InvalidOperation:
+            raise ValueError(f"{name} is not a valid decimal number") from None
+    else:
+        raise TypeError(
+            f"{name} must be a non-bool integer, Decimal or numeric string, "
+            f"not {type(value).__name__}"
+        )
+    if not number.is_finite():
+        raise ValueError(f"{name} must be finite")
+    sign, digits, exponent = number.as_tuple()
+    significand = int("".join(str(d) for d in digits)) if digits else 0
+    if exponent >= 0:
+        return sign, significand * 10**exponent, 0
+    return sign, significand, -exponent
+
+
+def _quantized_floor(triple: tuple[int, int, int], scale: int) -> int:
+    """Floor of ``number * scale`` for an exact decimal triple."""
+    sign, significand, frac_digits = triple
+    quotient, remainder = divmod(significand * scale, 10**frac_digits)
+    if sign:
+        return -(quotient + (1 if remainder else 0))
+    return quotient
+
+
+def _quantized_ceil(triple: tuple[int, int, int], scale: int) -> int:
+    """Ceiling of ``number * scale`` for an exact decimal triple."""
+    sign, significand, frac_digits = triple
+    quotient, remainder = divmod(significand * scale, 10**frac_digits)
+    if sign:
+        return -quotient
+    return quotient + (1 if remainder else 0)
+
+
+def quantize_coordinate(
+    x: int | Decimal | str,
+    y: int | Decimal | str,
+    *,
+    scale: int = 10**6,
+) -> tuple[int, int]:
+    """Quantize a fixed-point coordinate pair onto the integer lattice.
+
+    Each axis is rounded to the nearest grid point; values exactly on a
+    half-grid point (a tie) round away from zero. The arithmetic is exact
+    integer arithmetic over decimal digit tuples — no binary floating
+    point is used and the result never depends on the :class:`Decimal`
+    precision or rounding context.
+
+    ``x`` and ``y`` accept non-bool integers, finite :class:`Decimal`
+    values and decimal numeric strings; ``scale`` must be a non-bool
+    positive integer. Wrong object types raise :class:`TypeError`; empty
+    strings, malformed numbers, ``NaN`` or infinite values and a
+    non-positive ``scale`` raise :class:`ValueError`.
+    """
+    if isinstance(scale, bool) or not isinstance(scale, int):
+        raise TypeError("scale must be a non-bool positive integer")
+    if scale <= 0:
+        raise ValueError("scale must be a positive integer")
+    tx = _coerce_quantized(x, "x")
+    ty = _coerce_quantized(y, "y")
+
+    def nearest(triple: tuple[int, int, int]) -> int:
+        sign, significand, frac_digits = triple
+        denominator = 10**frac_digits
+        quotient, remainder = divmod(significand * scale, denominator)
+        # Round half away from zero: the tie point sits at remainder ==
+        # denominator/2 (when the denominator is even) or the first point
+        # strictly past it.
+        if 2 * remainder >= denominator:
+            quotient += 1
+        return -quotient if sign else quotient
+
+    return nearest(tx), nearest(ty)
+
+
+def quantize_region(
+    min_x: int | Decimal | str,
+    max_x: int | Decimal | str,
+    min_y: int | Decimal | str,
+    max_y: int | Decimal | str,
+    *,
+    scale: int = 10**6,
+) -> Region:
+    """Quantize a fixed-point axis-aligned rectangle into a :class:`Region`.
+
+    Minimum bounds round toward negative infinity and maximum bounds toward
+    positive infinity, so the returned inclusive integer region covers the
+    original rectangle (a real boundary exactly between two lattice points
+    pushes each bound outward). The arithmetic is exact integer arithmetic
+    over decimal digit tuples — no binary floating point is used and the
+    result never depends on the :class:`Decimal` precision or rounding
+    context.
+
+    The four bounds accept non-bool integers, finite :class:`Decimal`
+    values and decimal numeric strings; ``scale`` must be a non-bool
+    positive integer. Wrong object types raise :class:`TypeError`; empty
+    strings, malformed numbers, ``NaN`` or infinite values, a non-positive
+    ``scale`` or a rectangle whose minimum bound exceeds its maximum bound
+    on either axis raise :class:`ValueError`. No partial result is ever
+    returned.
+    """
+    if isinstance(scale, bool) or not isinstance(scale, int):
+        raise TypeError("scale must be a non-bool positive integer")
+    if scale <= 0:
+        raise ValueError("scale must be a positive integer")
+    triples = tuple(
+        _coerce_quantized(value, name)
+        for value, name in (
+            (min_x, "min_x"),
+            (max_x, "max_x"),
+            (min_y, "min_y"),
+            (max_y, "max_y"),
+        )
+    )
+    q_min_x = _quantized_floor(triples[0], scale)
+    q_max_x = _quantized_ceil(triples[1], scale)
+    q_min_y = _quantized_floor(triples[2], scale)
+    q_max_y = _quantized_ceil(triples[3], scale)
+    if q_min_x > q_max_x:
+        raise ValueError("min_x must not exceed max_x")
+    if q_min_y > q_max_y:
+        raise ValueError("min_y must not exceed max_y")
+    return Region(q_min_x, q_max_x, q_min_y, q_max_y)
 
 
 # ---------------------------------------------------------------------------

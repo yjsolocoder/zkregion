@@ -1,14 +1,19 @@
 import unittest
 
 from zkregion import (
+    ConvexPolygonProofBundle,
     ConvexPolygonRegion,
     ConvexPolygonRegionProof,
     DEFAULT_PRIME,
+    PedersenCommitment,
     RangeProof,
     WideRangeProof,
+    decode_convex_polygon_proof_bundle,
+    encode_convex_polygon_proof_bundle,
     pedersen_commit,
     prove_convex_polygon,
     verify_convex_polygon,
+    verify_convex_polygon_proof_bundle,
 )
 
 
@@ -344,6 +349,649 @@ class VerifyConvexPolygonTests(unittest.TestCase):
         bad = self._tamper(edge_proofs=(1, 2, 3))
         with self.assertRaises(TypeError):
             verify_convex_polygon(self.cx, self.cy, self.polygon, bad, b"c")
+
+
+class ConvexPolygonProofBundleTests(unittest.TestCase):
+    def bundle(
+        self,
+        x=1,
+        y=2,
+        polygon=None,
+        context=b"ctx",
+        vertices=TRIANGLE,
+        x_blinding=1234,
+        y_blinding=4321,
+    ):
+        polygon = ConvexPolygonRegion(vertices) if polygon is None else polygon
+        x_commitment, x_r = pedersen_commit(
+            x, polygon.min_x, polygon.max_x, blinding=x_blinding
+        )
+        y_commitment, y_r = pedersen_commit(
+            y, polygon.min_y, polygon.max_y, blinding=y_blinding
+        )
+        proof = prove_convex_polygon(
+            x_commitment, y_commitment, x, y, x_r, y_r, polygon, context,
+            randbelow=DetRand(),
+        )
+        return ConvexPolygonProofBundle(
+            x_commitment, y_commitment, polygon, context, proof
+        )
+
+    # ---- round trip ---------------------------------------------------------
+
+    def test_round_trip_triangle(self):
+        bundle = self.bundle()
+        raw = encode_convex_polygon_proof_bundle(bundle)
+        self.assertIsInstance(raw, bytes)
+        decoded = decode_convex_polygon_proof_bundle(raw)
+        self.assertEqual(decoded, bundle)
+        self.assertIsInstance(decoded.proof, ConvexPolygonRegionProof)
+        self.assertIsInstance(decoded.proof.x_proof, RangeProof)
+        self.assertEqual(
+            tuple(type(p) for p in decoded.proof.edge_proofs),
+            (WideRangeProof,) * len(decoded.polygon.vertices),
+        )
+        self.assertTrue(verify_convex_polygon_proof_bundle(bundle))
+        self.assertTrue(verify_convex_polygon_proof_bundle(decoded))
+
+    def test_round_trip_pentagon_with_negative_coordinates(self):
+        vertices = ((-5, -5), (5, -5), (8, 0), (5, 5), (-5, 5))
+        bundle = self.bundle(x=0, y=0, vertices=vertices, context=b"pentagon")
+        raw = encode_convex_polygon_proof_bundle(bundle)
+        decoded = decode_convex_polygon_proof_bundle(raw)
+        self.assertEqual(decoded, bundle)
+        self.assertEqual(len(decoded.proof.edge_proofs), 5)
+        self.assertTrue(verify_convex_polygon_proof_bundle(decoded))
+
+    def test_round_trip_empty_and_arbitrary_binary_context(self):
+        for context in (b"", b"\x00\xff", b"\x00\x00\x00\x09binary", b"a" * 300):
+            with self.subTest(context=context):
+                bundle = self.bundle(context=context)
+                decoded = decode_convex_polygon_proof_bundle(
+                    encode_convex_polygon_proof_bundle(bundle)
+                )
+                self.assertEqual(decoded, bundle)
+                self.assertEqual(decoded.context, context)
+                self.assertTrue(verify_convex_polygon_proof_bundle(decoded))
+
+    def test_rotated_and_reversed_polygon_representations_round_trip_alike(self):
+        bundle = self.bundle()
+        canonical = bundle.polygon
+        rotated = ConvexPolygonRegion(
+            tuple(canonical.vertices[1:] + canonical.vertices[:1])
+        )
+        reversed_polygon = ConvexPolygonRegion(tuple(reversed(canonical.vertices)))
+        raw = encode_convex_polygon_proof_bundle(bundle)
+        for same_region in (rotated, reversed_polygon):
+            other = ConvexPolygonProofBundle(
+                bundle.x_commitment,
+                bundle.y_commitment,
+                same_region,
+                bundle.context,
+                bundle.proof,
+            )
+            self.assertEqual(
+                encode_convex_polygon_proof_bundle(other), raw
+            )
+            self.assertEqual(
+                decode_convex_polygon_proof_bundle(raw), other
+            )
+
+    def test_large_integers_round_trip(self):
+        huge = 10**40
+        polygon = ConvexPolygonRegion(
+            ((-huge, -huge), (huge, -huge), (0, huge))
+        )
+        # Commitments need not open here: only the envelope is exercised.
+        x_commitment = PedersenCommitment(
+            element=1, lower=-huge, upper=huge, prime=2**255 - 19,
+            generator=3, h=pow(3, 2, 2**255 - 19),
+        )
+        y_commitment = PedersenCommitment(
+            element=1, lower=-huge, upper=huge, prime=2**255 - 19,
+            generator=3, h=pow(3, 2, 2**255 - 19),
+        )
+        proof = ConvexPolygonRegionProof(
+            x_proof=RangeProof((1,), (0,), (0,)),
+            y_proof=RangeProof((1,), (0,), (0,)),
+            edge_proofs=tuple(
+                WideRangeProof((1,), ((0, 0),), ((0, 0),)) for _ in range(3)
+            ),
+        )
+        bundle = ConvexPolygonProofBundle(
+            x_commitment, y_commitment, polygon, b"big", proof
+        )
+        decoded = decode_convex_polygon_proof_bundle(
+            encode_convex_polygon_proof_bundle(bundle)
+        )
+        self.assertEqual(decoded, bundle)
+
+    def test_encode_is_deterministic(self):
+        bundle = self.bundle()
+        self.assertEqual(
+            encode_convex_polygon_proof_bundle(bundle),
+            encode_convex_polygon_proof_bundle(bundle),
+        )
+        self.assertEqual(
+            encode_convex_polygon_proof_bundle(self.bundle()),
+            encode_convex_polygon_proof_bundle(self.bundle()),
+        )
+
+    def test_re_encoding_is_byte_identical(self):
+        raw = encode_convex_polygon_proof_bundle(self.bundle())
+        decoded = decode_convex_polygon_proof_bundle(raw)
+        self.assertEqual(encode_convex_polygon_proof_bundle(decoded), raw)
+
+    def test_header_carries_magic_and_version(self):
+        raw = encode_convex_polygon_proof_bundle(self.bundle())
+        self.assertEqual(raw[:5], b"zrgp" + bytes((1,)))
+
+    def test_bundle_is_frozen_and_value_compared(self):
+        bundle = self.bundle()
+        with self.assertRaises(Exception):
+            bundle.context = b"other"
+        self.assertEqual(bundle, self.bundle())
+
+    def test_distinct_fields_never_share_encoding(self):
+        base_raw = encode_convex_polygon_proof_bundle(self.bundle())
+        other_polygon = ConvexPolygonRegion(((0, 0), (4, 0), (0, 3)))
+        variants = (
+            self.bundle(context=b"other"),
+            self.bundle(polygon=other_polygon),
+        )
+        for variant in variants:
+            self.assertNotEqual(
+                encode_convex_polygon_proof_bundle(variant), base_raw
+            )
+        bundle = self.bundle()
+        reordered_edges = ConvexPolygonRegionProof(
+            bundle.proof.x_proof,
+            bundle.proof.y_proof,
+            (
+                bundle.proof.edge_proofs[1],
+                bundle.proof.edge_proofs[0],
+                bundle.proof.edge_proofs[2],
+            ),
+        )
+        variant = ConvexPolygonProofBundle(
+            bundle.x_commitment,
+            bundle.y_commitment,
+            bundle.polygon,
+            bundle.context,
+            reordered_edges,
+        )
+        self.assertNotEqual(
+            encode_convex_polygon_proof_bundle(variant), base_raw
+        )
+
+    # ---- decode failures ----------------------------------------------------
+
+    def test_every_truncation_rejected(self):
+        raw = encode_convex_polygon_proof_bundle(self.bundle())
+        self.assertGreater(len(raw), 100)
+        for cut in range(0, len(raw)):
+            with self.assertRaises(ValueError):
+                decode_convex_polygon_proof_bundle(raw[:cut])
+
+    def test_trailing_and_prepended_data_rejected(self):
+        raw = encode_convex_polygon_proof_bundle(self.bundle())
+        for extra in (b"\x00", b"ab", b"\xff" * 8):
+            with self.assertRaises(ValueError):
+                decode_convex_polygon_proof_bundle(raw + extra)
+            with self.assertRaises(ValueError):
+                decode_convex_polygon_proof_bundle(extra + raw)
+
+    def test_bad_magic_and_unknown_version_rejected(self):
+        raw = bytearray(encode_convex_polygon_proof_bundle(self.bundle()))
+        raw[0] = ord("X")
+        with self.assertRaises(ValueError):
+            decode_convex_polygon_proof_bundle(bytes(raw))
+        raw = bytearray(encode_convex_polygon_proof_bundle(self.bundle()))
+        raw[4] = 0
+        with self.assertRaises(ValueError):
+            decode_convex_polygon_proof_bundle(bytes(raw))
+        raw[4] = 2
+        with self.assertRaises(ValueError):
+            decode_convex_polygon_proof_bundle(bytes(raw))
+        raw[4] = 255
+        with self.assertRaises(ValueError):
+            decode_convex_polygon_proof_bundle(bytes(raw))
+
+    def test_decode_requires_bytes(self):
+        raw = encode_convex_polygon_proof_bundle(self.bundle())
+        for bad in (
+            bytearray(raw), memoryview(raw), str(raw), 123, None, [raw],
+        ):
+            with self.assertRaises(TypeError):
+                decode_convex_polygon_proof_bundle(bad)
+
+    def test_single_byte_tampering_never_yields_valid_original_bundle(self):
+        raw = encode_convex_polygon_proof_bundle(self.bundle())
+        for index in range(len(raw)):
+            tampered = bytearray(raw)
+            tampered[index] ^= 0xFF
+            try:
+                decoded = decode_convex_polygon_proof_bundle(bytes(tampered))
+            except ValueError:
+                continue
+            self.assertNotEqual(decoded, self.bundle(), index)
+            self.assertFalse(
+                verify_convex_polygon_proof_bundle(decoded),
+                f"tampered byte {index} verified",
+            )
+
+    def test_non_canonical_integers_rejected(self):
+        raw = bytearray(encode_convex_polygon_proof_bundle(self.bundle()))
+        # header (5) + first frame length (4) + commitment tuple count (4);
+        # the first framed integer starts at offset 13.
+        pos = 13
+        length = int.from_bytes(raw[pos:pos + 4], "big")
+        mutated = bytearray(raw)
+        # insert a leading zero byte in the magnitude and grow both the
+        # integer frame and the surrounding commitment frame by one
+        mutated[5:9] = (
+            int.from_bytes(mutated[5:9], "big") + 1
+        ).to_bytes(4, "big")
+        mutated[pos:pos + 4] = (length + 1).to_bytes(4, "big")
+        mutated[pos + 5:pos + 5] = b"\x00"
+        with self.assertRaises(ValueError):
+            decode_convex_polygon_proof_bundle(bytes(mutated))
+        # negative zero: a zero integer frames as uint32(2) 0x01 0x00
+        marker = bytes((0, 0, 0, 2, 1, 0))
+        zero_pos = bytes(raw).find(marker)
+        self.assertGreaterEqual(zero_pos, 0)
+        mutated = bytearray(raw)
+        mutated[zero_pos + 4] = 255
+        with self.assertRaises(ValueError):
+            decode_convex_polygon_proof_bundle(bytes(mutated))
+        mutated = bytearray(raw)
+        mutated[zero_pos + 4] = 7
+        with self.assertRaises(ValueError):
+            decode_convex_polygon_proof_bundle(bytes(mutated))
+
+    def test_invalid_commitment_field_values_rejected(self):
+        prime = DEFAULT_PRIME
+        good = dict(
+            element=1, lower=0, upper=4, prime=prime, generator=3, h=9
+        )
+        bad_cases = (
+            dict(element=0),
+            dict(element=prime),
+            dict(prime=3),
+            dict(generator=1),
+            dict(generator=prime),
+            dict(h=1),
+            dict(h=prime),
+            dict(lower=5),
+        )
+        for overrides in bad_cases:
+            values = dict(good)
+            values.update(overrides)
+            bundle = self.bundle()
+            object.__setattr__(
+                bundle, "x_commitment", PedersenCommitment(**values)
+            )
+            with self.assertRaises(ValueError):
+                decode_convex_polygon_proof_bundle(
+                    encode_convex_polygon_proof_bundle(bundle)
+                )
+
+    def test_wire_polygon_with_too_few_vertices_rejected(self):
+        raw = encode_convex_polygon_proof_bundle(self.bundle())
+        # header (5), then the x and y commitment frames, then the polygon
+        # frame whose body starts with the vertex cardinality
+        pos = 5
+        for _ in range(2):
+            length = int.from_bytes(raw[pos:pos + 4], "big")
+            pos += 4 + length
+        mutated = bytearray(raw)
+        mutated[pos + 4:pos + 8] = (2).to_bytes(4, "big")
+        with self.assertRaises(ValueError):
+            decode_convex_polygon_proof_bundle(bytes(mutated))
+
+    def test_wire_vertex_pair_with_wrong_cardinality_rejected(self):
+        raw = encode_convex_polygon_proof_bundle(self.bundle())
+        pos = 5
+        for _ in range(2):
+            length = int.from_bytes(raw[pos:pos + 4], "big")
+            pos += 4 + length
+        # polygon frame body: vertex count at [pos+4:pos+8], first vertex
+        # frame length at [pos+8:pos+12], pair cardinality at [pos+12:+16]
+        self.assertEqual(
+            int.from_bytes(raw[pos + 12:pos + 16], "big"), 2
+        )
+        mutated = bytearray(raw)
+        # declaring one coordinate leaves the second integer frame behind
+        # as trailing data inside the vertex body
+        mutated[pos + 12:pos + 16] = (1).to_bytes(4, "big")
+        with self.assertRaises(ValueError):
+            decode_convex_polygon_proof_bundle(bytes(mutated))
+        mutated = bytearray(raw)
+        mutated[pos + 12:pos + 16] = (3).to_bytes(4, "big")
+        with self.assertRaises(ValueError):
+            decode_convex_polygon_proof_bundle(bytes(mutated))
+
+    def test_edge_proof_count_mismatch_rejected(self):
+        bundle = self.bundle()
+        proof = bundle.proof
+        cases = (
+            ConvexPolygonRegionProof(
+                proof.x_proof, proof.y_proof, proof.edge_proofs[:-1]
+            ),
+            ConvexPolygonRegionProof(
+                proof.x_proof, proof.y_proof,
+                proof.edge_proofs + proof.edge_proofs[:1],
+            ),
+        )
+        for bad_proof in cases:
+            bad = ConvexPolygonProofBundle(
+                bundle.x_commitment,
+                bundle.y_commitment,
+                bundle.polygon,
+                bundle.context,
+                bad_proof,
+            )
+            with self.assertRaises(ValueError):
+                decode_convex_polygon_proof_bundle(
+                    encode_convex_polygon_proof_bundle(bad)
+                )
+
+    def test_malformed_range_proof_shape_rejected(self):
+        bundle = self.bundle()
+        good = bundle.proof.x_proof
+        self.assertGreater(len(good.t), 1)
+        for t, e, s in (
+            (good.t[:-1], good.e, good.s),
+            (good.t, good.e[:-1], good.s),
+            (good.t, good.e, good.s[:-1]),
+            ((), (), ()),
+        ):
+            bad_proof = ConvexPolygonRegionProof(
+                RangeProof(t, e, s),
+                bundle.proof.y_proof,
+                bundle.proof.edge_proofs,
+            )
+            bad = ConvexPolygonProofBundle(
+                bundle.x_commitment,
+                bundle.y_commitment,
+                bundle.polygon,
+                bundle.context,
+                bad_proof,
+            )
+            with self.assertRaises(ValueError):
+                decode_convex_polygon_proof_bundle(
+                    encode_convex_polygon_proof_bundle(bad)
+                )
+
+    def test_malformed_wide_edge_proof_shape_rejected(self):
+        bundle = self.bundle()
+        good = bundle.proof.edge_proofs[0]
+        bad_edge = WideRangeProof(
+            good.commitments[:-1], good.challenges, good.responses
+        )
+        bad_proof = ConvexPolygonRegionProof(
+            bundle.proof.x_proof,
+            bundle.proof.y_proof,
+            (bad_edge,) + bundle.proof.edge_proofs[1:],
+        )
+        bad = ConvexPolygonProofBundle(
+            bundle.x_commitment,
+            bundle.y_commitment,
+            bundle.polygon,
+            bundle.context,
+            bad_proof,
+        )
+        with self.assertRaises(ValueError):
+            decode_convex_polygon_proof_bundle(
+                encode_convex_polygon_proof_bundle(bad)
+            )
+
+    # ---- encode type errors -------------------------------------------------
+
+    def test_encode_rejects_wrong_object_and_field_types(self):
+        good = self.bundle()
+        with self.assertRaises(TypeError):
+            encode_convex_polygon_proof_bundle(object())
+        with self.assertRaises(TypeError):
+            encode_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    object(), good.y_commitment, good.polygon, b"c", good.proof
+                )
+            )
+        bool_commitment = PedersenCommitment(True, 0, 4, DEFAULT_PRIME, 3, 9)
+        with self.assertRaises(TypeError):
+            encode_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    bool_commitment, good.y_commitment, good.polygon, b"c",
+                    good.proof,
+                )
+            )
+        with self.assertRaises(TypeError):
+            encode_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    good.x_commitment, good.y_commitment, object(), b"c",
+                    good.proof,
+                )
+            )
+        with self.assertRaises(TypeError):
+            encode_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    good.x_commitment, good.y_commitment, good.polygon, "c",
+                    good.proof,
+                )
+            )
+        with self.assertRaises(TypeError):
+            encode_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    good.x_commitment, good.y_commitment, good.polygon, b"c",
+                    object(),
+                )
+            )
+        bad_proof = ConvexPolygonRegionProof(
+            RangeProof([1], (0,), (0,)),
+            good.proof.y_proof,
+            good.proof.edge_proofs,
+        )
+        with self.assertRaises(TypeError):
+            encode_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    good.x_commitment, good.y_commitment, good.polygon, b"c",
+                    bad_proof,
+                )
+            )
+        list_edges = ConvexPolygonRegionProof(
+            good.proof.x_proof, good.proof.y_proof, list(good.proof.edge_proofs)
+        )
+        with self.assertRaises(TypeError):
+            encode_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    good.x_commitment, good.y_commitment, good.polygon, b"c",
+                    list_edges,
+                )
+            )
+        int_edges = ConvexPolygonRegionProof(
+            good.proof.x_proof, good.proof.y_proof, (1, 2, 3)
+        )
+        with self.assertRaises(TypeError):
+            encode_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    good.x_commitment, good.y_commitment, good.polygon, b"c",
+                    int_edges,
+                )
+            )
+
+    def test_encode_rejects_forged_illegal_polygon(self):
+        bundle = self.bundle()
+        forged = object.__new__(ConvexPolygonRegion)
+        object.__setattr__(forged, "vertices", ((0, 0), (1, 1), (2, 2), (3, 3)))
+        object.__setattr__(bundle, "polygon", forged)
+        with self.assertRaises(ValueError):
+            encode_convex_polygon_proof_bundle(bundle)
+        forged = object.__new__(ConvexPolygonRegion)
+        object.__setattr__(forged, "vertices", ((0, 0), (1, 0), (0, 1), (1, 1)))
+        object.__setattr__(bundle, "polygon", forged)
+        with self.assertRaises(ValueError):
+            encode_convex_polygon_proof_bundle(bundle)
+
+    # ---- verify type errors -------------------------------------------------
+
+    def test_verify_type_errors(self):
+        good = self.bundle()
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_proof_bundle(object())
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    object(), good.y_commitment, good.polygon, b"c", good.proof
+                )
+            )
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    good.x_commitment, good.y_commitment, object(), b"c",
+                    good.proof,
+                )
+            )
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    good.x_commitment, good.y_commitment, good.polygon, 7,
+                    good.proof,
+                )
+            )
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    good.x_commitment, good.y_commitment, good.polygon, b"c",
+                    object(),
+                )
+            )
+        bad_edges = ConvexPolygonRegionProof(
+            good.proof.x_proof, good.proof.y_proof, (1, 2, 3)
+        )
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    good.x_commitment, good.y_commitment, good.polygon, b"c",
+                    bad_edges,
+                )
+            )
+        # malformed vertex container types on a forged polygon raise
+        forged = object.__new__(ConvexPolygonRegion)
+        object.__setattr__(forged, "vertices", [(0, 0), (1, 0), (0, 1)])
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_proof_bundle(
+                ConvexPolygonProofBundle(
+                    good.x_commitment, good.y_commitment, forged, b"c",
+                    good.proof,
+                )
+            )
+
+    # ---- verify False semantics ---------------------------------------------
+
+    def test_verify_accepts_valid_bundle(self):
+        self.assertIs(
+            verify_convex_polygon_proof_bundle(self.bundle()), True
+        )
+
+    def test_verify_rejects_context_mismatch(self):
+        bundle = self.bundle()
+        object.__setattr__(bundle, "context", b"other")
+        self.assertFalse(verify_convex_polygon_proof_bundle(bundle))
+
+    def test_verify_rejects_swapped_commitments(self):
+        bundle = self.bundle()
+        swapped = ConvexPolygonProofBundle(
+            bundle.y_commitment,
+            bundle.x_commitment,
+            bundle.polygon,
+            bundle.context,
+            bundle.proof,
+        )
+        self.assertFalse(verify_convex_polygon_proof_bundle(swapped))
+
+    def test_verify_rejects_swapped_axes(self):
+        bundle = self.bundle()
+        swapped = ConvexPolygonRegionProof(
+            x_proof=bundle.proof.y_proof,
+            y_proof=bundle.proof.x_proof,
+            edge_proofs=bundle.proof.edge_proofs,
+        )
+        object.__setattr__(bundle, "proof", swapped)
+        self.assertFalse(verify_convex_polygon_proof_bundle(bundle))
+
+    def test_verify_rejects_wrong_polygon(self):
+        bundle = self.bundle()
+        other = ConvexPolygonRegion(((0, 0), (4, 0), (0, 3)))
+        object.__setattr__(bundle, "polygon", other)
+        self.assertFalse(verify_convex_polygon_proof_bundle(bundle))
+
+    def test_verify_rejects_tampered_and_reordered_edge_proofs(self):
+        bundle = self.bundle()
+        edge = bundle.proof.edge_proofs[0]
+        bad_commitments = tuple(c + 1 for c in edge.commitments)
+        bad_edge = WideRangeProof(
+            bad_commitments, edge.challenges, edge.responses
+        )
+        tampered = ConvexPolygonRegionProof(
+            bundle.proof.x_proof,
+            bundle.proof.y_proof,
+            (bad_edge,) + bundle.proof.edge_proofs[1:],
+        )
+        object.__setattr__(bundle, "proof", tampered)
+        self.assertFalse(verify_convex_polygon_proof_bundle(bundle))
+        bundle = self.bundle()
+        reordered = ConvexPolygonRegionProof(
+            bundle.proof.x_proof,
+            bundle.proof.y_proof,
+            (
+                bundle.proof.edge_proofs[1],
+                bundle.proof.edge_proofs[0],
+                bundle.proof.edge_proofs[2],
+            ),
+        )
+        object.__setattr__(bundle, "proof", reordered)
+        self.assertFalse(verify_convex_polygon_proof_bundle(bundle))
+
+    def test_verify_rejects_dropped_edge_proof(self):
+        bundle = self.bundle()
+        dropped = ConvexPolygonRegionProof(
+            bundle.proof.x_proof,
+            bundle.proof.y_proof,
+            bundle.proof.edge_proofs[1:],
+        )
+        object.__setattr__(bundle, "proof", dropped)
+        self.assertFalse(verify_convex_polygon_proof_bundle(bundle))
+
+    def test_verify_rejects_mismatched_group_parameters(self):
+        bundle = self.bundle()
+        other_prime, _ = pedersen_commit(
+            1, bundle.polygon.min_x, bundle.polygon.max_x, prime=2**61 - 1
+        )
+        object.__setattr__(bundle, "x_commitment", other_prime)
+        self.assertFalse(verify_convex_polygon_proof_bundle(bundle))
+
+    def test_verify_false_for_forged_geometrically_invalid_polygon(self):
+        bundle = self.bundle()
+        forged = object.__new__(ConvexPolygonRegion)
+        object.__setattr__(forged, "vertices", ((0, 0), (1, 1), (2, 2), (3, 3)))
+        object.__setattr__(bundle, "polygon", forged)
+        self.assertFalse(verify_convex_polygon_proof_bundle(bundle))
+
+    def test_verify_false_for_forged_empty_vertex_polygon(self):
+        bundle = self.bundle()
+        forged = object.__new__(ConvexPolygonRegion)
+        object.__setattr__(forged, "vertices", ())
+        object.__setattr__(bundle, "polygon", forged)
+        self.assertFalse(verify_convex_polygon_proof_bundle(bundle))
+
+    def test_round_trip_preserves_verification_failure(self):
+        bundle = self.bundle()
+        object.__setattr__(bundle, "context", b"other")
+        raw = encode_convex_polygon_proof_bundle(bundle)
+        decoded = decode_convex_polygon_proof_bundle(raw)
+        self.assertEqual(decoded, bundle)
+        self.assertFalse(verify_convex_polygon_proof_bundle(decoded))
 
 
 if __name__ == "__main__":

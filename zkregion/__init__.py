@@ -116,6 +116,7 @@ __all__ = [
     "BoundConsistencyChainBatch",
     "BoundConsistencyChainReplayGuard",
     "BoundConsistencyReplayGuard",
+    "BoundConvexPolygonBatch",
     "BoundMerkleInclusionBatch",
     "BoundMerkleInclusionBatchReplayGuard",
     "BoundMerkleMultiBatch",
@@ -220,6 +221,7 @@ __all__ = [
     "prove_consistency_chain",
     "prove_consistency_chain_batch_bound",
     "prove_convex_polygon",
+    "prove_convex_polygon_batch_bound",
     "prove_inclusion",
     "prove_inclusion_batch_bound",
     "prove_multi_inclusion",
@@ -250,6 +252,7 @@ __all__ = [
     "verify_consistency_chain_batch_bound",
     "verify_convex_polygon",
     "verify_convex_polygon_batch",
+    "verify_convex_polygon_batch_bound",
     "verify_convex_polygon_proof_bundle",
     "verify_inclusion",
     "verify_inclusion_batch",
@@ -4598,6 +4601,236 @@ def verify_convex_polygon_batch(
         if pow(_h, state["sum"], prime) != state["product"]:
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed convex polygon batches
+#
+# A complete convex polygon batch frozen together with the Merkle multi
+# proof that commits to every entry. Each Merkle leaf starts from the
+# domain separator b"zkregion/convex-polygon-bound/v1" and frames, in
+# order, the six fields of both commitments, the canonical vertices of
+# the polygon, the context, the two bounding-box RangeProofs and one
+# WideRangeProof per polygon edge in canonical edge order. Verification
+# first checks every leaf against the Merkle root, then runs the
+# unchanged convex polygon batch verification.
+
+_CONVEX_POLYGON_BOUND_DOMAIN = b"zkregion/convex-polygon-bound/v1"
+
+
+@dataclass(frozen=True)
+class BoundConvexPolygonBatch:
+    """A complete convex polygon batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of
+    :class:`ConvexPolygonBatchEntry`; ``leaf_count`` — a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``; ``proof`` — the :class:`MerkleMultiProof`
+    whose indices cover ``0 .. leaf_count - 1`` without gaps or
+    duplicates. The entries keep their construction order and
+    duplicates, exactly as the bare batch allows any order and
+    repeated items. All three are positional construction arguments;
+    batches compare by value and are immutable.
+    """
+
+    entries: tuple[ConvexPolygonBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_convex_polygon_leaf(entry: ConvexPolygonBatchEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`ConvexPolygonBatchEntry`.
+
+    Items, in order: the domain separator, the six fields of the x then
+    the y commitment (dataclass field order), the polygon vertex count
+    followed by every canonical vertex's x then y coordinate, the
+    context, then the x and the y bounding-box :class:`RangeProof`,
+    each with its ``t`` / ``e`` / ``s`` sequences framed as its decimal
+    element count followed by every value, and finally the
+    :class:`WideRangeProof` of every edge in canonical edge order, each
+    with its ``commitments`` sequence framed as its decimal element
+    count followed by every bit commitment and each of the
+    ``challenges`` / ``responses`` pair sequences framed as its decimal
+    pair count followed by every pair item flattened in pair order.
+    Every item is prefixed with its four-byte unsigned big-endian
+    length; integers are encoded as decimal ASCII (negative sign kept).
+    """
+    items = [_CONVEX_POLYGON_BOUND_DOMAIN]
+    for commitment in (entry.x_commitment, entry.y_commitment):
+        items.extend(
+            str(getattr(commitment, name)).encode("ascii")
+            for name in ("element", "lower", "upper", "prime", "generator", "h")
+        )
+    vertices = entry.polygon.vertices
+    items.append(str(len(vertices)).encode("ascii"))
+    for vertex in vertices:
+        items.append(str(vertex[0]).encode("ascii"))
+        items.append(str(vertex[1]).encode("ascii"))
+    items.append(entry.context)
+    for sub_proof in (entry.proof.x_proof, entry.proof.y_proof):
+        for field_name in ("t", "e", "s"):
+            sequence = getattr(sub_proof, field_name)
+            items.append(str(len(sequence)).encode("ascii"))
+            items.extend(str(value).encode("ascii") for value in sequence)
+    for edge_proof in entry.proof.edge_proofs:
+        items.append(str(len(edge_proof.commitments)).encode("ascii"))
+        items.extend(str(value).encode("ascii") for value in edge_proof.commitments)
+        for field_name in ("challenges", "responses"):
+            sequence = getattr(edge_proof, field_name)
+            items.append(str(len(sequence)).encode("ascii"))
+            items.extend(
+                str(item).encode("ascii") for pair in sequence for item in pair
+            )
+    leaf = bytearray()
+    for item in items:
+        leaf += len(item).to_bytes(4, "big")
+        leaf += item
+    return bytes(leaf)
+
+
+def verify_convex_polygon_batch_bound(
+    batch: BoundConvexPolygonBatch,
+    root: bytes,
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundConvexPolygonBatch`.
+
+    The Merkle binding is checked first: every entry is encoded to its
+    leaf exactly as specified by :func:`_bound_convex_polygon_leaf` and
+    the whole batch is checked against ``root`` with
+    :func:`verify_multi_inclusion`. ``leaf_count`` must be a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``, and ``proof.indices`` must cover
+    ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering; an
+    empty batch, a missing entry or any index mismatch returns
+    ``False`` — all without consuming randomness. Only after the root
+    checks does the batch go through
+    :func:`verify_convex_polygon_batch` with the same ``randbelow``,
+    under its unchanged randomness contract: it is called once per
+    structurally valid bounding-box branch and twice per OR sub-branch
+    of every edge proof bit as ``randbelow(prime - 1)``.
+
+    Type errors — a batch that is not a :class:`BoundConvexPolygonBatch`,
+    non-tuple entries, non-:class:`ConvexPolygonBatchEntry` items, a
+    non-integer or ``bool`` ``leaf_count``, a wrong proof/root object,
+    malformed nested field types (a ``bool`` masquerading as an
+    integer, a non-tuple proof field at any nesting level, a non-bytes
+    context/root or sibling), or a non-callable ``randbelow`` — raise
+    :class:`TypeError`; a non-integer randomness return raises
+    :class:`TypeError` and an out-of-range one raises
+    :class:`ValueError`, both surfaced by
+    :func:`verify_convex_polygon_batch` per its own contract. Every
+    other invalidity (an empty batch, a count or index mismatch, a
+    wrong root, reordered or replaced entries, tampered leaf bytes,
+    mismatched group parameters or ranges, or an inner batch
+    rejection) returns ``False``. Inputs are never mutated.
+    """
+    if not isinstance(batch, BoundConvexPolygonBatch):
+        raise TypeError("batch must be a BoundConvexPolygonBatch")
+    _check_bytes(root, "root")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(
+            "batch entries must be a tuple of ConvexPolygonBatchEntry"
+        )
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        _check_convex_polygon_entry_fields(entry, position)
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_convex_polygon_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf, then
+    # 2) the unchanged convex polygon batch verification checks the proofs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_convex_polygon_batch(entries, randbelow=randbelow)
+
+
+def prove_convex_polygon_batch_bound(
+    entries: Sequence[ConvexPolygonBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> tuple[BoundConvexPolygonBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundConvexPolygonBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`ConvexPolygonBatchEntry` rules as
+    :func:`verify_convex_polygon_batch` and must be non-empty; every
+    entry is copied into a tuple in its original order with duplicates
+    preserved, and the inputs are never mutated. Each entry is encoded
+    to its outer leaf byte for byte with
+    :func:`_bound_convex_polygon_leaf`; the domain separator
+    ``b"zkregion/convex-polygon-bound/v1"``, the four-byte length
+    framing, decimal integer encoding (negative sign kept) and field
+    order stay unchanged, and the leaf digests and internal nodes
+    follow the existing SHA-256 Merkle rules. With ``n = len(entries)``,
+    the complete multi-inclusion proof is built with
+    :func:`prove_multi_inclusion` over the encoded leaves and the full
+    indices ``tuple(range(n))`` — so its ``indices`` cover every leaf
+    from zero and its ``siblings`` are empty — and the returned batch
+    carries ``leaf_count = n`` alongside that proof. The second return
+    value is the outer tree's :func:`merkle_root` of the encoded
+    leaves, which is exactly the root the batch verifies under:
+    ``verify_convex_polygon_batch_bound(batch, root)`` returns ``True``.
+    Single-item, odd- and even-sized batches and duplicate entries are
+    all deterministic, and the same inputs under the same random
+    source rebuild a byte-identical batch, root and proof.
+
+    A type preflight over the whole batch — every entry and every
+    nested field, including ``bool`` integers and later entries —
+    raises :class:`TypeError` before anything is built; an empty batch,
+    a batch count outside uint64, or
+    :func:`verify_convex_polygon_batch` returning ``False`` (an invalid
+    inner convex polygon proof) raises :class:`ValueError`. The
+    ``randbelow`` argument is passed through to
+    :func:`verify_convex_polygon_batch` unchanged under its randomness
+    contract.
+    """
+    items = _check_convex_polygon_batch_entries_types(entries)
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not items:
+        raise ValueError("entries must not be empty")
+    if len(items) > _UINT64_MAX:
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    if not verify_convex_polygon_batch(items, randbelow=randbelow):
+        raise ValueError("entries must pass verify_convex_polygon_batch")
+    ordered = tuple(items)
+    leaves = [_bound_convex_polygon_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundConvexPolygonBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
 
 
 # ---------------------------------------------------------------------------

@@ -458,6 +458,22 @@ polygon_proof = prove_convex_polygon(
 )
 assert verify_convex_polygon(px_commitment, py_commitment, polygon, polygon_proof, context=b"session-1")
 
+# Merkle 承诺的凸多边形证明完整批验：原序全集与公开 Merkle 根一次性绑定
+from zkregion import (
+    ConvexPolygonBatchEntry,
+    BoundConvexPolygonBatch,
+    prove_convex_polygon_batch_bound,
+    verify_convex_polygon_batch_bound,
+)
+
+polygon_entries = [
+    ConvexPolygonBatchEntry(
+        px_commitment, py_commitment, polygon, polygon_proof, b"session-1"),
+]
+bound_polygon, polygon_root = prove_convex_polygon_batch_bound(polygon_entries)
+assert verify_convex_polygon_batch_bound(bound_polygon, polygon_root)
+assert not verify_convex_polygon_batch_bound(bound_polygon, b"\x00" * 32)  # 根不符为 False
+
 # 二维区域证明的批量验证（按 (prime, generator, h) 分组做随机线性组合）
 from zkregion import RegionBatchEntry, verify_region_batch
 
@@ -1381,6 +1397,9 @@ python3 -m zkregion
 - `verify_convex_polygon(x_commitment, y_commitment, polygon, proof, context=b"") -> bool` — 只凭两个承诺、凸多边形、证明与 context 验证，无需坐标或盲因子；证明绑定多边形规范顶点序、两承诺的群参数与区间字段、轴分配和 context，换点承诺、交换两轴、改多边形（同一多边形的旋转/反向表示除外，其规范序相同）、改 context、改证明任一字段或伪造证明均返回 `False`；对象或嵌套字段错型（含 `bool` 与非 `bytes` context）抛 `TypeError`，其余语义失败一律返回 `False` 而不抛 `ValueError`，输入不被改写
 - `ConvexPolygonBatchEntry(x_commitment, y_commitment, polygon, proof, context=b"")` — 不可变凸多边形批验条目，字段次序与 `verify_convex_polygon` 入参一致（两承诺、`ConvexPolygonRegion`、`ConvexPolygonRegionProof`、`bytes` 上下文）；可位置构造、按值相等且不可变，构造时不做任何校验
 - `verify_convex_polygon_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 凸多边形成员证明的批量验证：先整批预检全部条目与嵌套字段（序列本身须为非 `bytes`/`bytearray`/`str` 序列，两承诺各六字段、多边形顶点元组与整数坐标、两轴 `RangeProof` 三字段、每边 `WideRangeProof` 三层元组整数及 `context`，错型含后项错型、用 `bool` 冒充整数与上下文不是字节串，一律抛唯一的 `TypeError`；随机源不可调用或返回非整数同样抛 `TypeError`），哪怕错型出现在最后一个条目也照抛，预检通过后才逐条核对；空批返回 `False` 且不消费随机数，任一条目无效整批返回 `False`（可短路）。每条目重新跑多边形规范化（伪造但类型合法的非法几何返回 `False`），核对两承诺同组且声明区间恰为包围盒、边证明数等于边数；Fiat-Shamir 转录（外部 context、规范顶点、两承诺字段）与 `bbox-x`/`bbox-y`/带边序号的 `edge` 派生 context 与单条验证逐字节一致，包围盒 `t`/`e`/`s` 形状与界、挑战份额求和、边承诺重算（`_edge_commitment`）、宽区间位宽 `1 <= k <= 24` 且 `edge_upper < prime - 1`、比特承诺按 `2**i` 加权乘回边承诺、各比特两个挑战份额之和等于转录挑战——全部逐条核对、不参与聚合。每个结构合法的 Schnorr 分支（包围盒每分支一个、每边证明每比特两条 OR 子分支）恰取一次非零系数 `a = r + 1`（`r = randbelow(prime - 1)`，须满足 `0 <= r < prime - 1`，越界抛 `ValueError`），跨轴、跨边、跨条目按 `(prime, generator, h)` 分组只做一次聚合随机线性等式 `h**Σ(a*s) == Π(t**a * D**(a*e)) (mod prime)`，不再逐项 AND；交换两轴、改 context 或 polygon、替换/重排/删除 `edge_proofs`、篡改任一子证明一律返回 `False` 且不抛异常；条目独立、可乱序可重复，固定随机源下结果可重复，且与逐项调用 `verify_convex_polygon` 的合取结论一致，输入不被改写
+- `BoundConvexPolygonBatch(entries, leaf_count, proof)` — 冻结的凸多边形证明完整批对象；字段依次为 `tuple[ConvexPolygonBatchEntry, ...]`（保持构造顺序并保留重复项）、正的非 `bool` `int`（同时等于条目数与 `proof.leaf_count`）、`MerkleMultiProof`（`indices` 恰好覆盖 `0 .. leaf_count - 1`，无缺口、重复或乱序），均可位置构造、按值相等且不可变，构造时不做校验
+- `verify_convex_polygon_batch_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的凸多边形证明完整批验：先整批预检全部嵌套类型（批对象、元组条目、两承诺六字段、规范顶点、两轴 `RangeProof`、每边 `WideRangeProof`、`context`、`leaf_count` 与 `proof` 三字段，`root`/context/sibling 非 `bytes`、用 `bool` 冒充整数或后项错型均抛 `TypeError`，`randbelow` 不可调用抛 `TypeError`），再核对空批、计数与索引完整覆盖，随后以全部 `(index, leaf)` 调 `verify_multi_inclusion` 先验外层根（此步前不消费随机数，空批返回 `False` 且不取随机数），根通过后才把同一 `randbelow` 原样交给 `verify_convex_polygon_batch`；根不匹配、索引缺口/重复/乱序、条目换序或替换、叶字段篡改、群参数或区间不一致、伪造几何、内层证明无效及空批一律返回 `False`，随机源返回非整数抛 `TypeError`、越界抛 `ValueError`（与内层契约一致），输入不被改写
+- `prove_convex_polygon_batch_bound(entries, *, randbelow=secrets.randbelow) -> tuple[BoundConvexPolygonBatch, bytes]` — 顶层构造 Merkle 承诺的凸多边形证明完整批：`entries` 沿用 `verify_convex_polygon_batch` 相同边界的非 `bytes`/`bytearray`/`str` 序列且必须非空，完整预检后按原序冻结为元组并保留重复项，输入不变；每项外层叶以独立域 `b"zkregion/convex-polygon-bound/v1"` 起头，按四字节长度前缀与十进制 ASCII 整数（负号保留）逐项成帧：x/y 两承诺六字段、多边形顶点数与规范顶点坐标、`context`、两轴 `RangeProof` 的 `t`/`e`/`s` 计数成帧，再按规范边序的每边 `WideRangeProof` 的 `commitments`/`challenges`/`responses` 计数成帧；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调 `prove_multi_inclusion`（`indices` 覆盖每片叶、`siblings` 为空），返回批的 `leaf_count = n`，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_convex_polygon_batch_bound(batch, root) is True`，单项、奇偶批与重复项均确定，保序留重，相同公开输入与相同随机源下批、根与证明逐字节一致；`randbelow` 原样透传给 `verify_convex_polygon_batch`；全批或任一嵌套字段错型（含后项错型与 `bool`）、`randbelow` 不可调用抛 `TypeError`，空输入、批次数越出 uint64 或内层批验返回 `False` 抛 `ValueError`
 - `ConvexPolygonProofBundle(x_commitment, y_commitment, polygon, context, proof)` — 凸多边形成员证明的跨进程规范化二进制信封数据类，字段按 `x_commitment`、`y_commitment`、`polygon`、`context`、`proof` 固定次序承载，分别为两个 `PedersenCommitment`、`ConvexPolygonRegion`、`bytes` 与 `ConvexPolygonRegionProof`；冻结、可位置构造、按值相等，构造时不做校验
 - `encode_convex_polygon_proof_bundle(bundle) -> bytes` — 对同一对象稳定输出同一字节串；输出依次为四字节魔数 `b"zrgp"`、一字节格式版本（当前为 `1`），随后按固定字段次序成帧两个承诺、**规范化顶点**构成的多边形、context 与证明；长度前缀、有符号任意精度整数（符号字节加最短大端绝对值）与元组基数语义与 `encode_region_proof_bundle` 完全一致；证明体为固定三元组：x/y 包围盒两个 `RangeProof`，再按规范边序排列的每边一个 `WideRangeProof`；只返回 `bytes`，不写文件或数据库；字段、context 或任一子证明不同均产生不同字节；对象或嵌套字段类型错误（含 `bool` 整数、非元组证明字段、宽证明对不是二元组）抛 `TypeError`；绕过构造器伪造的非法多边形抛 `ValueError`
 - `decode_convex_polygon_proof_bundle(data) -> ConvexPolygonProofBundle` — 只接受 `bytes`（非 `bytes` 抛 `TypeError`），逐层核对魔数 `b"zrgp"`、版本、长度前缀、元组基数与整数规范形；多边形经 `ConvexPolygonRegion` 构造器重建（旋转/反向归一，非法多边形拒绝），边证明数须恰等于边数，载荷须被完整消费且无尾随数据；非规范整数、坏长度或基数、未知版本、非法承诺字段值、非法多边形、子证明形状不匹配、截断或尾随数据一律抛 `ValueError`，失败不返回部分对象；重建对象与原对象逐字段相等且恢复 tuple 结构，保留零、负数与任意精度整数及任意 context
@@ -1890,6 +1909,27 @@ h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
 ```
 
 即跨两个轴、全部边与全部条目纳入同一组的随机线性组合，而**不是**逐项验证后做布尔 AND；不同 `(prime, generator, h)` 之间不跨组相消。交换两轴、改 context 或 polygon、替换/删除/重排 `edge_proofs`、篡改任一子证明都返回 `False`，批量结论与逐项调用 `verify_convex_polygon` 的合取一致。类型错误（含 `bool` 整数、非元组字段、非 `bytes` context、`randbelow` 不可调用或返回非整数）抛 `TypeError`；系数返回值越界抛 `ValueError`。固定随机源下结果可重复，缺省为 `secrets.randbelow`，输入不被改写。
+
+### Merkle 承诺的凸多边形证明完整批验
+
+`BoundConvexPolygonBatch(entries, leaf_count, proof)` 把一批**原序**凸多边形成员证明条目全集与一棵 Merkle 树的多包含证明及公开根固定在一起，三个字段依次为：
+
+1. `entries: tuple[ConvexPolygonBatchEntry, ...]` —— 必须是元组（不是列表），保持构造顺序并保留重复项；
+2. `leaf_count: int` —— 正的非 `bool` 整数，且必须同时等于 `len(entries)` 与 `proof.leaf_count`；
+3. `proof: MerkleMultiProof` —— 其 `indices` 必须无缺口、无重复、无乱序地恰好覆盖 `0 .. leaf_count - 1`（即等于 `tuple(range(leaf_count))`）。
+
+三字段均可位置构造、构造时不做校验，对象按值相等且不可变（冻结 dataclass）。空批（`leaf_count < 1` 或 `entries` 为空）、缺项（数量不符）、`leaf_count` 与任一方不一致、索引乱序/重复/有缺口均返回 `False`。
+
+每个条目的 Merkle 叶字节以独立域 `b"zkregion/convex-polygon-bound/v1"` 开始，再按固定顺序逐项长度前缀成帧：x 后 y 两个 `PedersenCommitment` 各六字段（`element`、`lower`、`upper`、`prime`、`generator`、`h`，按数据类字段顺序）、多边形**规范顶点**（先顶点数，再逐顶点的 x、y 坐标；旋转或反向表示编码为同一叶）、外部 `context`，随后是 x 与 y 两个包围盒 `RangeProof`——各子证明的 `t`/`e`/`s` 序列先写十进制元素数再逐项展开——最后按**规范边序**排列的每条边一个 `WideRangeProof`：先写 `commitments` 十进制元素数再逐项写比特承诺，`challenges` 与 `responses` 各自先写十进制对数再按对顺序把每对的两个整数逐项展开。每个原子项前置四字节无符号大端长度，整数为十进制 ASCII 且负号保留，Merkle 摘要规则沿用既有完整批的长度前缀约定，不改帧不重排；同一组公开输入总给出相同的根与证明。
+
+`verify_convex_polygon_batch_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` 的验证分两步、次序固定：
+
+1. 先对**整批**做嵌套类型预检（批对象、元组条目、两承诺六字段、多边形顶点元组与整数坐标、两轴 `RangeProof` 三字段、每边 `WideRangeProof` 三层元组整数、`context`、`leaf_count` 与 `proof` 字段；`root`、`context` 与每个 sibling 必须是 `bytes`；错型含用 `bool` 冒充整数与后项错型，一律抛唯一的 `TypeError`；`randbelow` 不可调用同样抛 `TypeError`）；结构校验（空批、计数与 `proof.leaf_count`/条目数相符、`indices` 完整覆盖）通过后，才以全部 `(index, leaf)` 调用 `verify_multi_inclusion` 校验外层 Merkle 根；
+2. 外层根通过后，才以**同一个 `randbelow`** 原样调用 `verify_convex_polygon_batch(entries, randbelow=randbelow)`，根校验通过前（含空批）不消费任何随机数；随机源返回非整数抛 `TypeError`、越界抛 `ValueError`，契约与内层批验完全一致。
+
+根不匹配、索引缺口或重复、条目换序或替换、任一叶字段被篡改、群参数或区间不一致、伪造几何、内层证明无效及空批一律返回 `False`；`root` 不是 `bytes` 等错型抛 `TypeError`。入口不改写任何输入，既有凸多边形单条、批验与信封入口行为不变。
+
+`prove_convex_polygon_batch_bound(entries, *, randbelow=secrets.randbelow) -> (batch, root)` 是规范构造入口：`entries` 沿用 `verify_convex_polygon_batch` 相同边界的非空、非 `bytes`/`bytearray`/`str` 序列，完整预检后按原顺序冻结为元组并保留重复项（保序留重），不改写输入；每项按上述同一叶编码成叶（即验根时重算的同一份叶），以全索引 `tuple(range(n))` 调 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖从零开始的全部位置、`siblings` 为空），返回冻结且按值相等的 `BoundConvexPolygonBatch` 与该批编码叶的 `merkle_root`。构造结果一次通过 `verify_convex_polygon_batch_bound(batch, root)`，单条目、奇偶批与重复项都给确定结果；相同公开输入与相同随机源下重复构造所得的批、根与证明逐字节一致。整批或任一嵌套字段错型（含后项错型与 `bool`）、`randbelow` 不可调用抛 `TypeError`，空输入、批次数越出 uint64 或内层 `verify_convex_polygon_batch` 不通过抛 `ValueError`；`randbelow` 原样透传，合格输入不被改写。
 
 ### 二维区域证明批量验证
 

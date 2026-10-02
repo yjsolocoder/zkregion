@@ -17,6 +17,10 @@ RangeProof / prove_range /
 verify_range / RangeBatchEntry / verify_range_batch /
 RangeSetProof / prove_range_set /
 verify_range_set / RangeSetBatchEntry / verify_range_set_batch /
+BoundRangeSetBatch / prove_range_set_batch_bound /
+verify_range_set_batch_bound /
+RangeSetBatchReplayGuard /
+BoundRangeSetBatchReplayGuard /
 RegionProof /
 WideRangeProof / prove_range_wide / verify_range_wide /
 WideRangeBatchEntry / verify_range_wide_batch /
@@ -128,6 +132,8 @@ __all__ = [
     "BoundRegionWideBatch",
     "BoundRegionWideReplayGuard",
     "BoundRangeReplayGuard",
+    "BoundRangeSetBatch",
+    "BoundRangeSetBatchReplayGuard",
     "BoundSchnorrBatch",
     "BoundSchnorrReplayGuard",
     "BoundWideRangeBatch",
@@ -165,6 +171,7 @@ __all__ = [
     "RangeBatchReplayGuard",
     "RangeProof",
     "RangeSetBatchEntry",
+    "RangeSetBatchReplayGuard",
     "RangeSetProof",
     "RangeReplayGuard",
     "Region",
@@ -218,6 +225,7 @@ __all__ = [
     "prove_range",
     "prove_range_batch_bound",
     "prove_range_set",
+    "prove_range_set_batch_bound",
     "prove_range_wide",
     "prove_range_wide_batch_bound",
     "prove_region",
@@ -255,6 +263,7 @@ __all__ = [
     "verify_range_bound",
     "verify_range_set",
     "verify_range_set_batch",
+    "verify_range_set_batch_bound",
     "verify_range_wide",
     "verify_range_wide_batch",
     "verify_range_wide_batch_bound",
@@ -1352,6 +1361,325 @@ def verify_range_set_batch(
         ):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed range set batches
+#
+# A complete range set batch frozen together with the Merkle proof that
+# commits to every entry. Each Merkle leaf starts from the domain separator
+# b"zkregion/rsb/v1" and frames, in order, the six commitment fields, the
+# context, the ordered interval endpoints (their decimal count followed by
+# every (lower, upper) pair in interval order) and the t / e / s fields of
+# the proof: each as its decimal element count followed by every item in
+# proof order. Verification first checks every leaf against the Merkle
+# root, then runs the unchanged range set batch verification.
+
+_RANGE_SET_BOUND_DOMAIN = b"zkregion/rsb/v1"
+
+
+@dataclass(frozen=True)
+class BoundRangeSetBatch:
+    """A complete range set batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of :class:`RangeSetBatchEntry`;
+    ``leaf_count`` — a positive, non-``bool`` integer equal to both
+    ``len(entries)`` and ``proof.leaf_count``; ``proof`` — the
+    :class:`MerkleMultiProof` whose indices cover ``0 .. leaf_count - 1``
+    without gaps or duplicates. The entries keep their construction order
+    and duplicates, exactly as the bare batch allows any order and
+    repeated items. All three are positional construction arguments;
+    batches compare by value and are immutable.
+    """
+
+    entries: tuple[RangeSetBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_range_set_leaf(entry: RangeSetBatchEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`RangeSetBatchEntry`.
+
+    Items, in order: the domain separator, the six commitment fields
+    (dataclass field order), the context, the intervals framed as their
+    decimal pair count followed by every ordered ``(lower, upper)``
+    endpoint pair, then each of the proof's ``t`` / ``e`` / ``s``
+    sequences framed as its decimal element count followed by every item
+    in proof order. Every item is prefixed with its four-byte unsigned
+    big-endian length; integers are encoded as decimal ASCII (negative
+    sign kept).
+    """
+    commitment = entry.commitment
+    items = [_RANGE_SET_BOUND_DOMAIN]
+    items.extend(
+        str(getattr(commitment, name)).encode("ascii")
+        for name in ("element", "lower", "upper", "prime", "generator", "h")
+    )
+    items.append(entry.context)
+    items.append(str(len(entry.intervals)).encode("ascii"))
+    for lower, upper in entry.intervals:
+        items.append(str(lower).encode("ascii"))
+        items.append(str(upper).encode("ascii"))
+    proof = entry.proof
+    for field_name in ("t", "e", "s"):
+        sequence = getattr(proof, field_name)
+        items.append(str(len(sequence)).encode("ascii"))
+        items.extend(str(item).encode("ascii") for item in sequence)
+    leaf = bytearray()
+    for item in items:
+        leaf += len(item).to_bytes(4, "big")
+        leaf += item
+    return bytes(leaf)
+
+
+def _check_range_set_batch_entries_types(
+    entries: object,
+) -> list[RangeSetBatchEntry]:
+    """Validate the range-set-batch ``entries`` argument types.
+
+    Mirrors the whole-batch type preflight of
+    :func:`verify_range_set_batch` exactly: ``entries`` must be a
+    non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`RangeSetBatchEntry` objects whose ``commitment`` is a
+    :class:`PedersenCommitment` of six non-``bool`` integer fields, whose
+    ``intervals`` is a non-string sequence of two-element integer tuples,
+    whose ``proof`` is a :class:`RangeSetProof` with tuple ``t`` / ``e`` /
+    ``s`` fields of non-``bool`` integers and whose ``context`` is
+    ``bytes``. A wrong type in any entry — including a later one —
+    raises :class:`TypeError`; the entries are copied into a fresh list
+    so the inputs are never mutated. An empty batch and every structural
+    or value problem are left to later checks.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(
+        entries, Sequence
+    ):
+        raise TypeError("entries must be a sequence of RangeSetBatchEntry")
+    items: list[RangeSetBatchEntry] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, RangeSetBatchEntry):
+            raise TypeError(f"entries[{position}] must be a RangeSetBatchEntry")
+        commitment = entry.commitment
+        proof = entry.proof
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(
+                f"entries[{position}] commitment must be a PedersenCommitment"
+            )
+        for name in ("element", "lower", "upper", "prime", "generator", "h"):
+            _check_int(
+                getattr(commitment, name),
+                f"entries[{position}] commitment {name}",
+            )
+        if isinstance(entry.intervals, (bytes, bytearray, str)) or not isinstance(
+            entry.intervals, Sequence
+        ):
+            raise TypeError(
+                f"entries[{position}] intervals must be a sequence of "
+                "(lower, upper) tuples"
+            )
+        for interval_position, interval in enumerate(entry.intervals):
+            if not isinstance(interval, tuple) or len(interval) != 2:
+                raise TypeError(
+                    f"entries[{position}] intervals[{interval_position}] "
+                    "must be a (lower, upper) tuple"
+                )
+            lower, upper = interval
+            _check_int(
+                lower,
+                f"entries[{position}] intervals[{interval_position}] lower",
+            )
+            _check_int(
+                upper,
+                f"entries[{position}] intervals[{interval_position}] upper",
+            )
+        if not isinstance(proof, RangeSetProof):
+            raise TypeError(f"entries[{position}] proof must be a RangeSetProof")
+        for field_name in ("t", "e", "s"):
+            field = getattr(proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"entries[{position}] proof {field_name} must be a tuple "
+                    "of integers"
+                )
+            for item in field:
+                _check_int(
+                    item, f"entries[{position}] proof {field_name} entry"
+                )
+        _check_bytes(entry.context, f"entries[{position}] context")
+        items.append(entry)
+    return items
+
+
+def verify_range_set_batch_bound(
+    batch: BoundRangeSetBatch,
+    root: bytes,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundRangeSetBatch`.
+
+    The Merkle binding is checked first: every entry is encoded to its
+    leaf exactly as specified by :func:`_bound_range_set_leaf` and the
+    whole batch is checked against ``root`` with
+    :func:`verify_multi_inclusion`. ``leaf_count`` must be a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``, and ``proof.indices`` must cover
+    ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering; an
+    empty batch, a missing entry or any index mismatch returns ``False``.
+    Only after the root checks does the batch go through
+    :func:`verify_range_set_batch` unchanged, with entries in their bound
+    order (duplicates included); each entry is then verified
+    independently with :func:`verify_range_set`.
+
+    Type errors — a batch that is not a :class:`BoundRangeSetBatch`,
+    non-tuple entries, non-:class:`RangeSetBatchEntry` items, a
+    non-integer or ``bool`` ``leaf_count``, a wrong proof/root object,
+    malformed nested field types (a non-:class:`PedersenCommitment`
+    commitment, a non-tuple interval or proof field, a non-integer
+    endpoint or proof entry, or non-bytes context/root at any nesting
+    level) — raise :class:`TypeError`. Every other invalidity (an empty
+    batch, a count or index mismatch, a wrong root, tampered leaf bytes,
+    bad interval structure or an inner batch rejection) returns
+    ``False``. Inputs are never mutated.
+    """
+    if not isinstance(batch, BoundRangeSetBatch):
+        raise TypeError("batch must be a BoundRangeSetBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError("batch entries must be a tuple of RangeSetBatchEntry")
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, RangeSetBatchEntry):
+            raise TypeError(f"entries[{position}] must be a RangeSetBatchEntry")
+        commitment = entry.commitment
+        entry_proof = entry.proof
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(
+                f"entries[{position}] commitment must be a PedersenCommitment"
+            )
+        for name in ("element", "lower", "upper", "prime", "generator", "h"):
+            _check_int(
+                getattr(commitment, name),
+                f"entries[{position}] commitment {name}",
+            )
+        if isinstance(entry.intervals, (bytes, bytearray, str)) or not isinstance(
+            entry.intervals, Sequence
+        ):
+            raise TypeError(
+                f"entries[{position}] intervals must be a sequence of "
+                "(lower, upper) tuples"
+            )
+        for interval_position, interval in enumerate(entry.intervals):
+            if not isinstance(interval, tuple) or len(interval) != 2:
+                raise TypeError(
+                    f"entries[{position}] intervals[{interval_position}] "
+                    "must be a (lower, upper) tuple"
+                )
+            lower, upper = interval
+            _check_int(
+                lower,
+                f"entries[{position}] intervals[{interval_position}] lower",
+            )
+            _check_int(
+                upper,
+                f"entries[{position}] intervals[{interval_position}] upper",
+            )
+        if not isinstance(entry_proof, RangeSetProof):
+            raise TypeError(f"entries[{position}] proof must be a RangeSetProof")
+        for field_name in ("t", "e", "s"):
+            field = getattr(entry_proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"entries[{position}] proof {field_name} must be a tuple "
+                    "of integers"
+                )
+            for item in field:
+                _check_int(
+                    item, f"entries[{position}] proof {field_name} entry"
+                )
+        _check_bytes(entry.context, f"entries[{position}] context")
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_range_set_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf, then
+    # 2) the unchanged range set batch verification checks the proofs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_range_set_batch(entries)
+
+
+def prove_range_set_batch_bound(
+    entries: Sequence[RangeSetBatchEntry],
+) -> tuple[BoundRangeSetBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundRangeSetBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`RangeSetBatchEntry` rules as
+    :func:`verify_range_set_batch` and must be non-empty; every entry is
+    copied into a tuple in its original order with duplicates preserved,
+    and the inputs are never mutated. Each entry is encoded to its outer
+    leaf byte for byte with :func:`_bound_range_set_leaf`; the domain
+    separator ``b"zkregion/rsb/v1"``, the length framing, decimal integer
+    encoding and field order stay unchanged, and the leaf digests and
+    internal nodes follow the existing SHA-256 Merkle rules. With
+    ``n = len(entries)``, the complete multi-inclusion proof is built
+    with :func:`prove_multi_inclusion` over the encoded leaves and the
+    full indices ``tuple(range(n))`` — so its ``indices`` cover every
+    leaf from zero and its ``siblings`` are empty — and the returned
+    batch carries ``leaf_count = n`` alongside that proof. The second
+    return value is the outer tree's :func:`merkle_root` of the encoded
+    leaves, which is exactly the root the batch verifies under:
+    ``verify_range_set_batch_bound(batch, root)`` returns ``True``.
+    Single-item, odd- and even-sized batches and duplicate entries are
+    all deterministic, and the same inputs rebuild a byte-identical
+    batch, root and proof.
+
+    A type preflight over the whole batch — every entry and every nested
+    field, including ``bool`` integers and later entries — raises
+    :class:`TypeError` before anything is built; an empty batch, a
+    ``U``-framed batch count outside uint64, or
+    :func:`verify_range_set_batch` returning ``False`` (bad interval
+    structure or an invalid inner range set proof) raises
+    :class:`ValueError`.
+    """
+    items = _check_range_set_batch_entries_types(entries)
+    if not items:
+        raise ValueError("entries must not be empty")
+    if len(items) > _UINT64_MAX:
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    if not verify_range_set_batch(items):
+        raise ValueError("entries must pass verify_range_set_batch")
+    ordered = tuple(items)
+    leaves = [_bound_range_set_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundRangeSetBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
 
 
 # ---------------------------------------------------------------------------
@@ -8568,6 +8896,8 @@ _REGION_CONTAINS_BATCH_REPLAY_DOMAIN = b"zr/rcbr/v1"
 _REGION_CONTAINS_REPLAY_DOMAIN = b"zr/rcrr/v1"
 _BOUND_REGION_CONTAINS_REPLAY_DOMAIN = b"zr/brcbr/v1"
 _BOUND_WIDE_RANGE_REPLAY_DOMAIN = b"zr/bwrr/v1"
+_RANGE_SET_BATCH_REPLAY_DOMAIN = b"zr/rsbr/v1"
+_BOUND_RANGE_SET_BATCH_REPLAY_DOMAIN = b"zr/brsbr/v1"
 _MERKLE_INCLUSION_ENTRY_REPLAY_DOMAIN = b"zr/mirr/v1"
 _WIDE_RANGE_REPLAY_DOMAIN = b"zr/wrr/v1"
 _WIDE_RANGE_BATCH_REPLAY_DOMAIN = b"zr/wrbr/v1"
@@ -22511,6 +22841,681 @@ class BoundRegionWideReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_region_wide_batch_bound(batch, root, randbelow=randbelow):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for batches of range set proofs
+#
+# A RangeSetBatchReplayGuard binds a whole non-empty batch of
+# RangeSetBatchEntry items to one session id, exactly as the other bare
+# batch guards do for their own entry types; without a store the
+# pending/claimed/consumed states are local to the guard instance, while
+# an SQLiteReplayStore keeps them under b"zr/rsbr/v1", shared across
+# instances, processes and restarts. bind_once registers a pending
+# binding, check claims the id atomically, recomputes the digest, checks
+# the expiry, delegates the batch verification to verify_range_set_batch
+# and consumes the id only on full success; every rejection leaves the
+# id untouched.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || S(entries, L) || F(E)
+# )
+#   D = b"zr/rsbr/v1"
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   L(e) = the range set complete-batch outer leaf raw bytes for e
+#          (_bound_range_set_leaf, the outer leaf encoding under
+#          b"zkregion/rsb/v1")
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+#
+# The domain differs from every other guard (including the bound range
+# set batch guard below), so replay records can never be reused between
+# the bare and bound entry points or between range set batches and any
+# other batch kind.
+
+
+def _range_set_batch_replay_encodable(
+    entries: Sequence[RangeSetBatchEntry],
+) -> bool:
+    """The S-framed batch length must fit in an unsigned 64-bit integer.
+
+    The outer ``S`` sequence writes the batch count with ``U`` (eight-byte
+    unsigned big-endian). Each entry is framed as the complete-batch outer
+    leaf, whose integers are encoded as decimal ASCII with the sign kept,
+    so every integer field frames for any value and no per-entry
+    encodability rule is needed.
+    """
+    return 0 <= len(entries) <= _UINT64_MAX
+
+
+def _range_set_batch_replay_digest(
+    entries: Sequence[RangeSetBatchEntry],
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the range-set-batch replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``S(entries, L)`` and
+    ``F(E)``; ``L(entry)`` is the complete-batch outer leaf raw bytes
+    (the same bytes :func:`_bound_range_set_leaf` builds for
+    :func:`verify_range_set_batch_bound`) and the entries keep their
+    batch order (duplicates included).
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_RANGE_SET_BATCH_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    # S(entries, L) = F(U(|entries|)) || Σ F(L(entry))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(entries))))
+    for entry in entries:
+        transcript.update(_frame_length_prefixed(_bound_range_set_leaf(entry)))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+class RangeSetBatchReplayGuard:
+    """Single-use replay protection for a batch of :class:`RangeSetBatchEntry`.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole non-empty batch
+    of :class:`RangeSetBatchEntry` items — the same sequence shape
+    accepted by :func:`verify_range_set_batch`, kept in the given order
+    with duplicates preserved — to a session id; :meth:`check` accepts
+    an equal pending binding exactly once, recomputing the binding
+    digest, checking the expiry and delegating to
+    :func:`verify_range_set_batch`, and then marks the id consumed. The
+    digest frames the batch under
+    ``SHA-256(F(D) || F(session_id) || S(entries, L) || F(E))`` with
+    domain ``b"zr/rsbr/v1"``, where ``L(entry)`` is the raw per-item
+    outer leaf of a complete range set batch (the same bytes
+    :func:`_bound_range_set_leaf` builds under ``b"zkregion/rsb/v1"``
+    for :func:`verify_range_set_batch_bound`); the F / U / S framing and
+    the E expiry encoding are reused byte for byte from the other batch
+    replay guards. By default both the pending and the consumed state
+    live on this guard instance and are never shared between instances;
+    passing an :class:`SQLiteReplayStore` as ``store`` instead keeps the
+    state in that store under the ``b"zr/rsbr/v1"`` key domain, so batch
+    guards attached to the same store namespace share pending, claimed
+    and consumed ids across independent instances, processes and
+    process restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim
+    taken before the digest/expiry work and the delegated batch
+    verification (the in-instance registry lock, or the store's short
+    transaction and unique claim token); the claim is per-id registry
+    state rather than a global lock, so a batch being verified under
+    one id never serializes checks or binds of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None
+            if store is None
+            else store._view(_RANGE_SET_BATCH_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        entries: Sequence[RangeSetBatchEntry],
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to the batch.
+
+        Returns the frozen :class:`ReplayBinding`. ``entries`` must be a
+        non-string, non-empty sequence of :class:`RangeSetBatchEntry`
+        objects following the same sequence and nested type rules as
+        :func:`verify_range_set_batch`: every entry's
+        :class:`PedersenCommitment` six integer fields, its interval
+        sequence of two-element integer tuples, its
+        :class:`RangeSetProof` tuple fields and its ``context`` are
+        type-checked; entries are kept in the given order with
+        duplicates preserved and no item dropped. ``session_id`` must be
+        non-empty ``bytes`` and ``expires_at`` must be either ``None`` or
+        a non-``bool`` unsigned 64-bit Unix-second timestamp; the
+        ``U``-framed batch length must fit in uint64. A session id that
+        is already pending, being checked or consumed raises
+        :class:`ValueError`. Wrong argument or nested field types
+        (including ``bool`` integers) raise :class:`TypeError`; an empty
+        batch or empty id, an out-of-uint64 expiry or batch length or a
+        rebind raise :class:`ValueError`. Inputs are never mutated.
+        """
+        items = _check_range_set_batch_entries_types(entries)
+        _check_bytes(session_id, "session_id")
+        if not items:
+            raise ValueError("entries must not be empty")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _range_set_batch_replay_encodable(items):
+            raise ValueError("batch length must be an unsigned 64-bit integer")
+        binding = ReplayBinding(
+            session_id,
+            _range_set_batch_replay_digest(items, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entries: Sequence[RangeSetBatchEntry],
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``. The
+        id is claimed atomically before the digest/expiry work and the
+        delegated verification, so among concurrent calls for the same id
+        at most one can return ``True``. The digest is recomputed over the
+        presented ``entries`` in their given order (duplicates included);
+        for a binding with an expiry, ``now >= expires_at`` makes the
+        check fail (``now`` defaults to the current Unix seconds and must
+        otherwise be a non-``bool`` uint64). Only then is the batch handed
+        to :func:`verify_range_set_batch` unchanged, under that function's
+        sequence and structure contract: an empty batch, bad interval
+        structure or an invalid inner proof returns ``False``.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, an
+        empty/oversized batch or :func:`verify_range_set_batch`
+        returning ``False``) returns ``False``, releases the claim and
+        leaves the registration pending. An exception escaping the
+        delegated verification likewise releases the claim and then
+        propagates unchanged, leaving the id usable. With a store
+        backend, only the holder of the current claim token can consume
+        the id (an expired claim may be taken over by a later equal
+        ``check``); a stale token neither consumes nor restores
+        anything. Verification runs without any lock or transaction
+        held, so other ids are never serialized. Argument type errors
+        (including ``bool`` integers) raise :class:`TypeError`; an
+        out-of-range ``now`` raises :class:`ValueError`. Inputs are
+        never mutated.
+        """
+        items = _check_range_set_batch_entries_types(entries)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _range_set_batch_replay_encodable(items):
+            return False  # an oversized batch
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(items, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _range_set_batch_replay_digest(items, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_range_set_batch(items):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entries: Sequence[RangeSetBatchEntry],
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim
+        is taken over and issued a fresh random token); verification runs
+        with no transaction held; only the token returned by the winning
+        claim can consume the id, and every rejection or escaped error
+        restores the id to pending with that same token. A stale token
+        (a claim taken over while verification ran) neither consumes nor
+        restores anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _range_set_batch_replay_digest(entries, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_range_set_batch(entries):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for Merkle-committed range set batches
+#
+# A BoundRangeSetBatchReplayGuard binds one BoundRangeSetBatch together
+# with the outer Merkle root it is claimed under to a session id,
+# reusing byte for byte the bound-batch framing of the other complete
+# batch guards; only the domain (b"zr/brsbr/v1") and the per-entry
+# leaves (_bound_range_set_leaf, the b"zkregion/rsb/v1" outer leaf
+# encoding) differ. bind_once registers a pending binding, check claims
+# the id atomically, recomputes the digest, checks the expiry,
+# delegates the root and inner batch verification to
+# verify_range_set_batch_bound and consumes the id only on full
+# success; every rejection leaves the id pending and reusable.
+#
+# digest = SHA-256(
+#     F(D) || F(session_id) || F(root) || F(U(batch.leaf_count))
+#     || Σ F(L(entry))
+#     || F(U(proof.leaf_count)) || S(proof.indices, U)
+#     || S(proof.siblings, λx.x) || F(E)
+# )
+#
+# The entries keep their batch order, duplicates included; entries are
+# never dropped or reordered, and the outer MerkleMultiProof's three
+# fields (leaf_count, indices, siblings) are all bound verbatim. The
+# domain is independent of both the bare RangeSetBatchReplayGuard and
+# every other guard, so a binding record from one entry point can
+# never be presented at another.
+
+
+def _bound_range_set_batch_replay_encodable(batch: BoundRangeSetBatch) -> bool:
+    """Every U-framed integer must fit in unsigned 64 bits.
+
+    ``batch.leaf_count``, ``batch.proof.leaf_count`` and every proof
+    index are written with ``U`` (eight-byte unsigned big-endian); a
+    negative or larger-than-uint64 value cannot be framed. The
+    decimal-ASCII range set leaves (the negative sign is kept), the raw
+    sibling bytes and the root encode for any value.
+    """
+    proof = batch.proof
+    values = [batch.leaf_count, proof.leaf_count, *proof.indices]
+    return all(0 <= value <= _UINT64_MAX for value in values)
+
+
+def _bound_range_set_batch_replay_digest(
+    batch: BoundRangeSetBatch,
+    root: bytes,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the BoundRangeSetBatch replay binding digest.
+
+    Byte-for-byte the :func:`_bound_wide_range_replay_digest` framing
+    with the bound range set batch replay domain and the range set
+    complete-batch (:func:`_bound_range_set_leaf`) leaves. Writes, in
+    order: ``F(D)``, ``F(session_id)``, ``F(root)``,
+    ``F(U(batch.leaf_count))``, one ``F(L(entry))`` per entry in batch
+    order, then ``F(U(proof.leaf_count))``, ``S(proof.indices, U)``,
+    ``S(proof.siblings, identity)`` and ``F(E)``.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_BOUND_RANGE_SET_BATCH_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    transcript.update(_frame_length_prefixed(root))
+    transcript.update(_frame_length_prefixed(_uint64_be(batch.leaf_count)))
+    for entry in batch.entries:  # entries order, each range set leaf under F
+        transcript.update(_frame_length_prefixed(_bound_range_set_leaf(entry)))
+    proof = batch.proof
+    transcript.update(_frame_length_prefixed(_uint64_be(proof.leaf_count)))
+    # S(proof.indices, U) = F(U(|indices|)) || Σ F(U(index))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.indices))))
+    for index in proof.indices:
+        transcript.update(_frame_length_prefixed(_uint64_be(index)))
+    # S(proof.siblings, λx.x) = F(U(|siblings|)) || Σ F(sibling)
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.siblings))))
+    for sibling in proof.siblings:
+        transcript.update(_frame_length_prefixed(sibling))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+def _check_bound_range_set_batch_types(batch: object, root: object) -> None:
+    """Validate BoundRangeSetBatch argument types for the replay guard.
+
+    Mirrors the type checks of :func:`verify_range_set_batch_bound`: the
+    batch must be a :class:`BoundRangeSetBatch` whose entries tuple
+    holds nestedly well-typed :class:`RangeSetBatchEntry` objects, whose
+    ``leaf_count`` is a non-``bool`` integer and whose proof is a
+    well-typed :class:`MerkleMultiProof`; ``root`` must be ``bytes``.
+    Structural and value problems (coverage, counts, ranges) are left to
+    :func:`verify_range_set_batch_bound` at check time.
+    """
+    if not isinstance(batch, BoundRangeSetBatch):
+        raise TypeError("batch must be a BoundRangeSetBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError("batch entries must be a tuple of RangeSetBatchEntry")
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, RangeSetBatchEntry):
+            raise TypeError(f"entries[{position}] must be a RangeSetBatchEntry")
+        commitment = entry.commitment
+        entry_proof = entry.proof
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(
+                f"entries[{position}] commitment must be a PedersenCommitment"
+            )
+        for name in ("element", "lower", "upper", "prime", "generator", "h"):
+            _check_int(
+                getattr(commitment, name),
+                f"entries[{position}] commitment {name}",
+            )
+        if isinstance(entry.intervals, (bytes, bytearray, str)) or not isinstance(
+            entry.intervals, Sequence
+        ):
+            raise TypeError(
+                f"entries[{position}] intervals must be a sequence of "
+                "(lower, upper) tuples"
+            )
+        for interval_position, interval in enumerate(entry.intervals):
+            if not isinstance(interval, tuple) or len(interval) != 2:
+                raise TypeError(
+                    f"entries[{position}] intervals[{interval_position}] "
+                    "must be a (lower, upper) tuple"
+                )
+            lower, upper = interval
+            _check_int(
+                lower,
+                f"entries[{position}] intervals[{interval_position}] lower",
+            )
+            _check_int(
+                upper,
+                f"entries[{position}] intervals[{interval_position}] upper",
+            )
+        if not isinstance(entry_proof, RangeSetProof):
+            raise TypeError(f"entries[{position}] proof must be a RangeSetProof")
+        for field_name in ("t", "e", "s"):
+            field = getattr(entry_proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"entries[{position}] proof {field_name} must be a tuple "
+                    "of integers"
+                )
+            for item in field:
+                _check_int(
+                    item, f"entries[{position}] proof {field_name} entry"
+                )
+        _check_bytes(entry.context, f"entries[{position}] context")
+
+
+class BoundRangeSetBatchReplayGuard:
+    """Single-use replay protection for a Merkle-committed range set batch.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole
+    :class:`BoundRangeSetBatch` together with the outer Merkle ``root``
+    it is claimed under; :meth:`check` accepts an equal pending binding
+    exactly once — first atomically claiming the id, then recomputing
+    the binding digest, checking the expiry and handing the batch/root
+    to :func:`verify_range_set_batch_bound`, which checks the outer
+    root and the inner range set batch in that fixed order — and then
+    marks the id consumed. The digest reuses the
+    :class:`BoundWideRangeReplayGuard` framing byte for byte, with only
+    the domain separator (``b"zr/brsbr/v1"``) and the per-entry leaves
+    changed to the range set complete-batch leaves
+    (:func:`_bound_range_set_leaf`). By default both the pending and
+    the consumed state live on this guard instance and are never
+    shared between instances; passing an :class:`SQLiteReplayStore` as
+    ``store`` instead keeps the state in that store under the
+    ``b"zr/brsbr/v1"`` key domain, so bound range set batch guards
+    attached to the same store namespace share pending, claimed and
+    consumed ids across independent instances, processes and process
+    restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim
+    taken before the digest/expiry work and the (potentially slow)
+    delegated root and batch verification (the in-instance registry
+    lock, or the store's short transaction and unique claim token);
+    the claim is per-id registry state rather than a global lock, so a
+    batch being verified under one id never serializes checks or binds
+    of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None
+            if store is None
+            else store._view(_BOUND_RANGE_SET_BATCH_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        batch: BoundRangeSetBatch,
+        root: bytes,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to a batch/root.
+
+        Returns the frozen :class:`ReplayBinding`. ``session_id`` must be
+        non-empty ``bytes`` and ``expires_at`` must be either ``None`` or
+        a non-``bool`` unsigned 64-bit Unix-second timestamp; the
+        U-framed integers (``leaf_count`` and the outer proof indices)
+        must likewise fit in uint64. A session id that is already
+        pending, being checked or consumed raises :class:`ValueError`.
+        Wrong argument or nested field types (including ``bool``
+        integers) raise :class:`TypeError`; an empty id, an
+        out-of-uint64 expiry or framed integer, or a rebind raise
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_bound_range_set_batch_types(batch, root)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _bound_range_set_batch_replay_encodable(batch):
+            raise ValueError("leaf_count and proof indices must be unsigned 64-bit integers")
+        binding = ReplayBinding(
+            session_id,
+            _bound_range_set_batch_replay_digest(batch, root, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        batch: BoundRangeSetBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch/root.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``.
+        The id is claimed atomically before the digest/expiry work and
+        the delegated verification, so among concurrent calls for the
+        same id at most one can return ``True``. The digest is
+        recomputed over the presented ``batch`` / ``root``; for a
+        binding with an expiry, ``now >= expires_at`` makes the check
+        fail (``now`` defaults to the current Unix seconds and must
+        otherwise be a non-``bool`` uint64). Only then is the
+        batch/root handed to :func:`verify_range_set_batch_bound`,
+        under that function's root and structure contract (outer root
+        first, then the inner range set batch).
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, a wrong root
+        or :func:`verify_range_set_batch_bound` returning ``False`` for
+        the root or the inner batch) returns ``False``, releases the
+        claim and leaves the registration pending, so a rejected id can
+        succeed on a later attempt. An exception escaping the
+        delegated verification likewise releases the claim and then
+        propagates unchanged, leaving the id usable; a database error
+        restores the claim before it propagates. With a store backend,
+        only the holder of the current claim token can consume the id
+        (an expired claim may be taken over by a later equal
+        ``check``); a stale token neither consumes nor restores
+        anything. Verification runs without any lock or transaction
+        held, so other ids are never serialized. Argument type errors
+        (including ``bool`` integers) raise :class:`TypeError`; an
+        out-of-range ``now`` raises :class:`ValueError`. Inputs are
+        never mutated.
+        """
+        _check_bound_range_set_batch_types(batch, root)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _bound_range_set_batch_replay_encodable(batch):
+            return False  # negative or oversized U-framed integers
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(batch, root, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_range_set_batch_replay_digest(batch, root, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_range_set_batch_bound(batch, root):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        batch: BoundRangeSetBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim
+        is taken over and issued a fresh random token); verification
+        runs with no transaction held; only the token returned by the
+        winning claim can consume the id, and every rejection, escaped
+        verification error or database error restores the id to pending
+        with that same token before propagating. A stale token (a claim
+        taken over while verification ran) neither consumes nor
+        restores anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                _bound_range_set_batch_replay_digest(batch, root, session_id, binding.expires_at),
+            ):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_range_set_batch_bound(batch, root):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

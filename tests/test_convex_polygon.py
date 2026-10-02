@@ -1,16 +1,26 @@
 import dataclasses
+import hashlib
+import os
+import sqlite3
+import tempfile
+import threading
 import unittest
 
 from zkregion import (
     BoundConvexPolygonBatch,
+    BoundConvexPolygonReplayGuard,
     ConvexPolygonBatchEntry,
+    ConvexPolygonBatchReplayGuard,
     ConvexPolygonProofBundle,
     ConvexPolygonRegion,
     ConvexPolygonRegionProof,
+    ConvexPolygonReplayGuard,
     DEFAULT_PRIME,
     MerkleMultiProof,
     PedersenCommitment,
     RangeProof,
+    ReplayBinding,
+    SQLiteReplayStore,
     WideRangeProof,
     _bound_convex_polygon_leaf,
     _edge_offset_upper,
@@ -2434,6 +2444,1908 @@ class ProveConvexPolygonBatchBoundTest(unittest.TestCase):
             prove_convex_polygon_batch_bound(
                 entries, randbelow=lambda _: DEFAULT_PRIME
             )
+
+
+# --- replay guards -----------------------------------------------------------
+
+
+def replay_entry(
+    x=1,
+    y=2,
+    vertices=TRIANGLE,
+    context=b"ctx",
+    x_blinding=1234,
+    y_blinding=4321,
+):
+    """A valid ConvexPolygonBatchEntry with deterministic proof randomness."""
+    polygon = ConvexPolygonRegion(vertices)
+    cx, rx = pedersen_commit(
+        x, polygon.min_x, polygon.max_x, blinding=x_blinding
+    )
+    cy, ry = pedersen_commit(
+        y, polygon.min_y, polygon.max_y, blinding=y_blinding
+    )
+    proof = prove_convex_polygon(
+        cx, cy, x, y, rx, ry, polygon, context, randbelow=DetRand()
+    )
+    return ConvexPolygonBatchEntry(cx, cy, polygon, proof, context)
+
+
+def forged_replay_entry(entry):
+    # a proof whose first edge proof is replaced by constants: digests frame
+    # it, but the convex polygon verification rejects it
+    edge = entry.proof.edge_proofs[0]
+    forged_edge = WideRangeProof(
+        commitments=tuple(5 for _ in edge.commitments),
+        challenges=tuple((1, 2) for _ in edge.challenges),
+        responses=tuple((3, 4) for _ in edge.responses),
+    )
+    forged_proof = ConvexPolygonRegionProof(
+        entry.proof.x_proof,
+        entry.proof.y_proof,
+        (forged_edge,) + entry.proof.edge_proofs[1:],
+    )
+    return dataclasses.replace(entry, proof=forged_proof)
+
+
+def forged_polygon_entry(entry):
+    # well-typed but geometrically invalid vertices cannot be framed into a
+    # leaf (canonicalization raises ValueError)
+    forged = object.__new__(ConvexPolygonRegion)
+    object.__setattr__(forged, "vertices", ((0, 0), (1, 1), (2, 2), (3, 3)))
+    return dataclasses.replace(entry, polygon=forged)
+
+
+def build_bound_batch(entries):
+    leaves = [_bound_convex_polygon_leaf(entry) for entry in entries]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+    return BoundConvexPolygonBatch(tuple(entries), len(entries), proof), root
+
+
+def _F(item):
+    return len(item).to_bytes(4, "big") + item
+
+
+def _U(value):
+    return value.to_bytes(8, "big")
+
+
+def _S(sequence, transform):
+    return _F(_U(len(sequence))) + b"".join(
+        _F(transform(item)) for item in sequence
+    )
+
+
+def _E(expires_at):
+    if expires_at is None:
+        return b"\x00"
+    return b"\x01" + expires_at.to_bytes(8, "big")
+
+
+class _ReplayGuardStoreMixin:
+    """Shared SQLite fixtures for the convex polygon replay guard tests."""
+
+    DOMAIN = None
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "convex-replay.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+
+class ConvexPolygonReplayGuardTest(_ReplayGuardStoreMixin, unittest.TestCase):
+    """Single-use replay bindings for one convex polygon batch entry."""
+
+    DOMAIN = b"zr/cpr/v1"
+    DELEGATE = "verify_convex_polygon"
+
+    def guard(self, **kwargs):
+        return ConvexPolygonReplayGuard(**kwargs)
+
+    def entry(self, **kwargs):
+        return replay_entry(**kwargs)
+
+    def expected_digest(self, entry, session_id, expires_at=None):
+        material = (
+            _F(b"zr/cpr/v1")
+            + _F(session_id)
+            + _bound_convex_polygon_leaf(entry)
+            + _F(_E(expires_at))
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(entry, b"s1"))
+        binding = guard.bind_once(entry, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(binding.digest, self.expected_digest(entry, b"s2", 1000))
+
+    def test_digest_uses_existing_leaf_bytes(self):
+        import zkregion
+
+        entry = self.entry()
+        binding = self.guard().bind_once(entry, b"s")
+        self.assertEqual(
+            binding.digest,
+            zkregion._convex_polygon_replay_digest(entry, b"s", None),
+        )
+        # the per-item leaf bytes are byte for byte the complete-batch leaf
+        self.assertEqual(
+            _bound_convex_polygon_leaf(entry),
+            zkregion._bound_convex_polygon_leaf(entry),
+        )
+
+    def test_digest_domain_is_distinct(self):
+        entry = self.entry()
+        binding = self.guard().bind_once(entry, b"s")
+        framing = (
+            _F(b"s") + _bound_convex_polygon_leaf(entry) + _F(b"\x00")
+        )
+        for other_domain in (
+            b"zr/cpbr/v1",
+            b"zr/bcpr/v1",
+            b"zr/rwr/v1",
+            b"zr/rg/v1",
+            b"zkregion/convex-polygon-bound/v1",
+        ):
+            foreign = hashlib.sha256(_F(other_domain) + framing).digest()
+            self.assertNotEqual(binding.digest, foreign)
+
+    def test_digest_binds_every_component(self):
+        entry = self.entry()
+        guard = self.guard()
+        base = guard.bind_once(entry, b"s")
+        self.assertNotEqual(base.digest, self.expected_digest(entry, b"other"))
+        self.assertNotEqual(base.digest, self.expected_digest(entry, b"s", 1))
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(dataclasses.replace(entry, context=b"other"), b"s"),
+        )
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(
+                dataclasses.replace(
+                    entry, polygon=ConvexPolygonRegion(((0, 0), (5, 0), (0, 5)))
+                ),
+                b"s",
+            ),
+        )
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(
+                dataclasses.replace(
+                    entry,
+                    x_commitment=dataclasses.replace(
+                        entry.x_commitment, element=entry.x_commitment.element + 1
+                    ),
+                ),
+                b"s",
+            ),
+        )
+        self.assertNotEqual(
+            base.digest,
+            self.expected_digest(forged_replay_entry(entry), b"s"),
+        )
+
+    def test_rotation_and_reversal_bind_identically(self):
+        entry = self.entry()
+        rotated = dataclasses.replace(
+            entry, polygon=ConvexPolygonRegion(((4, 0), (0, 4), (0, 0)))
+        )
+        reversed_ = dataclasses.replace(
+            entry, polygon=ConvexPolygonRegion(((0, 0), (0, 4), (4, 0)))
+        )
+        base = self.guard().bind_once(entry, b"s")
+        self.assertEqual(base.digest, self.guard().bind_once(rotated, b"s").digest)
+        self.assertEqual(base.digest, self.guard().bind_once(reversed_, b"s").digest)
+        # and the rotated entry passes the same binding's check
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"r")
+        self.assertTrue(guard.check(rotated, binding, now=1))
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        entry = self.entry()
+        no_expiry = self.guard().bind_once(entry, b"s")
+        with_expiry = self.guard().bind_once(entry, b"s", expires_at=0)
+        later = self.guard().bind_once(entry, b"s", expires_at=1)
+        self.assertNotEqual(no_expiry.digest, with_expiry.digest)
+        self.assertNotEqual(with_expiry.digest, later.digest)
+
+    def test_pending_id_cannot_be_rebound(self):
+        entry = self.entry()
+        guard = self.guard()
+        guard.bind_once(entry, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding, now=1))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        entry = self.entry()
+        guard = self.guard()
+        first = guard.bind_once(entry, b"s1")
+        second = guard.bind_once(entry, b"s2")
+        self.assertNotEqual(first, second)
+        self.assertTrue(guard.check(entry, first, now=1))
+        self.assertTrue(guard.check(entry, second, now=1))
+
+    # ---- bind argument validation -------------------------------------------
+
+    def test_bind_once_type_errors(self):
+        entry = self.entry()
+        guard = self.guard()
+        for bad in ("entry", 7, None, entry.proof, entry.polygon):
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entry, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entry, b"s", expires_at=bad)
+        with self.assertRaises(TypeError):
+            ConvexPolygonReplayGuard(store=object())
+
+    def test_bind_once_nested_type_errors(self):
+        entry = self.entry()
+        guard = self.guard()
+        x_proof = entry.proof.x_proof
+        edge = entry.proof.edge_proofs[0]
+        bad_entries = [
+            dataclasses.replace(entry, x_commitment="c"),
+            dataclasses.replace(entry, y_commitment=object()),
+            dataclasses.replace(
+                entry,
+                x_commitment=dataclasses.replace(entry.x_commitment, element=True),
+            ),
+            dataclasses.replace(entry, polygon="p"),
+            dataclasses.replace(entry, proof="p"),
+            dataclasses.replace(
+                entry,
+                proof=dataclasses.replace(
+                    entry.proof,
+                    x_proof=dataclasses.replace(x_proof, t=list(x_proof.t)),
+                ),
+            ),
+            dataclasses.replace(
+                entry,
+                proof=dataclasses.replace(
+                    entry.proof,
+                    x_proof=dataclasses.replace(
+                        x_proof, s=x_proof.s[:-1] + (True,)
+                    ),
+                ),
+            ),
+            dataclasses.replace(
+                entry,
+                proof=dataclasses.replace(entry.proof, edge_proofs=list(entry.proof.edge_proofs)),
+            ),
+            dataclasses.replace(
+                entry,
+                proof=dataclasses.replace(
+                    entry.proof,
+                    edge_proofs=(
+                        dataclasses.replace(edge, commitments=list(edge.commitments)),
+                    )
+                    + entry.proof.edge_proofs[1:],
+                ),
+            ),
+            dataclasses.replace(
+                entry,
+                proof=dataclasses.replace(
+                    entry.proof,
+                    edge_proofs=(
+                        dataclasses.replace(
+                            edge,
+                            responses=edge.responses[:-1] + ((1, "x"),),
+                        ),
+                    )
+                    + entry.proof.edge_proofs[1:],
+                ),
+            ),
+            dataclasses.replace(entry, context="ctx"),
+            dataclasses.replace(entry, context=bytearray(b"ctx")),
+        ]
+        for bad_entry in bad_entries:
+            with self.assertRaises(TypeError, msg=repr(bad_entry)):
+                guard.bind_once(bad_entry, b"s")
+
+    def test_bind_once_value_errors(self):
+        entry = self.entry()
+        guard = self.guard()
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"")
+        for bad in (-1, 2**64):
+            with self.assertRaises(ValueError):
+                guard.bind_once(entry, b"s", expires_at=bad)
+        # a forged polygon with well-typed but invalid vertices cannot be framed
+        with self.assertRaises(ValueError):
+            guard.bind_once(forged_polygon_entry(entry), b"s")
+
+    # ---- honest check and single use ----------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entry, binding, now=999))
+        # the consumed id is rejected and cannot be replayed
+        self.assertFalse(guard.check(entry, binding, now=999))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+
+    def test_check_without_expiry_ignores_now(self):
+        for now in (0, 2**64 - 1):
+            entry = self.entry()
+            guard = self.guard()
+            binding = guard.bind_once(entry, b"s")
+            self.assertTrue(guard.check(entry, binding, now=now))
+
+    def test_check_with_default_now(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        self.assertTrue(guard.check(entry, binding))
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s", expires_at=10**12)
+        self.assertTrue(guard.check(entry, binding))
+
+    def test_expiry_boundary_is_inclusive(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s1", expires_at=1000)
+        self.assertTrue(guard.check(entry, binding, now=999))
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s2", expires_at=1000)
+        self.assertFalse(guard.check(entry, binding, now=1000))
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s3", expires_at=1000)
+        self.assertFalse(guard.check(entry, binding, now=1001))
+
+    # ---- rejection never consumes -------------------------------------------
+
+    def test_expired_rejection_does_not_consume(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s", expires_at=1000)
+        self.assertFalse(guard.check(entry, binding, now=2000))
+        # still pending: an earlier clock succeeds and consumes it
+        self.assertTrue(guard.check(entry, binding, now=999))
+        self.assertFalse(guard.check(entry, binding, now=999))
+
+    def test_bad_proof_rejection_does_not_consume(self):
+        forged = forged_replay_entry(self.entry())
+        guard = self.guard()
+        binding = guard.bind_once(forged, b"s")
+        self.assertFalse(guard.check(forged, binding, now=1))
+        # id still pending — rebinding is still refused while it waits
+        with self.assertRaises(ValueError):
+            guard.bind_once(forged, b"s")
+        self.assertIn(b"s", guard._pending)
+
+    def test_forged_polygon_check_returns_false_without_consuming(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        forged = forged_polygon_entry(entry)
+        self.assertFalse(guard.check(forged, binding, now=1))
+        self.assertIn(b"s", guard._pending)
+        # the originally bound entry still verifies once
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    def test_entry_mismatch_rejection_does_not_consume(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        changed = (
+            dataclasses.replace(entry, context=b"other"),
+            dataclasses.replace(
+                entry, polygon=ConvexPolygonRegion(((0, 0), (5, 0), (0, 5)))
+            ),
+            forged_replay_entry(entry),
+        )
+        for changed_entry in changed:
+            self.assertFalse(guard.check(changed_entry, binding, now=1))
+        # the originally bound entry still verifies once
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    def test_unknown_or_foreign_binding_rejected(self):
+        entry = self.entry()
+        guard = self.guard()
+        guard.bind_once(entry, b"local")
+        # an equal binding built elsewhere verifies (bindings compare by
+        # value), but an id never registered in this guard does not
+        foreign = self.guard().bind_once(entry, b"elsewhere")
+        self.assertFalse(guard.check(entry, foreign, now=1))
+        equal = self.guard().bind_once(entry, b"local")
+        self.assertTrue(guard.check(entry, equal, now=1))
+        unknown = ReplayBinding(b"never-bound", b"\x00" * 32)
+        self.assertFalse(guard.check(entry, unknown, now=1))
+
+    def test_unequal_binding_rejected_without_consuming(self):
+        entry = self.entry()
+        guard = self.guard()
+        guard.bind_once(entry, b"s")
+        forged_digest = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(guard.check(entry, forged_digest, now=1))
+        forged_expiry = ReplayBinding(b"s", self.expected_digest(entry, b"s", 1), 1)
+        self.assertFalse(guard.check(entry, forged_expiry, now=0))
+
+    def test_cross_guard_binding_rejected(self):
+        # a batch or bound convex polygon binding for the same id is not a
+        # single-entry convex polygon binding
+        entry = self.entry()
+        batch_binding = ConvexPolygonBatchReplayGuard().bind_once([entry], b"s")
+        bound, root = build_bound_batch([entry])
+        bound_binding = BoundConvexPolygonReplayGuard().bind_once(bound, root, b"s")
+        guard = self.guard()
+        single_binding = guard.bind_once(entry, b"s")
+        self.assertFalse(guard.check(entry, batch_binding, now=1))
+        self.assertFalse(guard.check(entry, bound_binding, now=1))
+        self.assertNotEqual(batch_binding.digest, single_binding.digest)
+        self.assertNotEqual(bound_binding.digest, single_binding.digest)
+
+    # ---- check argument validation ------------------------------------------
+
+    def test_check_type_errors(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        for bad in ("entry", 7, None, entry.proof, entry.polygon):
+            with self.assertRaises(TypeError):
+                guard.check(bad, binding, now=1)
+        for bad in ("binding", 7, None, (b"s", binding.digest)):
+            with self.assertRaises(TypeError):
+                guard.check(entry, bad, now=1)
+        for bad in (True, False, 1.5, "1", b"1"):
+            with self.assertRaises(TypeError):
+                guard.check(entry, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        for bad in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                guard.check(entry, binding, now=bad)
+
+    def test_instances_are_independent(self):
+        entry = self.entry()
+        first = self.guard()
+        second = self.guard()
+        binding = first.bind_once(entry, b"s")
+        self.assertFalse(second.check(entry, binding, now=1))
+        # the rejected foreign check did not touch the first guard
+        self.assertTrue(first.check(entry, binding, now=1))
+
+    def test_inputs_are_not_mutated(self):
+        entry = self.entry()
+        guard = self.guard()
+        snapshot = dataclasses.replace(entry)
+        binding = guard.bind_once(entry, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        guard.check(entry, binding, now=1)
+        self.assertEqual(entry, snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+    def test_delegation_error_restores_pending_in_memory(self):
+        import zkregion
+
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        original = getattr(zkregion, self.DELEGATE)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        setattr(zkregion, self.DELEGATE, boom)
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entry, binding, now=1)
+        finally:
+            setattr(zkregion, self.DELEGATE, original)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+
+    # ---- concurrency ---------------------------------------------------------
+
+    def test_concurrent_checks_have_exactly_one_winner(self):
+        entry = self.entry()
+        guard = self.guard()
+        binding = guard.bind_once(entry, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = guard.check(entry, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+
+    def test_a_slow_check_of_one_id_does_not_serialize_other_ids(self):
+        import zkregion
+
+        slow_entry = self.entry(context=b"slow")
+        fast_entry = self.entry(context=b"fast")
+        guard = self.guard()
+        slow_binding = guard.bind_once(slow_entry, b"slow")
+        fast_binding = guard.bind_once(fast_entry, b"fast")
+        entered = threading.Event()
+        release = threading.Event()
+        original = getattr(zkregion, self.DELEGATE)
+
+        def staged(x_commitment, y_commitment, polygon, proof, context=b""):
+            if context == b"slow":
+                entered.set()
+                release.wait(timeout=5)
+                return True
+            return original(x_commitment, y_commitment, polygon, proof, context)
+
+        setattr(zkregion, self.DELEGATE, staged)
+        try:
+            slow_thread = threading.Thread(
+                target=lambda: guard.check(slow_entry, slow_binding, now=1)
+            )
+            slow_thread.start()
+            self.assertTrue(entered.wait(timeout=5))
+            # the slow id is mid-delegation; the other id must still complete
+            self.assertTrue(guard.check(fast_entry, fast_binding, now=1))
+            release.set()
+            slow_thread.join()
+        finally:
+            setattr(zkregion, self.DELEGATE, original)
+        self.assertFalse(guard.check(fast_entry, fast_binding, now=1))
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        entry = self.entry()
+        store = self.make_store()
+        binder = self.guard(store=store)
+        binding = binder.bind_once(entry, b"s", expires_at=1000)
+        checker = self.guard(store=store)
+        self.assertTrue(checker.check(entry, binding, now=999))
+        self.assertFalse(binder.check(entry, binding, now=999))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        entry = self.entry()
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(entry, b"s")
+        store.close()
+        reopened = self.make_store()
+        guard = self.guard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entry, binding, now=1))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = self.guard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(entry, b"s")
+        reopened_again.close()
+
+    def test_store_rows_use_the_cpr_domain(self):
+        entry = self.entry()
+        store = self.make_store()
+        self.guard(store=store).bind_once(entry, b"s")
+        domains = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(domains[(self.DOMAIN, b"s")], "pending")
+        store.close()
+
+    def test_store_domain_isolation_between_the_three_guard_kinds(self):
+        entry = self.entry()
+        bound, root = build_bound_batch([entry])
+        store = self.make_store()
+        single = ConvexPolygonReplayGuard(store=store)
+        batch_guard = ConvexPolygonBatchReplayGuard(store=store)
+        bound_guard = BoundConvexPolygonReplayGuard(store=store)
+        single_binding = single.bind_once(entry, b"same-id")
+        batch_binding = batch_guard.bind_once([entry], b"same-id")
+        bound_binding = bound_guard.bind_once(bound, root, b"same-id")
+        digests = {
+            single_binding.digest, batch_binding.digest, bound_binding.digest
+        }
+        self.assertEqual(len(digests), 3)
+        self.assertTrue(single.check(entry, single_binding, now=1))
+        self.assertTrue(
+            batch_guard.check([entry], batch_binding, now=1, randbelow=DetRand())
+        )
+        self.assertTrue(
+            bound_guard.check(bound, root, bound_binding, now=1, randbelow=DetRand())
+        )
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertEqual(domains, {b"zr/cpr/v1", b"zr/cpbr/v1", b"zr/bcpr/v1"})
+        store.close()
+
+    def test_store_namespace_isolation(self):
+        entry = self.entry()
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        binding_a = self.guard(store=first).bind_once(entry, b"s")
+        self.assertFalse(self.guard(store=second).check(entry, binding_a, now=1))
+        self.assertTrue(self.guard(store=first).check(entry, binding_a, now=1))
+        first.close()
+        second.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        entry = self.entry()
+        forged = forged_replay_entry(entry)
+        store = self.make_store()
+        binder = self.guard(store=store)
+        binding = binder.bind_once(entry, b"s")
+        checker = self.guard(store=store)
+        self.assertFalse(checker.check(forged, binding, now=1))
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(self.guard(store=store).check(entry, binding, now=1))
+        store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        entry = self.entry()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        guard = self.guard(store=store)
+        binding = guard.bind_once(entry, b"s")
+        view = store._view(self.DOMAIN)
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+        token = view.claim(b"s", binding)
+        self.assertIsNotNone(token)
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+        clock["t"] = 2000
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+        new_token = view.claim(b"s", binding)
+        self.assertTrue(view.commit(b"s", new_token))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entry, b"s")
+        store.close()
+
+    def test_store_lease_takeover_tokens(self):
+        entry = self.entry()
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        binding = self.guard(store=store).bind_once(entry, b"s")
+        view = store._view(self.DOMAIN)
+        old_token = view.claim(b"s", binding)
+        self.assertIsNotNone(old_token)
+        self.assertIsNone(view.claim(b"s", binding))
+        clock["t"] = 1011
+        new_token = view.claim(b"s", binding)
+        self.assertIsNotNone(new_token)
+        self.assertNotEqual(old_token, new_token)
+        self.assertFalse(view.commit(b"s", old_token))
+        self.assertFalse(view.release(b"s", old_token))
+        self.assertTrue(view.commit(b"s", new_token))
+        store.close()
+
+    def test_store_delegation_error_restores_pending(self):
+        import zkregion
+
+        entry = self.entry()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        binding = guard.bind_once(entry, b"s")
+        original = getattr(zkregion, self.DELEGATE)
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        setattr(zkregion, self.DELEGATE, boom)
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entry, binding, now=1)
+        finally:
+            setattr(zkregion, self.DELEGATE, original)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(self.guard(store=store).check(entry, binding, now=1))
+        store.close()
+
+    def test_store_sqlite_errors_propagate(self):
+        entry = self.entry()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        guard.bind_once(entry, b"s")
+        store._connection.execute("DROP TABLE replay_sessions_v1")
+        with self.assertRaises(sqlite3.Error):
+            guard.check(entry, ReplayBinding(b"s", b"\x00" * 32), now=1)
+        store.close()
+
+    def test_store_concurrent_checks_have_exactly_one_winner(self):
+        entry = self.entry()
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(entry, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = self.guard(store=store).check(entry, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+        store.close()
+
+
+class ConvexPolygonBatchReplayGuardTest(_ReplayGuardStoreMixin, unittest.TestCase):
+    """Single-use replay bindings for batches of convex polygon entries."""
+
+    DOMAIN = b"zr/cpbr/v1"
+    DELEGATE = "verify_convex_polygon_batch"
+
+    def setUp(self):
+        super().setUp()
+        self.entries = self.make_entries()
+
+    def guard(self, **kwargs):
+        return ConvexPolygonBatchReplayGuard(**kwargs)
+
+    def make_entries(self):
+        return [
+            replay_entry(1, 2, context=b"a", x_blinding=1001, y_blinding=2001),
+            replay_entry(3, 0, context=b"b", x_blinding=1002, y_blinding=2002),
+            replay_entry(
+                0, 3,
+                vertices=((0, 0), (5, 0), (6, 4), (2, 6), (-2, 3)),
+                context=b"c", x_blinding=1003, y_blinding=2003,
+            ),
+        ]
+
+    def expected_digest(self, entries, session_id, expires_at=None):
+        material = (
+            _F(b"zr/cpbr/v1")
+            + _F(session_id)
+            + _S(entries, _bound_convex_polygon_leaf)
+            + _F(_E(expires_at))
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(entries, b"s1"))
+        binding = guard.bind_once(entries, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(entries, b"s2", 1000)
+        )
+
+    def test_digest_uses_existing_leaf_bytes(self):
+        import zkregion
+
+        entries = self.entries
+        binding = self.guard().bind_once(entries, b"s")
+        self.assertEqual(
+            binding.digest,
+            zkregion._convex_polygon_batch_replay_digest(entries, b"s", None),
+        )
+        for entry in entries:
+            self.assertEqual(
+                _bound_convex_polygon_leaf(entry),
+                zkregion._bound_convex_polygon_leaf(entry),
+            )
+
+    def test_tuple_and_list_inputs_frame_identically(self):
+        entries = self.entries
+        from_list = self.guard().bind_once(list(entries), b"s")
+        from_tuple = self.guard().bind_once(tuple(entries), b"s")
+        self.assertEqual(from_list.digest, from_tuple.digest)
+        self.assertEqual(from_list, from_tuple)
+
+    def test_batch_order_and_duplicates_are_preserved(self):
+        entries = self.entries
+        base = self.guard().bind_once(entries, b"s")
+
+        def bind(batch):
+            return self.guard().bind_once(batch, b"s").digest
+
+        self.assertNotEqual(base.digest, bind(entries[::-1]))
+        self.assertNotEqual(base.digest, bind(entries[:-1]))
+        self.assertNotEqual(base.digest, bind([entries[0], entries[0]]))
+        self.assertEqual(base.digest, bind(list(entries)))
+
+    def test_domain_separator_is_distinct(self):
+        entries = self.entries
+        binding = self.guard().bind_once(entries, b"s")
+        framing = _F(b"s") + _S(entries, _bound_convex_polygon_leaf) + _F(b"\x00")
+        for other_domain in (
+            b"zr/cpr/v1",
+            b"zr/bcpr/v1",
+            b"zr/rwbr/v1",
+            b"zr/rgbr/v1",
+            b"zkregion/convex-polygon-bound/v1",
+        ):
+            foreign = hashlib.sha256(_F(other_domain) + framing).digest()
+            self.assertNotEqual(binding.digest, foreign)
+
+    def test_digest_binds_every_component(self):
+        entries = self.entries
+
+        def bind(batch=entries, s=b"s", **kw):
+            return self.guard().bind_once(batch, s, **kw).digest
+
+        base = bind()
+        self.assertNotEqual(base, bind(s=b"other"))
+        self.assertNotEqual(base, bind(expires_at=1))
+        self.assertNotEqual(bind(expires_at=1), bind(expires_at=2))
+        entry = entries[1]
+        self.assertNotEqual(
+            base,
+            bind([entries[0], dataclasses.replace(entry, context=b"x"), entries[2]]),
+        )
+        self.assertNotEqual(
+            base,
+            bind([
+                entries[0],
+                dataclasses.replace(
+                    entry, polygon=ConvexPolygonRegion(((0, 0), (5, 0), (0, 5)))
+                ),
+                entries[2],
+            ]),
+        )
+        self.assertNotEqual(base, bind([forged_replay_entry(entries[0])] + entries[1:]))
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        entries = self.entries
+        none_binding = self.guard().bind_once(entries, b"a")
+        zero_binding = self.guard().bind_once(entries, b"b", expires_at=0)
+        one_binding = self.guard().bind_once(entries, b"c", expires_at=1)
+        digests = {none_binding.digest, zero_binding.digest, one_binding.digest}
+        self.assertEqual(len(digests), 3)
+
+    # ---- bind_once state and validation -------------------------------------
+
+    def test_empty_batch_rejected(self):
+        for empty in ((), []):
+            with self.assertRaises(ValueError):
+                self.guard().bind_once(empty, b"s")
+
+    def test_pending_id_cannot_be_rebound(self):
+        entries = self.entries
+        guard = self.guard()
+        guard.bind_once(entries, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_claimed_id_cannot_be_rebound(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard._registry.claim(b"s", binding))
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        entries = self.entries
+        guard = self.guard()
+        first = guard.bind_once(entries, b"s1")
+        second = guard.bind_once(entries, b"s2")
+        self.assertTrue(guard.check(entries, first, now=1, randbelow=DetRand()))
+        self.assertFalse(guard.check(entries, first, now=1, randbelow=DetRand()))
+        self.assertTrue(guard.check(entries, second, now=1, randbelow=DetRand()))
+
+    def test_bind_type_errors(self):
+        entries = self.entries
+        guard = self.guard()
+        for bad in (b"abc", bytearray(b"abc"), "abc", 7, None, True, object(), 1.5):
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once(bad, b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once([entries[0], 42], b"s")
+        with self.assertRaises(TypeError):
+            guard.bind_once([("a", "b")], b"s")
+        entry = entries[0]
+        bad_fields = [
+            dataclasses.replace(entry, x_commitment="c"),
+            dataclasses.replace(
+                entry,
+                y_commitment=dataclasses.replace(entry.y_commitment, h=True),
+            ),
+            dataclasses.replace(entry, polygon="p"),
+            dataclasses.replace(entry, proof=object()),
+            dataclasses.replace(entry, context=bytearray(b"a")),
+        ]
+        for bad in bad_fields:
+            with self.assertRaises(TypeError, msg=repr(bad)):
+                guard.bind_once([entries[1], bad], b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entries, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(entries, b"x", expires_at=bad)
+        with self.assertRaises(TypeError):
+            ConvexPolygonBatchReplayGuard(store=object())
+
+    def test_bind_value_errors(self):
+        entries = self.entries
+        with self.assertRaises(ValueError):
+            self.guard().bind_once(entries, b"")
+        for bad_expiry in (-1, 2**64, 2**64 + 1):
+            with self.assertRaises(ValueError):
+                self.guard().bind_once(entries, b"s", expires_at=bad_expiry)
+        # a forged polygon with well-typed but invalid vertices cannot be framed
+        with self.assertRaises(ValueError):
+            self.guard().bind_once(
+                [forged_polygon_entry(entries[0])], b"s"
+            )
+
+    # ---- check: accept, reject, consume -------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entries, binding, now=999, randbelow=DetRand()))
+        self.assertFalse(guard.check(entries, binding, now=999, randbelow=DetRand()))
+        self.assertEqual(guard._consumed, {b"s"})
+        self.assertNotIn(b"s", guard._pending)
+
+    def test_check_with_default_now_and_randbelow(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding))
+
+    def test_check_without_expiry_ignores_now(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(
+            guard.check(entries, binding, now=2**64 - 1, randbelow=DetRand())
+        )
+
+    def test_expiry_boundary_is_inclusive(self):
+        entries = self.entries
+        for now in (1000, 1001, 2**64 - 1):
+            guard = self.guard()
+            binding = guard.bind_once(entries, b"s", expires_at=1000)
+            self.assertFalse(
+                guard.check(entries, binding, now=now, randbelow=DetRand())
+            )
+            self.assertIn(b"s", guard._pending)
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertTrue(guard.check(entries, binding, now=999, randbelow=DetRand()))
+
+    def test_empty_batch_check_returns_false_without_drawing(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertFalse(guard.check([], binding, now=1, randbelow=recording))
+        self.assertEqual(calls, [])
+        self.assertIn(b"s", guard._pending)
+
+    def test_wrong_batch_rejected_without_consuming(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertFalse(
+            guard.check(entries[::-1], binding, now=1, randbelow=DetRand())
+        )
+        self.assertFalse(
+            guard.check(entries[:-1], binding, now=1, randbelow=DetRand())
+        )
+        self.assertIn(b"s", guard._pending)
+        # the originally bound batch still verifies once
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+
+    def test_forged_entry_rejected_without_consuming(self):
+        entries = self.entries
+        forged = [forged_replay_entry(entries[0])] + entries[1:]
+        guard = self.guard()
+        binding = guard.bind_once(forged, b"s")
+        self.assertFalse(guard.check(forged, binding, now=1, randbelow=DetRand()))
+        self.assertIn(b"s", guard._pending)
+
+    def test_forged_polygon_entry_check_returns_false_without_consuming(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        forged = [forged_polygon_entry(entries[0])] + entries[1:]
+        self.assertFalse(guard.check(forged, binding, now=1, randbelow=DetRand()))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+
+    def test_unknown_or_unequal_binding_rejected(self):
+        entries = self.entries
+        guard = self.guard()
+        guard.bind_once(entries, b"s")
+        unknown = ReplayBinding(b"never-bound", b"\x00" * 32)
+        self.assertFalse(
+            guard.check(entries, unknown, now=1, randbelow=DetRand())
+        )
+        forged_digest = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(
+            guard.check(entries, forged_digest, now=1, randbelow=DetRand())
+        )
+        forged_expiry = ReplayBinding(
+            b"s", self.expected_digest(entries, b"s", 1), 1
+        )
+        self.assertFalse(
+            guard.check(entries, forged_expiry, now=0, randbelow=DetRand())
+        )
+        self.assertIn(b"s", guard._pending)
+
+    def test_deterministic_under_same_random_source(self):
+        entries = self.entries
+        results = []
+        for _ in range(2):
+            guard = self.guard()
+            binding = guard.bind_once(entries, b"s")
+            results.append(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        self.assertEqual(results, [True, True])
+
+    def test_randbelow_contract(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        with self.assertRaises(TypeError):
+            guard.check(entries, binding, now=1, randbelow=42)
+        with self.assertRaises(TypeError):
+            guard.check(entries, binding, now=1, randbelow=lambda _: "x")
+        # the escaped error leaves the id pending
+        self.assertIn(b"s", guard._pending)
+        with self.assertRaises(ValueError):
+            guard.check(
+                entries, binding, now=1, randbelow=lambda _: DEFAULT_PRIME
+            )
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+
+    def test_check_type_errors(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in ("entries", 7, None, b"x"):
+            with self.assertRaises(TypeError):
+                guard.check(bad, binding, now=1)
+        for bad in ("binding", 7, None):
+            with self.assertRaises(TypeError):
+                guard.check(entries, bad, now=1)
+        for bad in (True, False, 1.5, "1"):
+            with self.assertRaises(TypeError):
+                guard.check(entries, binding, now=bad)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        for bad in (-1, 2**64):
+            with self.assertRaises(ValueError):
+                guard.check(entries, binding, now=bad)
+
+    def test_instances_are_independent(self):
+        entries = self.entries
+        first = self.guard()
+        second = self.guard()
+        binding = first.bind_once(entries, b"s")
+        self.assertFalse(second.check(entries, binding, now=1, randbelow=DetRand()))
+        self.assertTrue(first.check(entries, binding, now=1, randbelow=DetRand()))
+
+    def test_inputs_are_not_mutated(self):
+        entries = self.entries
+        guard = self.guard()
+        snapshot = list(entries)
+        binding = guard.bind_once(entries, b"s")
+        guard.check(entries, binding, now=1, randbelow=DetRand())
+        self.assertEqual(entries, snapshot)
+        self.assertIsNot(entries, snapshot)
+
+    def test_delegation_error_restores_pending_in_memory(self):
+        import zkregion
+
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        original = getattr(zkregion, self.DELEGATE)
+
+        def boom(_entries, *, randbelow=None):
+            raise RuntimeError("boom")
+
+        setattr(zkregion, self.DELEGATE, boom)
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(entries, binding, now=1, randbelow=DetRand())
+        finally:
+            setattr(zkregion, self.DELEGATE, original)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+
+    # ---- concurrency ---------------------------------------------------------
+
+    def test_concurrent_checks_have_exactly_one_winner(self):
+        entries = self.entries
+        guard = self.guard()
+        binding = guard.bind_once(entries, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = guard.check(entries, binding, now=1, randbelow=DetRand())
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        entries = self.entries
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(entries, b"s", expires_at=1000)
+        checker = self.guard(store=store)
+        self.assertTrue(checker.check(entries, binding, now=999, randbelow=DetRand()))
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        entries = self.entries
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(entries, b"s")
+        store.close()
+        reopened = self.make_store()
+        guard = self.guard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = self.guard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(entries, b"s")
+        reopened_again.close()
+
+    def test_store_rows_use_the_cpbr_domain(self):
+        entries = self.entries
+        store = self.make_store()
+        self.guard(store=store).bind_once(entries, b"s")
+        domains = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(domains[(self.DOMAIN, b"s")], "pending")
+        store.close()
+
+    def test_store_domain_isolation_from_other_guard(self):
+        entries = self.entries
+        store = self.make_store()
+        guard = self.guard(store=store)
+        binding = guard.bind_once(entries, b"same-id")
+        # a ConvexPolygonReplayGuard row under b"zr/cpr/v1" with the same id
+        other_guard = ConvexPolygonReplayGuard(store=store)
+        other_binding = other_guard.bind_once(entries[0], b"same-id")
+        self.assertNotEqual(binding.digest, other_binding.digest)
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        self.assertTrue(other_guard.check(entries[0], other_binding, now=1))
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/cpr/v1", domains)
+        store.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        entries = self.entries
+        forged = [forged_replay_entry(entries[0])] + entries[1:]
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(entries, b"s")
+        checker = self.guard(store=store)
+        self.assertFalse(checker.check(forged, binding, now=1, randbelow=DetRand()))
+        self.assertIn(b"s", checker._pending)
+        self.assertTrue(
+            self.guard(store=store).check(entries, binding, now=1, randbelow=DetRand())
+        )
+        store.close()
+
+    def test_store_sqlite_errors_propagate(self):
+        entries = self.entries
+        store = self.make_store()
+        guard = self.guard(store=store)
+        guard.bind_once(entries, b"s")
+        store._connection.execute("DROP TABLE replay_sessions_v1")
+        with self.assertRaises(sqlite3.Error):
+            guard.check(entries, ReplayBinding(b"s", b"\x00" * 32), now=1)
+        store.close()
+
+    def test_store_concurrent_checks_have_exactly_one_winner(self):
+        entries = self.entries
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(entries, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = self.guard(store=store).check(
+                entries, binding, now=1, randbelow=DetRand()
+            )
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+        store.close()
+
+
+class BoundConvexPolygonReplayGuardTest(_ReplayGuardStoreMixin, unittest.TestCase):
+    """Single-use replay bindings for Merkle-bound convex polygon batches."""
+
+    DOMAIN = b"zr/bcpr/v1"
+    DELEGATE = "verify_convex_polygon_batch_bound"
+
+    def guard(self, **kwargs):
+        return BoundConvexPolygonReplayGuard(**kwargs)
+
+    def honest(self):
+        return build_bound_batch([
+            replay_entry(1, 2, context=b"a", x_blinding=11, y_blinding=21),
+            replay_entry(3, 0, context=b"b", x_blinding=12, y_blinding=22),
+            replay_entry(0, 3, context=b"c", x_blinding=13, y_blinding=23),
+        ])
+
+    def broken_inner_batch(self):
+        # honest outer leaves over a forged proof: the outer root checks, only
+        # verify_convex_polygon_batch rejects the inner batch
+        entries = [
+            replay_entry(1, 2, context=b"a", x_blinding=11, y_blinding=21),
+            replay_entry(3, 0, context=b"b", x_blinding=12, y_blinding=22),
+        ]
+        return build_bound_batch([forged_replay_entry(entries[0]), entries[1]])
+
+    @staticmethod
+    def expected_digest(batch, root, session_id, expires_at=None):
+        proof = batch.proof
+        material = (
+            _F(b"zr/bcpr/v1") + _F(session_id) + _F(root) + _F(_U(batch.leaf_count))
+        )
+        material += b"".join(
+            _F(_bound_convex_polygon_leaf(entry)) for entry in batch.entries
+        )
+        material += (
+            _F(_U(proof.leaf_count))
+            + _S(proof.indices, _U)
+            + _S(proof.siblings, lambda sibling: sibling)
+            + _F(_E(expires_at))
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(batch, root, b"s1"))
+        binding = guard.bind_once(batch, root, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(batch, root, b"s2", 1000)
+        )
+
+    def test_digest_uses_existing_leaf_bytes(self):
+        import zkregion
+
+        batch, root = self.honest()
+        binding = self.guard().bind_once(batch, root, b"s")
+        self.assertEqual(
+            binding.digest,
+            zkregion._bound_convex_polygon_replay_digest(batch, root, b"s", None),
+        )
+        for entry in batch.entries:
+            self.assertEqual(
+                _bound_convex_polygon_leaf(entry),
+                zkregion._bound_convex_polygon_leaf(entry),
+            )
+
+    def test_digest_domain_is_distinct(self):
+        batch, root = self.honest()
+        binding = self.guard().bind_once(batch, root, b"s")
+        proof = batch.proof
+        framing = (
+            _F(b"s") + _F(root) + _F(_U(batch.leaf_count))
+            + b"".join(
+                _F(_bound_convex_polygon_leaf(entry)) for entry in batch.entries
+            )
+            + _F(_U(proof.leaf_count))
+            + _S(proof.indices, _U)
+            + _S(proof.siblings, lambda sibling: sibling)
+            + _F(b"\x00")
+        )
+        for other_domain in (
+            b"zr/cpr/v1",
+            b"zr/cpbr/v1",
+            b"zr/brwr/v1",
+            b"zr/brg/v1",
+            b"zkregion/convex-polygon-bound/v1",
+        ):
+            foreign = hashlib.sha256(_F(other_domain) + framing).digest()
+            self.assertNotEqual(binding.digest, foreign)
+
+    def test_digest_binds_every_component(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        base = guard.bind_once(batch, root, b"s")
+        self.assertNotEqual(base.digest, self.expected_digest(batch, root, b"other"))
+        self.assertNotEqual(base.digest, self.expected_digest(batch, root, b"s", 1))
+        self.assertNotEqual(
+            base.digest, self.expected_digest(batch, b"\x00" * 32, b"s")
+        )
+        other_entries = (
+            dataclasses.replace(batch.entries[0], context=b"other"),
+        ) + batch.entries[1:]
+        other_batch = BoundConvexPolygonBatch(
+            other_entries, batch.leaf_count, batch.proof
+        )
+        self.assertNotEqual(
+            base.digest, self.expected_digest(other_batch, root, b"s")
+        )
+        replaced_proof = BoundConvexPolygonBatch(
+            batch.entries,
+            batch.leaf_count,
+            MerkleMultiProof(
+                batch.proof.leaf_count,
+                batch.proof.indices,
+                (b"\x00" * 32,),
+            ),
+        )
+        self.assertNotEqual(
+            base.digest, self.expected_digest(replaced_proof, root, b"s")
+        )
+        reordered = BoundConvexPolygonBatch(
+            batch.entries[::-1], batch.leaf_count, batch.proof
+        )
+        self.assertNotEqual(
+            base.digest, self.expected_digest(reordered, root, b"s")
+        )
+
+    def test_duplicate_entries_are_preserved(self):
+        entries = [
+            replay_entry(1, 2, context=b"a", x_blinding=11, y_blinding=21),
+        ]
+        duplicated, duplicated_root = build_bound_batch([entries[0], entries[0]])
+        guard = self.guard()
+        binding = guard.bind_once(duplicated, duplicated_root, b"s")
+        single, single_root = build_bound_batch([entries[0]])
+        rebound = guard.bind_once(single, single_root, b"t")
+        self.assertNotEqual(binding.digest, rebound.digest)
+        self.assertTrue(
+            guard.check(
+                duplicated, duplicated_root, binding, now=1, randbelow=DetRand()
+            )
+        )
+
+    def test_expiry_encodings_distinguish_presence_and_value(self):
+        batch, root = self.honest()
+        no_expiry = self.guard().bind_once(batch, root, b"s")
+        with_expiry = self.guard().bind_once(batch, root, b"s", expires_at=0)
+        later = self.guard().bind_once(batch, root, b"s", expires_at=1)
+        self.assertNotEqual(no_expiry.digest, with_expiry.digest)
+        self.assertNotEqual(with_expiry.digest, later.digest)
+
+    def test_pending_id_cannot_be_rebound(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        guard.bind_once(batch, root, b"s")
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_consumed_id_cannot_be_rebound(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding, now=1, randbelow=DetRand()))
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_distinct_session_ids_are_independent(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        first = guard.bind_once(batch, root, b"s1")
+        second = guard.bind_once(batch, root, b"s2")
+        self.assertTrue(guard.check(batch, root, first, now=1, randbelow=DetRand()))
+        self.assertTrue(guard.check(batch, root, second, now=1, randbelow=DetRand()))
+
+    # ---- bind argument validation -------------------------------------------
+
+    def test_bind_type_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        for bad in ("batch", 7, None, batch.entries, batch.proof):
+            with self.assertRaises(TypeError):
+                guard.bind_once(bad, root, b"s")
+        for bad in (bytearray(root), None, 7, "root"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, bad, b"s")
+        for bad in ("s", 7, None, bytearray(b"s")):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, root, bad)
+        for bad in (True, False, 1.5, "1000"):
+            with self.assertRaises(TypeError):
+                guard.bind_once(batch, root, b"s", expires_at=bad)
+        with self.assertRaises(TypeError):
+            BoundConvexPolygonReplayGuard(store=object())
+
+    def test_bind_nested_type_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        entries = batch.entries
+        proof = batch.proof
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConvexPolygonBatch(list(entries), 3, proof), root, b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConvexPolygonBatch(("x",) * 3, 3, proof), root, b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConvexPolygonBatch(entries, True, proof), root, b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConvexPolygonBatch(entries, 3.0, proof), root, b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConvexPolygonBatch(entries, 3, "proof"), root, b"s"
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConvexPolygonBatch(
+                    entries, 3, MerkleMultiProof(True, proof.indices, proof.siblings)
+                ),
+                root, b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConvexPolygonBatch(
+                    entries, 3, MerkleMultiProof(3, list(proof.indices), proof.siblings)
+                ),
+                root, b"s",
+            )
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConvexPolygonBatch(
+                    entries,
+                    3,
+                    MerkleMultiProof(3, proof.indices, list(proof.siblings)),
+                ),
+                root, b"s",
+            )
+        bad_entry = dataclasses.replace(entries[0], context="a")
+        with self.assertRaises(TypeError):
+            guard.bind_once(
+                BoundConvexPolygonBatch((bad_entry,) + entries[1:], 3, proof),
+                root, b"s",
+            )
+
+    def test_bind_value_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"")
+        for bad in (-1, 2**64):
+            with self.assertRaises(ValueError):
+                guard.bind_once(batch, root, b"s", expires_at=bad)
+        # U-framed integers must fit in uint64
+        with self.assertRaises(ValueError):
+            guard.bind_once(
+                BoundConvexPolygonBatch(batch.entries, -1, batch.proof), root, b"s"
+            )
+        with self.assertRaises(ValueError):
+            guard.bind_once(
+                BoundConvexPolygonBatch(
+                    batch.entries,
+                    batch.leaf_count,
+                    MerkleMultiProof(
+                        batch.proof.leaf_count, (2**64,) * 3, batch.proof.siblings
+                    ),
+                ),
+                root, b"s",
+            )
+        # a forged polygon with well-typed but invalid vertices cannot be framed
+        forged = forged_polygon_entry(batch.entries[0])
+        with self.assertRaises(ValueError):
+            guard.bind_once(
+                BoundConvexPolygonBatch(
+                    (forged,) + batch.entries[1:], batch.leaf_count, batch.proof
+                ),
+                root, b"s",
+            )
+
+    # ---- check: accept, reject, consume -------------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s", expires_at=1000)
+        self.assertTrue(guard.check(batch, root, binding, now=999, randbelow=DetRand()))
+        self.assertFalse(guard.check(batch, root, binding, now=999, randbelow=DetRand()))
+        self.assertEqual(guard._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard.bind_once(batch, root, b"s")
+
+    def test_check_with_default_now_and_randbelow(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertTrue(guard.check(batch, root, binding))
+
+    def test_wrong_root_rejected_without_consuming(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        other_root = b"\x00" * 32
+        # a different root is a digest mismatch against the original binding
+        self.assertFalse(
+            guard.check(batch, other_root, binding, now=1, randbelow=DetRand())
+        )
+        self.assertIn(b"s", guard._pending)
+        # and a binding made for the wrong root fails the root verification
+        wrong_binding = guard.bind_once(batch, other_root, b"s2")
+        self.assertFalse(
+            guard.check(batch, other_root, wrong_binding, now=1, randbelow=DetRand())
+        )
+        self.assertIn(b"s2", guard._pending)
+        self.assertTrue(guard.check(batch, root, binding, now=1, randbelow=DetRand()))
+
+    def test_tampered_merkle_proof_rejected(self):
+        batch, root = self.honest()
+        proof = batch.proof
+        tampered = BoundConvexPolygonBatch(
+            batch.entries,
+            batch.leaf_count,
+            MerkleMultiProof(proof.leaf_count, proof.indices, (b"\x00" * 32,)),
+        )
+        guard = self.guard()
+        binding = guard.bind_once(tampered, root, b"s")
+        self.assertFalse(
+            guard.check(tampered, root, binding, now=1, randbelow=DetRand())
+        )
+        self.assertIn(b"s", guard._pending)
+
+    def test_broken_inner_batch_rejected(self):
+        batch, root = self.broken_inner_batch()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        self.assertFalse(guard.check(batch, root, binding, now=1, randbelow=DetRand()))
+        self.assertIn(b"s", guard._pending)
+
+    def test_forged_polygon_entry_check_returns_false_without_consuming(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        forged = BoundConvexPolygonBatch(
+            (forged_polygon_entry(batch.entries[0]),) + batch.entries[1:],
+            batch.leaf_count,
+            batch.proof,
+        )
+        self.assertFalse(guard.check(forged, root, binding, now=1, randbelow=DetRand()))
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(batch, root, binding, now=1, randbelow=DetRand()))
+
+    def test_expiry_boundary_is_inclusive(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s1", expires_at=1000)
+        self.assertTrue(guard.check(batch, root, binding, now=999, randbelow=DetRand()))
+        for now in (1000, 1001):
+            guard = self.guard()
+            binding = guard.bind_once(batch, root, b"s2", expires_at=1000)
+            self.assertFalse(
+                guard.check(batch, root, binding, now=now, randbelow=DetRand())
+            )
+            self.assertIn(b"s2", guard._pending)
+
+    def test_unknown_or_unequal_binding_rejected(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        guard.bind_once(batch, root, b"s")
+        unknown = ReplayBinding(b"never-bound", b"\x00" * 32)
+        self.assertFalse(guard.check(batch, root, unknown, now=1, randbelow=DetRand()))
+        forged_digest = ReplayBinding(b"s", b"\x01" * 32)
+        self.assertFalse(
+            guard.check(batch, root, forged_digest, now=1, randbelow=DetRand())
+        )
+        forged_expiry = ReplayBinding(
+            b"s", self.expected_digest(batch, root, b"s", 1), 1
+        )
+        self.assertFalse(
+            guard.check(batch, root, forged_expiry, now=0, randbelow=DetRand())
+        )
+        self.assertIn(b"s", guard._pending)
+
+    def test_cross_guard_binding_rejected(self):
+        # a single-entry convex polygon binding for the same id is not a
+        # bound convex polygon binding
+        batch, root = self.honest()
+        single_binding = ConvexPolygonReplayGuard().bind_once(batch.entries[0], b"s")
+        guard = self.guard()
+        bound_binding = guard.bind_once(batch, root, b"s")
+        self.assertFalse(
+            guard.check(batch, root, single_binding, now=1, randbelow=DetRand())
+        )
+        self.assertNotEqual(single_binding.digest, bound_binding.digest)
+
+    def test_check_type_errors(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        for bad in ("batch", 7, None):
+            with self.assertRaises(TypeError):
+                guard.check(bad, root, binding, now=1)
+        for bad in (bytearray(root), None, 7):
+            with self.assertRaises(TypeError):
+                guard.check(batch, bad, binding, now=1)
+        for bad in ("binding", 7, None):
+            with self.assertRaises(TypeError):
+                guard.check(batch, root, bad, now=1)
+        for bad in (True, False, 1.5, "1"):
+            with self.assertRaises(TypeError):
+                guard.check(batch, root, binding, now=bad)
+        with self.assertRaises(TypeError):
+            guard.check(batch, root, binding, now=1, randbelow=42)
+
+    def test_check_now_out_of_range_is_a_value_error(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        for bad in (-1, 2**64):
+            with self.assertRaises(ValueError):
+                guard.check(batch, root, binding, now=bad)
+
+    def test_randbelow_contract(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        with self.assertRaises(TypeError):
+            guard.check(batch, root, binding, now=1, randbelow=lambda _: "x")
+        self.assertIn(b"s", guard._pending)
+        with self.assertRaises(ValueError):
+            guard.check(
+                batch, root, binding, now=1, randbelow=lambda _: DEFAULT_PRIME
+            )
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(batch, root, binding, now=1, randbelow=DetRand()))
+
+    def test_instances_are_independent(self):
+        batch, root = self.honest()
+        first = self.guard()
+        second = self.guard()
+        binding = first.bind_once(batch, root, b"s")
+        self.assertFalse(
+            second.check(batch, root, binding, now=1, randbelow=DetRand())
+        )
+        self.assertTrue(first.check(batch, root, binding, now=1, randbelow=DetRand()))
+
+    def test_inputs_are_not_mutated(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        snapshot = dataclasses.replace(batch)
+        binding = guard.bind_once(batch, root, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        guard.check(batch, root, binding, now=1, randbelow=DetRand())
+        self.assertEqual(batch, snapshot)
+        self.assertEqual(binding, binding_snapshot)
+
+    def test_delegation_error_restores_pending_in_memory(self):
+        import zkregion
+
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        original = getattr(zkregion, self.DELEGATE)
+
+        def boom(_batch, _root, *, randbelow=None):
+            raise RuntimeError("boom")
+
+        setattr(zkregion, self.DELEGATE, boom)
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(batch, root, binding, now=1, randbelow=DetRand())
+        finally:
+            setattr(zkregion, self.DELEGATE, original)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(batch, root, binding, now=1, randbelow=DetRand()))
+
+    # ---- concurrency ---------------------------------------------------------
+
+    def test_concurrent_checks_have_exactly_one_winner(self):
+        batch, root = self.honest()
+        guard = self.guard()
+        binding = guard.bind_once(batch, root, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = guard.check(batch, root, binding, now=1, randbelow=DetRand())
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+
+    # ---- SQLite backend ------------------------------------------------------
+
+    def test_store_check_accepts_across_independent_instances(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(batch, root, b"s", expires_at=1000)
+        checker = self.guard(store=store)
+        self.assertTrue(
+            checker.check(batch, root, binding, now=999, randbelow=DetRand())
+        )
+        states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        store.close()
+
+    def test_store_pending_and_consumed_persist_across_restart(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(batch, root, b"s")
+        store.close()
+        reopened = self.make_store()
+        guard = self.guard(store=reopened)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(batch, root, binding, now=1, randbelow=DetRand()))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard_again = self.guard(store=reopened_again)
+        self.assertEqual(guard_again._consumed, {b"s"})
+        with self.assertRaises(ValueError):
+            guard_again.bind_once(batch, root, b"s")
+        reopened_again.close()
+
+    def test_store_rows_use_the_bcpr_domain(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        self.guard(store=store).bind_once(batch, root, b"s")
+        domains = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+        self.assertEqual(domains[(self.DOMAIN, b"s")], "pending")
+        store.close()
+
+    def test_store_domain_isolation_from_other_guard(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        binding = guard.bind_once(batch, root, b"same-id")
+        # a ConvexPolygonBatchReplayGuard row under b"zr/cpbr/v1", same id
+        other_guard = ConvexPolygonBatchReplayGuard(store=store)
+        other_binding = other_guard.bind_once(list(batch.entries), b"same-id")
+        self.assertNotEqual(binding.digest, other_binding.digest)
+        self.assertTrue(guard.check(batch, root, binding, now=1, randbelow=DetRand()))
+        self.assertTrue(
+            other_guard.check(
+                list(batch.entries), other_binding, now=1, randbelow=DetRand()
+            )
+        )
+        domains = {row[1] for row in self.raw_rows()}
+        self.assertIn(self.DOMAIN, domains)
+        self.assertIn(b"zr/cpbr/v1", domains)
+        store.close()
+
+    def test_store_rejection_restores_pending_for_other_instance(self):
+        batch, root = self.broken_inner_batch()
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(batch, root, b"s")
+        checker = self.guard(store=store)
+        self.assertFalse(
+            checker.check(batch, root, binding, now=1, randbelow=DetRand())
+        )
+        self.assertIn(b"s", checker._pending)
+        store.close()
+
+    def test_store_sqlite_errors_propagate(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        guard = self.guard(store=store)
+        guard.bind_once(batch, root, b"s")
+        store._connection.execute("DROP TABLE replay_sessions_v1")
+        with self.assertRaises(sqlite3.Error):
+            guard.check(batch, root, ReplayBinding(b"s", b"\x00" * 32), now=1)
+        store.close()
+
+    def test_store_concurrent_checks_have_exactly_one_winner(self):
+        batch, root = self.honest()
+        store = self.make_store()
+        binding = self.guard(store=store).bind_once(batch, root, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = self.guard(store=store).check(
+                batch, root, binding, now=1, randbelow=DetRand()
+            )
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+        store.close()
 
 
 if __name__ == "__main__":

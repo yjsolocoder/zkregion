@@ -1,9 +1,13 @@
 import dataclasses
+import os
+import tempfile
+import threading
 import unittest
 
 from zkregion import (
     BoundConvexPolygonBatch,
     ConvexPolygonBatchEntry,
+    ConvexPolygonBatchReplayGuard,
     ConvexPolygonProofBundle,
     ConvexPolygonRegion,
     ConvexPolygonRegionProof,
@@ -11,6 +15,8 @@ from zkregion import (
     MerkleMultiProof,
     PedersenCommitment,
     RangeProof,
+    ReplayBinding,
+    SQLiteReplayStore,
     WideRangeProof,
     _bound_convex_polygon_leaf,
     _edge_offset_upper,
@@ -2434,6 +2440,347 @@ class ProveConvexPolygonBatchBoundTest(unittest.TestCase):
             prove_convex_polygon_batch_bound(
                 entries, randbelow=lambda _: DEFAULT_PRIME
             )
+
+
+class ConvexPolygonBatchReplayGuardTest(unittest.TestCase):
+    """End-to-end single-use semantics of ConvexPolygonBatchReplayGuard.
+
+    Real commitments and proofs are built through the public
+    ``pedersen_commit`` / ``prove_convex_polygon`` / ``ConvexPolygonBatchEntry``
+    entries, registered with ``bind_once`` and consumed through ``check``
+    against both the in-memory registry and the SQLiteReplayStore backend.
+    """
+
+    BACKENDS = ("memory", "store")
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._store_count = 0
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    @staticmethod
+    def entry(x, y, context):
+        polygon = ConvexPolygonRegion(TRIANGLE)
+        cx, rx = pedersen_commit(x, polygon.min_x, polygon.max_x)
+        cy, ry = pedersen_commit(y, polygon.min_y, polygon.max_y)
+        proof = prove_convex_polygon(
+            cx, cy, x, y, rx, ry, polygon, context, randbelow=DetRand()
+        )
+        return ConvexPolygonBatchEntry(cx, cy, polygon, proof, context)
+
+    def entries(self):
+        """Two distinct entries plus a duplicate; order is significant."""
+        first = self.entry(2, 1, b"alpha")
+        second = self.entry(1, 2, b"beta")
+        return [first, second, first]
+
+    def make_guard(self, backend):
+        if backend == "memory":
+            return ConvexPolygonBatchReplayGuard()
+        self._store_count += 1
+        path = os.path.join(self._tmp.name, f"cpbr-{self._store_count}.db")
+        # a fixed clock keeps claim leases independent of real time
+        store = SQLiteReplayStore(path, clock=lambda: 1000)
+        self.addCleanup(store.close)
+        return ConvexPolygonBatchReplayGuard(store=store)
+
+    def store_path(self, name="shared"):
+        return os.path.join(self._tmp.name, f"{name}.db")
+
+    # ---- register → check → consume, both backends ---------------------------
+
+    def test_memory_bind_check_consume_flow(self):
+        entries = self.entries()
+        guard = ConvexPolygonBatchReplayGuard()
+        binding = guard.bind_once(entries, b"session")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"session")
+        self.assertIsNone(binding.expires_at)
+        self.assertTrue(guard.check(entries, binding, now=1))
+        self.assertFalse(guard.check(entries, binding, now=1))
+        self.assertEqual(guard._consumed, {b"session"})
+        self.assertNotIn(b"session", guard._pending)
+
+    def test_store_bind_check_consume_flow(self):
+        entries = self.entries()
+        guard = self.make_guard("store")
+        binding = guard.bind_once(entries, b"session")
+        self.assertTrue(guard.check(entries, binding, now=1))
+        self.assertFalse(guard.check(entries, binding, now=1))
+        self.assertEqual(guard._consumed, {b"session"})
+        self.assertNotIn(b"session", guard._pending)
+
+    def test_rebind_pending_and_consumed_raises(self):
+        for backend in self.BACKENDS:
+            with self.subTest(backend=backend):
+                entries = self.entries()
+                guard = self.make_guard(backend)
+                binding = guard.bind_once(entries, b"session")
+                with self.assertRaises(ValueError):  # still pending
+                    guard.bind_once(entries, b"session")
+                self.assertTrue(guard.check(entries, binding, now=1))
+                with self.assertRaises(ValueError):  # already consumed
+                    guard.bind_once(entries, b"session")
+
+    def test_inputs_are_not_mutated(self):
+        for backend in self.BACKENDS:
+            with self.subTest(backend=backend):
+                entries = self.entries()
+                snapshot = list(entries)
+                guard = self.make_guard(backend)
+                binding = guard.bind_once(entries, b"session")
+                binding_snapshot = dataclasses.replace(binding)
+                self.assertTrue(guard.check(entries, binding, now=1))
+                self.assertEqual(entries, snapshot)
+                self.assertEqual(
+                    [id(item) for item in entries],
+                    [id(item) for item in snapshot],
+                )
+                self.assertEqual(binding, binding_snapshot)
+
+    # ---- rejection is not consumption -----------------------------------------
+
+    def test_rejections_do_not_consume_the_registration(self):
+        for backend in self.BACKENDS:
+            with self.subTest(backend=backend):
+                entries = self.entries()
+                guard = self.make_guard(backend)
+                binding = guard.bind_once(entries, b"session")
+                changed_context = dataclasses.replace(entries[0], context=b"other")
+                reordered = [entries[1], entries[0], entries[2]]
+                duplicate_dropped = entries[:-1]
+                for wrong in (
+                    [changed_context, entries[1], entries[2]],
+                    reordered,
+                    duplicate_dropped,
+                ):
+                    self.assertFalse(guard.check(wrong, binding, now=1))
+                # every rejection released the claim: the original batch is
+                # still accepted, exactly once
+                self.assertTrue(guard.check(entries, binding, now=1))
+                self.assertFalse(guard.check(entries, binding, now=1))
+
+    def test_rotated_and_reversed_polygon_representations_accepted(self):
+        entries = self.entries()
+        polygon = entries[0].polygon
+        rotated = ConvexPolygonRegion(((0, 4), (4, 0), (0, 0)))
+        reversed_ = ConvexPolygonRegion(((0, 0), (0, 4), (4, 0)))
+        self.assertEqual(rotated.vertices, polygon.vertices)
+        self.assertEqual(reversed_.vertices, polygon.vertices)
+        represented = [
+            dataclasses.replace(entries[0], polygon=rotated),
+            dataclasses.replace(entries[1], polygon=reversed_),
+            dataclasses.replace(entries[2], polygon=rotated),
+        ]
+        self.assertEqual(represented, entries)
+        for backend in self.BACKENDS:
+            with self.subTest(backend=backend):
+                guard = self.make_guard(backend)
+                binding = guard.bind_once(entries, b"session")
+                self.assertTrue(guard.check(represented, binding, now=1))
+                self.assertFalse(guard.check(represented, binding, now=1))
+
+    def test_unregistered_equal_binding_is_rejected(self):
+        entries = self.entries()
+        binding = ConvexPolygonBatchReplayGuard().bind_once(entries, b"session")
+        equal = ReplayBinding(b"session", binding.digest, binding.expires_at)
+        self.assertEqual(equal, binding)
+        for backend in self.BACKENDS:
+            with self.subTest(backend=backend):
+                guard = self.make_guard(backend)  # nothing ever registered
+                self.assertFalse(guard.check(entries, binding, now=1))
+                self.assertFalse(guard.check(entries, equal, now=1))
+
+    def test_expiry_boundary_rejects_without_consuming(self):
+        for backend in self.BACKENDS:
+            with self.subTest(backend=backend):
+                entries = self.entries()
+                guard = self.make_guard(backend)
+                binding = guard.bind_once(entries, b"session", expires_at=1000)
+                self.assertFalse(guard.check(entries, binding, now=1000))
+                self.assertFalse(guard.check(entries, binding, now=1001))
+                # the expiry rejections did not consume the registration
+                self.assertTrue(guard.check(entries, binding, now=999))
+                self.assertFalse(guard.check(entries, binding, now=999))
+
+    def test_randbelow_contract_errors_release_the_claim(self):
+        for backend in self.BACKENDS:
+            with self.subTest(backend=backend):
+                entries = self.entries()
+                guard = self.make_guard(backend)
+                binding = guard.bind_once(entries, b"session")
+                with self.assertRaises(TypeError):
+                    guard.check(
+                        entries, binding, now=1, randbelow=lambda upper: "x"
+                    )
+                with self.assertRaises(ValueError):
+                    guard.check(
+                        entries, binding, now=1, randbelow=lambda upper: -1
+                    )
+                # the escaped errors released the claim: a legal random
+                # source still succeeds, exactly once
+                self.assertTrue(
+                    guard.check(entries, binding, now=1, randbelow=DetRand())
+                )
+                self.assertFalse(
+                    guard.check(entries, binding, now=1, randbelow=DetRand())
+                )
+
+    def test_tampered_proof_batch_registers_but_never_checks(self):
+        for backend in self.BACKENDS:
+            with self.subTest(backend=backend):
+                entries = self.entries()
+                proof = entries[0].proof
+                tampered_proof = dataclasses.replace(
+                    proof,
+                    x_proof=dataclasses.replace(
+                        proof.x_proof,
+                        t=(proof.x_proof.t[0] + 1,) + proof.x_proof.t[1:],
+                    ),
+                )
+                batch = [
+                    dataclasses.replace(entries[0], proof=tampered_proof)
+                ] + entries[1:]
+                guard = self.make_guard(backend)
+                # registration binds the batch without verifying the proofs
+                binding = guard.bind_once(batch, b"session")
+                self.assertFalse(guard.check(batch, binding, now=1))
+                self.assertFalse(guard.check(batch, binding, now=1))
+                # the rejections left the id pending, so it cannot be rebound
+                with self.assertRaises(ValueError):
+                    guard.bind_once(batch, b"session")
+
+    # ---- concurrency -----------------------------------------------------------
+
+    def test_concurrent_checks_have_exactly_one_winner(self):
+        for backend in self.BACKENDS:
+            with self.subTest(backend=backend):
+                entries = self.entries()
+                guard = self.make_guard(backend)
+                binding = guard.bind_once(entries, b"session")
+                results = []
+                lock = threading.Lock()
+
+                def attempt():
+                    won = guard.check(entries, binding, now=1)
+                    with lock:
+                        results.append(won)
+
+                threads = [threading.Thread(target=attempt) for _ in range(8)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+                # the atomic claim decides the winner regardless of scheduling
+                self.assertEqual(sum(results), 1)
+                self.assertFalse(guard.check(entries, binding, now=1))
+
+    def test_inflight_check_does_not_block_other_sessions(self):
+        for backend in self.BACKENDS:
+            with self.subTest(backend=backend):
+                entries = self.entries()
+                guard = self.make_guard(backend)
+                binding = guard.bind_once(entries, b"session-a")
+                entered = threading.Event()
+                release = threading.Event()
+
+                def gated(upper):
+                    entered.set()
+                    release.wait(10)
+                    return 1
+
+                results = []
+                worker = threading.Thread(
+                    target=lambda: results.append(
+                        guard.check(entries, binding, now=1, randbelow=gated)
+                    )
+                )
+                worker.start()
+                try:
+                    # session-a's claim is held while its verification blocks
+                    self.assertTrue(entered.wait(10))
+                    other = self.entries()
+                    other_binding = guard.bind_once(other, b"session-b")
+                    self.assertTrue(guard.check(other, other_binding, now=1))
+                    self.assertFalse(guard.check(other, other_binding, now=1))
+                finally:
+                    release.set()
+                    worker.join(10)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(results, [True])
+
+    # ---- isolation and persistence --------------------------------------------
+
+    def test_memory_guards_do_not_share_registrations(self):
+        entries = self.entries()
+        first = ConvexPolygonBatchReplayGuard()
+        second = ConvexPolygonBatchReplayGuard()
+        binding = first.bind_once(entries, b"session")
+        self.assertFalse(second.check(entries, binding, now=1))
+        second_binding = second.bind_once(entries, b"session")
+        self.assertEqual(second_binding, binding)
+        self.assertTrue(first.check(entries, binding, now=1))
+        self.assertTrue(second.check(entries, second_binding, now=1))
+
+    def test_store_connections_share_registrations_and_consumption(self):
+        entries = self.entries()
+        path = self.store_path()
+        store_a = SQLiteReplayStore(path, clock=lambda: 1000)
+        store_b = SQLiteReplayStore(path, clock=lambda: 1000)
+        try:
+            guard_a = ConvexPolygonBatchReplayGuard(store=store_a)
+            guard_b = ConvexPolygonBatchReplayGuard(store=store_b)
+            binding = guard_a.bind_once(entries, b"session")
+            # the independent connection sees the same registration
+            self.assertTrue(guard_b.check(entries, binding, now=1))
+            # ... and the consumption it caused
+            self.assertFalse(guard_a.check(entries, binding, now=1))
+            with self.assertRaises(ValueError):
+                guard_a.bind_once(entries, b"session")
+        finally:
+            store_a.close()
+            store_b.close()
+
+    def test_store_registrations_survive_reopen(self):
+        entries = self.entries()
+        path = self.store_path()
+        store = SQLiteReplayStore(path, clock=lambda: 1000)
+        binding = ConvexPolygonBatchReplayGuard(store=store).bind_once(
+            entries, b"session"
+        )
+        store.close()
+        reopened = SQLiteReplayStore(path, clock=lambda: 1000)
+        guard = ConvexPolygonBatchReplayGuard(store=reopened)
+        with self.assertRaises(ValueError):  # the pending registration survived
+            guard.bind_once(entries, b"session")
+        self.assertTrue(guard.check(entries, binding, now=1))
+        reopened.close()
+        again = SQLiteReplayStore(path, clock=lambda: 1000)
+        guard = ConvexPolygonBatchReplayGuard(store=again)
+        self.assertFalse(guard.check(entries, binding, now=1))  # consumed survived
+        with self.assertRaises(ValueError):
+            guard.bind_once(entries, b"session")
+        again.close()
+
+    def test_store_namespaces_are_isolated(self):
+        entries = self.entries()
+        path = self.store_path()
+        store_a = SQLiteReplayStore(path, namespace=b"alpha", clock=lambda: 1000)
+        store_b = SQLiteReplayStore(path, namespace=b"beta", clock=lambda: 1000)
+        try:
+            guard_a = ConvexPolygonBatchReplayGuard(store=store_a)
+            guard_b = ConvexPolygonBatchReplayGuard(store=store_b)
+            binding = guard_a.bind_once(entries, b"session")
+            self.assertFalse(guard_b.check(entries, binding, now=1))
+            other = guard_b.bind_once(entries, b"session")  # same id, other namespace
+            self.assertEqual(other, binding)
+            self.assertTrue(guard_b.check(entries, other, now=1))
+            self.assertTrue(guard_a.check(entries, binding, now=1))
+        finally:
+            store_a.close()
+            store_b.close()
 
 
 if __name__ == "__main__":

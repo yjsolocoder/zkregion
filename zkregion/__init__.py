@@ -138,6 +138,7 @@ __all__ = [
     "BoundSchnorrReplayGuard",
     "BoundWideRangeBatch",
     "BoundWideRangeReplayGuard",
+    "ConvexPolygonProofBundle",
     "ConvexPolygonRegion",
     "ConvexPolygonRegionProof",
     "MerkleConsistencyBatchEntry",
@@ -205,8 +206,10 @@ __all__ = [
     "WideRangeReplayGuard",
     "commit",
     "commit_coordinate",
+    "decode_convex_polygon_proof_bundle",
     "decode_merkle_multi_proof_bundle",
     "decode_region_proof_bundle",
+    "encode_convex_polygon_proof_bundle",
     "encode_merkle_multi_proof_bundle",
     "encode_region_proof_bundle",
     "merkle_root",
@@ -245,6 +248,7 @@ __all__ = [
     "verify_consistency_chain_batch",
     "verify_consistency_chain_batch_bound",
     "verify_convex_polygon",
+    "verify_convex_polygon_proof_bundle",
     "verify_inclusion",
     "verify_inclusion_batch",
     "verify_inclusion_batch_bound",
@@ -4856,6 +4860,305 @@ def verify_region_proof_bundle(bundle: RegionProofBundle) -> bool:
             bundle.context,
         )
     raise TypeError("proof must be a RegionProof or RegionWideProof")
+
+
+# ---------------------------------------------------------------------------
+# Canonical binary envelope for convex polygon membership proofs
+#
+# A ConvexPolygonProofBundle freezes the five verification-relevant objects
+# of verify_convex_polygon (both PedersenCommitment objects, the
+# ConvexPolygonRegion, the external context and the
+# ConvexPolygonRegionProof) into a self-describing byte string. It reuses the
+# RegionProofBundle framing primitives verbatim — four-byte big-endian length
+# frames, sign-prefixed shortest big-endian integers and explicit tuple
+# cardinalities — but carries its own magic (b"zrgp"), so the two envelopes
+# can never be mistaken for one another. There is only one convex polygon
+# proof shape, so the header holds no proof-type tag.
+#
+# Layout:
+#
+#   magic (4) || version (1)
+#   frame(x_commitment) || frame(y_commitment) || frame(polygon)
+#   frame(context) || frame(proof)
+#
+# The polygon body is a tuple of canonical vertices, each a two-integer
+# tuple in (x, y) order. The proof body is a fixed three-item tuple: the
+# RangeProof x bounding-box sub-proof, the RangeProof y bounding-box
+# sub-proof and the edge_proofs tuple holding one WideRangeProof per
+# polygon edge in canonical boundary order.
+
+_CONVEX_BUNDLE_MAGIC = b"zrgp"
+_CONVEX_BUNDLE_VERSION = 1
+
+
+@dataclass(frozen=True)
+class ConvexPolygonProofBundle:
+    """A versioned, canonical binary envelope for one convex polygon proof.
+
+    Fields, in the fixed wire order: ``x_commitment`` / ``y_commitment``
+    (:class:`PedersenCommitment`), ``polygon``
+    (:class:`ConvexPolygonRegion`), ``context`` (``bytes``) and ``proof``
+    (a :class:`ConvexPolygonRegionProof`). Bundles are positional
+    construction arguments, compare by value and are immutable;
+    construction performs no validation — use
+    :func:`encode_convex_polygon_proof_bundle` /
+    :func:`verify_convex_polygon_proof_bundle` to check.
+    """
+
+    x_commitment: PedersenCommitment
+    y_commitment: PedersenCommitment
+    polygon: ConvexPolygonRegion
+    context: bytes
+    proof: ConvexPolygonRegionProof
+
+
+def _bundle_polygon(
+    vertices: Sequence[tuple[int, int]],
+) -> bytes:
+    """A ConvexPolygonRegion body: one ``(x, y)`` integer pair per vertex."""
+    return _bundle_tuple(
+        [
+            _bundle_tuple([_bundle_int(vertex[0]), _bundle_int(vertex[1])])
+            for vertex in vertices
+        ]
+    )
+
+
+def _bundle_check_polygon(polygon: object) -> tuple[tuple[int, int], ...]:
+    """Type-check a polygon and return its normalized canonical vertices.
+
+    Mirrors the :class:`ConvexPolygonRegion` constructor contract: wrong
+    container or element types (including a ``bool`` coordinate) raise
+    :class:`TypeError`; anything that is not a legal convex polygon — too
+    few vertices, repeats, collinear triples, self-intersection or a
+    reflex vertex — raises :class:`ValueError`.
+    """
+    if not isinstance(polygon, ConvexPolygonRegion):
+        raise TypeError("polygon must be a ConvexPolygonRegion")
+    return _normalize_polygon_vertices(getattr(polygon, "vertices", None))
+
+
+def _bundle_check_convex_proof(
+    proof: object, vertex_count: int
+) -> ConvexPolygonRegionProof:
+    """Validate every nested type and the edge-proof cardinality."""
+    if not isinstance(proof, ConvexPolygonRegionProof):
+        raise TypeError("proof must be a ConvexPolygonRegionProof")
+    _bundle_check_range_proof(proof.x_proof, "proof x_proof")
+    _bundle_check_range_proof(proof.y_proof, "proof y_proof")
+    edge_proofs = proof.edge_proofs
+    if not isinstance(edge_proofs, tuple):
+        raise TypeError("proof edge_proofs must be a tuple of WideRangeProof")
+    for position, edge_proof in enumerate(edge_proofs):
+        if not isinstance(edge_proof, WideRangeProof):
+            raise TypeError(
+                f"proof edge_proofs[{position}] must be a WideRangeProof"
+            )
+        _bundle_check_wide_range_proof(
+            edge_proof, f"proof edge_proofs[{position}]"
+        )
+    if len(edge_proofs) != vertex_count:
+        raise ValueError(
+            "proof must carry exactly one edge proof per polygon edge"
+        )
+    return proof
+
+
+def encode_convex_polygon_proof_bundle(
+    bundle: ConvexPolygonProofBundle,
+) -> bytes:
+    """Encode a :class:`ConvexPolygonProofBundle` into its canonical envelope.
+
+    The same bundle object always encodes to the same byte string. The
+    output starts with the four-byte magic ``b"zrgp"`` and a one-byte
+    format version, followed by the five fields in fixed order
+    (``x_commitment``, ``y_commitment``, ``polygon``, ``context``,
+    ``proof``); each item is length-prefixed with a four-byte big-endian
+    header. The polygon is stored through its normalized canonical
+    vertices as ``(x, y)`` integer pairs; the proof body is a fixed
+    three-item tuple: the two :class:`RangeProof` bounding-box sub-proofs
+    (x then y) and the tuple of per-edge :class:`WideRangeProof` objects
+    in canonical boundary order. Arbitrary-precision integers (including
+    negative coordinates) carry a sign byte and a shortest big-endian
+    magnitude; tuples carry an explicit cardinality. The function returns
+    ``bytes`` only and never writes to the file system or a database.
+
+    A wrong object or field type (including a ``bool`` integer, a
+    non-tuple proof field, a wide-proof pair that is not a two-tuple, or
+    a proof that is not a :class:`ConvexPolygonRegionProof`) raises
+    :class:`TypeError`. An illegal polygon (including one forged by
+    bypassing the constructor) or an edge-proof tuple whose cardinality
+    does not equal the number of polygon edges raises
+    :class:`ValueError`.
+    """
+    if not isinstance(bundle, ConvexPolygonProofBundle):
+        raise TypeError("bundle must be a ConvexPolygonProofBundle")
+    _bundle_check_commitment(bundle.x_commitment, "x_commitment")
+    _bundle_check_commitment(bundle.y_commitment, "y_commitment")
+    vertices = _bundle_check_polygon(bundle.polygon)
+    if not isinstance(bundle.context, bytes):
+        raise TypeError("context must be bytes")
+    proof = _bundle_check_convex_proof(bundle.proof, len(vertices))
+    proof_body = _bundle_tuple(
+        [
+            _bundle_range_proof(proof.x_proof),
+            _bundle_range_proof(proof.y_proof),
+            _bundle_tuple(
+                [
+                    _bundle_wide_range_proof(edge_proof)
+                    for edge_proof in proof.edge_proofs
+                ]
+            ),
+        ]
+    )
+    out = bytearray()
+    out += _CONVEX_BUNDLE_MAGIC
+    out += bytes((_CONVEX_BUNDLE_VERSION,))
+    out += _bundle_frame(_bundle_commitment(bundle.x_commitment))
+    out += _bundle_frame(_bundle_commitment(bundle.y_commitment))
+    out += _bundle_frame(_bundle_polygon(vertices))
+    out += _bundle_frame(bundle.context)
+    out += _bundle_frame(proof_body)
+    return bytes(out)
+
+
+def _read_convex_polygon(reader: "_BundleReader") -> ConvexPolygonRegion:
+    """Parse and geometrically validate the polygon frame of a zrgp envelope."""
+    body = reader.frame("polygon")
+    inner = _BundleReader(body)
+    count = inner.tuple_cardinality("polygon")
+    vertices: list[tuple[int, int]] = []
+    for index in range(count):
+        item_body = inner.frame(f"polygon vertex[{index}]")
+        item_reader = _BundleReader(item_body)
+        item_count = item_reader.tuple_cardinality(f"polygon vertex[{index}]")
+        if item_count != 2:
+            raise ValueError(f"polygon vertex[{index}] must be an (x, y) pair")
+        x_coord = item_reader.int_value(f"polygon vertex[{index}] x")
+        y_coord = item_reader.int_value(f"polygon vertex[{index}] y")
+        if not item_reader.at_end():
+            raise ValueError(f"polygon vertex[{index}] has trailing data")
+        vertices.append((x_coord, y_coord))
+    if not inner.at_end():
+        raise ValueError("polygon tuple has trailing data")
+    # The constructor enforces (with ValueError) every geometric rule and
+    # canonicalizes the vertex sequence.
+    return ConvexPolygonRegion(tuple(vertices))
+
+
+def _read_convex_polygon_proof(
+    reader: "_BundleReader", edge_count: int
+) -> ConvexPolygonRegionProof:
+    """Parse the proof frame: two RangeProofs then one WideRangeProof/edge."""
+    body = reader.frame("proof")
+    inner = _BundleReader(body)
+    count = inner.tuple_cardinality("proof")
+    if count != 3:
+        raise ValueError("convex polygon proof must have exactly three fields")
+    x_proof = inner.range_proof("convex polygon proof x_proof")
+    y_proof = inner.range_proof("convex polygon proof y_proof")
+    edges_body = inner.frame("convex polygon proof edge_proofs")
+    edge_reader = _BundleReader(edges_body)
+    wire_count = edge_reader.tuple_cardinality("convex polygon proof edge_proofs")
+    if wire_count != edge_count:
+        raise ValueError(
+            "convex polygon proof must carry exactly one edge proof per edge"
+        )
+    edge_proofs = tuple(
+        edge_reader.wide_range_proof(f"convex polygon proof edge_proofs[{index}]")
+        for index in range(wire_count)
+    )
+    if not edge_reader.at_end():
+        raise ValueError("convex polygon proof edge_proofs have trailing data")
+    if not inner.at_end():
+        raise ValueError("convex polygon proof has trailing data")
+    return ConvexPolygonRegionProof(
+        x_proof=x_proof, y_proof=y_proof, edge_proofs=edge_proofs
+    )
+
+
+def decode_convex_polygon_proof_bundle(
+    data: bytes,
+) -> ConvexPolygonProofBundle:
+    """Decode a canonical envelope back into a :class:`ConvexPolygonProofBundle`.
+
+    ``data`` must be exactly the output of
+    :func:`encode_convex_polygon_proof_bundle`: the magic, a known format
+    version and the five fields in their fixed order with valid length
+    prefixes, tuple cardinalities and integer sign bytes. The vertex
+    tuple must describe a legal convex polygon and is canonicalized on
+    rebuild; the edge-proof cardinality must equal the number of polygon
+    edges. The payload must be consumed completely with no trailing
+    bytes. A truncated input, an out-of-bounds length, an unknown magic
+    or version, a non-canonical integer, an illegal polygon, a bad tuple
+    cardinality or length, a nested sub-proof whose shape does not match
+    its declared form, or trailing data raises :class:`ValueError`; a
+    non-``bytes`` input raises :class:`TypeError`. A decoded bundle
+    compares equal field-for-field to the original, with all tuple
+    structure preserved, and a region-proof envelope (``b"zrgn"``) can
+    never be decoded as a convex polygon envelope (or vice versa).
+    """
+    if not isinstance(data, bytes):
+        raise TypeError("data must be bytes")
+    reader = _BundleReader(data)
+    reader.expect(_CONVEX_BUNDLE_MAGIC, "convex polygon proof bundle magic")
+    version = reader.byte("format version")
+    if version != _CONVEX_BUNDLE_VERSION:
+        raise ValueError("unknown convex polygon proof bundle format version")
+    x_commitment = reader.commitment("x_commitment")
+    y_commitment = reader.commitment("y_commitment")
+    polygon = _read_convex_polygon(reader)
+    context = reader.frame("context")
+    proof = _read_convex_polygon_proof(reader, len(polygon.vertices))
+    if not reader.at_end():
+        raise ValueError(
+            "trailing data after convex polygon proof bundle payload"
+        )
+    return ConvexPolygonProofBundle(
+        x_commitment=x_commitment,
+        y_commitment=y_commitment,
+        polygon=polygon,
+        context=context,
+        proof=proof,
+    )
+
+
+def verify_convex_polygon_proof_bundle(
+    bundle: ConvexPolygonProofBundle,
+) -> bool:
+    """Verify the convex polygon proof carried by a :class:`ConvexPolygonProofBundle`.
+
+    Verification follows :func:`verify_convex_polygon` exactly, using only
+    the two :class:`PedersenCommitment` objects, the
+    :class:`ConvexPolygonRegion` and the ``context`` — never coordinates
+    or blinding factors. A wrong object or field type (including a
+    ``bool`` integer, a non-``bytes`` context, or a proof that is not a
+    :class:`ConvexPolygonRegionProof` with two :class:`RangeProof`
+    bounding-box sub-proofs and a tuple of :class:`WideRangeProof` edge
+    sub-proofs) raises :class:`TypeError`; every other failure —
+    mismatched group parameters or declared ranges, a context mismatch,
+    swapped axes or commitments, a different polygon, a tampered or
+    reordered edge proof, an edge-proof cardinality mismatch, or a failed
+    verification equation — returns ``False``. Encoding and then decoding
+    a bundle preserves the verification verdict.
+    """
+    if not isinstance(bundle, ConvexPolygonProofBundle):
+        raise TypeError("bundle must be a ConvexPolygonProofBundle")
+    _bundle_check_commitment(bundle.x_commitment, "x_commitment")
+    _bundle_check_commitment(bundle.y_commitment, "y_commitment")
+    if not isinstance(bundle.polygon, ConvexPolygonRegion):
+        raise TypeError("polygon must be a ConvexPolygonRegion")
+    if not isinstance(bundle.context, bytes):
+        raise TypeError("context must be bytes")
+    if not isinstance(bundle.proof, ConvexPolygonRegionProof):
+        raise TypeError("proof must be a ConvexPolygonRegionProof")
+    return verify_convex_polygon(
+        bundle.x_commitment,
+        bundle.y_commitment,
+        bundle.polygon,
+        bundle.proof,
+        bundle.context,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -138,6 +138,7 @@ __all__ = [
     "BoundSchnorrReplayGuard",
     "BoundWideRangeBatch",
     "BoundWideRangeReplayGuard",
+    "ConvexPolygonBatchEntry",
     "ConvexPolygonProofBundle",
     "ConvexPolygonRegion",
     "ConvexPolygonRegionProof",
@@ -248,6 +249,7 @@ __all__ = [
     "verify_consistency_chain_batch",
     "verify_consistency_chain_batch_bound",
     "verify_convex_polygon",
+    "verify_convex_polygon_batch",
     "verify_convex_polygon_proof_bundle",
     "verify_inclusion",
     "verify_inclusion_batch",
@@ -4170,6 +4172,430 @@ def verify_convex_polygon(
             proof.edge_proofs[edge_index],
             _polygon_sub_context(b"edge", edge_items),
         ):
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class ConvexPolygonBatchEntry:
+    """One item of a convex polygon batch verification.
+
+    Fields are the x and y :class:`PedersenCommitment` objects, the
+    claimed :class:`ConvexPolygonRegion`, the
+    :class:`ConvexPolygonRegionProof` and the external ``context``
+    (empty by default) — exactly the arguments of
+    :func:`verify_convex_polygon`, in the same order
+    (``x_commitment``, ``y_commitment``, ``polygon``, ``proof``,
+    ``context``). Construction performs no validation; entries are
+    positional, compare by value and are immutable.
+    """
+
+    x_commitment: PedersenCommitment
+    y_commitment: PedersenCommitment
+    polygon: ConvexPolygonRegion
+    proof: ConvexPolygonRegionProof
+    context: bytes = b""
+
+
+def _check_convex_polygon_entry_fields(entry: object, position: int) -> None:
+    """Validate every nested type of one :class:`ConvexPolygonBatchEntry`.
+
+    Mirrors the type expectations of :func:`verify_convex_polygon`: both
+    commitments must be :class:`PedersenCommitment` objects with
+    non-``bool`` integer fields, the polygon must be a
+    :class:`ConvexPolygonRegion` whose vertices are a tuple of
+    two-element non-``bool`` integer tuples, the proof must be a
+    :class:`ConvexPolygonRegionProof` whose two bounding-box
+    :class:`RangeProof` objects and whose per-edge
+    :class:`WideRangeProof` objects carry tuple fields of non-``bool``
+    integers at every nesting level, and the context must be ``bytes``.
+    """
+    label = f"entries[{position}]"
+    if not isinstance(entry, ConvexPolygonBatchEntry):
+        raise TypeError(f"{label} must be a ConvexPolygonBatchEntry")
+    x_commitment = entry.x_commitment
+    y_commitment = entry.y_commitment
+    polygon = entry.polygon
+    proof = entry.proof
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError(f"{label} x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError(f"{label} y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    if not isinstance(polygon, ConvexPolygonRegion):
+        raise TypeError(f"{label} polygon must be a ConvexPolygonRegion")
+    vertices = polygon.vertices
+    if not isinstance(vertices, tuple):
+        raise TypeError(
+            f"{label} polygon vertices must be a tuple of (x, y) tuples"
+        )
+    for vertex_position, vertex in enumerate(vertices):
+        if not isinstance(vertex, tuple) or len(vertex) != 2:
+            raise TypeError(
+                f"{label} polygon vertices[{vertex_position}] must be a "
+                "(x, y) tuple"
+            )
+        _check_int(vertex[0], f"{label} polygon vertices[{vertex_position}] x")
+        _check_int(vertex[1], f"{label} polygon vertices[{vertex_position}] y")
+    if not isinstance(proof, ConvexPolygonRegionProof):
+        raise TypeError(f"{label} proof must be a ConvexPolygonRegionProof")
+    for axis_name, sub_proof in (("x", proof.x_proof), ("y", proof.y_proof)):
+        if not isinstance(sub_proof, RangeProof):
+            raise TypeError(
+                f"{label} proof {axis_name}_proof must be a RangeProof"
+            )
+        for field_name in ("t", "e", "s"):
+            field = getattr(sub_proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"{label} proof {axis_name}_proof {field_name} must be a "
+                    "tuple of integers"
+                )
+            for item in field:
+                _check_int(
+                    item,
+                    f"{label} proof {axis_name}_proof {field_name} entry",
+                )
+    if not isinstance(proof.edge_proofs, tuple):
+        raise TypeError(
+            f"{label} proof edge_proofs must be a tuple of WideRangeProof"
+        )
+    for edge_position, edge_proof in enumerate(proof.edge_proofs):
+        edge_label = f"{label} proof edge_proofs[{edge_position}]"
+        if not isinstance(edge_proof, WideRangeProof):
+            raise TypeError(f"{edge_label} must be a WideRangeProof")
+        if not isinstance(edge_proof.commitments, tuple):
+            raise TypeError(
+                f"{edge_label} commitments must be a tuple of integers"
+            )
+        for item in edge_proof.commitments:
+            _check_int(item, f"{edge_label} commitments entry")
+        for field_name in ("challenges", "responses"):
+            field = getattr(edge_proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"{edge_label} {field_name} must be a tuple of integer pairs"
+                )
+            for pair in field:
+                if not isinstance(pair, tuple):
+                    raise TypeError(
+                        f"{edge_label} {field_name} entry must be a tuple of "
+                        "integers"
+                    )
+                for item in pair:
+                    _check_int(item, f"{edge_label} {field_name} entry item")
+    _check_bytes(entry.context, f"{label} context")
+
+
+def _check_convex_polygon_batch_entries_types(
+    entries: object,
+) -> list[ConvexPolygonBatchEntry]:
+    """Validate the convex-polygon-batch ``entries`` argument types.
+
+    Mirrors the type expectations of :func:`verify_convex_polygon` for
+    *every* entry before any verification runs: ``entries`` must be a
+    non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`ConvexPolygonBatchEntry` objects with valid nested types at
+    every level. The whole batch is walked (a bad type in the last
+    entry still raises), and the entries are copied into a fresh list
+    so the inputs are never mutated. An empty batch is left to
+    :func:`verify_convex_polygon_batch` to reject with ``False``;
+    structural and value problems are left to the per-entry checks
+    during verification.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(
+        entries, Sequence
+    ):
+        raise TypeError("entries must be a sequence of ConvexPolygonBatchEntry")
+    items: list[ConvexPolygonBatchEntry] = []
+    for position, entry in enumerate(entries):
+        _check_convex_polygon_entry_fields(entry, position)
+        items.append(entry)
+    return items
+
+
+def verify_convex_polygon_batch(
+    entries: Sequence[ConvexPolygonBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a batch of :class:`ConvexPolygonRegionProof` objects.
+
+    ``entries`` must be a non-empty, non-``bytes`` / ``bytearray`` /
+    ``str`` sequence of :class:`ConvexPolygonBatchEntry`; an empty
+    batch returns ``False`` and lists, tuples, duplicate entries and
+    entries in any order are legal. The nested types of the *whole*
+    batch and every nested field are preflighted first, so a wrong
+    type in any entry — including the last one, a ``bool`` passed as
+    an integer, a non-tuple proof field or a non-``bytes`` context —
+    raises :class:`TypeError` rather than becoming a batch rejection.
+
+    Every entry then reuses the :func:`verify_convex_polygon` rules
+    byte for byte: the polygon is taken through its canonical vertex
+    order (a forged object with well-typed but geometrically invalid
+    vertices returns ``False``), both commitments must share the same
+    ``(prime, generator, h)`` group and be declared over exactly the
+    polygon's bounding box, there must be one edge proof per polygon
+    edge, and every Fiat-Shamir transcript is rebuilt unchanged from
+    the external context, the canonical vertices and both commitment
+    fields — the ``bbox-x`` and ``bbox-y`` bounding-box sub-contexts
+    and the per-edge ``edge`` sub-context with the edge index, in
+    canonical boundary order. The bounding-box range proofs must keep
+    their tuple sizes, ``t`` / ``e`` / ``s`` bounds and transcript
+    challenge-share sums; every edge commitment is recomputed via
+    :func:`_edge_commitment`, its wide range must fit
+    ``2**k - 1`` with ``1 <= k <= 24`` and stay below ``prime - 1``,
+    the bit commitments weighted by ``2**i`` must multiply back to
+    the edge commitment element, and the two challenge shares of
+    every edge-proof bit must sum to its transcript challenge. Those
+    checks stay per entry and are never aggregated.
+
+    Each structurally valid Schnorr branch then draws exactly one
+    random coefficient ``a = r + 1`` with
+    ``r = randbelow(prime - 1)``: one draw per bounding-box
+    range-proof branch and one draw per OR sub-branch of every edge
+    proof bit. Branches sharing the same ``(prime, generator, h)``
+    group — across the two axes, across edges and across entries —
+    are checked together with a single aggregate equation
+
+    ``h**Σ(a*s) == Π(t**a * D**(a*e)) (mod prime)``
+
+    where ``D`` is ``element * generator**(-i)`` for a bounding-box
+    branch and the bit commitment (or the bit commitment divided by
+    ``generator``) for an edge-proof sub-branch, exactly as in
+    :func:`verify_range` and :func:`verify_range_wide`; per-branch
+    results are never AND-ed together. The result is exactly the
+    conjunction of calling :func:`verify_convex_polygon` on every
+    entry: a swapped axis, a changed ``context`` or polygon,
+    mismatched commitment ranges or group parameters, a replaced,
+    dropped or reordered ``edge_proofs`` entry, or any tampered
+    sub-proof returns ``False``, and one invalid entry fails the
+    whole batch. Type errors — including ``bool`` integers and a
+    non-callable ``randbelow`` or one that returns a non-integer —
+    raise :class:`TypeError`; a coefficient outside
+    ``[0, prime - 1)`` raises :class:`ValueError`. Inputs are never
+    mutated.
+    """
+    items = _check_convex_polygon_batch_entries_types(entries)
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not items:
+        return False
+
+    # group -> {"sum": Σ(a*s), "product": Π(t**a * D**(a*e))}
+    groups: dict[tuple[int, int, int], dict[str, int]] = {}
+
+    def add_branch(
+        group_key: tuple[int, int, int],
+        t_i: int,
+        e_i: int,
+        s_i: int,
+        statement_i: int,
+    ) -> None:
+        prime, _generator, _h = group_key
+        r = randbelow(prime - 1)
+        if not isinstance(r, int) or isinstance(r, bool):
+            raise TypeError("coefficient source randbelow must return an integer")
+        if not 0 <= r < prime - 1:
+            raise ValueError("coefficient source must satisfy 0 <= r < prime - 1")
+        coefficient = r + 1
+        state = groups.setdefault(group_key, {"sum": 0, "product": 1})
+        state["sum"] += coefficient * s_i
+        state["product"] = (
+            state["product"]
+            * pow(t_i, coefficient, prime)
+            % prime
+            * pow(statement_i, coefficient * e_i, prime)
+            % prime
+        )
+
+    for entry in items:
+        x_commitment = entry.x_commitment
+        y_commitment = entry.y_commitment
+        proof = entry.proof
+        # Re-run canonicalization: a forged polygon with well-typed
+        # vertices is a semantic failure (False), never an exception.
+        try:
+            polygon = ConvexPolygonRegion(entry.polygon.vertices)
+        except ValueError:
+            return False
+        if (
+            x_commitment.prime != y_commitment.prime
+            or x_commitment.generator != y_commitment.generator
+            or x_commitment.h != y_commitment.h
+        ):
+            return False
+        if (x_commitment.lower, x_commitment.upper) != (
+            polygon.min_x,
+            polygon.max_x,
+        ):
+            return False
+        if (y_commitment.lower, y_commitment.upper) != (
+            polygon.min_y,
+            polygon.max_y,
+        ):
+            return False
+        if len(proof.edge_proofs) != len(polygon.vertices):
+            return False
+        if (polygon.max_x - polygon.min_x + 1) > _MAX_RANGE_VALUES:
+            return False
+        if (polygon.max_y - polygon.min_y + 1) > _MAX_RANGE_VALUES:
+            return False
+        transcript_items = _polygon_transcript_items(
+            entry.context, polygon, x_commitment, y_commitment
+        )
+        # Bounding-box axes: every verify_range check except the
+        # per-branch Schnorr equations, which join the group check.
+        for axis_name, commitment, sub_proof in (
+            ("x", x_commitment, proof.x_proof),
+            ("y", y_commitment, proof.y_proof),
+        ):
+            sub_context = _polygon_sub_context(
+                b"bbox-" + axis_name.encode("ascii"), transcript_items
+            )
+            try:
+                (
+                    prime,
+                    generator,
+                    h,
+                    size,
+                    announcements,
+                    shares,
+                    responses,
+                ) = _range_proof_check_material(commitment, sub_proof, sub_context)
+                inverses = [pow(generator, -i, prime) for i in range(size)]
+            except (TypeError, ValueError):
+                return False  # structural/transcript mismatch: short-circuit
+            group_key = (prime, generator, h)
+            for i in range(size):
+                offset_i = commitment.element * inverses[i] % prime
+                add_branch(
+                    group_key,
+                    announcements[i],
+                    shares[i],
+                    responses[i],
+                    offset_i,
+                )
+        prime = x_commitment.prime
+        for edge_index, edge in enumerate(polygon._interior_edges()):
+            offset_upper = _edge_offset_upper(polygon, edge)
+            width = max(1, offset_upper.bit_length())
+            if width > _MAX_WIDE_RANGE_BITS:
+                return False
+            edge_upper = (1 << width) - 1
+            if edge_upper >= prime - 1:
+                return False
+            edge_commitment = _edge_commitment(
+                x_commitment, y_commitment, edge, edge_upper
+            )
+            edge_proof = proof.edge_proofs[edge_index]
+            edge_context = _polygon_sub_context(
+                b"edge",
+                [*transcript_items, str(edge_index).encode("ascii")],
+            )
+            # Every verify_range_wide check except the two per-bit
+            # Schnorr equations, which join the group check.
+            if prime <= 3:
+                return False
+            if not 1 < edge_commitment.generator < prime or not (
+                1 < edge_commitment.h < prime
+            ):
+                return False
+            if not 0 < edge_commitment.element < prime:
+                return False
+            if edge_commitment.lower > edge_commitment.upper:
+                return False
+            if edge_commitment.upper - edge_commitment.lower >= prime - 1:
+                return False
+            edge_width = _wide_range_bit_width(edge_commitment)
+            if not 1 <= edge_width <= _MAX_WIDE_RANGE_BITS:
+                return False
+            if not (
+                len(edge_proof.commitments)
+                == len(edge_proof.challenges)
+                == len(edge_proof.responses)
+                == edge_width
+            ):
+                return False
+            if any(len(pair) != 2 for pair in edge_proof.challenges):
+                return False
+            if any(len(pair) != 2 for pair in edge_proof.responses):
+                return False
+            if any(not 1 <= c_i < prime for c_i in edge_proof.commitments):
+                return False
+            if any(
+                not 0 <= share < prime
+                for pair in edge_proof.challenges
+                for share in pair
+            ):
+                return False
+            if any(
+                not 0 <= response < prime - 1
+                for pair in edge_proof.responses
+                for response in pair
+            ):
+                return False
+            # The power-of-two weighted binding stays a per-edge check.
+            product = 1
+            for i, bit_commitment in enumerate(edge_proof.commitments):
+                product = product * pow(bit_commitment, 1 << i, prime) % prime
+            if product != edge_commitment.element:
+                return False
+            generator = edge_commitment.generator
+            h = edge_commitment.h
+            try:
+                generator_inverse = pow(generator, -1, prime)
+            except ValueError:
+                return False  # generator not invertible modulo prime
+            announcements: list[tuple[int, int]] = []
+            for i in range(edge_width):
+                pair: list[int] = []
+                for branch in (0, 1):
+                    statement = edge_proof.commitments[i]
+                    if branch:
+                        statement = statement * generator_inverse % prime
+                    try:
+                        announcement = (
+                            pow(h, edge_proof.responses[i][branch], prime)
+                            * pow(
+                                statement,
+                                -edge_proof.challenges[i][branch],
+                                prime,
+                            )
+                            % prime
+                        )
+                    except ValueError:
+                        return False  # statement not invertible modulo prime
+                    pair.append(announcement)
+                announcements.append((pair[0], pair[1]))
+            # The per-bit challenge-share sums stay per-edge checks.
+            challenge = _wide_range_challenge(
+                edge_commitment,
+                edge_context,
+                edge_width,
+                edge_proof.commitments,
+                tuple(announcements),
+            )
+            for pair_e in edge_proof.challenges:
+                if (pair_e[0] + pair_e[1]) % prime != challenge:
+                    return False
+            group_key = (prime, generator, h)
+            for i in range(edge_width):
+                for branch in (0, 1):
+                    statement = edge_proof.commitments[i]
+                    if branch:
+                        statement = statement * generator_inverse % prime
+                    add_branch(
+                        group_key,
+                        announcements[i][branch],
+                        edge_proof.challenges[i][branch],
+                        edge_proof.responses[i][branch],
+                        statement,
+                    )
+
+    for (prime, _generator, _h), state in groups.items():
+        if pow(_h, state["sum"], prime) != state["product"]:
             return False
     return True
 

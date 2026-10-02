@@ -1,6 +1,7 @@
 import unittest
 
 from zkregion import (
+    ConvexPolygonBatchEntry,
     ConvexPolygonProofBundle,
     ConvexPolygonRegion,
     ConvexPolygonRegionProof,
@@ -13,6 +14,7 @@ from zkregion import (
     pedersen_commit,
     prove_convex_polygon,
     verify_convex_polygon,
+    verify_convex_polygon_batch,
     verify_convex_polygon_proof_bundle,
 )
 
@@ -992,6 +994,449 @@ class ConvexPolygonProofBundleTests(unittest.TestCase):
         decoded = decode_convex_polygon_proof_bundle(raw)
         self.assertEqual(decoded, bundle)
         self.assertFalse(verify_convex_polygon_proof_bundle(decoded))
+
+
+class ConvexPolygonBatchTests(unittest.TestCase):
+    def _entry(
+        self,
+        x=1,
+        y=2,
+        vertices=TRIANGLE,
+        context=b"ctx",
+        x_blinding=None,
+        y_blinding=None,
+    ):
+        polygon = ConvexPolygonRegion(vertices)
+        cx_kwargs = {} if x_blinding is None else {"blinding": x_blinding}
+        cy_kwargs = {} if y_blinding is None else {"blinding": y_blinding}
+        x_commitment, x_blinding = pedersen_commit(
+            x, polygon.min_x, polygon.max_x, **cx_kwargs
+        )
+        y_commitment, y_blinding = pedersen_commit(
+            y, polygon.min_y, polygon.max_y, **cy_kwargs
+        )
+        proof = prove_convex_polygon(
+            x_commitment, y_commitment, x, y, x_blinding, y_blinding,
+            polygon, context, randbelow=DetRand(),
+        )
+        return ConvexPolygonBatchEntry(
+            x_commitment, y_commitment, polygon, proof, context
+        )
+
+    def _expected_branch_count(self, entry):
+        """One draw per bbox branch plus two draws per edge-proof bit."""
+        from zkregion import _edge_offset_upper
+
+        polygon = entry.polygon
+        count = (polygon.max_x - polygon.min_x + 1) + (
+            polygon.max_y - polygon.min_y + 1
+        )
+        for edge in polygon._interior_edges():
+            upper = _edge_offset_upper(polygon, edge)
+            count += 2 * max(1, upper.bit_length())
+        return count
+
+    # ---- happy paths --------------------------------------------------------
+
+    def test_valid_batches(self):
+        entries = [
+            self._entry(1, 2, context=b"a"),
+            self._entry(3, 0, context=b"b"),
+            self._entry(0, 3, vertices=((0, 0), (5, 0), (6, 4), (2, 6), (-2, 3))),
+        ]
+        self.assertIs(verify_convex_polygon_batch(entries), True)
+        self.assertIs(verify_convex_polygon_batch(tuple(entries)), True)
+        self.assertIs(verify_convex_polygon_batch([entries[0]]), True)
+
+    def test_duplicate_entries_are_legal(self):
+        entry = self._entry()
+        self.assertIs(
+            verify_convex_polygon_batch([entry, entry, entry]), True
+        )
+
+    def test_empty_batch_returns_false_without_drawing(self):
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertIs(
+            verify_convex_polygon_batch([], randbelow=recording), False
+        )
+        self.assertEqual(calls, [])
+
+    def test_default_context_is_empty_bytes(self):
+        entry = self._entry(context=b"")
+        default = ConvexPolygonBatchEntry(
+            entry.x_commitment, entry.y_commitment, entry.polygon, entry.proof
+        )
+        self.assertEqual(default.context, b"")
+        self.assertIs(verify_convex_polygon_batch([default]), True)
+
+    def test_entry_is_frozen_and_value_compared(self):
+        entry = self._entry(x_blinding=1234, y_blinding=4321)
+        with self.assertRaises(Exception):
+            entry.context = b"other"
+        self.assertEqual(
+            entry, self._entry(x_blinding=1234, y_blinding=4321)
+        )
+
+    def test_deterministic_under_same_random_source(self):
+        entries = [self._entry(1, 1), self._entry(2, 2)]
+        first = verify_convex_polygon_batch(entries, randbelow=DetRand())
+        second = verify_convex_polygon_batch(entries, randbelow=DetRand())
+        self.assertIs(first, True)
+        self.assertEqual(first, second)
+
+    def test_custom_group_parameters_share_one_group_check(self):
+        prime = DEFAULT_PRIME
+        generator, h = 5, pow(5, 7, prime)
+        vertices = ((0, 0), (5, 0), (6, 4), (2, 6), (-2, 3))
+        entries = []
+        for x, y in ((0, 0), (2, 3), (2, 6), (1, 4)):
+            polygon = ConvexPolygonRegion(vertices)
+            cx, rx = pedersen_commit(
+                x, polygon.min_x, polygon.max_x,
+                prime=prime, generator=generator, h=h,
+            )
+            cy, ry = pedersen_commit(
+                y, polygon.min_y, polygon.max_y,
+                prime=prime, generator=generator, h=h,
+            )
+            proof = prove_convex_polygon(
+                cx, cy, x, y, rx, ry, polygon, b"g", randbelow=DetRand()
+            )
+            entries.append(
+                ConvexPolygonBatchEntry(cx, cy, polygon, proof, b"g")
+            )
+        self.assertIs(
+            verify_convex_polygon_batch(entries, randbelow=DetRand()), True
+        )
+
+    # ---- agreement with per-item verification ------------------------------
+
+    def test_matches_verify_convex_polygon_pointwise(self):
+        entries = []
+        for point in ((0, 0), (1, 1), (3, 0), (0, 3), (4, 0)):
+            entries.append(self._entry(*point))
+        for order in (entries, list(reversed(entries)), entries[::2]):
+            batch_result = verify_convex_polygon_batch(order, randbelow=DetRand())
+            single_result = all(
+                verify_convex_polygon(
+                    entry.x_commitment, entry.y_commitment, entry.polygon,
+                    entry.proof, entry.context,
+                )
+                for entry in order
+            )
+            self.assertIs(batch_result, single_result)
+
+    # ---- one draw per structurally valid branch ----------------------------
+
+    def test_randbelow_called_once_per_structurally_valid_branch(self):
+        entry = self._entry()
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return (len(calls) * 7919 + 13) % upper
+
+        self.assertIs(
+            verify_convex_polygon_batch([entry], randbelow=recording), True
+        )
+        expected = self._expected_branch_count(entry)
+        self.assertEqual(calls, [entry.x_commitment.prime - 1] * expected)
+
+    def test_invalid_entry_short_circuits_before_its_first_draw(self):
+        entry = self._entry()
+        # dropping one edge proof is a structural failure detected before
+        # any branch of that entry is drawn
+        dropped = ConvexPolygonRegionProof(
+            entry.proof.x_proof, entry.proof.y_proof, entry.proof.edge_proofs[1:]
+        )
+        invalid = ConvexPolygonBatchEntry(
+            entry.x_commitment, entry.y_commitment, entry.polygon, dropped,
+            entry.context,
+        )
+        calls = []
+
+        def recording(upper):
+            calls.append(upper)
+            return 0
+
+        self.assertFalse(
+            verify_convex_polygon_batch([invalid, entry], randbelow=recording)
+        )
+        self.assertEqual(calls, [])
+        self.assertFalse(
+            verify_convex_polygon_batch([entry, invalid], randbelow=recording)
+        )
+        self.assertEqual(
+            calls, [entry.x_commitment.prime - 1]
+            * self._expected_branch_count(entry)
+        )
+
+    # ---- False semantics ----------------------------------------------------
+
+    def test_wrong_context_returns_false(self):
+        entry = self._entry()
+        for context in (b"other", b""):
+            bad = ConvexPolygonBatchEntry(
+                entry.x_commitment, entry.y_commitment, entry.polygon,
+                entry.proof, context,
+            )
+            self.assertFalse(verify_convex_polygon_batch([bad]))
+
+    def test_swapped_axes_return_false(self):
+        entry = self._entry()
+        swapped = ConvexPolygonBatchEntry(
+            entry.y_commitment, entry.x_commitment, entry.polygon,
+            entry.proof, entry.context,
+        )
+        self.assertFalse(
+            verify_convex_polygon_batch([swapped], randbelow=DetRand())
+        )
+
+    def test_changed_polygon_returns_false(self):
+        entry = self._entry()
+        for vertices in (
+            ((0, 0), (4, 0), (0, 3)),
+            ((1, 0), (5, 0), (1, 4)),
+        ):
+            other = ConvexPolygonRegion(vertices)
+            bad = ConvexPolygonBatchEntry(
+                entry.x_commitment, entry.y_commitment, other, entry.proof,
+                entry.context,
+            )
+            self.assertFalse(verify_convex_polygon_batch([bad]))
+
+    def test_rotated_polygon_representation_still_verifies(self):
+        entry = self._entry()
+        rotated = ConvexPolygonRegion(
+            tuple(entry.polygon.vertices[1:] + entry.polygon.vertices[:1])
+        )
+        equivalent = ConvexPolygonBatchEntry(
+            entry.x_commitment, entry.y_commitment, rotated, entry.proof,
+            entry.context,
+        )
+        self.assertIs(verify_convex_polygon_batch([equivalent]), True)
+
+    def test_tampered_subproofs_return_false(self):
+        entry = self._entry()
+        proof = entry.proof
+        bad_x = RangeProof(
+            proof.x_proof.t,
+            tuple(e + 1 for e in proof.x_proof.e),
+            proof.x_proof.s,
+        )
+        variants = (
+            ConvexPolygonRegionProof(bad_x, proof.y_proof, proof.edge_proofs),
+            ConvexPolygonRegionProof(
+                proof.x_proof, proof.y_proof, proof.edge_proofs[:1]
+                + proof.edge_proofs[2:]
+            ),
+            ConvexPolygonRegionProof(
+                proof.x_proof, proof.y_proof,
+                (
+                    proof.edge_proofs[1],
+                    proof.edge_proofs[0],
+                    proof.edge_proofs[2],
+                ),
+            ),
+        )
+        for tampered in variants:
+            bad = ConvexPolygonBatchEntry(
+                entry.x_commitment, entry.y_commitment, entry.polygon,
+                tampered, entry.context,
+            )
+            self.assertFalse(
+                verify_convex_polygon_batch([bad], randbelow=DetRand())
+            )
+
+    def test_tampered_edge_commitment_binding_returns_false(self):
+        entry = self._entry()
+        edge = entry.proof.edge_proofs[0]
+        bad_commitments = tuple(
+            c + 1 if c < 100 else c - 1 for c in edge.commitments
+        )
+        bad_edge = WideRangeProof(
+            bad_commitments, edge.challenges, edge.responses
+        )
+        tampered = ConvexPolygonRegionProof(
+            entry.proof.x_proof, entry.proof.y_proof,
+            (bad_edge,) + entry.proof.edge_proofs[1:],
+        )
+        bad = ConvexPolygonBatchEntry(
+            entry.x_commitment, entry.y_commitment, entry.polygon,
+            tampered, entry.context,
+        )
+        self.assertFalse(verify_convex_polygon_batch([bad]))
+
+    def test_forged_edge_proof_returns_false(self):
+        entry = self._entry()
+        edge = entry.proof.edge_proofs[0]
+        forged_edge = WideRangeProof(
+            commitments=tuple(5 for _ in edge.commitments),
+            challenges=tuple((1, 2) for _ in edge.challenges),
+            responses=tuple((3, 4) for _ in edge.responses),
+        )
+        forged = ConvexPolygonRegionProof(
+            entry.proof.x_proof, entry.proof.y_proof,
+            (forged_edge,) + entry.proof.edge_proofs[1:],
+        )
+        bad = ConvexPolygonBatchEntry(
+            entry.x_commitment, entry.y_commitment, entry.polygon,
+            forged, entry.context,
+        )
+        self.assertFalse(verify_convex_polygon_batch([bad]))
+
+    def test_mismatched_group_parameters_return_false(self):
+        entry = self._entry()
+        other_prime = pedersen_commit(
+            1, entry.polygon.min_x, entry.polygon.max_x, prime=2**61 - 1
+        )[0]
+        bad = ConvexPolygonBatchEntry(
+            other_prime, entry.y_commitment, entry.polygon, entry.proof,
+            entry.context,
+        )
+        self.assertFalse(verify_convex_polygon_batch([bad]))
+
+    def test_one_invalid_entry_fails_the_whole_batch(self):
+        good = self._entry(1, 1, context=b"a")
+        bad = self._entry(2, 2, context=b"b")
+        object.__setattr__(bad, "context", b"tampered")
+        self.assertFalse(
+            verify_convex_polygon_batch([good, bad], randbelow=DetRand())
+        )
+        self.assertFalse(
+            verify_convex_polygon_batch([bad, good], randbelow=DetRand())
+        )
+
+    def test_forged_geometrically_invalid_polygon_returns_false(self):
+        entry = self._entry()
+        for vertices in (
+            ((0, 0), (1, 1), (2, 2), (3, 3)),
+            (),
+        ):
+            forged = object.__new__(ConvexPolygonRegion)
+            object.__setattr__(forged, "vertices", vertices)
+            bad = ConvexPolygonBatchEntry(
+                entry.x_commitment, entry.y_commitment, forged, entry.proof,
+                entry.context,
+            )
+            self.assertFalse(verify_convex_polygon_batch([bad]))
+
+    # ---- type errors (whole-batch preflight) --------------------------------
+
+    def test_entries_container_type_errors(self):
+        entry = self._entry()
+        for bad in ("entries", b"entries", bytearray(b"x"), 42, None, iter([entry])):
+            with self.assertRaises(TypeError):
+                verify_convex_polygon_batch(bad)
+
+    def test_entry_and_nested_field_type_errors(self):
+        entry = self._entry()
+
+        def expect(bad):
+            with self.assertRaises(TypeError):
+                verify_convex_polygon_batch([entry, bad])
+
+        expect(("x", entry.y_commitment, entry.polygon, entry.proof, b"c"))
+        expect(ConvexPolygonBatchEntry(
+            "x", entry.y_commitment, entry.polygon, entry.proof, b"c"
+        ))
+        expect(ConvexPolygonBatchEntry(
+            entry.x_commitment, entry.y_commitment,
+            ((0, 0), (4, 0), (0, 4)), entry.proof, b"c",
+        ))
+        expect(ConvexPolygonBatchEntry(
+            entry.x_commitment, entry.y_commitment, entry.polygon,
+            entry.proof, "c",
+        ))
+        # a bool masquerading as a commitment integer
+        prime = entry.x_commitment.prime
+        bool_commitment = PedersenCommitment(True, 0, 4, prime, 3, 9)
+        expect(ConvexPolygonBatchEntry(
+            bool_commitment, entry.y_commitment, entry.polygon, entry.proof,
+            b"c",
+        ))
+        # a non-RangeProof x sub-proof
+        bad_proof = ConvexPolygonRegionProof(
+            "x", entry.proof.y_proof, entry.proof.edge_proofs
+        )
+        expect(ConvexPolygonBatchEntry(
+            entry.x_commitment, entry.y_commitment, entry.polygon, bad_proof,
+            b"c",
+        ))
+        # edge_proofs that is a list rather than a tuple
+        list_edges = ConvexPolygonRegionProof(
+            entry.proof.x_proof, entry.proof.y_proof,
+            list(entry.proof.edge_proofs),
+        )
+        expect(ConvexPolygonBatchEntry(
+            entry.x_commitment, entry.y_commitment, entry.polygon, list_edges,
+            b"c",
+        ))
+        # a non-WideRangeProof edge entry
+        int_edges = ConvexPolygonRegionProof(
+            entry.proof.x_proof, entry.proof.y_proof, (1, 2, 3)
+        )
+        expect(ConvexPolygonBatchEntry(
+            entry.x_commitment, entry.y_commitment, entry.polygon, int_edges,
+            b"c",
+        ))
+        # a forged polygon whose vertices container has the wrong type
+        forged = object.__new__(ConvexPolygonRegion)
+        object.__setattr__(forged, "vertices", [(0, 0), (1, 0), (0, 1)])
+        expect(ConvexPolygonBatchEntry(
+            entry.x_commitment, entry.y_commitment, forged, entry.proof, b"c"
+        ))
+
+    def test_randbelow_type_error(self):
+        entry = self._entry()
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_batch([entry], randbelow=123)
+
+    def test_coefficient_source_value_errors(self):
+        entry = self._entry()
+        prime = entry.x_commitment.prime
+        for bad in (-1, prime - 1, prime):
+            with self.assertRaises(ValueError):
+                verify_convex_polygon_batch(
+                    [entry], randbelow=lambda upper, bad=bad: bad
+                )
+
+    def test_coefficient_source_bool_return_is_type_error(self):
+        entry = self._entry()
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_batch([entry], randbelow=lambda upper: False)
+
+    # ---- hygiene ------------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        entries = [self._entry(1, 1), self._entry(2, 2)]
+        snapshot = [
+            (
+                entry.x_commitment.element,
+                tuple(entry.proof.x_proof.e),
+                entry.proof.edge_proofs[0].commitments,
+            )
+            for entry in entries
+        ]
+        original_order = list(entries)
+        verify_convex_polygon_batch(entries, randbelow=DetRand())
+        self.assertEqual(entries, original_order)
+        self.assertEqual(
+            [
+                (
+                    entry.x_commitment.element,
+                    tuple(entry.proof.x_proof.e),
+                    entry.proof.edge_proofs[0].commitments,
+                )
+                for entry in entries
+            ],
+            snapshot,
+        )
 
 
 if __name__ == "__main__":

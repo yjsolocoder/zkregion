@@ -21,6 +21,9 @@ BoundRangeSetBatch / prove_range_set_batch_bound /
 verify_range_set_batch_bound /
 RangeSetBatchReplayGuard /
 BoundRangeSetBatchReplayGuard /
+ConvexPolygonReplayGuard /
+ConvexPolygonBatchReplayGuard /
+BoundConvexPolygonReplayGuard /
 RegionProof /
 WideRangeProof / prove_range_wide / verify_range_wide /
 WideRangeBatchEntry / verify_range_wide_batch /
@@ -117,6 +120,7 @@ __all__ = [
     "BoundConsistencyChainReplayGuard",
     "BoundConsistencyReplayGuard",
     "BoundConvexPolygonBatch",
+    "BoundConvexPolygonReplayGuard",
     "BoundMerkleInclusionBatch",
     "BoundMerkleInclusionBatchReplayGuard",
     "BoundMerkleMultiBatch",
@@ -140,9 +144,11 @@ __all__ = [
     "BoundWideRangeBatch",
     "BoundWideRangeReplayGuard",
     "ConvexPolygonBatchEntry",
+    "ConvexPolygonBatchReplayGuard",
     "ConvexPolygonProofBundle",
     "ConvexPolygonRegion",
     "ConvexPolygonRegionProof",
+    "ConvexPolygonReplayGuard",
     "MerkleConsistencyBatchEntry",
     "MerkleConsistencyBatchReplayGuard",
     "MerkleConsistencyChain",
@@ -9880,6 +9886,9 @@ _WIDE_RANGE_BATCH_REPLAY_DOMAIN = b"zr/wrbr/v1"
 _REGION_WIDE_REPLAY_DOMAIN = b"zr/rwr/v1"
 _REGION_WIDE_BATCH_REPLAY_DOMAIN = b"zr/rwbr/v1"
 _BOUND_REGION_WIDE_REPLAY_DOMAIN = b"zr/brwr/v1"
+_CONVEX_POLYGON_REPLAY_DOMAIN = b"zr/cpr/v1"
+_CONVEX_POLYGON_BATCH_REPLAY_DOMAIN = b"zr/cpbr/v1"
+_BOUND_CONVEX_POLYGON_REPLAY_DOMAIN = b"zr/bcpr/v1"
 _UINT64_MAX = (1 << 64) - 1
 
 
@@ -24492,6 +24501,908 @@ class BoundRangeSetBatchReplayGuard:
             if binding.expires_at is not None and current >= binding.expires_at:
                 return False  # expired: rejection does not consume the id
             if not verify_range_set_batch_bound(batch, root):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+# ---------------------------------------------------------------------------
+# Replay protection for convex polygon membership proofs
+#
+# Three guards share the ReplayBinding / _ReplayRegistry / SQLiteReplayStore
+# machinery of the other replay guards and reuse their F / U / S framing and
+# the E expiry encoding byte for byte; only the domain separators and the
+# per-entry leaves differ. The leaf L(entry) is always the raw per-item
+# outer leaf of a complete convex polygon batch (_bound_convex_polygon_leaf,
+# the existing outer leaf encoding under
+# b"zkregion/convex-polygon-bound/v1"), which commits the six public fields
+# of both commitments, the canonical polygon vertices (so a rotated or
+# reversed boundary with the same canonical vertices binds identically),
+# the context, both bounding-box range proofs and every per-edge wide range
+# proof in canonical boundary order.
+#
+# ConvexPolygonReplayGuard binds one ConvexPolygonBatchEntry:
+#   digest = SHA-256(F(D) || F(session_id) || L(entry) || F(E))
+#   D = b"zr/cpr/v1"
+#
+# ConvexPolygonBatchReplayGuard binds a whole non-empty batch, kept in
+# construction order with duplicates preserved:
+#   digest = SHA-256(F(D) || F(session_id) || S(entries, L) || F(E))
+#   D = b"zr/cpbr/v1"
+#
+# BoundConvexPolygonReplayGuard binds a BoundConvexPolygonBatch together
+# with the outer Merkle root it is claimed under:
+#   digest = SHA-256(
+#       F(D) || F(session_id) || F(root) || F(U(batch.leaf_count))
+#       || Σ F(L(entry))
+#       || F(U(proof.leaf_count)) || S(proof.indices, U)
+#       || S(proof.siblings, λx.x) || F(E)
+#   )
+#   D = b"zr/bcpr/v1"
+#
+#   F(x) = four-byte unsigned big-endian length prefix of x, followed by x
+#   U(n) = eight-byte unsigned big-endian encoding of n
+#   S(a, f) = F(U(|a|)) || Σ F(f(a_i))
+#   E is the same expiry encoding as the other guards:
+#     b"\x00" when expires_at is None, b"\x01" + uint64be(expires_at) otherwise
+#
+# The three domains differ from each other and from every other guard, so a
+# binding record from one entry point can never be presented at another.
+# Without a store the pending/claimed/consumed states are local to each
+# guard instance; an SQLiteReplayStore keeps them in the store under the
+# guard's own domain, shared across same-type instances, processes and
+# restarts. bind_once registers a pending binding, check claims the id
+# atomically, recomputes the digest, checks the expiry, delegates the proof
+# verification (verify_convex_polygon, verify_convex_polygon_batch or
+# verify_convex_polygon_batch_bound, the latter two with the random source
+# passed through unchanged) and consumes the id only on full success; every
+# rejection leaves the id pending and reusable.
+
+
+def _convex_polygon_replay_digest(
+    entry: ConvexPolygonBatchEntry,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute ``SHA-256(F(D) || F(session_id) || L(entry) || F(E))``."""
+    transcript = hashlib.sha256()
+    transcript.update(len(_CONVEX_POLYGON_REPLAY_DOMAIN).to_bytes(4, "big"))
+    transcript.update(_CONVEX_POLYGON_REPLAY_DOMAIN)
+    transcript.update(len(session_id).to_bytes(4, "big"))
+    transcript.update(session_id)
+    transcript.update(_bound_convex_polygon_leaf(entry))  # raw leaf, no F framing
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(len(expiry).to_bytes(4, "big"))
+    transcript.update(expiry)
+    return transcript.digest()
+
+
+def _check_convex_polygon_batch_entry(
+    entry: object, name: str = "entry"
+) -> ConvexPolygonBatchEntry:
+    """Validate one ConvexPolygonBatchEntry and its nested field types."""
+    if not isinstance(entry, ConvexPolygonBatchEntry):
+        raise TypeError(f"{name} must be a ConvexPolygonBatchEntry")
+    _check_convex_polygon_entry_fields(entry, 0)
+    return entry
+
+
+class ConvexPolygonReplayGuard:
+    """Single-use replay protection for one convex polygon batch entry.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` for a single
+    :class:`ConvexPolygonBatchEntry`; :meth:`check` accepts an equal
+    pending binding exactly once and then marks the id consumed. By
+    default both the pending and the consumed state live on this guard
+    instance and are never shared between instances; passing an
+    :class:`SQLiteReplayStore` as ``store`` instead keeps the state in
+    that store under the ``b"zr/cpr/v1"`` key domain, so guards attached
+    to the same store namespace share pending, claimed and consumed ids
+    across independent instances, processes and restarts.
+
+    The binding digest reuses the single-entry guard framing of
+    :class:`RangeReplayGuard` byte for byte (``F(D) || F(session_id) ||
+    L(entry) || F(E)``), differing only in the domain separator
+    (``b"zr/cpr/v1"``, which doubles as the store row-key domain) and in
+    ``L(entry)``: the raw per-item outer leaf bytes of a complete convex
+    polygon batch (:func:`_bound_convex_polygon_leaf`, the existing
+    outer leaf encoding under ``b"zkregion/convex-polygon-bound/v1"``),
+    which commits both commitments' public fields, the canonical polygon
+    vertices, the context, the bounding-box range proofs and the
+    per-edge wide range proofs.
+
+    As with :class:`RangeReplayGuard`, concurrent checks of the same id
+    are decided by an atomic claim taken before the digest/expiry work
+    and the potentially slow proof verification (the in-instance
+    registry lock, or the store's short transaction and unique claim
+    token); the verification runs without any lock or transaction held,
+    so different ids are never serialized.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None if store is None else store._view(_CONVEX_POLYGON_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        entry: ConvexPolygonBatchEntry,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to ``entry``.
+
+        Returns the frozen :class:`ReplayBinding`. ``session_id`` must be
+        non-empty ``bytes`` and ``expires_at`` must be either ``None`` or
+        a non-``bool`` unsigned 64-bit Unix-second timestamp. A session
+        id that is already pending, being checked or has been consumed
+        raises :class:`ValueError`; wrong argument or nested field types
+        (including ``bool`` integers) raise :class:`TypeError` (an empty
+        id or an out-of-range expiry raises :class:`ValueError`, as does
+        a polygon whose vertices fail canonicalization). Inputs are
+        never mutated.
+        """
+        _check_convex_polygon_batch_entry(entry)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        binding = ReplayBinding(
+            session_id,
+            _convex_polygon_replay_digest(entry, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entry: ConvexPolygonBatchEntry,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+    ) -> bool:
+        """Verify and consume the pending binding for ``entry``.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``.
+        The id is claimed atomically before verification, so among
+        concurrent calls for the same id at most one can return ``True``.
+        The digest is then recomputed over the presented entry, the
+        expiry is checked (``now >= expires_at`` makes the check fail;
+        ``now`` defaults to the current Unix seconds and must otherwise
+        be a non-``bool`` unsigned 64-bit integer), and only then is the
+        entry's proof checked with :func:`verify_convex_polygon` called
+        with ``entry.x_commitment``, ``entry.y_commitment``,
+        ``entry.polygon``, ``entry.proof`` and ``entry.context`` in
+        field order, unchanged.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry or a failing
+        convex polygon proof) returns ``False``, releases any claim and
+        leaves the registration pending, so a rejected id can succeed on
+        a later attempt. An exception escaping the delegated
+        verification likewise releases the claim and then propagates
+        unchanged, leaving the id usable; a database error restores the
+        claim before it propagates. With a store backend, only the
+        holder of the current claim token can consume the id (an expired
+        claim may be taken over by a later equal ``check``); a stale
+        token neither consumes nor restores anything. Verification runs
+        without a lock, so other ids are never blocked. Type errors
+        raise :class:`TypeError`; an out-of-range ``now`` raises
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_convex_polygon_batch_entry(entry)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(entry, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            try:
+                digest = _convex_polygon_replay_digest(
+                    entry, session_id, binding.expires_at
+                )
+            except ValueError:
+                return False  # forged polygon vertices cannot be leaf-encoded
+            if not hmac.compare_digest(binding.digest, digest):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_convex_polygon(
+                entry.x_commitment,
+                entry.y_commitment,
+                entry.polygon,
+                entry.proof,
+                entry.context,
+            ):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entry: ConvexPolygonBatchEntry,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim
+        is taken over); verification runs with no transaction held; only
+        the token returned by the winning claim can consume the id, and
+        every rejection or escaped error restores the id to pending with
+        that same token. A stale token (a claim taken over while
+        verification ran) neither consumes nor restores anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            try:
+                digest = _convex_polygon_replay_digest(
+                    entry, session_id, binding.expires_at
+                )
+            except ValueError:
+                return False  # forged polygon vertices cannot be leaf-encoded
+            if not hmac.compare_digest(binding.digest, digest):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_convex_polygon(
+                entry.x_commitment,
+                entry.y_commitment,
+                entry.polygon,
+                entry.proof,
+                entry.context,
+            ):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+def _convex_polygon_batch_replay_encodable(
+    entries: Sequence[ConvexPolygonBatchEntry],
+) -> bool:
+    """The S-framed batch length must fit in an unsigned 64-bit integer.
+
+    The outer ``S`` sequence writes the batch count with ``U``
+    (eight-byte unsigned big-endian). Each entry is framed as the
+    complete-batch outer leaf, whose integers are encoded as decimal
+    ASCII with the sign kept, so every integer field frames for any
+    value and no per-entry encodability rule is needed.
+    """
+    return 0 <= len(entries) <= _UINT64_MAX
+
+
+def _convex_polygon_batch_replay_digest(
+    entries: Sequence[ConvexPolygonBatchEntry],
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the convex-polygon-batch replay binding digest.
+
+    Writes, in order: ``F(D)``, ``F(session_id)``, ``S(entries, L)`` and
+    ``F(E)``; ``L(entry)`` is the complete-batch outer leaf raw bytes
+    (the same bytes :func:`_bound_convex_polygon_leaf` builds for
+    :func:`verify_convex_polygon_batch_bound`) and the entries keep
+    their batch order (duplicates included).
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_CONVEX_POLYGON_BATCH_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    # S(entries, L) = F(U(|entries|)) || Σ F(L(entry))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(entries))))
+    for entry in entries:
+        transcript.update(_frame_length_prefixed(_bound_convex_polygon_leaf(entry)))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+class ConvexPolygonBatchReplayGuard:
+    """Single-use replay protection for a batch of :class:`ConvexPolygonBatchEntry`.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole non-empty batch
+    of :class:`ConvexPolygonBatchEntry` items — the same sequence shape
+    accepted by :func:`verify_convex_polygon_batch`, kept in the given
+    order with duplicates preserved — to a session id; :meth:`check`
+    accepts an equal pending binding exactly once, recomputing the
+    binding digest, checking the expiry and delegating to
+    :func:`verify_convex_polygon_batch` with the random source passed
+    through unchanged, and then marks the id consumed. The digest frames
+    the batch under ``SHA-256(F(D) || F(session_id) || S(entries, L) ||
+    F(E))`` with domain ``b"zr/cpbr/v1"``, where ``L(entry)`` is the raw
+    per-item outer leaf of a complete convex polygon batch (the same
+    bytes :func:`_bound_convex_polygon_leaf` builds under
+    ``b"zkregion/convex-polygon-bound/v1"`` for
+    :func:`verify_convex_polygon_batch_bound`); the F / U / S framing
+    and the E expiry encoding are reused byte for byte from the other
+    batch replay guards. By default both the pending and the consumed
+    state live on this guard instance and are never shared between
+    instances; passing an :class:`SQLiteReplayStore` as ``store``
+    instead keeps the state in that store under the ``b"zr/cpbr/v1"``
+    key domain, so batch guards attached to the same store namespace
+    share pending, claimed and consumed ids across independent
+    instances, processes and process restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim
+    taken before the digest/expiry work and the delegated batch
+    verification (the in-instance registry lock, or the store's short
+    transaction and unique claim token); the claim is per-id registry
+    state rather than a global lock, so a batch being verified under one
+    id never serializes checks or binds of other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None
+            if store is None
+            else store._view(_CONVEX_POLYGON_BATCH_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        entries: Sequence[ConvexPolygonBatchEntry],
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to the batch.
+
+        Returns the frozen :class:`ReplayBinding`. ``entries`` must be a
+        non-string, non-empty sequence of :class:`ConvexPolygonBatchEntry`
+        objects following the same sequence and nested type rules as
+        :func:`verify_convex_polygon_batch`: every entry's two
+        :class:`PedersenCommitment` six integer fields, its
+        :class:`ConvexPolygonRegion` vertex tuples, its
+        :class:`ConvexPolygonRegionProof` bounding-box and per-edge
+        sub-proof tuple fields at every nesting level and its
+        ``context`` are type-checked; entries are kept in the given
+        order with duplicates preserved and no item dropped.
+        ``session_id`` must be non-empty ``bytes`` and ``expires_at``
+        must be either ``None`` or a non-``bool`` unsigned 64-bit
+        Unix-second timestamp; the ``U``-framed batch length must fit in
+        uint64. A session id that is already pending, being checked or
+        consumed raises :class:`ValueError`. Wrong argument or nested
+        field types (including ``bool`` integers) raise
+        :class:`TypeError`; an empty batch or empty id, an out-of-uint64
+        expiry or batch length, a polygon whose vertices fail
+        canonicalization or a rebind raise :class:`ValueError`. Inputs
+        are never mutated.
+        """
+        items = _check_convex_polygon_batch_entries_types(entries)
+        _check_bytes(session_id, "session_id")
+        if not items:
+            raise ValueError("entries must not be empty")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _convex_polygon_batch_replay_encodable(items):
+            raise ValueError("batch length must be an unsigned 64-bit integer")
+        binding = ReplayBinding(
+            session_id,
+            _convex_polygon_batch_replay_digest(items, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        entries: Sequence[ConvexPolygonBatchEntry],
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+        randbelow: Callable[[int], int] = secrets.randbelow,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``.
+        The id is claimed atomically before the digest/expiry work and
+        the delegated verification, so among concurrent calls for the
+        same id at most one can return ``True``. The digest is
+        recomputed over the presented ``entries`` in their given order
+        (duplicates included); for a binding with an expiry,
+        ``now >= expires_at`` makes the check fail (``now`` defaults to
+        the current Unix seconds and must otherwise be a non-``bool``
+        uint64). Only then is the batch handed to
+        :func:`verify_convex_polygon_batch` with ``randbelow`` passed
+        through unchanged, under that function's sequence, structure and
+        randomness contract: it is called once per structurally valid
+        bounding-box range-proof branch and once per OR sub-branch of
+        every edge proof bit as ``randbelow(prime - 1)``, an empty batch
+        returns ``False`` without any draw, a non-callable source or a
+        non-integer result raises :class:`TypeError` and a coefficient
+        outside ``[0, prime - 1)`` raises :class:`ValueError`.
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, an
+        empty/oversized batch or :func:`verify_convex_polygon_batch`
+        returning ``False``) returns ``False``, releases the claim and
+        leaves the registration pending. An exception escaping the
+        delegated verification (such as the :class:`TypeError` /
+        :class:`ValueError` raised by a bad ``randbelow``) likewise
+        releases the claim and then propagates unchanged, leaving the id
+        usable. With a store backend, only the holder of the current
+        claim token can consume the id (an expired claim may be taken
+        over by a later equal ``check``); a stale token neither consumes
+        nor restores anything. Verification runs without any lock or
+        transaction held, so other ids are never serialized. Argument
+        type errors (including a non-callable ``randbelow``) raise
+        :class:`TypeError`; an out-of-range ``now`` raises
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        items = _check_convex_polygon_batch_entries_types(entries)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if not callable(randbelow):
+            raise TypeError("randbelow must be callable")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _convex_polygon_batch_replay_encodable(items):
+            return False  # an oversized batch
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(items, binding, session_id, current, randbelow)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            try:
+                digest = _convex_polygon_batch_replay_digest(
+                    items, session_id, binding.expires_at
+                )
+            except ValueError:
+                return False  # forged polygon vertices cannot be leaf-encoded
+            if not hmac.compare_digest(binding.digest, digest):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_convex_polygon_batch(items, randbelow=randbelow):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entries: Sequence[ConvexPolygonBatchEntry],
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+        randbelow: Callable[[int], int],
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim
+        is taken over and issued a fresh random token); verification
+        runs with no transaction held; only the token returned by the
+        winning claim can consume the id, and every rejection or escaped
+        error restores the id to pending with that same token. A stale
+        token (a claim taken over while verification ran) neither
+        consumes nor restores anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            try:
+                digest = _convex_polygon_batch_replay_digest(
+                    entries, session_id, binding.expires_at
+                )
+            except ValueError:
+                return False  # forged polygon vertices cannot be leaf-encoded
+            if not hmac.compare_digest(binding.digest, digest):
+                return False  # the presented batch is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_convex_polygon_batch(entries, randbelow=randbelow):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+def _bound_convex_polygon_replay_encodable(batch: BoundConvexPolygonBatch) -> bool:
+    """Every U-framed integer must fit in unsigned 64 bits.
+
+    ``batch.leaf_count``, ``batch.proof.leaf_count`` and every proof
+    index are written with ``U`` (eight-byte unsigned big-endian); a
+    negative or larger-than-uint64 value cannot be framed. The
+    decimal-ASCII convex polygon leaves (the negative sign is kept),
+    the raw sibling bytes and the root encode for any value.
+    """
+    proof = batch.proof
+    values = [batch.leaf_count, proof.leaf_count, *proof.indices]
+    return all(0 <= value <= _UINT64_MAX for value in values)
+
+
+def _bound_convex_polygon_replay_digest(
+    batch: BoundConvexPolygonBatch,
+    root: bytes,
+    session_id: bytes,
+    expires_at: int | None,
+) -> bytes:
+    """Compute the BoundConvexPolygonBatch replay binding digest.
+
+    Byte-for-byte the :func:`_bound_wide_range_replay_digest` framing
+    with the bound convex polygon replay domain and the convex polygon
+    complete-batch (:func:`_bound_convex_polygon_leaf`) leaves. Writes,
+    in order: ``F(D)``, ``F(session_id)``, ``F(root)``,
+    ``F(U(batch.leaf_count))``, one ``F(L(entry))`` per entry in batch
+    order, then ``F(U(proof.leaf_count))``, ``S(proof.indices, U)``,
+    ``S(proof.siblings, identity)`` and ``F(E)``.
+    """
+    transcript = hashlib.sha256()
+    transcript.update(_frame_length_prefixed(_BOUND_CONVEX_POLYGON_REPLAY_DOMAIN))
+    transcript.update(_frame_length_prefixed(session_id))
+    transcript.update(_frame_length_prefixed(root))
+    transcript.update(_frame_length_prefixed(_uint64_be(batch.leaf_count)))
+    for entry in batch.entries:  # entries order, each convex polygon leaf under F
+        transcript.update(_frame_length_prefixed(_bound_convex_polygon_leaf(entry)))
+    proof = batch.proof
+    transcript.update(_frame_length_prefixed(_uint64_be(proof.leaf_count)))
+    # S(proof.indices, U) = F(U(|indices|)) || Σ F(U(index))
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.indices))))
+    for index in proof.indices:
+        transcript.update(_frame_length_prefixed(_uint64_be(index)))
+    # S(proof.siblings, λx.x) = F(U(|siblings|)) || Σ F(sibling)
+    transcript.update(_frame_length_prefixed(_uint64_be(len(proof.siblings))))
+    for sibling in proof.siblings:
+        transcript.update(_frame_length_prefixed(sibling))
+    expiry = _replay_expiry_bytes(expires_at)
+    transcript.update(_frame_length_prefixed(expiry))
+    return transcript.digest()
+
+
+def _check_bound_convex_polygon_batch_types(batch: object, root: object) -> None:
+    """Validate BoundConvexPolygonBatch argument types for the replay guard.
+
+    Mirrors the type checks of :func:`verify_convex_polygon_batch_bound`:
+    the batch must be a :class:`BoundConvexPolygonBatch` whose entries
+    tuple holds nestedly well-typed :class:`ConvexPolygonBatchEntry`
+    objects, whose ``leaf_count`` is a non-``bool`` integer and whose
+    proof is a well-typed :class:`MerkleMultiProof`; ``root`` must be
+    ``bytes``. Structural and value problems (coverage, counts, ranges)
+    are left to :func:`verify_convex_polygon_batch_bound` at check time.
+    """
+    if not isinstance(batch, BoundConvexPolygonBatch):
+        raise TypeError("batch must be a BoundConvexPolygonBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(
+            "batch entries must be a tuple of ConvexPolygonBatchEntry"
+        )
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        _check_convex_polygon_entry_fields(entry, position)
+
+
+class BoundConvexPolygonReplayGuard:
+    """Single-use replay protection for a Merkle-committed convex polygon batch.
+
+    A fresh guard has no registrations. :meth:`bind_once` registers a
+    pending :class:`ReplayBinding` that commits a whole
+    :class:`BoundConvexPolygonBatch` together with the outer Merkle
+    ``root`` it is claimed under; :meth:`check` accepts an equal pending
+    binding exactly once — first atomically claiming the id, then
+    recomputing the binding digest, checking the expiry and handing the
+    batch/root and the same random source unchanged to
+    :func:`verify_convex_polygon_batch_bound`, which checks the outer
+    root and the inner convex polygon batch in that fixed order — and
+    then marks the id consumed. The digest reuses the
+    :class:`BoundWideRangeReplayGuard` framing byte for byte, with only
+    the domain separator (``b"zr/bcpr/v1"``) and the per-entry leaves
+    changed to the convex polygon complete-batch leaves
+    (:func:`_bound_convex_polygon_leaf`). By default both the pending
+    and the consumed state live on this guard instance and are never
+    shared between instances; passing an :class:`SQLiteReplayStore` as
+    ``store`` instead keeps the state in that store under the
+    ``b"zr/bcpr/v1"`` key domain, so bound convex polygon guards
+    attached to the same store namespace share pending, claimed and
+    consumed ids across independent instances, processes and process
+    restarts.
+
+    Concurrent checks of the same id are decided by an atomic claim
+    taken before the digest/expiry work and the (potentially slow)
+    delegated root and batch verification (the in-instance registry
+    lock, or the store's short transaction and unique claim token); the
+    claim is per-id registry state rather than a global lock, so a batch
+    being verified under one id never serializes checks or binds of
+    other ids.
+    """
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = (
+            None
+            if store is None
+            else store._view(_BOUND_CONVEX_POLYGON_REPLAY_DOMAIN)
+        )
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def bind_once(
+        self,
+        batch: BoundConvexPolygonBatch,
+        root: bytes,
+        session_id: bytes,
+        *,
+        expires_at: int | None = None,
+    ) -> ReplayBinding:
+        """Register this instance's binding of ``session_id`` to a batch/root.
+
+        Returns the frozen :class:`ReplayBinding`. ``session_id`` must
+        be non-empty ``bytes`` and ``expires_at`` must be either
+        ``None`` or a non-``bool`` unsigned 64-bit Unix-second
+        timestamp; the U-framed integers (``leaf_count`` and the outer
+        proof indices) must likewise fit in uint64. A session id that is
+        already pending, being checked or consumed raises
+        :class:`ValueError`. Wrong argument or nested field types
+        (including ``bool`` integers) raise :class:`TypeError`; an empty
+        id, an out-of-uint64 expiry or framed integer, a polygon whose
+        vertices fail canonicalization or a rebind raise
+        :class:`ValueError`. Inputs are never mutated.
+        """
+        _check_bound_convex_polygon_batch_types(batch, root)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        if not _bound_convex_polygon_replay_encodable(batch):
+            raise ValueError("leaf_count and proof indices must be unsigned 64-bit integers")
+        binding = ReplayBinding(
+            session_id,
+            _bound_convex_polygon_replay_digest(batch, root, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def check(
+        self,
+        batch: BoundConvexPolygonBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        *,
+        now: int | None = None,
+        randbelow: Callable[[int], int] = secrets.randbelow,
+    ) -> bool:
+        """Verify and consume the pending binding for the batch/root.
+
+        ``binding`` must be the equal, still-pending :class:`ReplayBinding`
+        previously registered on this guard for ``binding.session_id``.
+        The id is claimed atomically before the digest/expiry work and
+        the delegated verification, so among concurrent calls for the
+        same id at most one can return ``True``. The digest is
+        recomputed over the presented ``batch`` / ``root``; for a
+        binding with an expiry, ``now >= expires_at`` makes the check
+        fail (``now`` defaults to the current Unix seconds and must
+        otherwise be a non-``bool`` uint64). Only then is the batch/root
+        handed to :func:`verify_convex_polygon_batch_bound` with
+        ``randbelow`` passed through unchanged, under that function's
+        root, structure and randomness contract (outer root first, then
+        the inner convex polygon batch; an empty batch returns ``False``
+        without any draw).
+
+        Only a fully successful check consumes the session id; every
+        rejection (unknown or consumed id, a claim lost to a concurrent
+        check, unequal binding, digest mismatch, expiry, a wrong root or
+        :func:`verify_convex_polygon_batch_bound` returning ``False``
+        for the root or the inner batch) returns ``False``, releases the
+        claim and leaves the registration pending, so a rejected id can
+        succeed on a later attempt. An exception escaping the delegated
+        verification likewise releases the claim and then propagates
+        unchanged, leaving the id usable; a database error restores the
+        claim before it propagates. With a store backend, only the
+        holder of the current claim token can consume the id (an expired
+        claim may be taken over by a later equal ``check``); a stale
+        token neither consumes nor restores anything. Verification runs
+        without any lock or transaction held, so other ids are never
+        serialized. Argument type errors (including a non-callable
+        ``randbelow`` and ``bool`` integers) raise :class:`TypeError`;
+        an out-of-range ``now`` raises :class:`ValueError`. Inputs are
+        never mutated.
+        """
+        _check_bound_convex_polygon_batch_types(batch, root)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if not callable(randbelow):
+            raise TypeError("randbelow must be callable")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        if not _bound_convex_polygon_replay_encodable(batch):
+            return False  # negative or oversized U-framed integers
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(batch, root, binding, session_id, current, randbelow)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            try:
+                digest = _bound_convex_polygon_replay_digest(
+                    batch, root, session_id, binding.expires_at
+                )
+            except ValueError:
+                return False  # forged polygon vertices cannot be leaf-encoded
+            if not hmac.compare_digest(binding.digest, digest):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_convex_polygon_batch_bound(batch, root, randbelow=randbelow):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        batch: BoundConvexPolygonBatch,
+        root: bytes,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+        randbelow: Callable[[int], int],
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for :meth:`check`.
+
+        The claim is taken in one short transaction (or an expired claim
+        is taken over and issued a fresh random token); verification
+        runs with no transaction held; only the token returned by the
+        winning claim can consume the id, and every rejection, escaped
+        verification error or database error restores the id to pending
+        with that same token before propagating. A stale token (a claim
+        taken over while verification ran) neither consumes nor restores
+        anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            try:
+                digest = _bound_convex_polygon_replay_digest(
+                    batch, root, session_id, binding.expires_at
+                )
+            except ValueError:
+                return False  # forged polygon vertices cannot be leaf-encoded
+            if not hmac.compare_digest(binding.digest, digest):
+                return False  # the presented batch/root is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not verify_convex_polygon_batch_bound(batch, root, randbelow=randbelow):
                 return False
             if not self._store.commit(session_id, token):
                 return False  # the lease expired and another check took over

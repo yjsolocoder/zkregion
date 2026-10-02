@@ -1,9 +1,14 @@
 import dataclasses
+import hashlib
+import os
+import tempfile
+import threading
 import unittest
 
 from zkregion import (
     BoundConvexPolygonBatch,
     ConvexPolygonBatchEntry,
+    ConvexPolygonBatchReplayGuard,
     ConvexPolygonProofBundle,
     ConvexPolygonRegion,
     ConvexPolygonRegionProof,
@@ -11,6 +16,8 @@ from zkregion import (
     MerkleMultiProof,
     PedersenCommitment,
     RangeProof,
+    ReplayBinding,
+    SQLiteReplayStore,
     WideRangeProof,
     _bound_convex_polygon_leaf,
     _edge_offset_upper,
@@ -2434,6 +2441,449 @@ class ProveConvexPolygonBatchBoundTest(unittest.TestCase):
             prove_convex_polygon_batch_bound(
                 entries, randbelow=lambda _: DEFAULT_PRIME
             )
+
+
+class ConvexPolygonBatchReplayGuardTest(unittest.TestCase):
+    """Single-use replay bindings for convex polygon proof batches."""
+
+    DOMAIN = b"zr/cpbr/v1"
+    PENTAGON = ((0, 0), (5, 0), (6, 4), (2, 6), (-2, 3))
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "cpbr.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _entry(self, x=1, y=2, vertices=TRIANGLE, context=b"ctx"):
+        polygon = ConvexPolygonRegion(vertices)
+        x_commitment, x_blinding = pedersen_commit(
+            x, polygon.min_x, polygon.max_x
+        )
+        y_commitment, y_blinding = pedersen_commit(
+            y, polygon.min_y, polygon.max_y
+        )
+        proof = prove_convex_polygon(
+            x_commitment, y_commitment, x, y, x_blinding, y_blinding,
+            polygon, context, randbelow=DetRand(),
+        )
+        return ConvexPolygonBatchEntry(
+            x_commitment, y_commitment, polygon, proof, context
+        )
+
+    def honest_entries(self):
+        """Distinct entries plus a preserved duplicate, in batch order."""
+        first = self._entry(1, 2, context=b"a")
+        second = self._entry(0, 3, vertices=self.PENTAGON, context=b"b")
+        return [first, second, first]
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    @staticmethod
+    def expected_digest(entries, session_id, expires_at=None):
+        def F(item):
+            return len(item).to_bytes(4, "big") + item
+
+        def U(value):
+            return value.to_bytes(8, "big")
+
+        def S(sequence, transform):
+            return F(U(len(sequence))) + b"".join(
+                F(transform(item)) for item in sequence
+            )
+
+        expiry = b"\x00" if expires_at is None else b"\x01" + expires_at.to_bytes(8, "big")
+        material = (
+            F(b"zr/cpbr/v1") + F(session_id)
+            + S(entries, _bound_convex_polygon_leaf) + F(expiry)
+        )
+        return hashlib.sha256(material).digest()
+
+    # ---- binding / digest wire format ---------------------------------------
+
+    def test_bind_once_returns_spec_digest(self):
+        entries = self.honest_entries()
+        guard = ConvexPolygonBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s1")
+        self.assertIsInstance(binding, ReplayBinding)
+        self.assertEqual(binding.session_id, b"s1")
+        self.assertIsNone(binding.expires_at)
+        self.assertEqual(len(binding.digest), 32)
+        self.assertEqual(binding.digest, self.expected_digest(entries, b"s1"))
+        binding = guard.bind_once(entries, b"s2", expires_at=1000)
+        self.assertEqual(binding.expires_at, 1000)
+        self.assertEqual(
+            binding.digest, self.expected_digest(entries, b"s2", 1000)
+        )
+
+    # ---- register, check, consume (in-memory) -------------------------------
+
+    def test_check_accepts_then_consumes(self):
+        entries = self.honest_entries()
+        guard = ConvexPolygonBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        self.assertFalse(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        self.assertEqual(guard._consumed, {b"s"})
+        self.assertNotIn(b"s", guard._pending)
+
+    def test_pending_and_consumed_ids_cannot_be_rebound(self):
+        entries = self.honest_entries()
+        guard = ConvexPolygonBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        with self.assertRaises(ValueError):  # still pending
+            guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        with self.assertRaises(ValueError):  # already consumed
+            guard.bind_once(entries, b"s")
+
+    def test_inputs_are_not_mutated(self):
+        entries = self.honest_entries()
+        snapshots = [dataclasses.replace(entry) for entry in entries]
+        guard = ConvexPolygonBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        binding_snapshot = dataclasses.replace(binding)
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        self.assertEqual(entries, snapshots)
+        self.assertEqual(binding, binding_snapshot)
+
+    # ---- rejection is not consumption ---------------------------------------
+
+    def test_rejection_does_not_consume_registration(self):
+        entries = self.honest_entries()
+        guard = ConvexPolygonBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        changed_context = dataclasses.replace(entries[1], context=b"other")
+        wrong_batches = (
+            [entries[0], changed_context, entries[2]],  # altered context
+            [entries[1], entries[0], entries[2]],  # swapped distinct entries
+            entries[:-1],  # dropped duplicate
+        )
+        for wrong in wrong_batches:
+            self.assertFalse(
+                guard.check(wrong, binding, now=1, randbelow=DetRand())
+            )
+        self.assertIn(b"s", guard._pending)
+        # the original batch is still accepted, exactly once
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        self.assertFalse(guard.check(entries, binding, now=1, randbelow=DetRand()))
+
+    def test_rotated_and_reversed_polygons_are_not_rejected(self):
+        entries = self.honest_entries()
+        guard = ConvexPolygonBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        rotated = dataclasses.replace(
+            entries[0], polygon=ConvexPolygonRegion(((0, 4), (4, 0), (0, 0)))
+        )
+        reversed_ = dataclasses.replace(
+            entries[0], polygon=ConvexPolygonRegion(((0, 0), (0, 4), (4, 0)))
+        )
+        # canonicalization makes the representations value-equal
+        self.assertEqual(rotated, entries[0])
+        self.assertEqual(reversed_, entries[0])
+        presented = [rotated, entries[1], reversed_]
+        self.assertTrue(
+            guard.check(presented, binding, now=1, randbelow=DetRand())
+        )
+
+    def test_unregistered_equal_binding_is_rejected(self):
+        entries = self.honest_entries()
+        guard = ConvexPolygonBatchReplayGuard()
+        binding = ConvexPolygonBatchReplayGuard().bind_once(entries, b"s")
+        self.assertFalse(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        clone = ReplayBinding(binding.session_id, binding.digest, binding.expires_at)
+        self.assertEqual(clone, binding)
+        self.assertFalse(guard.check(entries, clone, now=1, randbelow=DetRand()))
+
+    def test_expiry_boundary_rejects_without_consuming(self):
+        entries = self.honest_entries()
+        guard = ConvexPolygonBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s", expires_at=1000)
+        self.assertFalse(
+            guard.check(entries, binding, now=1000, randbelow=DetRand())
+        )
+        self.assertIn(b"s", guard._pending)
+        # the rejection did not consume the registration: an earlier
+        # explicit timestamp still verifies and consumes exactly once
+        self.assertTrue(
+            guard.check(entries, binding, now=999, randbelow=DetRand())
+        )
+        self.assertFalse(
+            guard.check(entries, binding, now=999, randbelow=DetRand())
+        )
+
+    def test_randbelow_errors_release_the_claim(self):
+        entries = self.honest_entries()
+        guard = ConvexPolygonBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s")
+        with self.assertRaises(TypeError):
+            guard.check(entries, binding, now=1, randbelow=lambda upper: "x")
+        with self.assertRaises(ValueError):
+            guard.check(entries, binding, now=1, randbelow=lambda upper: -1)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        self.assertFalse(guard.check(entries, binding, now=1, randbelow=DetRand()))
+
+    def test_tampered_proof_batch_binds_but_never_checks(self):
+        entries = self.honest_entries()
+        proof = entries[0].proof
+        last_s = proof.x_proof.s[-1]
+        tampered = dataclasses.replace(
+            entries[0],
+            proof=ConvexPolygonRegionProof(
+                dataclasses.replace(
+                    proof.x_proof, s=proof.x_proof.s[:-1] + (last_s + 1,)
+                ),
+                proof.y_proof,
+                proof.edge_proofs,
+            ),
+        )
+        bad = [tampered] + entries[1:]
+        guard = ConvexPolygonBatchReplayGuard()
+        # registration commits to the batch bytes; it does not verify proofs
+        binding = guard.bind_once(bad, b"s")
+        self.assertFalse(guard.check(bad, binding, now=1, randbelow=DetRand()))
+        self.assertFalse(guard.check(bad, binding, now=1, randbelow=DetRand()))
+        with self.assertRaises(ValueError):  # still pending, never consumed
+            guard.bind_once(bad, b"s")
+
+    # ---- concurrency (in-memory) ---------------------------------------------
+
+    def test_concurrent_checks_have_exactly_one_winner(self):
+        entries = self.honest_entries()
+        for _ in range(5):  # the outcome does not depend on scheduling
+            guard = ConvexPolygonBatchReplayGuard()
+            binding = guard.bind_once(entries, b"s")
+            barrier = threading.Barrier(8)
+            results = []
+            lock = threading.Lock()
+
+            def attempt():
+                barrier.wait()
+                won = guard.check(entries, binding, now=1, randbelow=DetRand())
+                with lock:
+                    results.append(won)
+
+            threads = [threading.Thread(target=attempt) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(sum(results), 1)
+            self.assertEqual(results.count(False), 7)
+
+    def test_other_session_completes_while_one_check_is_in_flight(self):
+        entries = self.honest_entries()
+        other_entries = [self._entry(3, 0, context=b"c")]
+        guard = ConvexPolygonBatchReplayGuard()
+        binding = guard.bind_once(entries, b"s1")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_randbelow(upper):
+            entered.set()
+            release.wait(5)
+            return 0
+
+        outcome = []
+
+        def slow_check():
+            outcome.append(
+                guard.check(entries, binding, now=1, randbelow=blocking_randbelow)
+            )
+
+        thread = threading.Thread(target=slow_check)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(5))  # s1 claimed, verification blocked
+            # another session registers and checks without waiting for s1
+            other = guard.bind_once(other_entries, b"s2")
+            self.assertTrue(
+                guard.check(other_entries, other, now=1, randbelow=DetRand())
+            )
+        finally:
+            release.set()
+        thread.join(5)
+        self.assertEqual(outcome, [True])
+        self.assertFalse(guard.check(entries, binding, now=1, randbelow=DetRand()))
+
+    def test_in_memory_guards_do_not_share_registrations(self):
+        entries = self.honest_entries()
+        first = ConvexPolygonBatchReplayGuard()
+        second = ConvexPolygonBatchReplayGuard()
+        binding = first.bind_once(entries, b"s")
+        self.assertFalse(
+            second.check(entries, binding, now=1, randbelow=DetRand())
+        )
+        other = second.bind_once(entries, b"s")  # the id is free on second
+        self.assertEqual(other, binding)
+        self.assertTrue(first.check(entries, binding, now=1, randbelow=DetRand()))
+        self.assertTrue(second.check(entries, other, now=1, randbelow=DetRand()))
+
+    # ---- SQLite backend -------------------------------------------------------
+
+    def test_store_check_accepts_then_consumes(self):
+        entries = self.honest_entries()
+        store = self.make_store()
+        guard = ConvexPolygonBatchReplayGuard(store=store)
+        binding = guard.bind_once(entries, b"s")
+        with self.assertRaises(ValueError):  # pending id cannot be rebound
+            guard.bind_once(entries, b"s")
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        self.assertFalse(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        with self.assertRaises(ValueError):  # consumed id cannot be rebound
+            guard.bind_once(entries, b"s")
+        store.close()
+
+    def test_store_connections_share_registration_and_consumption(self):
+        entries = self.honest_entries()
+        first_store = self.make_store()
+        second_store = self.make_store()
+        binding = ConvexPolygonBatchReplayGuard(store=first_store).bind_once(
+            entries, b"s"
+        )
+        checker = ConvexPolygonBatchReplayGuard(store=second_store)
+        self.assertTrue(checker.check(entries, binding, now=1, randbelow=DetRand()))
+        self.assertFalse(
+            ConvexPolygonBatchReplayGuard(store=first_store).check(
+                entries, binding, now=1, randbelow=DetRand()
+            )
+        )
+        with self.assertRaises(ValueError):
+            checker.bind_once(entries, b"s")
+        first_store.close()
+        second_store.close()
+
+    def test_store_state_survives_reopen(self):
+        entries = self.honest_entries()
+        single = [entries[0]]
+        store = self.make_store()
+        guard = ConvexPolygonBatchReplayGuard(store=store)
+        pending = guard.bind_once(entries, b"pending")
+        consumed = guard.bind_once(single, b"consumed")
+        self.assertTrue(guard.check(single, consumed, now=1, randbelow=DetRand()))
+        store.close()
+        reopened = self.make_store()
+        guard = ConvexPolygonBatchReplayGuard(store=reopened)
+        with self.assertRaises(ValueError):
+            guard.bind_once(single, b"consumed")
+        self.assertFalse(guard.check(single, consumed, now=1, randbelow=DetRand()))
+        self.assertTrue(guard.check(entries, pending, now=1, randbelow=DetRand()))
+        reopened.close()
+        reopened_again = self.make_store()
+        guard = ConvexPolygonBatchReplayGuard(store=reopened_again)
+        self.assertEqual(guard._consumed, {b"consumed", b"pending"})
+        reopened_again.close()
+
+    def test_store_namespaces_are_isolated(self):
+        entries = self.honest_entries()
+        store_a = self.make_store(namespace=b"a")
+        store_b = self.make_store(namespace=b"b")
+        binding_a = ConvexPolygonBatchReplayGuard(store=store_a).bind_once(
+            entries, b"s"
+        )
+        guard_b = ConvexPolygonBatchReplayGuard(store=store_b)
+        self.assertFalse(
+            guard_b.check(entries, binding_a, now=1, randbelow=DetRand())
+        )
+        binding_b = guard_b.bind_once(entries, b"s")  # same id, other namespace
+        self.assertTrue(
+            guard_b.check(entries, binding_b, now=1, randbelow=DetRand())
+        )
+        self.assertTrue(
+            ConvexPolygonBatchReplayGuard(store=store_a).check(
+                entries, binding_a, now=1, randbelow=DetRand()
+            )
+        )
+        store_a.close()
+        store_b.close()
+
+    def test_store_randbelow_errors_release_the_claim(self):
+        entries = self.honest_entries()
+        store = self.make_store()
+        guard = ConvexPolygonBatchReplayGuard(store=store)
+        binding = guard.bind_once(entries, b"s")
+        with self.assertRaises(TypeError):
+            guard.check(entries, binding, now=1, randbelow=lambda upper: "x")
+        with self.assertRaises(ValueError):
+            guard.check(entries, binding, now=1, randbelow=lambda upper: -1)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(entries, binding, now=1, randbelow=DetRand()))
+        store.close()
+
+    def test_store_concurrent_checks_have_exactly_one_winner(self):
+        entries = self.honest_entries()
+        store = self.make_store(lease_seconds=1000, clock=lambda: 1000)
+        for round_ in range(3):  # the outcome does not depend on scheduling
+            session_id = f"s{round_}".encode()
+            binding = ConvexPolygonBatchReplayGuard(store=store).bind_once(
+                entries, session_id
+            )
+            barrier = threading.Barrier(8)
+            results = []
+            lock = threading.Lock()
+
+            def attempt():
+                barrier.wait()
+                won = ConvexPolygonBatchReplayGuard(store=store).check(
+                    entries, binding, now=1, randbelow=DetRand()
+                )
+                with lock:
+                    results.append(won)
+
+            threads = [threading.Thread(target=attempt) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(sum(results), 1)
+            self.assertEqual(results.count(False), 7)
+        store.close()
+
+    def test_store_other_session_completes_while_one_check_is_in_flight(self):
+        entries = self.honest_entries()
+        other_entries = [self._entry(3, 0, context=b"c")]
+        store = self.make_store(lease_seconds=1000, clock=lambda: 1000)
+        first_guard = ConvexPolygonBatchReplayGuard(store=store)
+        second_guard = ConvexPolygonBatchReplayGuard(store=store)
+        binding = first_guard.bind_once(entries, b"s1")
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking_randbelow(upper):
+            entered.set()
+            release.wait(5)
+            return 0
+
+        outcome = []
+
+        def slow_check():
+            outcome.append(
+                first_guard.check(
+                    entries, binding, now=1, randbelow=blocking_randbelow
+                )
+            )
+
+        thread = threading.Thread(target=slow_check)
+        thread.start()
+        try:
+            self.assertTrue(entered.wait(5))  # s1 claimed, verification blocked
+            other = second_guard.bind_once(other_entries, b"s2")
+            self.assertTrue(
+                second_guard.check(
+                    other_entries, other, now=1, randbelow=DetRand()
+                )
+            )
+        finally:
+            release.set()
+        thread.join(5)
+        self.assertEqual(outcome, [True])
+        self.assertFalse(
+            second_guard.check(entries, binding, now=1, randbelow=DetRand())
+        )
+        store.close()
 
 
 if __name__ == "__main__":

@@ -1892,6 +1892,137 @@ def prove_range_wide(
     )
 
 
+def _check_wide_range_proof_types(proof: object, label: str) -> WideRangeProof:
+    """Validate the nested types of one :class:`WideRangeProof`.
+
+    ``label`` is the caller's name for the proof in error messages
+    (``"proof"`` for :func:`verify_range_wide`, ``entries[i]``-style
+    labels for the batch preflights). The proof must be a
+    :class:`WideRangeProof` whose ``commitments`` is a tuple of
+    non-``bool`` integers and whose ``challenges`` / ``responses`` are
+    tuples of tuples of non-``bool`` integers; anything else raises
+    :class:`TypeError`. Returns the proof unchanged.
+    """
+    if not isinstance(proof, WideRangeProof):
+        raise TypeError(f"{label} must be a WideRangeProof")
+    if not isinstance(proof.commitments, tuple):
+        raise TypeError(f"{label} commitments must be a tuple of integers")
+    for item in proof.commitments:
+        _check_int(item, f"{label} commitments entry")
+    for field_name in ("challenges", "responses"):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(f"{label} {field_name} must be a tuple of integer pairs")
+        for pair in field:
+            if not isinstance(pair, tuple):
+                raise TypeError(
+                    f"{label} {field_name} entry must be a tuple of integers"
+                )
+            for item in pair:
+                _check_int(item, f"{label} {field_name} entry item")
+    return proof
+
+
+def _wide_range_check_material(
+    commitment: PedersenCommitment,
+    proof: WideRangeProof,
+    context: bytes,
+) -> tuple[int, int, tuple[tuple[int, int], ...]]:
+    """Validate one wide range proof and return its batch material.
+
+    Runs every :func:`verify_range_wide` check that stays per proof —
+    the group parameters, the declared ``2**k`` range with
+    ``1 <= k <= 24``, the proof tuple sizes, the bit-commitment /
+    challenge-share / response bounds, the power-of-two weighted
+    commitment binding and the per-bit challenge-share sums against the
+    byte-for-byte transcript — assuming the caller already preflighted
+    the nested types with :func:`_check_wide_range_proof_types`. Any
+    failure raises :class:`ValueError`; the callers turn that into
+    their own ``False``. The returned tuple is
+    ``(width, generator_inverse, announcements)`` with the recomputed
+    per-bit announcement pairs, ready for the aggregated Schnorr
+    equation of the batch verifiers.
+    """
+    prime = commitment.prime
+    generator = commitment.generator
+    h = commitment.h
+    if prime <= 3 or not 1 < generator < prime or not 1 < h < prime:
+        raise ValueError("invalid commitment group parameters")
+    if not 0 < commitment.element < prime:
+        raise ValueError("commitment element out of range")
+    if commitment.lower > commitment.upper:
+        raise ValueError("commitment lower must not exceed upper")
+    if commitment.upper - commitment.lower >= prime - 1:
+        raise ValueError("commitment range width must be smaller than prime - 1")
+    width = _wide_range_bit_width(commitment)
+    if not 1 <= width <= _MAX_WIDE_RANGE_BITS:
+        raise ValueError(
+            "range must contain exactly 2**k integers with 1 <= k <= "
+            f"{_MAX_WIDE_RANGE_BITS}"
+        )
+    if not (
+        len(proof.commitments) == len(proof.challenges) == len(proof.responses) == width
+    ):
+        raise ValueError("proof fields must have one entry per bit of the range")
+    if any(len(pair) != 2 for pair in proof.challenges):
+        raise ValueError("proof challenges entries must be pairs")
+    if any(len(pair) != 2 for pair in proof.responses):
+        raise ValueError("proof responses entries must be pairs")
+    if any(not 1 <= c_i < prime for c_i in proof.commitments):
+        raise ValueError("proof bit commitment out of range")
+    if any(not 0 <= share < prime for pair in proof.challenges for share in pair):
+        raise ValueError("proof challenge share out of range")
+    if any(
+        not 0 <= response < prime - 1
+        for pair in proof.responses
+        for response in pair
+    ):
+        raise ValueError("proof response out of range")
+    # The power-of-two weighted binding stays a per-proof check.
+    product = 1
+    for i, bit_commitment in enumerate(proof.commitments):
+        product = product * pow(bit_commitment, 1 << i, prime) % prime
+    if product != commitment.element:
+        raise ValueError("bit commitments do not multiply back to the commitment")
+    try:
+        generator_inverse = pow(generator, -1, prime)
+    except ValueError:
+        raise ValueError("generator not invertible modulo prime") from None
+    announcements: list[tuple[int, int]] = []
+    for i in range(width):
+        pair: list[int] = []
+        for branch in (0, 1):
+            statement = proof.commitments[i]
+            if branch:
+                statement = statement * generator_inverse % prime
+            try:
+                announcement = (
+                    pow(h, proof.responses[i][branch], prime)
+                    * pow(statement, -proof.challenges[i][branch], prime)
+                    % prime
+                )
+            except ValueError:
+                raise ValueError(
+                    "proof statement not invertible modulo prime"
+                ) from None
+            pair.append(announcement)
+        announcements.append((pair[0], pair[1]))
+    # The per-bit challenge-share sums stay per-proof checks.
+    challenge = _wide_range_challenge(
+        commitment,
+        context,
+        width,
+        proof.commitments,
+        tuple(announcements),
+    )
+    for pair_e in proof.challenges:
+        if (pair_e[0] + pair_e[1]) % prime != challenge:
+            raise ValueError(
+                "proof challenge shares do not sum to the transcript challenge"
+            )
+    return width, generator_inverse, tuple(announcements)
+
+
 def verify_range_wide(
     commitment: PedersenCommitment,
     proof: WideRangeProof,
@@ -1915,94 +2046,12 @@ def verify_range_wide(
     if not isinstance(commitment, PedersenCommitment):
         raise TypeError("commitment must be a PedersenCommitment")
     _check_commitment_fields(commitment)
-    if not isinstance(proof, WideRangeProof):
-        raise TypeError("proof must be a WideRangeProof")
-    if not isinstance(proof.commitments, tuple):
-        raise TypeError("proof commitments must be a tuple of integers")
-    for item in proof.commitments:
-        _check_int(item, "proof commitments entry")
-    for field_name in ("challenges", "responses"):
-        field = getattr(proof, field_name)
-        if not isinstance(field, tuple):
-            raise TypeError(f"proof {field_name} must be a tuple of integer pairs")
-        for pair in field:
-            if not isinstance(pair, tuple):
-                raise TypeError(f"proof {field_name} entry must be a tuple of integers")
-            for item in pair:
-                _check_int(item, f"proof {field_name} entry item")
+    _check_wide_range_proof_types(proof, "proof")
     _check_bytes(context, "context")
-    prime = commitment.prime
-    if prime <= 3:
-        return False
-    if not 1 < commitment.generator < prime or not 1 < commitment.h < prime:
-        return False
-    if not 0 < commitment.element < prime:
-        return False
-    if commitment.lower > commitment.upper:
-        return False
-    if commitment.upper - commitment.lower >= prime - 1:
-        return False
-    width = _wide_range_bit_width(commitment)
-    if not 1 <= width <= _MAX_WIDE_RANGE_BITS:
-        return False
-    if not (
-        len(proof.commitments) == len(proof.challenges) == len(proof.responses) == width
-    ):
-        return False
-    if any(len(pair) != 2 for pair in proof.challenges):
-        return False
-    if any(len(pair) != 2 for pair in proof.responses):
-        return False
-    if any(not 1 <= c_i < prime for c_i in proof.commitments):
-        return False
-    if any(
-        not 0 <= share < prime for pair in proof.challenges for share in pair
-    ):
-        return False
-    if any(
-        not 0 <= response < prime - 1
-        for pair in proof.responses
-        for response in pair
-    ):
-        return False
-    product = 1
-    for i, bit_commitment in enumerate(proof.commitments):
-        product = product * pow(bit_commitment, 1 << i, prime) % prime
-    if product != commitment.element:
-        return False
-    generator = commitment.generator
-    h = commitment.h
     try:
-        generator_inverse = pow(generator, -1, prime)
+        _wide_range_check_material(commitment, proof, context)
     except ValueError:
-        return False  # generator not invertible modulo prime
-    announcements: list[tuple[int, int]] = []
-    for i in range(width):
-        pair: list[int] = []
-        for branch in (0, 1):
-            statement = proof.commitments[i]
-            if branch:
-                statement = statement * generator_inverse % prime
-            try:
-                announcement = (
-                    pow(h, proof.responses[i][branch], prime)
-                    * pow(statement, -proof.challenges[i][branch], prime)
-                    % prime
-                )
-            except ValueError:
-                return False  # statement not invertible modulo prime
-            pair.append(announcement)
-        announcements.append((pair[0], pair[1]))
-    challenge = _wide_range_challenge(
-        commitment,
-        context,
-        width,
-        proof.commitments,
-        tuple(announcements),
-    )
-    for pair_e in proof.challenges:
-        if (pair_e[0] + pair_e[1]) % prime != challenge:
-            return False
+        return False
     return True
 
 
@@ -2052,32 +2101,7 @@ def _check_wide_range_batch_entries_types(
                 f"entries[{position}] commitment must be a PedersenCommitment"
             )
         _check_commitment_fields(commitment)
-        proof = entry.proof
-        if not isinstance(proof, WideRangeProof):
-            raise TypeError(f"entries[{position}] proof must be a WideRangeProof")
-        if not isinstance(proof.commitments, tuple):
-            raise TypeError(
-                f"entries[{position}] proof commitments must be a tuple of integers"
-            )
-        for item in proof.commitments:
-            _check_int(item, f"entries[{position}] proof commitments entry")
-        for field_name in ("challenges", "responses"):
-            field = getattr(proof, field_name)
-            if not isinstance(field, tuple):
-                raise TypeError(
-                    f"entries[{position}] proof {field_name} must be a tuple "
-                    "of integer pairs"
-                )
-            for pair in field:
-                if not isinstance(pair, tuple):
-                    raise TypeError(
-                        f"entries[{position}] proof {field_name} entry must be "
-                        "a tuple of integers"
-                    )
-                for item in pair:
-                    _check_int(
-                        item, f"entries[{position}] proof {field_name} entry item"
-                    )
+        _check_wide_range_proof_types(entry.proof, f"entries[{position}] proof")
         _check_bytes(entry.context, f"entries[{position}] context")
         items.append(entry)
     return items
@@ -2167,79 +2191,15 @@ def verify_range_wide_batch(
         commitment = entry.commitment
         proof = entry.proof
         prime = commitment.prime
-        if prime <= 3:
-            return False
-        if not 1 < commitment.generator < prime or not 1 < commitment.h < prime:
-            return False
-        if not 0 < commitment.element < prime:
-            return False
-        if commitment.lower > commitment.upper:
-            return False
-        if commitment.upper - commitment.lower >= prime - 1:
-            return False
-        width = _wide_range_bit_width(commitment)
-        if not 1 <= width <= _MAX_WIDE_RANGE_BITS:
-            return False
-        if not (
-            len(proof.commitments) == len(proof.challenges) == len(proof.responses) == width
-        ):
-            return False
-        if any(len(pair) != 2 for pair in proof.challenges):
-            return False
-        if any(len(pair) != 2 for pair in proof.responses):
-            return False
-        if any(not 1 <= c_i < prime for c_i in proof.commitments):
-            return False
-        if any(
-            not 0 <= share < prime for pair in proof.challenges for share in pair
-        ):
-            return False
-        if any(
-            not 0 <= response < prime - 1
-            for pair in proof.responses
-            for response in pair
-        ):
-            return False
-        # The power-of-two weighted binding stays a per-entry check.
-        product = 1
-        for i, bit_commitment in enumerate(proof.commitments):
-            product = product * pow(bit_commitment, 1 << i, prime) % prime
-        if product != commitment.element:
-            return False
         generator = commitment.generator
         h = commitment.h
+        # The structural, binding and challenge-sum checks stay per entry.
         try:
-            generator_inverse = pow(generator, -1, prime)
+            width, generator_inverse, announcements = _wide_range_check_material(
+                commitment, proof, entry.context
+            )
         except ValueError:
-            return False  # generator not invertible modulo prime
-        announcements: list[tuple[int, int]] = []
-        for i in range(width):
-            pair: list[int] = []
-            for branch in (0, 1):
-                statement = proof.commitments[i]
-                if branch:
-                    statement = statement * generator_inverse % prime
-                try:
-                    announcement = (
-                        pow(h, proof.responses[i][branch], prime)
-                        * pow(statement, -proof.challenges[i][branch], prime)
-                        % prime
-                    )
-                except ValueError:
-                    return False  # statement not invertible modulo prime
-                pair.append(announcement)
-            announcements.append((pair[0], pair[1]))
-        # The per-bit challenge-share sums stay per-entry checks.
-        challenge = _wide_range_challenge(
-            commitment,
-            entry.context,
-            width,
-            proof.commitments,
-            tuple(announcements),
-        )
-        for pair_e in proof.challenges:
-            if (pair_e[0] + pair_e[1]) % prime != challenge:
-                return False
+            return False
         group_key = (prime, generator, h)
         for i in range(width):
             for branch in (0, 1):
@@ -4271,29 +4231,9 @@ def _check_convex_polygon_entry_fields(entry: object, position: int) -> None:
             f"{label} proof edge_proofs must be a tuple of WideRangeProof"
         )
     for edge_position, edge_proof in enumerate(proof.edge_proofs):
-        edge_label = f"{label} proof edge_proofs[{edge_position}]"
-        if not isinstance(edge_proof, WideRangeProof):
-            raise TypeError(f"{edge_label} must be a WideRangeProof")
-        if not isinstance(edge_proof.commitments, tuple):
-            raise TypeError(
-                f"{edge_label} commitments must be a tuple of integers"
-            )
-        for item in edge_proof.commitments:
-            _check_int(item, f"{edge_label} commitments entry")
-        for field_name in ("challenges", "responses"):
-            field = getattr(edge_proof, field_name)
-            if not isinstance(field, tuple):
-                raise TypeError(
-                    f"{edge_label} {field_name} must be a tuple of integer pairs"
-                )
-            for pair in field:
-                if not isinstance(pair, tuple):
-                    raise TypeError(
-                        f"{edge_label} {field_name} entry must be a tuple of "
-                        "integers"
-                    )
-                for item in pair:
-                    _check_int(item, f"{edge_label} {field_name} entry item")
+        _check_wide_range_proof_types(
+            edge_proof, f"{label} proof edge_proofs[{edge_position}]"
+        )
     _check_bytes(entry.context, f"{label} context")
 
 
@@ -4505,91 +4445,17 @@ def verify_convex_polygon_batch(
             )
             # Every verify_range_wide check except the two per-bit
             # Schnorr equations, which join the group check.
-            if prime <= 3:
-                return False
-            if not 1 < edge_commitment.generator < prime or not (
-                1 < edge_commitment.h < prime
-            ):
-                return False
-            if not 0 < edge_commitment.element < prime:
-                return False
-            if edge_commitment.lower > edge_commitment.upper:
-                return False
-            if edge_commitment.upper - edge_commitment.lower >= prime - 1:
-                return False
-            edge_width = _wide_range_bit_width(edge_commitment)
-            if not 1 <= edge_width <= _MAX_WIDE_RANGE_BITS:
-                return False
-            if not (
-                len(edge_proof.commitments)
-                == len(edge_proof.challenges)
-                == len(edge_proof.responses)
-                == edge_width
-            ):
-                return False
-            if any(len(pair) != 2 for pair in edge_proof.challenges):
-                return False
-            if any(len(pair) != 2 for pair in edge_proof.responses):
-                return False
-            if any(not 1 <= c_i < prime for c_i in edge_proof.commitments):
-                return False
-            if any(
-                not 0 <= share < prime
-                for pair in edge_proof.challenges
-                for share in pair
-            ):
-                return False
-            if any(
-                not 0 <= response < prime - 1
-                for pair in edge_proof.responses
-                for response in pair
-            ):
-                return False
-            # The power-of-two weighted binding stays a per-edge check.
-            product = 1
-            for i, bit_commitment in enumerate(edge_proof.commitments):
-                product = product * pow(bit_commitment, 1 << i, prime) % prime
-            if product != edge_commitment.element:
-                return False
-            generator = edge_commitment.generator
-            h = edge_commitment.h
             try:
-                generator_inverse = pow(generator, -1, prime)
+                (
+                    edge_width,
+                    generator_inverse,
+                    announcements,
+                ) = _wide_range_check_material(
+                    edge_commitment, edge_proof, edge_context
+                )
             except ValueError:
-                return False  # generator not invertible modulo prime
-            announcements: list[tuple[int, int]] = []
-            for i in range(edge_width):
-                pair: list[int] = []
-                for branch in (0, 1):
-                    statement = edge_proof.commitments[i]
-                    if branch:
-                        statement = statement * generator_inverse % prime
-                    try:
-                        announcement = (
-                            pow(h, edge_proof.responses[i][branch], prime)
-                            * pow(
-                                statement,
-                                -edge_proof.challenges[i][branch],
-                                prime,
-                            )
-                            % prime
-                        )
-                    except ValueError:
-                        return False  # statement not invertible modulo prime
-                    pair.append(announcement)
-                announcements.append((pair[0], pair[1]))
-            # The per-bit challenge-share sums stay per-edge checks.
-            challenge = _wide_range_challenge(
-                edge_commitment,
-                edge_context,
-                edge_width,
-                edge_proof.commitments,
-                tuple(announcements),
-            )
-            for pair_e in edge_proof.challenges:
-                if (pair_e[0] + pair_e[1]) % prime != challenge:
-                    return False
-            group_key = (prime, generator, h)
+                return False
+            group_key = (prime, edge_commitment.generator, edge_commitment.h)
             for i in range(edge_width):
                 for branch in (0, 1):
                     statement = edge_proof.commitments[i]

@@ -41934,6 +41934,32 @@ class RangeSetBatchReplayGuardTest(unittest.TestCase):
         finally:
             conn.close()
 
+    # Payload adapters let the bound-batch subclass reuse the lease
+    # takeover scenarios below unchanged: the bare guard binds a list of
+    # entries, the bound guard binds a (batch, root) pair. VERIFY_ATTR
+    # names the zkregion module function the guard delegates to, so the
+    # tests can defer verification deterministically.
+    VERIFY_ATTR = "verify_range_set_batch"
+
+    def payload(self):
+        return self.make_entries()
+
+    def bind_payload(self, guard, payload, session_id, **kwargs):
+        return guard.bind_once(payload, session_id, **kwargs)
+
+    def check_payload(self, guard, payload, binding, **kwargs):
+        return guard.check(payload, binding, **kwargs)
+
+    def clocked_store_pair(self, clock, lease_seconds=10):
+        """Two independent connections to the same file and namespace."""
+        first = self.make_store(
+            lease_seconds=lease_seconds, clock=lambda: clock["t"]
+        )
+        second = self.make_store(
+            lease_seconds=lease_seconds, clock=lambda: clock["t"]
+        )
+        return first, second
+
     # ---- in-memory binding lifecycle ---------------------------------------
 
     def test_bind_returns_frozen_binding(self):
@@ -42129,6 +42155,429 @@ class RangeSetBatchReplayGuardTest(unittest.TestCase):
         self.assertIn(b"zr/brsbr/v1", domains)
         store.close()
 
+    # ---- SQLite lease takeover ----------------------------------------------
+    #
+    # Two SQLiteReplayStore connections on the same file and namespace share
+    # one mutable clock, so lease expiry and the order of the two checks are
+    # fully deterministic: verification is deferred either re-entrantly (the
+    # patched delegated verifier runs the interleaved check itself) or with
+    # event-synchronized threads. No real waiting is involved.
+
+    def test_store_lease_takeover_while_first_check_verifies(self):
+        import zkregion
+
+        payload = self.payload()
+        clock = {"t": 1000}
+        store_a, store_b = self.clocked_store_pair(clock)
+        outcomes = {}
+        try:
+            guard_a = self.guard(store=store_a)
+            guard_b = self.guard(store=store_b)
+            binding = self.bind_payload(guard_a, payload, b"s")
+            original = getattr(zkregion, self.VERIFY_ATTR)
+            depth = {"n": 0}
+
+            def slow_verify(*args):
+                depth["n"] += 1
+                if depth["n"] == 1:
+                    # A holds the claim (lease until t=1010) and is still
+                    # verifying: B's check is turned away while the lease
+                    # is live...
+                    outcomes["b_live_lease"] = self.check_payload(
+                        guard_b, payload, binding, now=1005
+                    )
+                    # ...and takes the expired lease over once it lapses,
+                    # consuming the session itself.
+                    clock["t"] = 1011
+                    outcomes["b_takeover"] = self.check_payload(
+                        guard_b, payload, binding, now=1011
+                    )
+                return original(*args)
+
+            setattr(zkregion, self.VERIFY_ATTR, slow_verify)
+            try:
+                outcomes["a"] = self.check_payload(
+                    guard_a, payload, binding, now=1000
+                )
+            finally:
+                setattr(zkregion, self.VERIFY_ATTR, original)
+            self.assertFalse(
+                outcomes["b_live_lease"],
+                "a live claim lease must reject a second check",
+            )
+            self.assertTrue(
+                outcomes["b_takeover"],
+                "an expired lease must let an equal binding take over",
+            )
+            self.assertFalse(
+                outcomes["a"],
+                "the resumed stale check must not consume the session",
+            )
+            self.assertFalse(
+                self.check_payload(guard_b, payload, binding, now=1012),
+                "the consumed session must reject replays",
+            )
+            self.assertFalse(
+                self.check_payload(guard_a, payload, binding, now=1012)
+            )
+            states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+            self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        finally:
+            store_a.close()
+            store_b.close()
+
+    def test_store_stale_cleanup_does_not_undo_takeover(self):
+        import zkregion
+
+        payload = self.payload()
+        clock = {"t": 1000}
+        store_a, store_b = self.clocked_store_pair(clock)
+        outcomes = {}
+        a_entered = threading.Event()
+        b_entered = threading.Event()
+        a_finish = threading.Event()
+        b_finish = threading.Event()
+        calls = {"n": 0}
+        calls_lock = threading.Lock()
+        original = getattr(zkregion, self.VERIFY_ATTR)
+
+        def gated_verify(*args):
+            with calls_lock:
+                calls["n"] += 1
+                n = calls["n"]
+            if n == 1:  # A verifies first; B is not started until A is in
+                a_entered.set()
+                a_finish.wait(10)
+            else:  # B's takeover verification
+                b_entered.set()
+                b_finish.wait(10)
+            return original(*args)
+
+        def run(name, guard, now):
+            try:
+                outcomes[name] = self.check_payload(
+                    guard, payload, binding, now=now
+                )
+            except BaseException as exc:  # surfaced by the main thread
+                outcomes[name] = exc
+
+        threads = []
+        try:
+            guard_a = self.guard(store=store_a)
+            guard_b = self.guard(store=store_b)
+            binding = self.bind_payload(guard_a, payload, b"s")
+            setattr(zkregion, self.VERIFY_ATTR, gated_verify)
+            try:
+                first = threading.Thread(
+                    target=run, args=("a", guard_a, 1000)
+                )
+                second = threading.Thread(
+                    target=run, args=("b", guard_b, 1011)
+                )
+                threads.extend((first, second))
+                first.start()
+                self.assertTrue(a_entered.wait(10))
+                clock["t"] = 1011  # A's lease lapses while it verifies
+                second.start()
+                self.assertTrue(b_entered.wait(10))
+                # B holds the claim now; A finishes first, but its stale
+                # token can neither commit nor release B's claim.
+                a_finish.set()
+                first.join()
+                self.assertIs(
+                    outcomes["a"], False,
+                    "the stale check must lose to the takeover",
+                )
+                self.assertFalse(
+                    self.check_payload(guard_a, payload, binding, now=1012),
+                    "A's stale cleanup must not restore the id to pending",
+                )
+                b_finish.set()
+                second.join()
+                self.assertIs(
+                    outcomes["b"], True,
+                    "the taker-over consumes the session",
+                )
+                self.assertFalse(
+                    self.check_payload(guard_b, payload, binding, now=1013),
+                    "the consumed session must reject replays",
+                )
+            finally:
+                setattr(zkregion, self.VERIFY_ATTR, original)
+        finally:
+            a_finish.set()
+            b_finish.set()
+            for thread in threads:
+                thread.join()
+            store_a.close()
+            store_b.close()
+
+    def test_store_failed_takeover_leaves_binding_consumable_once(self):
+        import zkregion
+
+        payload = self.payload()
+        clock = {"t": 1000}
+        store_a, store_b = self.clocked_store_pair(clock)
+        outcomes = {}
+        try:
+            guard_a = self.guard(store=store_a)
+            guard_b = self.guard(store=store_b)
+            binding = self.bind_payload(guard_a, payload, b"s")
+            original = getattr(zkregion, self.VERIFY_ATTR)
+            depth = {"n": 0}
+
+            def verify(*args):
+                depth["n"] += 1
+                if depth["n"] == 1:
+                    # A is stuck verifying past its lease; B takes the id
+                    # over but its own verification fails.
+                    clock["t"] = 1011
+                    outcomes["b"] = self.check_payload(
+                        guard_b, payload, binding, now=1011
+                    )
+                    return original(*args)
+                if depth["n"] == 2:
+                    return False  # the taker-over's verification fails
+                return original(*args)
+
+            setattr(zkregion, self.VERIFY_ATTR, verify)
+            try:
+                outcomes["a"] = self.check_payload(
+                    guard_a, payload, binding, now=1000
+                )
+            finally:
+                setattr(zkregion, self.VERIFY_ATTR, original)
+            self.assertFalse(
+                outcomes["b"],
+                "the taker-over's failed verification rejects its check",
+            )
+            self.assertFalse(
+                outcomes["a"],
+                "A's stale token cannot commit after the takeover",
+            )
+            # Neither the failed takeover nor A's resumed cleanup consumed
+            # the session: the next legitimate check succeeds exactly once.
+            self.assertTrue(
+                self.check_payload(guard_b, payload, binding, now=1012),
+                "a failed takeover must leave the binding consumable",
+            )
+            self.assertFalse(
+                self.check_payload(guard_a, payload, binding, now=1013)
+            )
+            states = {(row[1], row[2]): row[3] for row in self.raw_rows()}
+            self.assertEqual(states[(self.DOMAIN, b"s")], "consumed")
+        finally:
+            store_a.close()
+            store_b.close()
+
+    def test_store_takeover_error_propagates_and_session_survives(self):
+        import zkregion
+
+        payload = self.payload()
+        clock = {"t": 1000}
+        store_a, store_b = self.clocked_store_pair(clock)
+        outcomes = {}
+        boom = RuntimeError("boom")
+        try:
+            guard_a = self.guard(store=store_a)
+            guard_b = self.guard(store=store_b)
+            binding = self.bind_payload(guard_a, payload, b"s")
+            original = getattr(zkregion, self.VERIFY_ATTR)
+            depth = {"n": 0}
+
+            def verify(*args):
+                depth["n"] += 1
+                if depth["n"] == 1:
+                    # A is stuck verifying past its lease; B takes the id
+                    # over and its verification raises.
+                    clock["t"] = 1011
+                    try:
+                        self.check_payload(guard_b, payload, binding, now=1011)
+                    except RuntimeError as exc:
+                        outcomes["b_error"] = exc
+                    return original(*args)
+                if depth["n"] == 2:
+                    raise boom
+                return original(*args)
+
+            setattr(zkregion, self.VERIFY_ATTR, verify)
+            try:
+                outcomes["a"] = self.check_payload(
+                    guard_a, payload, binding, now=1000
+                )
+            finally:
+                setattr(zkregion, self.VERIFY_ATTR, original)
+            self.assertIs(
+                outcomes["b_error"], boom,
+                "the taker-over's error must propagate unchanged",
+            )
+            self.assertFalse(
+                outcomes["a"],
+                "A's stale token cannot commit after the takeover",
+            )
+            # The escaped error released B's claim without consuming: the
+            # binding is still usable, exactly once.
+            self.assertTrue(
+                self.check_payload(guard_b, payload, binding, now=1012),
+                "an escaped error must leave the binding consumable",
+            )
+            self.assertFalse(
+                self.check_payload(guard_a, payload, binding, now=1013)
+            )
+        finally:
+            store_a.close()
+            store_b.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        import zkregion
+
+        payload = self.payload()
+        clock = {"t": 1000}
+        store_a, store_b = self.clocked_store_pair(clock)
+        outcomes = {}
+        entered = threading.Event()
+        finish = threading.Event()
+        try:
+            guard_a = self.guard(store=store_a)
+            guard_b = self.guard(store=store_b)
+            binding = self.bind_payload(guard_a, payload, b"s")
+            with self.assertRaises(ValueError):  # pending
+                self.bind_payload(guard_b, payload, b"s")
+            original = getattr(zkregion, self.VERIFY_ATTR)
+
+            def slow_verify(*args):
+                entered.set()
+                finish.wait(10)
+                return original(*args)
+
+            def run():
+                try:
+                    outcomes["check"] = self.check_payload(
+                        guard_a, payload, binding, now=1000
+                    )
+                except BaseException as exc:
+                    outcomes["check"] = exc
+
+            setattr(zkregion, self.VERIFY_ATTR, slow_verify)
+            thread = threading.Thread(target=run)
+            try:
+                thread.start()
+                self.assertTrue(entered.wait(10))
+                with self.assertRaises(ValueError):  # claimed, live lease
+                    self.bind_payload(guard_b, payload, b"s")
+                clock["t"] = 2000  # lease expired but not yet taken over
+                with self.assertRaises(ValueError):
+                    self.bind_payload(guard_b, payload, b"s")
+            finally:
+                finish.set()
+                thread.join()
+                setattr(zkregion, self.VERIFY_ATTR, original)
+            self.assertIs(outcomes["check"], True)
+            with self.assertRaises(ValueError):  # consumed
+                self.bind_payload(guard_b, payload, b"s")
+        finally:
+            store_a.close()
+            store_b.close()
+
+    def test_store_lease_takeover_does_not_extend_binding_expiry(self):
+        import zkregion
+
+        payload = self.payload()
+        clock = {"t": 1000}
+        store_a, store_b = self.clocked_store_pair(clock)
+        outcomes = {}
+        try:
+            guard_a = self.guard(store=store_a)
+            guard_b = self.guard(store=store_b)
+            binding = self.bind_payload(guard_a, payload, b"s", expires_at=1015)
+            original = getattr(zkregion, self.VERIFY_ATTR)
+            depth = {"n": 0}
+
+            def verify(*args):
+                depth["n"] += 1
+                if depth["n"] == 1:
+                    # A's claim lease (t=1010) lapses while it verifies; B
+                    # takes the id over with a fresh lease, but the
+                    # binding's own expiry has passed as well and the new
+                    # lease cannot extend it.
+                    clock["t"] = 2030
+                    outcomes["b"] = self.check_payload(
+                        guard_b, payload, binding, now=2030
+                    )
+                return original(*args)
+
+            setattr(zkregion, self.VERIFY_ATTR, verify)
+            try:
+                outcomes["a"] = self.check_payload(
+                    guard_a, payload, binding, now=1000
+                )
+            finally:
+                setattr(zkregion, self.VERIFY_ATTR, original)
+            self.assertFalse(
+                outcomes["b"],
+                "an expired binding rejects even a valid taker-over",
+            )
+            self.assertFalse(
+                outcomes["a"],
+                "A's stale token cannot commit after the takeover",
+            )
+            self.assertFalse(
+                self.check_payload(guard_b, payload, binding, now=2031),
+                "the binding expiry is not extended by any lease",
+            )
+            self.assertIn(
+                b"s", guard_b._pending,
+                "expiry rejections must not consume the session",
+            )
+        finally:
+            store_a.close()
+            store_b.close()
+
+    def test_store_verification_of_one_session_does_not_block_another(self):
+        import zkregion
+
+        first_payload = self.payload()
+        second_payload = self.payload()
+        clock = {"t": 1000}
+        store_a, store_b = self.clocked_store_pair(clock)
+        outcomes = {}
+        try:
+            guard_a = self.guard(store=store_a)
+            guard_b = self.guard(store=store_b)
+            binding_one = self.bind_payload(guard_a, first_payload, b"s1")
+            original = getattr(zkregion, self.VERIFY_ATTR)
+            depth = {"n": 0}
+
+            def verify(*args):
+                depth["n"] += 1
+                if depth["n"] == 1:
+                    # s1's verification is in flight on one connection;
+                    # s2 binds and verifies to completion on the other.
+                    binding_two = self.bind_payload(
+                        guard_b, second_payload, b"s2"
+                    )
+                    outcomes["s2"] = self.check_payload(
+                        guard_b, second_payload, binding_two, now=1000
+                    )
+                return original(*args)
+
+            setattr(zkregion, self.VERIFY_ATTR, verify)
+            try:
+                outcomes["s1"] = self.check_payload(
+                    guard_a, first_payload, binding_one, now=1000
+                )
+            finally:
+                setattr(zkregion, self.VERIFY_ATTR, original)
+            self.assertTrue(
+                outcomes["s2"],
+                "a second session must bind and verify during the first",
+            )
+            self.assertTrue(outcomes["s1"])
+            self.assertEqual(guard_a._consumed, {b"s1", b"s2"})
+        finally:
+            store_a.close()
+            store_b.close()
+
 
 class BoundRangeSetBatchReplayGuardTest(RangeSetBatchReplayGuardTest):
     """Single-use replay bindings for Merkle-bound range set batches."""
@@ -42142,6 +42591,23 @@ class BoundRangeSetBatchReplayGuardTest(RangeSetBatchReplayGuardTest):
         entries = [self.entry(value=value) for value in values]
         batch, root = prove_range_set_batch_bound(entries)
         return entries, batch, root
+
+    # Payload adapters for the shared lease takeover scenarios: the bound
+    # guard binds a (batch, root) pair and delegates to
+    # verify_range_set_batch_bound.
+    VERIFY_ATTR = "verify_range_set_batch_bound"
+
+    def payload(self):
+        _entries, batch, root = self.honest()
+        return (batch, root)
+
+    def bind_payload(self, guard, payload, session_id, **kwargs):
+        batch, root = payload
+        return guard.bind_once(batch, root, session_id, **kwargs)
+
+    def check_payload(self, guard, payload, binding, **kwargs):
+        batch, root = payload
+        return guard.check(batch, root, binding, **kwargs)
 
     # The bare-batch entry-point tests below are specific to the
     # (entries, binding) signature and are replaced by bound-batch tests

@@ -28888,6 +28888,339 @@ class RegionBatchReplayGuardTest(unittest.TestCase):
         store.close()
 
 
+class BatchReplayGuardRefactorRegressionTest(unittest.TestCase):
+    """Public-entry regressions for the shared batch replay lifecycle.
+
+    Pins the behaviour RangeBatchReplayGuard and RegionBatchReplayGuard
+    gained when their bind/claim/verify/consume flow moved onto the
+    private shared base: byte-for-byte identical ReplayBinding digests
+    (golden vectors produced by the pre-refactor implementation), retry
+    after a failed or erroring verification, non-serialization of
+    different ids, SQLite lease takeover exercised only through
+    bind_once/check, and isolation between the two batch domains.
+    """
+
+    PRIME_A = SMALL_PRIME
+    PRIME_B = 104723
+
+    RANGE_GOLDEN = {
+        "plain": "51edd83bedb08cb75ff78c636a73b9bda43b4b7aef0193ad5e81e631fe08d798",
+        "expiry": "5136ff50c8afc64b7deeedb101e07dda90dafce4c4eeb8e8787ddb6a286505b8",
+        "reverse": "b4b6ce6601a7ef276fdba526039c15f5379c49009ec11bfb3927c6220d1eb58d",
+        "duplicate": "9daca47a6e5935328ef6e7dbf08b06a4008734a38dbc55f2c9ddbfd21d2e38b4",
+        "other_session": "5fdb6915c6963e0231bb79e529a23d17a77122b3a1c5765b52369f354c439a36",
+    }
+    REGION_GOLDEN = {
+        "plain": "5e2ad42ddbc8364242edf49bcbe218c7e3de0edcdf6f5edfbc11c0ab59fad071",
+        "expiry": "831b9e4a27b311bf087b84c94166a52a4a92f58c8701705b3dabc6b5d6aedb54",
+        "reverse": "54a4f3e3c56c954e6a00c5a34dfb790b39156443b4357ffd425df9eb19a87c0e",
+        "duplicate": "efb89e45203878755af908c8fc5b9baa01abbb19721d5cc50940c1055351b656",
+        "other_session": "3e5aec5bbf211437879d429f7fae7b216ef3040577d5eba7e0dae2b9f034d849",
+    }
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "batch-refactor.db")
+        self.range_entries = [
+            self.make_range_entry(4, prime=self.PRIME_A, blinding=1001),
+            self.make_range_entry(7, prime=self.PRIME_A, blinding=1002),
+            self.make_range_entry(3, prime=self.PRIME_B, blinding=2001),
+        ]
+        region = Region(0, 10, 20, 30)
+        self.region_entries = [
+            self.make_region_entry(
+                4, 22, prime=self.PRIME_A, x_blinding=1001, y_blinding=1002,
+                region=region,
+            ),
+            self.make_region_entry(
+                7, 28, prime=self.PRIME_A, x_blinding=2001, y_blinding=2002,
+                region=region,
+            ),
+            self.make_region_entry(
+                3, 25, prime=self.PRIME_B, x_blinding=3001, y_blinding=3002,
+                region=region,
+            ),
+        ]
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def make_range_entry(self, value, *, prime, blinding, context=b"batch"):
+        commitment, r = pedersen_commit(
+            value, 0, 10, prime=prime, generator=3, blinding=blinding,
+        )
+        proof = prove_range(
+            commitment, value, r, context=context,
+            randbelow=counter_randbelow(),
+        )
+        return RangeBatchEntry(commitment, proof, context)
+
+    def make_region_entry(self, x, y, *, prime, x_blinding, y_blinding, region):
+        x_commitment, x_r = pedersen_commit(
+            x, region.min_x, region.max_x,
+            prime=prime, generator=3, blinding=x_blinding,
+        )
+        y_commitment, y_r = pedersen_commit(
+            y, region.min_y, region.max_y,
+            prime=prime, generator=3, blinding=y_blinding,
+        )
+        proof = prove_region(
+            x_commitment, y_commitment, x, y, x_r, y_r, region,
+            context=b"batch", randbelow=counter_randbelow(),
+        )
+        return RegionBatchEntry(x_commitment, y_commitment, region, proof, b"batch")
+
+    # ---- byte-identical bindings --------------------------------------------
+
+    def _assert_golden_bindings(self, Guard, entries, golden):
+        cases = {
+            "plain": (entries, b"s1", None),
+            "expiry": (entries, b"s2", 1000),
+            "reverse": (list(reversed(entries)), b"s1", None),
+            "duplicate": ([entries[0], entries[0]], b"s1", None),
+            "other_session": (entries, b"other", None),
+        }
+        for name, (batch, session_id, expires_at) in cases.items():
+            binding = Guard().bind_once(batch, session_id, expires_at=expires_at)
+            self.assertEqual(
+                binding.digest.hex(), golden[name],
+                msg=f"{Guard.__name__} {name} digest changed",
+            )
+
+    def test_range_binding_bytes_match_pre_refactor_vectors(self):
+        self._assert_golden_bindings(
+            RangeBatchReplayGuard, self.range_entries, self.RANGE_GOLDEN
+        )
+
+    def test_region_binding_bytes_match_pre_refactor_vectors(self):
+        self._assert_golden_bindings(
+            RegionBatchReplayGuard, self.region_entries, self.REGION_GOLDEN
+        )
+
+    # ---- retry after failure / escaped error -------------------------------
+
+    def _retry_cases(self):
+        import zkregion
+
+        return [
+            (
+                RangeBatchReplayGuard, self.range_entries,
+                zkregion, "verify_range_batch",
+            ),
+            (
+                RegionBatchReplayGuard, self.region_entries,
+                zkregion, "verify_region_batch",
+            ),
+        ]
+
+    def test_memory_failed_and_erroring_checks_leave_a_retryable_binding(self):
+        for Guard, entries, module, verifier_name in self._retry_cases():
+            with self.subTest(guard=Guard.__name__):
+                guard = Guard()
+                binding = guard.bind_once(entries, b"s")
+                # a digest mismatch (reversed batch) rejects without consuming
+                self.assertFalse(
+                    guard.check(
+                        list(reversed(entries)), binding, now=1,
+                        randbelow=counter_randbelow(),
+                    )
+                )
+                self.assertIn(b"s", guard._pending)
+                # an exception escaping verification propagates and restores
+                original = getattr(module, verifier_name)
+
+                def boom(_entries, **_kwargs):
+                    raise RuntimeError("boom")
+
+                setattr(module, verifier_name, boom)
+                try:
+                    with self.assertRaises(RuntimeError):
+                        guard.check(
+                            entries, binding, now=1,
+                            randbelow=counter_randbelow(),
+                        )
+                finally:
+                    setattr(module, verifier_name, original)
+                self.assertIn(b"s", guard._pending)
+                # the original binding still verifies exactly once
+                self.assertTrue(
+                    guard.check(
+                        entries, binding, now=1, randbelow=counter_randbelow()
+                    )
+                )
+                self.assertFalse(
+                    guard.check(
+                        entries, binding, now=1, randbelow=counter_randbelow()
+                    )
+                )
+
+    def test_store_failed_check_leaves_a_retryable_binding(self):
+        store = SQLiteReplayStore(self.path, b"retry")
+        try:
+            for Guard, entries, _module, _name in self._retry_cases():
+                with self.subTest(guard=Guard.__name__):
+                    session_id = Guard.__name__.encode()
+                    binding = Guard(store=store).bind_once(entries, session_id)
+                    self.assertFalse(
+                        Guard(store=store).check(
+                            list(reversed(entries)), binding, now=1,
+                            randbelow=counter_randbelow(),
+                        )
+                    )
+                    self.assertIn(session_id, Guard(store=store)._pending)
+                    self.assertTrue(
+                        Guard(store=store).check(
+                            entries, binding, now=1,
+                            randbelow=counter_randbelow(),
+                        )
+                    )
+                    self.assertFalse(
+                        Guard(store=store).check(
+                            entries, binding, now=1,
+                            randbelow=counter_randbelow(),
+                        )
+                    )
+        finally:
+            store.close()
+
+    # ---- concurrency --------------------------------------------------------
+
+    def test_slow_verification_of_one_id_does_not_block_other_ids(self):
+        guard = RangeBatchReplayGuard()
+        entries = self.range_entries
+        binding_a = guard.bind_once(entries, b"A")
+        binding_b = guard.bind_once(entries, b"B")
+        claimed = threading.Event()
+        release = threading.Event()
+
+        def hold(_upper):
+            claimed.set()
+            self.assertTrue(release.wait(10))
+            return 0
+
+        result = {}
+
+        def holder():
+            result["a"] = guard.check(entries, binding_a, now=1, randbelow=hold)
+
+        thread = threading.Thread(target=holder)
+        thread.start()
+        self.assertTrue(claimed.wait(10))
+        try:
+            # B must verify to completion while A is stuck inside verification
+            self.assertTrue(
+                guard.check(
+                    entries, binding_b, now=1, randbelow=counter_randbelow()
+                )
+            )
+        finally:
+            release.set()
+            thread.join(10)
+        self.assertFalse(thread.is_alive())
+        self.assertTrue(result["a"])
+        self.assertFalse(
+            guard.check(entries, binding_b, now=1, randbelow=counter_randbelow())
+        )
+
+    def test_store_lease_takeover_through_public_check(self):
+        clock = {"t": 1000}
+        store = SQLiteReplayStore(
+            self.path, b"takeover", lease_seconds=10,
+            clock=lambda: clock["t"],
+        )
+        try:
+            entries = self.range_entries
+            holder_guard = RangeBatchReplayGuard(store=store)
+            binding = holder_guard.bind_once(entries, b"s")
+            claimed = threading.Event()
+            release = threading.Event()
+
+            def hold(_upper):
+                claimed.set()
+                self.assertTrue(release.wait(10))
+                return 0
+
+            result = {}
+
+            def holder():
+                result["holder"] = holder_guard.check(
+                    entries, binding, now=1000, randbelow=hold
+                )
+
+            thread = threading.Thread(target=holder)
+            thread.start()
+            self.assertTrue(claimed.wait(10))
+            try:
+                # a live claim cannot be taken over
+                clock["t"] = 1005
+                self.assertFalse(
+                    RangeBatchReplayGuard(store=store).check(
+                        entries, binding, now=1000,
+                        randbelow=counter_randbelow(),
+                    )
+                )
+                # once the lease lapses a later equal check takes over
+                clock["t"] = 1011
+                self.assertTrue(
+                    RangeBatchReplayGuard(store=store).check(
+                        entries, binding, now=1000,
+                        randbelow=counter_randbelow(),
+                    )
+                )
+            finally:
+                release.set()
+                thread.join(10)
+            self.assertFalse(thread.is_alive())
+            # the stale holder can neither consume nor release the takeover
+            self.assertFalse(result["holder"])
+            # the id is consumed: nobody can check or rebind it
+            self.assertFalse(
+                RangeBatchReplayGuard(store=store).check(
+                    entries, binding, now=1000, randbelow=counter_randbelow()
+                )
+            )
+            with self.assertRaises(ValueError):
+                RangeBatchReplayGuard(store=store).bind_once(entries, b"s")
+        finally:
+            store.close()
+
+    def test_range_and_region_batch_domains_are_isolated_in_one_store(self):
+        store = SQLiteReplayStore(self.path, b"domains")
+        try:
+            range_guard = RangeBatchReplayGuard(store=store)
+            region_guard = RegionBatchReplayGuard(store=store)
+            range_binding = range_guard.bind_once(self.range_entries, b"same-id")
+            region_binding = region_guard.bind_once(self.region_entries, b"same-id")
+            self.assertEqual(range_binding.session_id, region_binding.session_id)
+            self.assertNotEqual(range_binding.digest, region_binding.digest)
+            self.assertTrue(
+                range_guard.check(
+                    self.range_entries, range_binding, now=1,
+                    randbelow=counter_randbelow(),
+                )
+            )
+            self.assertTrue(
+                region_guard.check(
+                    self.region_entries, region_binding, now=1,
+                    randbelow=counter_randbelow(),
+                )
+            )
+            self.assertFalse(
+                range_guard.check(
+                    self.range_entries, range_binding, now=1,
+                    randbelow=counter_randbelow(),
+                )
+            )
+            self.assertFalse(
+                region_guard.check(
+                    self.region_entries, region_binding, now=1,
+                    randbelow=counter_randbelow(),
+                )
+            )
+        finally:
+            store.close()
+
+
 class MerkleConsistencyChainBatchReplayGuardTest(unittest.TestCase):
     """Single-use replay bindings for batches of consistency chains."""
 

@@ -10601,7 +10601,170 @@ def _check_range_batch_entry(entry: object, name: str = "entry") -> RangeBatchEn
     return entry
 
 
-class RangeReplayGuard:
+class _SingleEntryReplayGuard:
+    """Shared session-validation lifecycle for the single-entry replay guards.
+
+    This is the common machinery behind :class:`RangeReplayGuard` and
+    :class:`RegionReplayGuard`; it is private and not part of the public
+    API. A subclass supplies four hooks — ``_STORE_DOMAIN`` (the key-domain
+    segment its rows live under when the state is kept in an
+    :class:`SQLiteReplayStore`), ``_validate_entry`` (the nested type
+    checks for its entry kind), ``_digest`` (its binding digest) and
+    ``_verify_entry`` (its underlying proof verification) — and keeps its
+    own public ``bind_once``/``check`` methods, which delegate to
+    :meth:`_bind` and :meth:`_verify_and_consume` here.
+
+    The lifecycle is exactly the one the guards previously each spelled
+    out: ``_bind`` validates the arguments, computes the binding digest
+    and registers the id as pending without verifying any proof; a check
+    claims the pending id atomically (the in-instance registry lock, or
+    the store's short transaction and unique claim token), recomputes the
+    digest, enforces the expiry and runs the proof verification with no
+    lock or transaction held, and only a fully successful check consumes
+    the id. Every rejection or escaped error releases the claim and
+    leaves the registration pending.
+    """
+
+    _STORE_DOMAIN = _REPLAY_DOMAIN
+
+    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
+        if store is not None and not isinstance(store, SQLiteReplayStore):
+            raise TypeError("store must be an SQLiteReplayStore")
+        self._store = None if store is None else store._view(self._STORE_DOMAIN)
+        self._registry = None if store is not None else _ReplayRegistry()
+
+    @staticmethod
+    def _validate_entry(entry: object) -> None:
+        """Raise :class:`TypeError` unless ``entry`` has the guard's shape."""
+        raise NotImplementedError
+
+    @staticmethod
+    def _digest(
+        entry: object, session_id: bytes, expires_at: int | None
+    ) -> bytes:
+        """The guard's binding digest of ``entry`` for ``session_id``."""
+        raise NotImplementedError
+
+    @staticmethod
+    def _verify_entry(entry: object) -> bool:
+        """Run the guard's underlying proof verification for ``entry``."""
+        raise NotImplementedError
+
+    @property
+    def _pending(self) -> dict[bytes, ReplayBinding]:
+        if self._store is not None:
+            return self._store.pending_snapshot()
+        return self._registry.pending_snapshot()
+
+    @property
+    def _consumed(self) -> set[bytes]:
+        if self._store is not None:
+            return self._store.consumed_snapshot()
+        return self._registry.consumed_snapshot()
+
+    def _bind(
+        self, entry: object, session_id: bytes, expires_at: int | None
+    ) -> ReplayBinding:
+        """The shared ``bind_once`` body; see the public method's contract."""
+        self._validate_entry(entry)
+        _check_bytes(session_id, "session_id")
+        if not session_id:
+            raise ValueError("session_id must not be empty")
+        if expires_at is not None:
+            _check_uint64(expires_at, "expires_at")
+        binding = ReplayBinding(
+            session_id,
+            self._digest(entry, session_id, expires_at),
+            expires_at,
+        )
+        if self._store is not None:
+            self._store.register(session_id, binding)
+        else:
+            self._registry.register(session_id, binding)
+        return binding
+
+    def _verify_and_consume(
+        self, entry: object, binding: ReplayBinding, now: int | None
+    ) -> bool:
+        """The shared ``check`` body; see the public method's contract."""
+        self._validate_entry(entry)
+        if not isinstance(binding, ReplayBinding):
+            raise TypeError("binding must be a ReplayBinding")
+        if now is None:
+            current = int(time.time())
+        else:
+            _check_uint64(now, "now")
+            current = now
+        session_id = binding.session_id
+        if self._store is not None:
+            return self._check_with_store(entry, binding, session_id, current)
+        if not self._registry.claim(session_id, binding):
+            return False  # unknown id, already consumed, claimed, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                self._digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not self._verify_entry(entry):
+                return False
+            self._registry.commit(session_id)
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to the pending state; after commit() the claim is gone and this
+            # is a no-op, leaving the id consumed.
+            if not committed:
+                self._registry.release(session_id)
+
+    def _check_with_store(
+        self,
+        entry: object,
+        binding: ReplayBinding,
+        session_id: bytes,
+        current: int,
+    ) -> bool:
+        """The store-backed claim/verify/consume flow for a check.
+
+        The claim is taken in one short transaction (or an expired claim is
+        taken over); verification runs with no transaction held; only the
+        token returned by the winning claim can consume the id, and every
+        rejection or escaped error restores the id to pending with that same
+        token. A stale token (a claim taken over while verification ran)
+        neither consumes nor restores anything.
+        """
+        token = self._store.claim(session_id, binding)
+        if token is None:
+            return False  # unknown id, already consumed, live claim, or unequal binding
+        committed = False
+        try:
+            if not hmac.compare_digest(
+                binding.digest,
+                self._digest(entry, session_id, binding.expires_at),
+            ):
+                return False  # the presented entry is not the one originally bound
+            if binding.expires_at is not None and current >= binding.expires_at:
+                return False  # expired: rejection does not consume the id
+            if not self._verify_entry(entry):
+                return False
+            if not self._store.commit(session_id, token):
+                return False  # the lease expired and another check took over
+            committed = True
+            return True
+        finally:
+            # A False result, an expiry or an escaped error hands the id back
+            # to pending, but only while the current token still owns it;
+            # after commit() (or a takeover) the token is stale and this is a
+            # no-op, leaving the id consumed or re-claimed by the new owner.
+            if not committed:
+                self._store.release(session_id, token)
+
+
+class RangeReplayGuard(_SingleEntryReplayGuard):
     """Single-use replay protection for range-proof entries.
 
     A fresh guard has no registrations. :meth:`bind_once` registers a pending
@@ -10621,23 +10784,13 @@ class RangeReplayGuard:
     held, so different ids are never serialized.
     """
 
-    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
-        if store is not None and not isinstance(store, SQLiteReplayStore):
-            raise TypeError("store must be an SQLiteReplayStore")
-        self._store = None if store is None else store._view(_RANGE_REPLAY_DOMAIN)
-        self._registry = None if store is not None else _ReplayRegistry()
+    _STORE_DOMAIN = _RANGE_REPLAY_DOMAIN
+    _validate_entry = staticmethod(_check_range_batch_entry)
+    _digest = staticmethod(_range_replay_digest)
 
-    @property
-    def _pending(self) -> dict[bytes, ReplayBinding]:
-        if self._store is not None:
-            return self._store.pending_snapshot()
-        return self._registry.pending_snapshot()
-
-    @property
-    def _consumed(self) -> set[bytes]:
-        if self._store is not None:
-            return self._store.consumed_snapshot()
-        return self._registry.consumed_snapshot()
+    @staticmethod
+    def _verify_entry(entry: RangeBatchEntry) -> bool:
+        return verify_range(entry.commitment, entry.proof, entry.context)
 
     def bind_once(
         self,
@@ -10656,22 +10809,7 @@ class RangeReplayGuard:
         (an empty id or an out-of-range expiry raise :class:`ValueError`).
         Inputs are never mutated.
         """
-        _check_range_batch_entry(entry)
-        _check_bytes(session_id, "session_id")
-        if not session_id:
-            raise ValueError("session_id must not be empty")
-        if expires_at is not None:
-            _check_uint64(expires_at, "expires_at")
-        binding = ReplayBinding(
-            session_id,
-            _range_replay_digest(entry, session_id, expires_at),
-            expires_at,
-        )
-        if self._store is not None:
-            self._store.register(session_id, binding)
-        else:
-            self._registry.register(session_id, binding)
-        return binding
+        return self._bind(entry, session_id, expires_at)
 
     def check(
         self,
@@ -10702,78 +10840,7 @@ class RangeReplayGuard:
         out-of-range ``now`` raises :class:`ValueError`. Inputs are never
         mutated.
         """
-        _check_range_batch_entry(entry)
-        if not isinstance(binding, ReplayBinding):
-            raise TypeError("binding must be a ReplayBinding")
-        if now is None:
-            current = int(time.time())
-        else:
-            _check_uint64(now, "now")
-            current = now
-        session_id = binding.session_id
-        if self._store is not None:
-            return self._check_with_store(entry, binding, session_id, current)
-        if not self._registry.claim(session_id, binding):
-            return False  # unknown id, already consumed, claimed, or unequal binding
-        committed = False
-        try:
-            if not hmac.compare_digest(
-                binding.digest,
-                _range_replay_digest(entry, session_id, binding.expires_at),
-            ):
-                return False  # the presented entry is not the one originally bound
-            if binding.expires_at is not None and current >= binding.expires_at:
-                return False  # expired: rejection does not consume the id
-            if not verify_range(entry.commitment, entry.proof, entry.context):
-                return False
-            self._registry.commit(session_id)
-            committed = True
-            return True
-        finally:
-            if not committed:
-                self._registry.release(session_id)
-
-    def _check_with_store(
-        self,
-        entry: RangeBatchEntry,
-        binding: ReplayBinding,
-        session_id: bytes,
-        current: int,
-    ) -> bool:
-        """The store-backed claim/verify/consume flow for :meth:`check`.
-
-        The claim is taken in one short transaction (or an expired claim is
-        taken over); verification runs with no transaction held; only the
-        token returned by the winning claim can consume the id, and every
-        rejection or escaped error restores the id to pending with that same
-        token. A stale token (a claim taken over while verification ran)
-        neither consumes nor restores anything.
-        """
-        token = self._store.claim(session_id, binding)
-        if token is None:
-            return False  # unknown id, already consumed, live claim, or unequal binding
-        committed = False
-        try:
-            if not hmac.compare_digest(
-                binding.digest,
-                _range_replay_digest(entry, session_id, binding.expires_at),
-            ):
-                return False  # the presented entry is not the one originally bound
-            if binding.expires_at is not None and current >= binding.expires_at:
-                return False  # expired: rejection does not consume the id
-            if not verify_range(entry.commitment, entry.proof, entry.context):
-                return False
-            if not self._store.commit(session_id, token):
-                return False  # the lease expired and another check took over
-            committed = True
-            return True
-        finally:
-            # A False result, an expiry or an escaped error hands the id back
-            # to pending, but only while the current token still owns it;
-            # after commit() (or a takeover) the token is stale and this is a
-            # no-op, leaving the id consumed or re-claimed by the new owner.
-            if not committed:
-                self._store.release(session_id, token)
+        return self._verify_and_consume(entry, binding, now)
 
 
 def _region_replay_digest(
@@ -10830,7 +10897,7 @@ def _check_region_batch_entry(entry: object, name: str = "entry") -> RegionBatch
     return entry
 
 
-class RegionReplayGuard:
+class RegionReplayGuard(_SingleEntryReplayGuard):
     """Single-use replay protection for region-proof entries.
 
     A fresh guard has no registrations. :meth:`bind_once` registers a pending
@@ -10850,23 +10917,19 @@ class RegionReplayGuard:
     lock or transaction held, so different ids are never serialized.
     """
 
-    def __init__(self, *, store: SQLiteReplayStore | None = None) -> None:
-        if store is not None and not isinstance(store, SQLiteReplayStore):
-            raise TypeError("store must be an SQLiteReplayStore")
-        self._store = None if store is None else store._view(_REGION_REPLAY_DOMAIN)
-        self._registry = None if store is not None else _ReplayRegistry()
+    _STORE_DOMAIN = _REGION_REPLAY_DOMAIN
+    _validate_entry = staticmethod(_check_region_batch_entry)
+    _digest = staticmethod(_region_replay_digest)
 
-    @property
-    def _pending(self) -> dict[bytes, ReplayBinding]:
-        if self._store is not None:
-            return self._store.pending_snapshot()
-        return self._registry.pending_snapshot()
-
-    @property
-    def _consumed(self) -> set[bytes]:
-        if self._store is not None:
-            return self._store.consumed_snapshot()
-        return self._registry.consumed_snapshot()
+    @staticmethod
+    def _verify_entry(entry: RegionBatchEntry) -> bool:
+        return verify_region(
+            entry.x_commitment,
+            entry.y_commitment,
+            entry.region,
+            entry.proof,
+            entry.context,
+        )
 
     def bind_once(
         self,
@@ -10885,22 +10948,7 @@ class RegionReplayGuard:
         (an empty id or an out-of-range expiry raise :class:`ValueError`).
         Inputs are never mutated.
         """
-        _check_region_batch_entry(entry)
-        _check_bytes(session_id, "session_id")
-        if not session_id:
-            raise ValueError("session_id must not be empty")
-        if expires_at is not None:
-            _check_uint64(expires_at, "expires_at")
-        binding = ReplayBinding(
-            session_id,
-            _region_replay_digest(entry, session_id, expires_at),
-            expires_at,
-        )
-        if self._store is not None:
-            self._store.register(session_id, binding)
-        else:
-            self._registry.register(session_id, binding)
-        return binding
+        return self._bind(entry, session_id, expires_at)
 
     def check(
         self,
@@ -10931,90 +10979,7 @@ class RegionReplayGuard:
         :class:`TypeError`; an out-of-range ``now`` raises
         :class:`ValueError`. Inputs are never mutated.
         """
-        _check_region_batch_entry(entry)
-        if not isinstance(binding, ReplayBinding):
-            raise TypeError("binding must be a ReplayBinding")
-        if now is None:
-            current = int(time.time())
-        else:
-            _check_uint64(now, "now")
-            current = now
-        session_id = binding.session_id
-        if self._store is not None:
-            return self._check_with_store(entry, binding, session_id, current)
-        if not self._registry.claim(session_id, binding):
-            return False  # unknown id, already consumed, claimed, or unequal binding
-        committed = False
-        try:
-            if not hmac.compare_digest(
-                binding.digest,
-                _region_replay_digest(entry, session_id, binding.expires_at),
-            ):
-                return False  # the presented entry is not the one originally bound
-            if binding.expires_at is not None and current >= binding.expires_at:
-                return False  # expired: rejection does not consume the id
-            if not verify_region(
-                entry.x_commitment,
-                entry.y_commitment,
-                entry.region,
-                entry.proof,
-                entry.context,
-            ):
-                return False
-            self._registry.commit(session_id)
-            committed = True
-            return True
-        finally:
-            if not committed:
-                self._registry.release(session_id)
-
-    def _check_with_store(
-        self,
-        entry: RegionBatchEntry,
-        binding: ReplayBinding,
-        session_id: bytes,
-        current: int,
-    ) -> bool:
-        """The store-backed claim/verify/consume flow for :meth:`check`.
-
-        The claim is taken in one short transaction (or an expired claim is
-        taken over); verification runs with no transaction held; only the
-        token returned by the winning claim can consume the id, and every
-        rejection or escaped error restores the id to pending with that same
-        token. A stale token (a claim taken over while verification ran)
-        neither consumes nor restores anything.
-        """
-        token = self._store.claim(session_id, binding)
-        if token is None:
-            return False  # unknown id, already consumed, live claim, or unequal binding
-        committed = False
-        try:
-            if not hmac.compare_digest(
-                binding.digest,
-                _region_replay_digest(entry, session_id, binding.expires_at),
-            ):
-                return False  # the presented entry is not the one originally bound
-            if binding.expires_at is not None and current >= binding.expires_at:
-                return False  # expired: rejection does not consume the id
-            if not verify_region(
-                entry.x_commitment,
-                entry.y_commitment,
-                entry.region,
-                entry.proof,
-                entry.context,
-            ):
-                return False
-            if not self._store.commit(session_id, token):
-                return False  # the lease expired and another check took over
-            committed = True
-            return True
-        finally:
-            # A False result, an expiry or an escaped error hands the id back
-            # to pending, but only while the current token still owns it;
-            # after commit() (or a takeover) the token is stale and this is a
-            # no-op, leaving the id consumed or re-claimed by the new owner.
-            if not committed:
-                self._store.release(session_id, token)
+        return self._verify_and_consume(entry, binding, now)
 
 
 # ---------------------------------------------------------------------------

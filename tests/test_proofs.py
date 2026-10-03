@@ -12866,6 +12866,429 @@ class RegionReplayGuardTest(unittest.TestCase):
         self.assertEqual(binding, binding_snapshot)
 
 
+class SingleEntryReplayGuardStoreTestBase:
+    """Shared regression tests for the single-entry replay guards' lifecycle.
+
+    RangeReplayGuard and RegionReplayGuard share their session-validation
+    lifecycle through a common private base; these tests pin the behaviour
+    of that lifecycle for each concrete guard, in memory and through
+    independent SQLite connections to one store file.
+    """
+
+    DOMAIN = None  # the guard's store key-domain segment
+    GUARD = None  # the guard class under test
+    VERIFY_ATTR = None  # the zkregion verification function the guard calls
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "single-entry.db")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def guard(self, **kwargs):
+        return self.GUARD(**kwargs)
+
+    def make_store(self, *args, **kwargs):
+        return SQLiteReplayStore(self.path, *args, **kwargs)
+
+    def raw_rows(self):
+        conn = sqlite3.connect(self.path)
+        try:
+            return conn.execute(
+                "SELECT namespace, domain, session_id, state FROM replay_sessions_v1"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    def row_states(self):
+        return {(row[1], row[2]): row[3] for row in self.raw_rows()}
+
+    # ---- independent connections to one file ---------------------------------
+
+    def test_store_check_accepts_across_independent_connections(self):
+        store = self.make_store()
+        binder = self.guard(store=store)
+        binding = binder.bind_once(self.entry, b"s", expires_at=1000)
+        other = self.make_store()  # a second connection to the same file
+        try:
+            checker = self.guard(store=other)
+            self.assertTrue(checker.check(self.entry, binding, now=999))
+            self.assertFalse(binder.check(self.entry, binding, now=999))
+            self.assertEqual(binder._consumed, {b"s"})
+            self.assertEqual(
+                self.row_states()[(self.DOMAIN, b"s")], "consumed"
+            )
+        finally:
+            store.close()
+            other.close()
+
+    def test_store_pending_and_consumed_persist_across_reopen(self):
+        store = self.make_store()
+        pending_binding = self.guard(store=store).bind_once(self.entry, b"pending")
+        consumed_binding = self.guard(store=store).bind_once(self.entry, b"consumed")
+        self.assertTrue(self.guard(store=store).check(self.entry, consumed_binding, now=1))
+        store.close()
+        reopened = self.make_store()
+        try:
+            guard = self.guard(store=reopened)
+            self.assertIn(b"pending", guard._pending)
+            self.assertEqual(guard._consumed, {b"consumed"})
+            with self.assertRaises(ValueError):
+                guard.bind_once(self.entry, b"consumed")
+            # the pending id still verifies exactly once after the reopen
+            self.assertTrue(guard.check(self.entry, pending_binding, now=1))
+            self.assertFalse(guard.check(self.entry, pending_binding, now=1))
+            self.assertEqual(guard._consumed, {b"pending", b"consumed"})
+        finally:
+            reopened.close()
+
+    def test_store_namespace_isolation(self):
+        first = self.make_store(namespace=b"a")
+        second = self.make_store(namespace=b"b")
+        try:
+            binding = self.guard(store=first).bind_once(self.entry, b"s")
+            self.assertFalse(self.guard(store=second).check(self.entry, binding, now=1))
+            self.assertTrue(self.guard(store=first).check(self.entry, binding, now=1))
+        finally:
+            first.close()
+            second.close()
+
+    # ---- rejection never consumes ---------------------------------------------
+
+    def test_store_entry_mismatch_rejection_restores_pending(self):
+        store = self.make_store()
+        try:
+            guard = self.guard(store=store)
+            binding = guard.bind_once(self.entry, b"s")
+            checker = self.guard(store=store)
+            self.assertFalse(checker.check(self.changed_entry, binding, now=1))
+            self.assertIn(b"s", guard._pending)
+            # the originally bound entry still verifies once
+            self.assertTrue(self.guard(store=store).check(self.entry, binding, now=1))
+        finally:
+            store.close()
+
+    def test_store_expired_rejection_leaves_pending(self):
+        store = self.make_store()
+        try:
+            guard = self.guard(store=store)
+            binding = guard.bind_once(self.entry, b"s", expires_at=1000)
+            self.assertFalse(guard.check(self.entry, binding, now=1000))
+            self.assertIn(b"s", self.guard(store=store)._pending)
+            # still pending: an earlier clock succeeds and consumes it
+            self.assertTrue(self.guard(store=store).check(self.entry, binding, now=999))
+            self.assertFalse(self.guard(store=store).check(self.entry, binding, now=999))
+        finally:
+            store.close()
+
+    def test_store_bad_proof_rejection_restores_pending(self):
+        store = self.make_store()
+        try:
+            guard = self.guard(store=store)
+            binding = guard.bind_once(self.forged_entry, b"s")
+            self.assertFalse(self.guard(store=store).check(self.forged_entry, binding, now=1))
+            self.assertIn(b"s", guard._pending)
+            with self.assertRaises(ValueError):
+                guard.bind_once(self.forged_entry, b"s")
+        finally:
+            store.close()
+
+    # ---- exceptions release the claim and a retry succeeds ---------------------
+
+    def test_in_memory_verification_error_restores_pending_and_retry_succeeds(self):
+        import zkregion
+
+        guard = self.guard()
+        binding = guard.bind_once(self.entry, b"s")
+        original = getattr(zkregion, self.VERIFY_ATTR)
+
+        def boom(*args):
+            raise RuntimeError("boom")
+
+        setattr(zkregion, self.VERIFY_ATTR, boom)
+        try:
+            with self.assertRaises(RuntimeError):
+                guard.check(self.entry, binding, now=1)
+        finally:
+            setattr(zkregion, self.VERIFY_ATTR, original)
+        self.assertIn(b"s", guard._pending)
+        self.assertTrue(guard.check(self.entry, binding, now=1))
+        self.assertFalse(guard.check(self.entry, binding, now=1))
+
+    def test_store_verification_error_restores_pending_and_retry_succeeds(self):
+        import zkregion
+
+        store = self.make_store()
+        try:
+            guard = self.guard(store=store)
+            binding = guard.bind_once(self.entry, b"s")
+            original = getattr(zkregion, self.VERIFY_ATTR)
+
+            def boom(*args):
+                raise RuntimeError("boom")
+
+            setattr(zkregion, self.VERIFY_ATTR, boom)
+            try:
+                with self.assertRaises(RuntimeError):
+                    guard.check(self.entry, binding, now=1)
+            finally:
+                setattr(zkregion, self.VERIFY_ATTR, original)
+            self.assertIn(b"s", self.guard(store=store)._pending)
+            self.assertEqual(self.row_states()[(self.DOMAIN, b"s")], "pending")
+            self.assertTrue(self.guard(store=store).check(self.entry, binding, now=1))
+        finally:
+            store.close()
+
+    # ---- concurrency: one winner, no cross-id blocking -------------------------
+
+    def test_in_memory_concurrent_checks_have_exactly_one_winner(self):
+        guard = self.guard()
+        binding = guard.bind_once(self.entry, b"s")
+        results = []
+        lock = threading.Lock()
+
+        def attempt():
+            won = guard.check(self.entry, binding, now=1)
+            with lock:
+                results.append(won)
+
+        threads = [threading.Thread(target=attempt) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(sum(results), 1)
+
+    def test_store_concurrent_checks_have_exactly_one_winner(self):
+        store = self.make_store()
+        try:
+            binding = self.guard(store=store).bind_once(self.entry, b"s")
+            results = []
+            lock = threading.Lock()
+
+            def attempt():
+                won = self.guard(store=store).check(self.entry, binding, now=1)
+                with lock:
+                    results.append(won)
+
+            threads = [threading.Thread(target=attempt) for _ in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(sum(results), 1)
+        finally:
+            store.close()
+
+    def test_slow_verification_does_not_block_other_ids(self):
+        import zkregion
+
+        guard = self.guard()
+        slow_binding = guard.bind_once(self.entry, b"slow")
+        started = threading.Event()
+        release = threading.Event()
+        original = getattr(zkregion, self.VERIFY_ATTR)
+        state = {"blocked": False}
+
+        def slow_once(*args):
+            if not state["blocked"]:
+                state["blocked"] = True
+                started.set()
+                release.wait(5)
+            return original(*args)
+
+        outcomes = {}
+        setattr(zkregion, self.VERIFY_ATTR, slow_once)
+        try:
+            thread = threading.Thread(
+                target=lambda: outcomes.setdefault(
+                    "slow", guard.check(self.entry, slow_binding, now=1)
+                )
+            )
+            thread.start()
+            self.assertTrue(started.wait(2))
+            # while the first check verifies, other ids bind and check freely
+            fast_binding = guard.bind_once(self.entry, b"fast")
+            outcomes["fast"] = guard.check(self.entry, fast_binding, now=1)
+            release.set()
+            thread.join()
+        finally:
+            setattr(zkregion, self.VERIFY_ATTR, original)
+        self.assertTrue(outcomes["slow"])
+        self.assertTrue(outcomes["fast"])
+
+    # ---- lease takeover ---------------------------------------------------------
+
+    def test_store_lease_takeover_tokens(self):
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        try:
+            binding = self.guard(store=store).bind_once(self.entry, b"s")
+            view = store._view(self.DOMAIN)
+            old_token = view.claim(b"s", binding)
+            self.assertIsNotNone(old_token)
+            self.assertIsNone(view.claim(b"s", binding))  # live claim held
+            clock["t"] = 1011  # past the lease deadline
+            new_token = view.claim(b"s", binding)
+            self.assertIsNotNone(new_token)
+            self.assertNotEqual(old_token, new_token)
+            # the taken-over token can neither consume nor release any more
+            self.assertFalse(view.commit(b"s", old_token))
+            self.assertFalse(view.release(b"s", old_token))
+            self.assertTrue(view.commit(b"s", new_token))
+        finally:
+            store.close()
+
+    def test_store_expired_lease_takeover_lets_new_checker_win(self):
+        import zkregion
+
+        clock = {"t": 1000}
+        store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        started = threading.Event()
+        release = threading.Event()
+        original = getattr(zkregion, self.VERIFY_ATTR)
+        state = {"blocked": False}
+
+        def slow_once(*args):
+            if not state["blocked"]:
+                state["blocked"] = True
+                started.set()
+                release.wait(5)
+            return original(*args)
+
+        outcomes = {}
+        setattr(zkregion, self.VERIFY_ATTR, slow_once)
+        try:
+            binding = self.guard(store=store).bind_once(self.entry, b"s")
+            stale = threading.Thread(
+                target=lambda: outcomes.setdefault(
+                    "stale", self.guard(store=store).check(self.entry, binding, now=1)
+                )
+            )
+            stale.start()
+            self.assertTrue(started.wait(2))
+            clock["t"] = 1011  # let the first check's lease expire
+            # a second check takes the expired claim over and wins
+            outcomes["fresh"] = self.guard(store=store).check(self.entry, binding, now=1)
+            release.set()
+            stale.join()
+        finally:
+            setattr(zkregion, self.VERIFY_ATTR, original)
+            store.close()
+        # the taken-over checker's stale token can no longer consume the id
+        self.assertFalse(outcomes["stale"])
+        self.assertTrue(outcomes["fresh"])
+        self.assertEqual(self.row_states()[(self.DOMAIN, b"s")], "consumed")
+
+    # ---- database errors ---------------------------------------------------------
+
+    def test_store_sqlite_errors_propagate(self):
+        store = self.make_store()
+        try:
+            guard = self.guard(store=store)
+            guard.bind_once(self.entry, b"s")
+            store._connection.execute("DROP TABLE replay_sessions_v1")
+            with self.assertRaises(sqlite3.Error):
+                guard.check(self.entry, ReplayBinding(b"s", b"\x00" * 32), now=1)
+        finally:
+            store.close()
+
+
+class RangeReplayGuardStoreTest(SingleEntryReplayGuardStoreTestBase, unittest.TestCase):
+    """Store-backed lifecycle regression tests for RangeReplayGuard."""
+
+    DOMAIN = b"zr/rr/v1"
+    GUARD = RangeReplayGuard
+    VERIFY_ATTR = "verify_range"
+
+    def setUp(self):
+        super().setUp()
+        self.commitment, self.blinding = pedersen_commit(
+            4, 0, 10, prime=SMALL_PRIME, generator=3, blinding=1000,
+        )
+        self.proof = prove_range(
+            self.commitment, 4, self.blinding, context=b"ctx",
+            randbelow=counter_randbelow(),
+        )
+        self.entry = RangeBatchEntry(self.commitment, self.proof, b"ctx")
+        self.changed_entry = dataclasses.replace(self.entry, context=b"other")
+        self.forged_entry = dataclasses.replace(
+            self.entry,
+            proof=RangeProof(
+                self.proof.t, self.proof.e,
+                self.proof.s[:-1] + (self.proof.s[-1] + 1,),
+            ),
+        )
+
+    def test_store_domain_isolation_from_region_guard(self):
+        region = Region(0, 10, 20, 30)
+        x_commitment, x_blinding = pedersen_commit(
+            5, 0, 10, prime=SMALL_PRIME, generator=3, blinding=1234,
+        )
+        y_commitment, y_blinding = pedersen_commit(
+            25, 20, 30, prime=SMALL_PRIME, generator=3, blinding=4321,
+        )
+        region_proof = prove_region(
+            x_commitment, y_commitment, 5, 25, x_blinding, y_blinding,
+            region, context=b"ctx", randbelow=counter_randbelow(),
+        )
+        region_entry = RegionBatchEntry(
+            x_commitment, y_commitment, region, region_proof, b"ctx"
+        )
+        store = self.make_store()
+        try:
+            range_guard = RangeReplayGuard(store=store)
+            region_guard = RegionReplayGuard(store=store)
+            # the same session id serves both entry kinds without mixing
+            range_binding = range_guard.bind_once(self.entry, b"same-id")
+            region_binding = region_guard.bind_once(region_entry, b"same-id")
+            self.assertNotEqual(range_binding.digest, region_binding.digest)
+            self.assertTrue(range_guard.check(self.entry, range_binding, now=1))
+            # consuming the range id leaves the region id pending
+            self.assertIn(b"same-id", region_guard._pending)
+            self.assertTrue(region_guard.check(region_entry, region_binding, now=1))
+            states = self.row_states()
+            self.assertEqual(states[(b"zr/rr/v1", b"same-id")], "consumed")
+            self.assertEqual(states[(b"zr/rg/v1", b"same-id")], "consumed")
+        finally:
+            store.close()
+
+
+class RegionReplayGuardStoreTest(SingleEntryReplayGuardStoreTestBase, unittest.TestCase):
+    """Store-backed lifecycle regression tests for RegionReplayGuard."""
+
+    DOMAIN = b"zr/rg/v1"
+    GUARD = RegionReplayGuard
+    VERIFY_ATTR = "verify_region"
+
+    def setUp(self):
+        super().setUp()
+        self.region = Region(0, 10, 20, 30)
+        self.x_commitment, self.x_blinding = pedersen_commit(
+            5, 0, 10, prime=SMALL_PRIME, generator=3, blinding=1234,
+        )
+        self.y_commitment, self.y_blinding = pedersen_commit(
+            25, 20, 30, prime=SMALL_PRIME, generator=3, blinding=4321,
+        )
+        self.proof = prove_region(
+            self.x_commitment, self.y_commitment,
+            5, 25, self.x_blinding, self.y_blinding,
+            self.region, context=b"ctx", randbelow=counter_randbelow(),
+        )
+        self.entry = RegionBatchEntry(
+            self.x_commitment, self.y_commitment, self.region, self.proof, b"ctx"
+        )
+        self.changed_entry = dataclasses.replace(self.entry, context=b"other")
+        tampered_x = RangeProof(
+            self.proof.x_proof.t, self.proof.x_proof.e,
+            self.proof.x_proof.s[:-1] + (self.proof.x_proof.s[-1] + 1,),
+        )
+        self.forged_entry = dataclasses.replace(
+            self.entry, proof=RegionProof(tampered_x, self.proof.y_proof)
+        )
+
+
 class BoundRegionReplayGuardTest(unittest.TestCase):
     PRIME = SMALL_PRIME
     G = 3

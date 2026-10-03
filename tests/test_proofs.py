@@ -42129,11 +42129,545 @@ class RangeSetBatchReplayGuardTest(unittest.TestCase):
         self.assertIn(b"zr/brsbr/v1", domains)
         store.close()
 
+    # ---- SQLite lease takeover ---------------------------------------------
+    #
+    # The checks below exercise the store claim/lease state machine through
+    # the public bind_once/check entry points only: the real SQLiteReplayStore
+    # claim path (not direct row writes) produces the pending and claimed
+    # rows, a controllable clock decides when a claim lease expires, and a
+    # scripted delegated verifier decides when each proof verification
+    # resumes. Two independent store connections (two SQLiteReplayStore
+    # instances on the same file and namespace) stand in for the two
+    # claimants; every result comes from a return value, an exception or a
+    # later retry, never from inspecting or mutating the database directly.
+
+    CONTESTED_SESSION = b"takeover-id"
+    OTHER_SESSION = b"other-id"
+    DELEGATE = "verify_range_set_batch"
+
+    def make_tagged_entries(self, tag):
+        return [
+            self.entry(value=5, context=tag, blinding=2001),
+            self.entry(value=95, context=b"inner-2", blinding=2002),
+        ]
+
+    def bind_scenario(self, guard, session_id=None, *, expires_at=None):
+        """bind_once a valid tagged batch; return ``(payload, binding)``.
+
+        ``payload`` holds the positional ``check`` arguments for this entry
+        point (the bare batch here, the ``(batch, root)`` pair in the bound
+        subclass); the bound batch uses the real outer Merkle root.
+        """
+        if session_id is None:
+            session_id = self.CONTESTED_SESSION
+        entries = self.make_tagged_entries(b"contested")
+        binding = guard.bind_once(
+            entries, session_id, expires_at=expires_at
+        )
+        return entries, binding
+
+    def bind_other(self, guard):
+        """bind_once the independent second session on ``guard``."""
+        entries = self.make_tagged_entries(b"other")
+        binding = guard.bind_once(entries, self.OTHER_SESSION)
+        return entries, binding
+
+    def check_payload(self, guard, payload, binding, *, now):
+        return guard.check(payload, binding, now=now)
+
+    def rebind(self, guard, payload):
+        """Attempt to bind the contested payload to its id again."""
+        guard.bind_once(payload, self.CONTESTED_SESSION)
+
+    def _script_tag(self, args):
+        return args[0][0].context
+
+    def _install_verifier_script(self, script):
+        """Patch the delegated verifier with a per-arrival script.
+
+        ``script`` maps the first entry's context tag to a list of
+        callables consumed one per verification of that session in arrival
+        order; each callable's return value (or raised exception) is the
+        verification outcome. Tags absent from the script -- or sessions
+        whose steps are exhausted -- fall through to the real verifier, so
+        a second id can be bound and fully checked while the contested id
+        is parked mid-verification.
+        """
+        import zkregion
+
+        original = getattr(zkregion, self.DELEGATE)
+        queues = {tag: list(steps) for tag, steps in script.items()}
+
+        def staged(*args):
+            steps = queues.get(self._script_tag(args))
+            if not steps:
+                return original(*args)
+            return steps.pop(0)()
+
+        setattr(zkregion, self.DELEGATE, staged)
+        return original
+
+    def _restore_verifier(self, original):
+        import zkregion
+
+        setattr(zkregion, self.DELEGATE, original)
+
+    @staticmethod
+    def _block(entered, release):
+        entered.set()
+        release.wait(5)
+        return True
+
+    def _start_check(self, guard, payload, binding, now, outcomes):
+        thread = threading.Thread(
+            target=lambda: outcomes.append(
+                self.check_payload(guard, payload, binding, now=now)
+            )
+        )
+        thread.start()
+        return thread
+
+    def _takeover_stores(self, clock):
+        first = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        second = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        return first, second
+
+    def test_store_live_claim_blocks_takeover_until_lease_expires(self):
+        # The first check is inside proof verification: while its claim
+        # lease is live a second check returns False. After the lease
+        # expires a second, equal check takes the claim over and returns
+        # True; the recovered first check returns False, and every later
+        # replay returns False.
+        clock = {"t": 1000}
+        first_store, second_store = self._takeover_stores(clock)
+        first = self.guard(store=first_store)
+        second = self.guard(store=second_store)
+        payload, binding = self.bind_scenario(first)
+        old_entered = threading.Event()
+        old_release = threading.Event()
+        new_entered = threading.Event()
+        threads = []
+        try:
+            script = {
+                b"contested": [
+                    lambda: self._block(old_entered, old_release),
+                    lambda: (new_entered.set(), True)[1],
+                ]
+            }
+            original = self._install_verifier_script(script)
+            old_outcomes = []
+            try:
+                old_thread = self._start_check(
+                    first, payload, binding, 1000, old_outcomes
+                )
+                threads.append(old_thread)
+                self.assertTrue(
+                    old_entered.wait(5), "first check never entered verification"
+                )
+                # the live claim is still held by the first connection
+                self.assertFalse(
+                    self.check_payload(second, payload, binding, now=1005)
+                )
+                clock["t"] = 1011  # the claim lease has expired
+                new_outcomes = []
+                new_thread = self._start_check(
+                    second, payload, binding, 1011, new_outcomes
+                )
+                threads.append(new_thread)
+                self.assertTrue(
+                    new_entered.wait(5), "takeover check never entered verification"
+                )
+                new_thread.join(5)
+                self.assertFalse(new_thread.is_alive())
+                self.assertEqual(new_outcomes, [True])
+                # the recovered first check holds a stale token
+                old_release.set()
+                old_thread.join(5)
+                self.assertFalse(old_thread.is_alive())
+                self.assertEqual(old_outcomes, [False])
+            finally:
+                self._restore_verifier(original)
+            # every later replay, on either connection, returns False
+            self.assertFalse(
+                self.check_payload(first, payload, binding, now=clock["t"])
+            )
+            self.assertFalse(
+                self.check_payload(second, payload, binding, now=clock["t"])
+            )
+        finally:
+            old_release.set()
+            for thread in threads:
+                thread.join(5)
+            first_store.close()
+            second_store.close()
+
+    def test_store_old_cleanup_cannot_undo_a_live_takeover(self):
+        # The old check finishes while the takeover check is itself still
+        # verifying: its stale-token cleanup must leave the new claim in
+        # place, a third check returns False, and the takeover check still
+        # consumes the id once.
+        clock = {"t": 1000}
+        first_store, second_store = self._takeover_stores(clock)
+        third_store = self.make_store(lease_seconds=10, clock=lambda: clock["t"])
+        first = self.guard(store=first_store)
+        second = self.guard(store=second_store)
+        payload, binding = self.bind_scenario(first)
+        old_entered = threading.Event()
+        old_release = threading.Event()
+        new_entered = threading.Event()
+        new_release = threading.Event()
+        threads = []
+        try:
+            script = {
+                b"contested": [
+                    lambda: self._block(old_entered, old_release),
+                    lambda: self._block(new_entered, new_release),
+                ]
+            }
+            original = self._install_verifier_script(script)
+            old_outcomes = []
+            new_outcomes = []
+            try:
+                old_thread = self._start_check(
+                    first, payload, binding, 1000, old_outcomes
+                )
+                threads.append(old_thread)
+                self.assertTrue(old_entered.wait(5))
+                self.assertFalse(
+                    self.check_payload(second, payload, binding, now=1005)
+                )
+                clock["t"] = 1011
+                new_thread = self._start_check(
+                    second, payload, binding, 1011, new_outcomes
+                )
+                threads.append(new_thread)
+                self.assertTrue(new_entered.wait(5))
+                # finish the old check while the takeover is still verifying
+                old_release.set()
+                old_thread.join(5)
+                self.assertFalse(old_thread.is_alive())
+                self.assertEqual(old_outcomes, [False])
+                # the stale-token cleanup did not hand the id back; the new
+                # claim is live, so a third connection cannot take it
+                self.assertFalse(
+                    self.check_payload(
+                        self.guard(store=third_store),
+                        payload, binding, now=clock["t"],
+                    )
+                )
+                new_release.set()
+                new_thread.join(5)
+                self.assertFalse(new_thread.is_alive())
+                self.assertEqual(new_outcomes, [True])
+            finally:
+                self._restore_verifier(original)
+            self.assertFalse(
+                self.check_payload(first, payload, binding, now=clock["t"])
+            )
+        finally:
+            old_release.set()
+            new_release.set()
+            for thread in threads:
+                thread.join(5)
+            first_store.close()
+            second_store.close()
+            third_store.close()
+
+    def test_store_takeover_failure_leaves_session_consumable_once(self):
+        # The takeover's own verification returns False: it must not
+        # consume the id (its live token restores pending). The next
+        # legitimate check consumes the id exactly once; recovering the
+        # old check afterwards returns False and changes nothing.
+        clock = {"t": 1000}
+        first_store, second_store = self._takeover_stores(clock)
+        first = self.guard(store=first_store)
+        second = self.guard(store=second_store)
+        payload, binding = self.bind_scenario(first)
+        old_entered = threading.Event()
+        old_release = threading.Event()
+        takeover_entered = threading.Event()
+        threads = []
+        try:
+            script = {
+                b"contested": [
+                    lambda: self._block(old_entered, old_release),
+                    lambda: (takeover_entered.set(), False)[1],
+                ]
+            }
+            original = self._install_verifier_script(script)
+            old_outcomes = []
+            try:
+                old_thread = self._start_check(
+                    first, payload, binding, 1000, old_outcomes
+                )
+                threads.append(old_thread)
+                self.assertTrue(old_entered.wait(5))
+                clock["t"] = 1011
+                self.assertFalse(
+                    self.check_payload(second, payload, binding, now=1011)
+                )
+                self.assertTrue(takeover_entered.wait(5))
+                # the failed takeover restored pending; the next legitimate
+                # check (its scripted steps are exhausted, so the real
+                # verifier runs) consumes the id exactly once
+                self.assertTrue(
+                    self.check_payload(first, payload, binding, now=1011)
+                )
+                self.assertFalse(
+                    self.check_payload(second, payload, binding, now=1011)
+                )
+                # recovering the stale old check cannot undo the consumption
+                old_release.set()
+                old_thread.join(5)
+                self.assertFalse(old_thread.is_alive())
+                self.assertEqual(old_outcomes, [False])
+            finally:
+                self._restore_verifier(original)
+            self.assertFalse(
+                self.check_payload(first, payload, binding, now=clock["t"])
+            )
+        finally:
+            old_release.set()
+            for thread in threads:
+                thread.join(5)
+            first_store.close()
+            second_store.close()
+
+    def test_store_takeover_runtime_error_propagates_and_retries(self):
+        # The takeover's verification raises RuntimeError: that same
+        # exception propagates, the id is restored to pending, the stale
+        # old check still returns False, and a later legitimate check
+        # succeeds exactly once.
+        clock = {"t": 1000}
+        first_store, second_store = self._takeover_stores(clock)
+        first = self.guard(store=first_store)
+        second = self.guard(store=second_store)
+        payload, binding = self.bind_scenario(first)
+        old_entered = threading.Event()
+        old_release = threading.Event()
+        takeover_entered = threading.Event()
+        takeover_error = RuntimeError("takeover verification failed")
+        threads = []
+
+        def fail_takeover():
+            takeover_entered.set()
+            raise takeover_error
+
+        try:
+            script = {
+                b"contested": [
+                    lambda: self._block(old_entered, old_release),
+                    fail_takeover,
+                ]
+            }
+            original = self._install_verifier_script(script)
+            old_outcomes = []
+            try:
+                old_thread = self._start_check(
+                    first, payload, binding, 1000, old_outcomes
+                )
+                threads.append(old_thread)
+                self.assertTrue(old_entered.wait(5))
+                clock["t"] = 1011
+                with self.assertRaises(RuntimeError) as caught:
+                    self.check_payload(second, payload, binding, now=1011)
+                self.assertIs(caught.exception, takeover_error)
+                self.assertTrue(takeover_entered.wait(5))
+                # the id is usable again: one legitimate consumption
+                self.assertTrue(
+                    self.check_payload(first, payload, binding, now=1011)
+                )
+                self.assertFalse(
+                    self.check_payload(second, payload, binding, now=1011)
+                )
+                old_release.set()
+                old_thread.join(5)
+                self.assertFalse(old_thread.is_alive())
+                self.assertEqual(old_outcomes, [False])
+            finally:
+                self._restore_verifier(original)
+        finally:
+            old_release.set()
+            for thread in threads:
+                thread.join(5)
+            first_store.close()
+            second_store.close()
+
+    def test_store_other_session_completes_while_one_is_verifying(self):
+        # While the contested session is mid-verification on the first
+        # connection, a second session can be bound and fully verified on
+        # the second: claim state is per-id, never a global lock.
+        clock = {"t": 1000}
+        first_store, second_store = self._takeover_stores(clock)
+        first = self.guard(store=first_store)
+        second = self.guard(store=second_store)
+        payload, binding = self.bind_scenario(first)
+        entered = threading.Event()
+        release = threading.Event()
+        threads = []
+        try:
+            script = {
+                b"contested": [lambda: self._block(entered, release)]
+            }
+            original = self._install_verifier_script(script)
+            outcomes = []
+            try:
+                held_thread = self._start_check(
+                    first, payload, binding, 1000, outcomes
+                )
+                threads.append(held_thread)
+                self.assertTrue(entered.wait(5))
+                # bind and verify a different session on the other connection
+                other_payload, other_binding = self.bind_other(second)
+                self.assertTrue(
+                    self.check_payload(
+                        second, other_payload, other_binding, now=1000
+                    )
+                )
+                self.assertFalse(
+                    self.check_payload(
+                        second, other_payload, other_binding, now=1000
+                    )
+                )
+                release.set()
+                held_thread.join(5)
+                self.assertFalse(held_thread.is_alive())
+                self.assertEqual(outcomes, [True])
+            finally:
+                self._restore_verifier(original)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(5)
+            first_store.close()
+            second_store.close()
+
+    def test_store_rebind_rejected_in_every_state(self):
+        # bind_once rejects the same id while pending, while a check has it
+        # claimed, once the claim lease has expired but before a takeover,
+        # and after consumption -- every state reached through the public
+        # bind/check flow, never by writing the database directly.
+        clock = {"t": 1000}
+        first_store, second_store = self._takeover_stores(clock)
+        first = self.guard(store=first_store)
+        second = self.guard(store=second_store)
+        payload, binding = self.bind_scenario(first)
+        entered = threading.Event()
+        release = threading.Event()
+        threads = []
+        try:
+            # pending
+            with self.assertRaises(ValueError):
+                self.rebind(first, payload)
+            script = {b"contested": [lambda: self._block(entered, release)]}
+            original = self._install_verifier_script(script)
+            outcomes = []
+            try:
+                held_thread = self._start_check(
+                    first, payload, binding, 1000, outcomes
+                )
+                threads.append(held_thread)
+                self.assertTrue(entered.wait(5))
+                # claimed by the in-flight check, on either connection
+                with self.assertRaises(ValueError):
+                    self.rebind(first, payload)
+                with self.assertRaises(ValueError):
+                    self.rebind(second, payload)
+                clock["t"] = 1011  # lease expired, no takeover yet
+                with self.assertRaises(ValueError):
+                    self.rebind(second, payload)
+                release.set()
+                held_thread.join(5)
+                self.assertFalse(held_thread.is_alive())
+                # No takeover happened, so the original token -- not the
+                # deadline -- still owns the claim: the recovered check
+                # commits and the id ends consumed.
+                self.assertEqual(outcomes, [True])
+            finally:
+                self._restore_verifier(original)
+            # consumed: an id can never be rebound, on either connection
+            with self.assertRaises(ValueError):
+                self.rebind(first, payload)
+            with self.assertRaises(ValueError):
+                self.rebind(second, payload)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(5)
+            first_store.close()
+            second_store.close()
+
+    def test_store_binding_expiry_is_independent_of_claim_lease(self):
+        # Reaching the binding's own expires_at makes check return False;
+        # an expired claim lease and a later takeover cannot extend that
+        # deadline.
+        clock = {"t": 1000}
+        first_store, second_store = self._takeover_stores(clock)
+        first = self.guard(store=first_store)
+        second = self.guard(store=second_store)
+        entered = threading.Event()
+        release = threading.Event()
+        threads = []
+        try:
+            # a binding is honored right before its deadline, once
+            payload_a, binding_a = self.bind_scenario(
+                first, b"binding-a", expires_at=2000
+            )
+            self.assertTrue(
+                self.check_payload(first, payload_a, binding_a, now=1999)
+            )
+            self.assertFalse(
+                self.check_payload(first, payload_a, binding_a, now=1999)
+            )
+            # claimed while still valid; the check parks in verification
+            payload_b, binding_b = self.bind_scenario(
+                first, b"binding-b", expires_at=2000
+            )
+            script = {b"contested": [lambda: self._block(entered, release)]}
+            original = self._install_verifier_script(script)
+            outcomes = []
+            try:
+                held_thread = self._start_check(
+                    first, payload_b, binding_b, 1999, outcomes
+                )
+                threads.append(held_thread)
+                self.assertTrue(entered.wait(5))
+                clock["t"] = 5000  # lease long expired, binding expired too
+                # takeover claims the expired lease but still honors the
+                # binding expiry, so it returns False and stays pending
+                self.assertFalse(
+                    self.check_payload(second, payload_b, binding_b, now=5000)
+                )
+                self.assertIn(b"binding-b", second._pending)
+                self.assertFalse(
+                    self.check_payload(second, payload_b, binding_b, now=5000)
+                )
+                release.set()
+                held_thread.join(5)
+                self.assertFalse(held_thread.is_alive())
+                self.assertEqual(outcomes, [False])
+            finally:
+                self._restore_verifier(original)
+            # no later takeover, at any later time, can consume it
+            clock["t"] = 9000
+            self.assertFalse(
+                self.check_payload(first, payload_b, binding_b, now=9000)
+            )
+            self.assertIn(b"binding-b", first._pending)
+        finally:
+            release.set()
+            for thread in threads:
+                thread.join(5)
+            first_store.close()
+            second_store.close()
+
+
 
 class BoundRangeSetBatchReplayGuardTest(RangeSetBatchReplayGuardTest):
     """Single-use replay bindings for Merkle-bound range set batches."""
 
     DOMAIN = b"zr/brsbr/v1"
+    DELEGATE = "verify_range_set_batch_bound"
 
     def guard(self, **kwargs):
         return BoundRangeSetBatchReplayGuard(**kwargs)
@@ -42142,6 +42676,35 @@ class BoundRangeSetBatchReplayGuardTest(RangeSetBatchReplayGuardTest):
         entries = [self.entry(value=value) for value in values]
         batch, root = prove_range_set_batch_bound(entries)
         return entries, batch, root
+
+    # ---- lease-takeover entry-point hooks ----------------------------------
+
+    def bind_scenario(self, guard, session_id=None, *, expires_at=None):
+        if session_id is None:
+            session_id = self.CONTESTED_SESSION
+        entries = self.make_tagged_entries(b"contested")
+        batch, root = prove_range_set_batch_bound(entries)
+        binding = guard.bind_once(
+            batch, root, session_id, expires_at=expires_at
+        )
+        return (batch, root), binding
+
+    def bind_other(self, guard):
+        entries = self.make_tagged_entries(b"other")
+        batch, root = prove_range_set_batch_bound(entries)
+        binding = guard.bind_once(batch, root, self.OTHER_SESSION)
+        return (batch, root), binding
+
+    def check_payload(self, guard, payload, binding, *, now):
+        batch, root = payload
+        return guard.check(batch, root, binding, now=now)
+
+    def rebind(self, guard, payload):
+        batch, root = payload
+        guard.bind_once(batch, root, self.CONTESTED_SESSION)
+
+    def _script_tag(self, args):
+        return args[0].entries[0].context
 
     # The bare-batch entry-point tests below are specific to the
     # (entries, binding) signature and are replaced by bound-batch tests

@@ -4057,6 +4057,88 @@ def prove_convex_polygon(
     )
 
 
+def _check_convex_polygon_input_types(
+    x_commitment: object,
+    y_commitment: object,
+    polygon: object,
+    proof: object,
+    context: object,
+    *,
+    label: str = "",
+) -> None:
+    """Preflight every nested input type of :func:`verify_convex_polygon`.
+
+    Walks the complete input shape before any semantic verdict is
+    allowed: both commitments must be :class:`PedersenCommitment`
+    objects with non-``bool`` integer fields, the polygon must be a
+    :class:`ConvexPolygonRegion` whose vertices are a tuple of
+    two-element non-``bool`` integer tuples, the proof must be a
+    :class:`ConvexPolygonRegionProof` whose two bounding-box
+    :class:`RangeProof` objects carry non-``bool`` integer tuple
+    fields and whose ``edge_proofs`` is a tuple of
+    :class:`WideRangeProof` objects with tuple fields of non-``bool``
+    integers at every nesting level, and the context must be
+    ``bytes``. The whole shape is always walked, so a wrong type in a
+    late field raises :class:`TypeError` even when an earlier field is
+    already doomed to fail semantically. ``label`` prefixes messages
+    for batch-style callers (``""`` for the single-entry verifier).
+    """
+    prefix = f"{label} " if label else ""
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError(f"{prefix}x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError(f"{prefix}y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    if not isinstance(polygon, ConvexPolygonRegion):
+        raise TypeError(f"{prefix}polygon must be a ConvexPolygonRegion")
+    vertices = polygon.vertices
+    if not isinstance(vertices, tuple):
+        raise TypeError(
+            f"{prefix}polygon vertices must be a tuple of (x, y) tuples"
+        )
+    for vertex_position, vertex in enumerate(vertices):
+        if not isinstance(vertex, tuple) or len(vertex) != 2:
+            raise TypeError(
+                f"{prefix}polygon vertices[{vertex_position}] must be a "
+                "(x, y) tuple"
+            )
+        _check_int(
+            vertex[0], f"{prefix}polygon vertices[{vertex_position}] x"
+        )
+        _check_int(
+            vertex[1], f"{prefix}polygon vertices[{vertex_position}] y"
+        )
+    if not isinstance(proof, ConvexPolygonRegionProof):
+        raise TypeError(f"{prefix}proof must be a ConvexPolygonRegionProof")
+    for axis_name, sub_proof in (("x", proof.x_proof), ("y", proof.y_proof)):
+        if not isinstance(sub_proof, RangeProof):
+            raise TypeError(
+                f"{prefix}proof {axis_name}_proof must be a RangeProof"
+            )
+        for field_name in ("t", "e", "s"):
+            field = getattr(sub_proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"{prefix}proof {axis_name}_proof {field_name} must be a "
+                    "tuple of integers"
+                )
+            for item in field:
+                _check_int(
+                    item, f"{prefix}proof {axis_name}_proof {field_name} entry"
+                )
+    edge_proofs = proof.edge_proofs
+    if not isinstance(edge_proofs, tuple):
+        raise TypeError(
+            f"{prefix}proof edge_proofs must be a tuple of WideRangeProof"
+        )
+    for edge_position, edge_proof in enumerate(edge_proofs):
+        _check_wide_range_proof_types(
+            edge_proof, f"{prefix}proof edge_proofs[{edge_position}]"
+        )
+    _check_bytes(context, f"{prefix}context")
+
+
 def verify_convex_polygon(
     x_commitment: PedersenCommitment,
     y_commitment: PedersenCommitment,
@@ -4067,33 +4149,34 @@ def verify_convex_polygon(
     """Verify a :class:`ConvexPolygonRegionProof` against public inputs only.
 
     The verifier needs just the two commitments, the polygon, the proof and
-    the context — never the coordinates or blinding factors. Type errors
-    (wrong object or field types at any nesting level, including a ``bool``
-    integer or a non-``bytes`` context) raise :class:`TypeError`; every
-    semantic failure — mismatched group parameters or declared ranges, a
-    tampered proof field, a forged proof, a different polygon, commitment or
-    context, or swapped axes — returns ``False``. Inputs are never mutated.
+    the context — never the coordinates or blinding factors. Every nested
+    input type is checked across the *whole* input shape first, so a wrong
+    type anywhere (a ``bool`` passed as an integer, a non-tuple vertex or
+    proof container, a malformed sub-proof element, or a non-``bytes``
+    context) raises :class:`TypeError` no matter which field it sits in —
+    a late field's wrong type still raises even after an earlier
+    commitment, range or sub-proof mismatch has doomed the verdict.
+    Every semantic failure — mismatched group parameters or declared
+    ranges, a tampered proof field, a forged proof, a different polygon,
+    commitment or context, swapped axes, or a forged polygon object whose
+    well-typed vertices violate the constructor rules — returns
+    ``False``. Inputs are never mutated.
     """
-    if not isinstance(x_commitment, PedersenCommitment):
-        raise TypeError("x_commitment must be a PedersenCommitment")
-    if not isinstance(y_commitment, PedersenCommitment):
-        raise TypeError("y_commitment must be a PedersenCommitment")
-    _check_commitment_fields(x_commitment)
-    _check_commitment_fields(y_commitment)
-    if not isinstance(polygon, ConvexPolygonRegion):
-        raise TypeError("polygon must be a ConvexPolygonRegion")
-    if not isinstance(proof, ConvexPolygonRegionProof):
-        raise TypeError("proof must be a ConvexPolygonRegionProof")
-    if not isinstance(proof.x_proof, RangeProof):
-        raise TypeError("proof x_proof must be a RangeProof")
-    if not isinstance(proof.y_proof, RangeProof):
-        raise TypeError("proof y_proof must be a RangeProof")
-    if not isinstance(proof.edge_proofs, tuple):
-        raise TypeError("proof edge_proofs must be a tuple of WideRangeProof")
-    for edge_proof in proof.edge_proofs:
-        if not isinstance(edge_proof, WideRangeProof):
-            raise TypeError("proof edge_proofs entries must be WideRangeProof")
-    _check_bytes(context, "context")
+    # Full nested type preflight over every field: TypeError must never be
+    # masked by an earlier semantic rejection.
+    _check_convex_polygon_input_types(
+        x_commitment, y_commitment, polygon, proof, context
+    )
+    # Re-run canonicalization on the as-stored vertices: an object forged
+    # bypassing __post_init__ with well-typed but geometrically invalid
+    # vertices (too few, repeated, collinear, concave or self-intersecting)
+    # is a semantic failure (False), never a leaked ValueError/IndexError.
+    # Rotations and reversals normalize to the same canonical region, so the
+    # verdict is representation-independent and the input object is untouched.
+    try:
+        polygon = ConvexPolygonRegion(polygon.vertices)
+    except ValueError:
+        return False
     if (
         x_commitment.prime != y_commitment.prime
         or x_commitment.generator != y_commitment.generator
@@ -4182,59 +4265,14 @@ def _check_convex_polygon_entry_fields(entry: object, position: int) -> None:
     label = f"entries[{position}]"
     if not isinstance(entry, ConvexPolygonBatchEntry):
         raise TypeError(f"{label} must be a ConvexPolygonBatchEntry")
-    x_commitment = entry.x_commitment
-    y_commitment = entry.y_commitment
-    polygon = entry.polygon
-    proof = entry.proof
-    if not isinstance(x_commitment, PedersenCommitment):
-        raise TypeError(f"{label} x_commitment must be a PedersenCommitment")
-    if not isinstance(y_commitment, PedersenCommitment):
-        raise TypeError(f"{label} y_commitment must be a PedersenCommitment")
-    _check_commitment_fields(x_commitment)
-    _check_commitment_fields(y_commitment)
-    if not isinstance(polygon, ConvexPolygonRegion):
-        raise TypeError(f"{label} polygon must be a ConvexPolygonRegion")
-    vertices = polygon.vertices
-    if not isinstance(vertices, tuple):
-        raise TypeError(
-            f"{label} polygon vertices must be a tuple of (x, y) tuples"
-        )
-    for vertex_position, vertex in enumerate(vertices):
-        if not isinstance(vertex, tuple) or len(vertex) != 2:
-            raise TypeError(
-                f"{label} polygon vertices[{vertex_position}] must be a "
-                "(x, y) tuple"
-            )
-        _check_int(vertex[0], f"{label} polygon vertices[{vertex_position}] x")
-        _check_int(vertex[1], f"{label} polygon vertices[{vertex_position}] y")
-    if not isinstance(proof, ConvexPolygonRegionProof):
-        raise TypeError(f"{label} proof must be a ConvexPolygonRegionProof")
-    for axis_name, sub_proof in (("x", proof.x_proof), ("y", proof.y_proof)):
-        if not isinstance(sub_proof, RangeProof):
-            raise TypeError(
-                f"{label} proof {axis_name}_proof must be a RangeProof"
-            )
-        for field_name in ("t", "e", "s"):
-            field = getattr(sub_proof, field_name)
-            if not isinstance(field, tuple):
-                raise TypeError(
-                    f"{label} proof {axis_name}_proof {field_name} must be a "
-                    "tuple of integers"
-                )
-            for item in field:
-                _check_int(
-                    item,
-                    f"{label} proof {axis_name}_proof {field_name} entry",
-                )
-    if not isinstance(proof.edge_proofs, tuple):
-        raise TypeError(
-            f"{label} proof edge_proofs must be a tuple of WideRangeProof"
-        )
-    for edge_position, edge_proof in enumerate(proof.edge_proofs):
-        _check_wide_range_proof_types(
-            edge_proof, f"{label} proof edge_proofs[{edge_position}]"
-        )
-    _check_bytes(entry.context, f"{label} context")
+    _check_convex_polygon_input_types(
+        entry.x_commitment,
+        entry.y_commitment,
+        entry.polygon,
+        entry.proof,
+        entry.context,
+        label=label,
+    )
 
 
 def _check_convex_polygon_batch_entries_types(
@@ -5478,31 +5516,6 @@ def _bundle_check_polygon(polygon: object) -> None:
     _normalize_polygon_vertices(polygon.vertices)
 
 
-def _bundle_check_polygon_field_types(polygon: object) -> ConvexPolygonRegion:
-    """Type-check a polygon and return its canonical reconstruction.
-
-    Geometric invalidity is decided (``False``) by the delegated
-    :func:`verify_convex_polygon`, never raised here; malformed vertex
-    container types raise :class:`TypeError` so no foreign exception can
-    leak out of the verifier. A forged polygon whose vertices have the
-    right types but fail the constructor rules raises
-    :class:`ValueError`, which the verify entry point converts into
-    ``False``; for every legally constructed polygon the reconstruction
-    equals the original.
-    """
-    if not isinstance(polygon, ConvexPolygonRegion):
-        raise TypeError("polygon must be a ConvexPolygonRegion")
-    vertices = polygon.vertices
-    if not isinstance(vertices, tuple):
-        raise TypeError("polygon vertices must be a tuple of (x, y) tuples")
-    for position, vertex in enumerate(vertices):
-        if not isinstance(vertex, tuple) or len(vertex) != 2:
-            raise TypeError(f"polygon vertices[{position}] must be a (x, y) tuple")
-        _bundle_check_int(vertex[0], f"polygon vertices[{position}] x")
-        _bundle_check_int(vertex[1], f"polygon vertices[{position}] y")
-    return ConvexPolygonRegion(vertices)
-
-
 def _bundle_check_polygon_proof(proof: object) -> None:
     """Validate the nested types of a :class:`ConvexPolygonRegionProof`."""
     if not isinstance(proof, ConvexPolygonRegionProof):
@@ -5675,32 +5688,36 @@ def verify_convex_polygon_proof_bundle(bundle: ConvexPolygonProofBundle) -> bool
     Verification follows :func:`verify_convex_polygon` exactly, using only
     the two :class:`PedersenCommitment` objects, the
     :class:`ConvexPolygonRegion`, the :class:`ConvexPolygonRegionProof`
-    and the ``context`` — never coordinates or blinding factors. A wrong
-    object or field type at any nesting level (including a ``bool``
-    integer, a non-tuple proof field or a non-``bytes`` context) raises
-    :class:`TypeError`; every other failure — mismatched group
-    parameters or declared ranges, a context mismatch, swapped
-    commitments or axes, a different polygon, a tampered edge proof or a
-    failed verification equation — returns ``False``. Encoding and then
-    decoding a bundle preserves the verification verdict.
+    and the ``context`` — never coordinates or blinding factors. Every
+    nested type is checked across the *whole* envelope first (including a
+    ``bool`` integer, a non-tuple proof field or a non-``bytes``
+    context), so a proof-field type error raises :class:`TypeError` even
+    when the envelope also carries a forged, geometrically invalid
+    polygon — illegal geometry must never mask a wrong type. Every other
+    failure — an illegal polygon shape with well-typed vertices,
+    mismatched group parameters or declared ranges, a context mismatch,
+    swapped commitments or axes, a different polygon, a tampered edge
+    proof or a failed verification equation — returns ``False``.
+    Encoding and then decoding a bundle preserves the verification
+    verdict.
     """
     if not isinstance(bundle, ConvexPolygonProofBundle):
         raise TypeError("bundle must be a ConvexPolygonProofBundle")
-    _bundle_check_commitment(bundle.x_commitment, "x_commitment")
-    _bundle_check_commitment(bundle.y_commitment, "y_commitment")
-    try:
-        polygon = _bundle_check_polygon_field_types(bundle.polygon)
-    except ValueError:
-        # A forged polygon with valid element types but an illegal shape
-        # is a semantic failure, never an exception at this entry point.
-        return False
-    if not isinstance(bundle.context, bytes):
-        raise TypeError("context must be bytes")
-    _bundle_check_polygon_proof(bundle.proof)
+    # Complete every nested type check (commitments, polygon vertices,
+    # both RangeProofs, every WideRangeProof and context) before any
+    # semantic verdict, so geometric invalidity cannot shadow a wrong
+    # type sitting later in the envelope.
+    _check_convex_polygon_input_types(
+        bundle.x_commitment,
+        bundle.y_commitment,
+        bundle.polygon,
+        bundle.proof,
+        bundle.context,
+    )
     return verify_convex_polygon(
         bundle.x_commitment,
         bundle.y_commitment,
-        polygon,
+        bundle.polygon,
         bundle.proof,
         bundle.context,
     )

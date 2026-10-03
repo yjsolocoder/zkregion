@@ -368,6 +368,159 @@ class VerifyConvexPolygonTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             verify_convex_polygon(self.cx, self.cy, self.polygon, bad, b"c")
 
+    # ---- error classification must not depend on field position ----------
+
+    @staticmethod
+    def _forge_polygon(vertices):
+        """A ConvexPolygonRegion that bypassed __post_init__ validation."""
+        forged = object.__new__(ConvexPolygonRegion)
+        object.__setattr__(forged, "vertices", vertices)
+        return forged
+
+    def _late_edge_bool_proof(self):
+        """A proof whose LAST edge proof carries a bool response integer."""
+        edges = self.proof.edge_proofs
+        edge = edges[-1]
+        responses = list(edge.responses)
+        responses[-1] = (True, responses[-1][1])
+        bad_edge = dataclasses.replace(
+            edge, responses=tuple(responses)
+        )
+        return dataclasses.replace(
+            self.proof, edge_proofs=edges[:-1] + (bad_edge,)
+        )
+
+    def _late_y_proof_bool(self):
+        """A proof whose bounding-box y_proof carries a bool share."""
+        y_proof = self.proof.y_proof
+        bad = RangeProof(
+            y_proof.t, (True,) + tuple(y_proof.e[1:]), y_proof.s
+        )
+        return self._tamper(y_proof=bad)
+
+    def test_front_semantic_failure_does_not_mask_late_type_error(self):
+        bad_prime = dataclasses.replace(self.cx, prime=2 ** 61 - 1)
+        bad_range = dataclasses.replace(self.cx, lower=self.cx.lower + 1)
+        late_bad_proofs = (
+            self._late_edge_bool_proof(),
+            self._late_y_proof_bool(),
+        )
+        for bad_commitment in (bad_prime, bad_range):
+            for bad_proof in late_bad_proofs:
+                with self.subTest(commitment=bad_commitment, proof=bad_proof):
+                    with self.assertRaises(TypeError):
+                        verify_convex_polygon(
+                            bad_commitment, self.cy, self.polygon,
+                            bad_proof, b"ctx",
+                        )
+
+    def test_semantically_failed_sub_proof_does_not_mask_late_type_error(self):
+        # An early edge proof is a forged semantic failure (its verification
+        # equation cannot hold), yet the bool in the last edge proof must
+        # still surface as TypeError rather than an early False.
+        edges = list(self.proof.edge_proofs)
+        first = edges[0]
+        edges[0] = WideRangeProof(
+            commitments=tuple(5 for _ in first.commitments),
+            challenges=tuple((1, 2) for _ in first.challenges),
+            responses=tuple((3, 4) for _ in first.responses),
+        )
+        last = edges[-1]
+        responses = list(last.responses)
+        responses[-1] = (True, responses[-1][1])
+        edges[-1] = dataclasses.replace(last, responses=tuple(responses))
+        bad_proof = dataclasses.replace(self.proof, edge_proofs=tuple(edges))
+        with self.assertRaises(TypeError):
+            verify_convex_polygon(
+                self.cx, self.cy, self.polygon, bad_proof, b"ctx"
+            )
+
+    def test_context_type_checked_despite_other_failures(self):
+        with self.assertRaises(TypeError):
+            verify_convex_polygon(
+                dataclasses.replace(self.cx, prime=2 ** 61 - 1),
+                self.cy,
+                self.polygon,
+                self._late_edge_bool_proof(),
+                "ctx",
+            )
+
+    def test_wrong_vertex_type_checked_despite_other_failures(self):
+        bad_prime = dataclasses.replace(self.cx, prime=2 ** 61 - 1)
+        # list instead of tuple outer container
+        list_vertices = self._forge_polygon(list(self.polygon.vertices))
+        with self.assertRaises(TypeError):
+            verify_convex_polygon(
+                bad_prime, self.cy, list_vertices,
+                self._late_edge_bool_proof(), b"ctx",
+            )
+        # bool vertex coordinate
+        bool_vertex = self._forge_polygon(
+            ((True, 0),) + tuple(self.polygon.vertices[1:])
+        )
+        with self.assertRaises(TypeError):
+            verify_convex_polygon(
+                bad_prime, self.cy, bool_vertex,
+                self._late_edge_bool_proof(), b"ctx",
+            )
+
+    def test_forged_illegal_polygon_returns_false_without_leaking(self):
+        illegal = (
+            (),
+            ((0, 0), (1, 0)),
+            ((0, 0), (1, 0), (0, 0)),
+            ((0, 0), (1, 0), (2, 0), (0, 1)),
+            ((0, 0), (2, 0), (0, 2), (1, 1)),
+            ((0, 0), (3, 0), (1, 1), (3, 3), (0, 3)),
+            ((0, 0), (4, 0), (0, 4), (4, 4), (2, 2)),
+        )
+        for vertices in illegal:
+            forged = self._forge_polygon(vertices)
+            with self.subTest(vertices=vertices):
+                self.assertIs(
+                    verify_convex_polygon(
+                        self.cx, self.cy, forged, self.proof, b"ctx"
+                    ),
+                    False,
+                )
+
+    def test_illegal_polygon_does_not_mask_late_type_error(self):
+        forged = self._forge_polygon(((0, 0), (1, 0)))
+        with self.assertRaises(TypeError):
+            verify_convex_polygon(
+                self.cx, self.cy, forged,
+                self._late_edge_bool_proof(), b"ctx",
+            )
+
+    def test_malformed_wide_pair_arity_with_valid_types_is_false(self):
+        edge = self.proof.edge_proofs[-1]
+        bad_edge = dataclasses.replace(
+            edge, responses=edge.responses[:-1] + ((1,),)
+        )
+        bad_proof = dataclasses.replace(
+            self.proof,
+            edge_proofs=self.proof.edge_proofs[:-1] + (bad_edge,),
+        )
+        self.assertFalse(
+            verify_convex_polygon(
+                self.cx, self.cy, self.polygon, bad_proof, b"ctx"
+            )
+        )
+
+    def test_reversal_representation_verifies(self):
+        reversal = ConvexPolygonRegion(tuple(reversed(self.polygon.vertices)))
+        self.assertTrue(self.verify(polygon=reversal))
+
+    def test_forged_polygon_input_is_not_mutated(self):
+        vertices = ((0, 0), (1, 0))
+        forged = self._forge_polygon(vertices)
+        self.assertFalse(
+            verify_convex_polygon(
+                self.cx, self.cy, forged, self.proof, b"ctx"
+            )
+        )
+        self.assertIs(forged.vertices, vertices)
+
 
 class ConvexPolygonProofBundleTests(unittest.TestCase):
     def bundle(
@@ -1010,6 +1163,92 @@ class ConvexPolygonProofBundleTests(unittest.TestCase):
         decoded = decode_convex_polygon_proof_bundle(raw)
         self.assertEqual(decoded, bundle)
         self.assertFalse(verify_convex_polygon_proof_bundle(decoded))
+
+    # ---- error classification must not depend on field position ----------
+
+    @staticmethod
+    def _forge_polygon(vertices):
+        forged = object.__new__(ConvexPolygonRegion)
+        object.__setattr__(forged, "vertices", vertices)
+        return forged
+
+    def _late_edge_bool_bundle(self, polygon=None, context=b"ctx"):
+        bundle = self.bundle(polygon=polygon, context=context)
+        edges = bundle.proof.edge_proofs
+        edge = edges[-1]
+        responses = list(edge.responses)
+        responses[-1] = (True, responses[-1][1])
+        bad_edge = dataclasses.replace(edge, responses=tuple(responses))
+        return ConvexPolygonProofBundle(
+            bundle.x_commitment,
+            bundle.y_commitment,
+            bundle.polygon,
+            bundle.context,
+            dataclasses.replace(
+                bundle.proof, edge_proofs=edges[:-1] + (bad_edge,)
+            ),
+        )
+
+    def test_illegal_geometry_does_not_mask_proof_type_error(self):
+        illegal = (
+            ((0, 0), (1, 0)),
+            (),
+            ((0, 0), (1, 0), (0, 0)),
+            ((0, 0), (1, 0), (2, 0), (0, 1)),
+            ((0, 0), (2, 0), (0, 2), (1, 1)),
+            ((0, 0), (4, 0), (0, 4), (4, 4), (2, 2)),
+        )
+        for vertices in illegal:
+            bundle = self._late_edge_bool_bundle()
+            object.__setattr__(
+                bundle, "polygon", self._forge_polygon(vertices)
+            )
+            with self.subTest(vertices=vertices):
+                with self.assertRaises(TypeError):
+                    verify_convex_polygon_proof_bundle(bundle)
+
+    def test_illegal_geometry_does_not_mask_context_type_error(self):
+        bundle = self.bundle()
+        object.__setattr__(bundle, "context", "ctx")
+        object.__setattr__(
+            bundle, "polygon", self._forge_polygon(((0, 0), (1, 0)))
+        )
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_proof_bundle(bundle)
+
+    def test_illegal_geometry_and_mismatched_group_with_late_type_error(self):
+        other_prime, _ = pedersen_commit(1, 0, 4, prime=2 ** 61 - 1)
+        bundle = self._late_edge_bool_bundle()
+        object.__setattr__(
+            bundle, "polygon", self._forge_polygon(((0, 0), (1, 0)))
+        )
+        object.__setattr__(bundle, "x_commitment", other_prime)
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_proof_bundle(bundle)
+
+    def test_illegal_geometry_with_all_valid_types_returns_false(self):
+        for vertices in (
+            ((0, 0), (1, 0)),
+            (),
+            ((0, 0), (1, 0), (2, 0), (0, 1)),
+            ((0, 0), (4, 0), (1, 1), (4, 4), (0, 4)),
+        ):
+            bundle = self.bundle()
+            object.__setattr__(
+                bundle, "polygon", self._forge_polygon(vertices)
+            )
+            with self.subTest(vertices=vertices):
+                self.assertIs(
+                    verify_convex_polygon_proof_bundle(bundle), False
+                )
+
+    def test_illegal_geometry_bundle_is_not_mutated(self):
+        vertices = ((0, 0), (1, 0))
+        forged = self._forge_polygon(vertices)
+        bundle = self.bundle()
+        object.__setattr__(bundle, "polygon", forged)
+        self.assertFalse(verify_convex_polygon_proof_bundle(bundle))
+        self.assertIs(bundle.polygon.vertices, vertices)
 
 
 class ConvexPolygonBatchTests(unittest.TestCase):

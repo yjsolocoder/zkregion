@@ -1,7 +1,10 @@
 import dataclasses
 import hashlib
+import json
 import os
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import threading
 import unittest
@@ -27812,6 +27815,331 @@ class RangeBatchReplayGuardTest(unittest.TestCase):
             )
         )
         store.close()
+
+
+class RangeBatchReplayGuardCrossProcessTest(unittest.TestCase):
+    """Cross-process lease takeover and one-shot consumption on a shared file.
+
+    Every scenario runs real participant processes against one SQLite file
+    and namespace via tests/rbr_xproc_worker.py: the workers regenerate the
+    honest commitments/proofs themselves from public entry points, and all
+    assertions are made on public outcomes (check return values, propagated
+    exceptions, follow-up checks and bind_once rejections) — never on the
+    store's private columns. The lease clock is pinned per process and the
+    binding expiry is passed explicitly to check, so lease expiry and
+    binding expiry are advanced deterministically with no real waiting.
+    """
+
+    WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "rbr_xproc_worker.py")
+    NAMESPACE = b"xproc"
+    PRIME_A = 104729
+    PRIME_B = 104723
+    LEASE_SECONDS = 60
+    CLOCK_T0 = 1000          # lease taken here is valid through CLOCK_T0 + 60
+    LEASE_EXPIRED = 1060     # == claim deadline: takeover is allowed
+    BINDING_EXPIRY = 10000   # far beyond every lease step in the scenarios
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "rbr-xproc.db")
+        self.entries = self.make_entries()
+        self._workers = []
+        self._seq = 0
+
+    def tearDown(self):
+        for proc, release_file in self._workers:
+            if release_file is not None and not os.path.exists(release_file):
+                with open(release_file, "w", encoding="utf-8"):
+                    pass
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
+            proc.stdout.close()
+            proc.stderr.close()
+        self._tmp.cleanup()
+
+    def make_entry(self, value, *, prime, blinding):
+        commitment, nonce = pedersen_commit(
+            value, 0, 10, prime=prime, generator=3, blinding=blinding,
+        )
+        proof = prove_range(
+            commitment, value, nonce, context=b"batch",
+            randbelow=counter_randbelow(),
+        )
+        return RangeBatchEntry(commitment, proof, b"batch")
+
+    def make_entries(self):
+        return [
+            self.make_entry(4, prime=self.PRIME_A, blinding=1001),
+            self.make_entry(7, prime=self.PRIME_A, blinding=1002),
+            self.make_entry(3, prime=self.PRIME_B, blinding=2001),
+        ]
+
+    def _name(self, suffix):
+        self._seq += 1
+        return os.path.join(self._tmp.name, f"{self._seq}-{suffix}")
+
+    def bind(self, session_id=b"s", *, expires_at=None, clock=CLOCK_T0):
+        """Register a binding from this process and return its digest."""
+        store = SQLiteReplayStore(
+            self.path, self.NAMESPACE,
+            lease_seconds=self.LEASE_SECONDS, clock=lambda: clock,
+        )
+        try:
+            binding = RangeBatchReplayGuard(store=store).bind_once(
+                self.entries, session_id, expires_at=expires_at,
+            )
+        finally:
+            store.close()
+        return binding
+
+    def start_worker(
+        self, mode, *, session_id=b"s", digest=None, expires_at=None,
+        now=CLOCK_T0, clock=CLOCK_T0, wait_gate=False,
+    ):
+        """Launch one participant process; returns (Popen, paths dict)."""
+        result_file = self._name("result.json")
+        gate_file = self._name("gate")
+        release_file = self._name("release")
+        spec = {
+            "mode": mode,
+            "db_path": self.path,
+            "session_id": session_id.decode(),
+            "digest": digest.hex() if digest is not None else None,
+            "expires_at": expires_at,
+            "now": now,
+            "clock_start": clock,
+            "lease_seconds": self.LEASE_SECONDS,
+            "result_file": result_file,
+            "gate_file": gate_file,
+            "release_file": release_file,
+        }
+        spec_file = self._name("spec.json")
+        with open(spec_file, "w", encoding="utf-8") as handle:
+            json.dump(spec, handle)
+        proc = subprocess.Popen(
+            [sys.executable, self.WORKER, spec_file],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self._workers.append((proc, release_file))
+        if wait_gate:
+            self._wait_until(lambda: os.path.exists(gate_file),
+                             f"{mode} worker to claim")
+        return proc, {"result": result_file, "gate": gate_file,
+                      "release": release_file}
+
+    def release(self, paths):
+        with open(paths["release"], "w", encoding="utf-8"):
+            pass
+
+    def wait_result(self, proc, paths, timeout=30.0):
+        self._wait_until(lambda: os.path.exists(paths["result"]),
+                         "worker result")
+        proc.wait(timeout=timeout)
+        proc.stdout.close()
+        proc.stderr.close()
+        with open(paths["result"], "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+        self.assertEqual(
+            payload["outcome"] in ("true", "false", "ValueError",
+                                   "RuntimeError", "other"),
+            True, payload,
+        )
+        return payload["outcome"]
+
+    @staticmethod
+    def _wait_until(predicate, what, timeout=30.0):
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while not predicate():
+            if _time.monotonic() > deadline:
+                raise AssertionError(f"timed out waiting for {what}")
+            _time.sleep(0.01)
+
+    def reopen_check(self, *, now, clock, session_id=b"s", digest=None,
+                     expires_at=None):
+        """A fresh process that opens the store, checks once and exits."""
+        proc, paths = self.start_worker(
+            "check", session_id=session_id, digest=digest,
+            expires_at=expires_at, now=now, clock=clock,
+        )
+        return self.wait_result(proc, paths)
+
+    def reopen_bind(self, *, clock):
+        """A fresh process attempting to rebind the same session id."""
+        result_file = self._name("bind-result.json")
+        spec_file = self._name("bind-spec.json")
+        with open(spec_file, "w", encoding="utf-8") as handle:
+            json.dump({
+                "mode": "bind",
+                "db_path": self.path,
+                "session_id": "s",
+                "expires_at": None,
+                "clock_start": clock,
+                "lease_seconds": self.LEASE_SECONDS,
+                "result_file": result_file,
+            }, handle)
+        proc = subprocess.Popen(
+            [sys.executable, self.WORKER, spec_file],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self._workers.append((proc, None))
+        return self.wait_result(proc, {"result": result_file})
+
+    # ---- scenarios ----------------------------------------------------------
+
+    def test_one_winner_then_persistent_false_and_rebind_valueerror(self):
+        binding = self.bind(b"s")
+        contenders = [
+            self.start_worker(
+                "check", digest=binding.digest,
+                now=self.CLOCK_T0, clock=self.CLOCK_T0,
+            )
+            for _ in range(3)
+        ]
+        outcomes = [self.wait_result(proc, paths) for proc, paths in contenders]
+        self.assertEqual(sorted(outcomes), ["false", "false", "true"])
+        # A brand-new process reopening the file after consumption still fails.
+        self.assertEqual(
+            self.reopen_check(now=self.CLOCK_T0, clock=self.CLOCK_T0,
+                              digest=binding.digest),
+            "false",
+        )
+        # Re-registering the consumed session id in another process raises.
+        self.assertEqual(self.reopen_bind(clock=self.CLOCK_T0), "ValueError")
+
+    def test_live_lease_blocks_takeover_expired_lease_allows_consume(self):
+        binding = self.bind(b"s", expires_at=self.BINDING_EXPIRY)
+        owner, owner_paths = self.start_worker(
+            "blocked", digest=binding.digest, expires_at=self.BINDING_EXPIRY,
+            now=self.CLOCK_T0, clock=self.CLOCK_T0, wait_gate=True,
+        )
+        # While the owner's lease is live another process cannot take over.
+        self.assertEqual(
+            self.reopen_check(now=self.CLOCK_T0, clock=self.CLOCK_T0,
+                              digest=binding.digest,
+                              expires_at=self.BINDING_EXPIRY),
+            "false",
+        )
+        # At the lease deadline a new process takes over and consumes once.
+        self.assertEqual(
+            self.reopen_check(now=self.LEASE_EXPIRED, clock=self.LEASE_EXPIRED,
+                              digest=binding.digest,
+                              expires_at=self.BINDING_EXPIRY),
+            "true",
+        )
+        # The original owner resumes with a correct proof but its token is
+        # stale: it must return False without undoing the consumption.
+        self.release(owner_paths)
+        self.assertEqual(self.wait_result(owner, owner_paths), "false")
+        self.assertEqual(
+            self.reopen_check(now=self.LEASE_EXPIRED, clock=self.LEASE_EXPIRED,
+                              digest=binding.digest,
+                              expires_at=self.BINDING_EXPIRY),
+            "false",
+        )
+        self.assertEqual(self.reopen_bind(clock=self.LEASE_EXPIRED), "ValueError")
+
+    def test_takeover_error_propagates_old_owner_false_later_check_succeeds(self):
+        binding = self.bind(b"s", expires_at=self.BINDING_EXPIRY)
+        owner, owner_paths = self.start_worker(
+            "blocked", digest=binding.digest, expires_at=self.BINDING_EXPIRY,
+            now=self.CLOCK_T0, clock=self.CLOCK_T0, wait_gate=True,
+        )
+        # The lease-deadline takeover's random source raises RuntimeError;
+        # check must propagate that exception unchanged.
+        error_proc, error_paths = self.start_worker(
+            "error", digest=binding.digest, expires_at=self.BINDING_EXPIRY,
+            now=self.LEASE_EXPIRED, clock=self.LEASE_EXPIRED,
+        )
+        self.assertEqual(
+            self.wait_result(error_proc, error_paths), "RuntimeError"
+        )
+        # The resuming old owner holds a stale token and can only get False.
+        self.release(owner_paths)
+        self.assertEqual(self.wait_result(owner, owner_paths), "false")
+        # The escaped error released the takeover claim, so a later valid
+        # check in a fresh process succeeds exactly once.
+        self.assertEqual(
+            self.reopen_check(now=self.LEASE_EXPIRED, clock=self.LEASE_EXPIRED,
+                              digest=binding.digest,
+                              expires_at=self.BINDING_EXPIRY),
+            "true",
+        )
+        self.assertEqual(
+            self.reopen_check(now=self.LEASE_EXPIRED, clock=self.LEASE_EXPIRED,
+                              digest=binding.digest,
+                              expires_at=self.BINDING_EXPIRY),
+            "false",
+        )
+
+    def test_dead_claimant_without_cleanup_is_takeable_at_deadline(self):
+        binding = self.bind(b"s", expires_at=self.BINDING_EXPIRY)
+        dead, dead_paths = self.start_worker(
+            "crash", digest=binding.digest, expires_at=self.BINDING_EXPIRY,
+            now=self.CLOCK_T0, clock=self.CLOCK_T0, wait_gate=True,
+        )
+        dead.wait(timeout=10)
+        self.assertNotEqual(dead.returncode, 0)
+        # The claim survived the hard exit; a live-lease check is rejected
+        # and a rebind raises ValueError while the lease is still live.
+        self.assertEqual(
+            self.reopen_check(now=self.CLOCK_T0, clock=self.CLOCK_T0,
+                              digest=binding.digest,
+                              expires_at=self.BINDING_EXPIRY),
+            "false",
+        )
+        self.assertEqual(self.reopen_bind(clock=self.CLOCK_T0), "ValueError")
+        # After the deadline a fresh process takes over and consumes once.
+        self.assertEqual(
+            self.reopen_check(now=self.LEASE_EXPIRED, clock=self.LEASE_EXPIRED,
+                              digest=binding.digest,
+                              expires_at=self.BINDING_EXPIRY),
+            "true",
+        )
+        self.assertEqual(
+            self.reopen_check(now=self.LEASE_EXPIRED, clock=self.LEASE_EXPIRED,
+                              digest=binding.digest,
+                              expires_at=self.BINDING_EXPIRY),
+            "false",
+        )
+        # Consumed ids can never be rebound, including from another process.
+        self.assertEqual(self.reopen_bind(clock=self.LEASE_EXPIRED), "ValueError")
+
+    def test_takeover_does_not_extend_binding_expiry(self):
+        expires_at = 2000
+        binding = self.bind(b"s", expires_at=expires_at)
+        owner, owner_paths = self.start_worker(
+            "blocked", digest=binding.digest, expires_at=expires_at,
+            now=self.CLOCK_T0, clock=self.CLOCK_T0, wait_gate=True,
+        )
+        # A lease-deadline takeover with now == the binding's expires_at is
+        # rejected by the binding expiry; the fresh claim did not extend it.
+        self.assertEqual(
+            self.reopen_check(now=expires_at, clock=self.LEASE_EXPIRED,
+                              digest=binding.digest, expires_at=expires_at),
+            "false",
+        )
+        # The expiry rejection did not consume the registration: a not-yet-
+        # expired check in another process succeeds exactly once.
+        self.assertEqual(
+            self.reopen_check(now=expires_at - 1, clock=self.LEASE_EXPIRED,
+                              digest=binding.digest, expires_at=expires_at),
+            "true",
+        )
+        self.assertEqual(
+            self.reopen_check(now=expires_at - 1, clock=self.LEASE_EXPIRED,
+                              digest=binding.digest, expires_at=expires_at),
+            "false",
+        )
+        self.release(owner_paths)
+        self.assertEqual(self.wait_result(owner, owner_paths), "false")
 
 
 class RegionBatchReplayGuardTest(unittest.TestCase):

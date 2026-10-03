@@ -369,6 +369,244 @@ class VerifyConvexPolygonTests(unittest.TestCase):
             verify_convex_polygon(self.cx, self.cy, self.polygon, bad, b"c")
 
 
+def forged_polygon(vertices):
+    """A ConvexPolygonRegion that bypassed the constructor validation."""
+    forged = object.__new__(ConvexPolygonRegion)
+    object.__setattr__(forged, "vertices", vertices)
+    return forged
+
+
+class VerifyConvexPolygonTypeClassificationTests(unittest.TestCase):
+    """Type errors raise TypeError no matter where an earlier semantic
+    failure sits; well-typed but invalid inputs return False."""
+
+    def setUp(self):
+        self.polygon, self.cx, self.cy, self.rx, self.ry = triangle_commit(1, 2)
+        self.proof = prove_convex_polygon(
+            self.cx, self.cy, 1, 2, self.rx, self.ry, self.polygon,
+            b"ctx", randbelow=DetRand(),
+        )
+
+    def verify(self, **override):
+        kwargs = dict(x_commitment=self.cx, y_commitment=self.cy,
+                      polygon=self.polygon, proof=self.proof, context=b"ctx")
+        kwargs.update(override)
+        return verify_convex_polygon(**kwargs)
+
+    def mismatched_x(self):
+        # well-typed commitment whose group parameters differ: a semantic
+        # failure that sits before every proof check
+        return pedersen_commit(1, 0, 4, prime=2 ** 61 - 1)[0]
+
+    def tampered(self, **fields):
+        return ConvexPolygonRegionProof(
+            x_proof=fields.get("x_proof", self.proof.x_proof),
+            y_proof=fields.get("y_proof", self.proof.y_proof),
+            edge_proofs=fields.get("edge_proofs", self.proof.edge_proofs),
+        )
+
+    def test_deep_type_errors_raise_despite_earlier_semantic_failure(self):
+        bad_x = self.mismatched_x()
+        edge = self.proof.edge_proofs[-1]
+        bad_edge_fields = (
+            WideRangeProof((True,) * len(edge.commitments),
+                           edge.challenges, edge.responses),
+            WideRangeProof(list(edge.commitments),
+                           edge.challenges, edge.responses),
+            WideRangeProof(edge.commitments,
+                           ([1, 2],) + edge.challenges[1:],
+                           edge.responses),
+            WideRangeProof(edge.commitments, edge.challenges,
+                           tuple((a, False) for a, _ in edge.responses)),
+            "not a proof",
+        )
+        for bad_edge in bad_edge_fields:
+            proof = self.tampered(
+                edge_proofs=self.proof.edge_proofs[:-1] + (bad_edge,)
+            )
+            with self.subTest(bad_edge=bad_edge):
+                with self.assertRaises(TypeError):
+                    self.verify(proof=proof)
+                # the same bad type at the last field still raises when a
+                # group-parameter mismatch would return False first
+                with self.assertRaises(TypeError):
+                    self.verify(x_commitment=bad_x, proof=proof)
+        bad_axis_proofs = (
+            self.tampered(x_proof=RangeProof("t", (), ())),
+            self.tampered(x_proof=RangeProof((1,), (True,), (0,))),
+            self.tampered(y_proof=RangeProof((1,), [0], (0,))),
+            self.tampered(edge_proofs=[1, 2, 3]),
+        )
+        for proof in bad_axis_proofs:
+            with self.subTest(proof=proof):
+                with self.assertRaises(TypeError):
+                    self.verify(x_commitment=bad_x, proof=proof)
+
+    def test_polygon_vertex_type_errors_raise_despite_semantic_failure(self):
+        bad_x = self.mismatched_x()
+        bad_vertices = (
+            [(0, 0), (4, 0), (0, 4)],
+            ((0, 0), [4, 0], (0, 4)),
+            ((0, 0), (4, 0, 0), (0, 4)),
+            ((0, 0), (True, 0), (0, 4)),
+            ((0, 0), (1.5, 0), (0, 4)),
+        )
+        for vertices in bad_vertices:
+            forged = forged_polygon(vertices)
+            with self.subTest(vertices=vertices):
+                with self.assertRaises(TypeError):
+                    self.verify(polygon=forged)
+                with self.assertRaises(TypeError):
+                    self.verify(x_commitment=bad_x, polygon=forged)
+
+    def test_forged_geometrically_invalid_polygons_return_false(self):
+        bad_vertices = (
+            (),
+            ((0, 0),),
+            ((0, 0), (1, 0)),
+            ((0, 0), (1, 0), (0, 0)),
+            ((0, 0), (1, 1), (2, 2), (3, 3)),
+            ((0, 0), (3, 0), (1, 1), (3, 3), (0, 3)),
+            ((0, 0), (2, 2), (2, 0), (0, 2)),
+        )
+        for vertices in bad_vertices:
+            forged = forged_polygon(vertices)
+            with self.subTest(vertices=vertices):
+                self.assertIs(self.verify(polygon=forged), False)
+                # the input object is left untouched
+                self.assertEqual(forged.vertices, vertices)
+
+    def test_forged_rotated_and_reversed_polygons_verify(self):
+        canonical = self.polygon.vertices
+        for vertices in (
+            canonical[1:] + canonical[:1],
+            tuple(reversed(canonical)),
+        ):
+            forged = forged_polygon(vertices)
+            with self.subTest(vertices=vertices):
+                self.assertIs(self.verify(polygon=forged), True)
+                self.assertEqual(forged.vertices, vertices)
+
+    def test_well_typed_semantic_mutations_return_false(self):
+        _, cx2, cy2, _, _ = triangle_commit(2, 1)
+        self.assertFalse(self.verify(context=b"other"))
+        self.assertFalse(verify_convex_polygon(
+            self.cy, self.cx, self.polygon, self.proof, b"ctx"))
+        self.assertFalse(self.verify(x_commitment=cx2))
+        self.assertFalse(self.verify(y_commitment=cy2))
+        self.assertFalse(self.verify(proof=self.tampered(
+            edge_proofs=self.proof.edge_proofs[:-1])))
+        edge = self.proof.edge_proofs[0]
+        bad_edge = WideRangeProof(
+            tuple(c + 1 for c in edge.commitments),
+            edge.challenges,
+            edge.responses,
+        )
+        self.assertFalse(self.verify(proof=self.tampered(
+            edge_proofs=(bad_edge,) + self.proof.edge_proofs[1:])))
+
+    def test_valid_and_round_tripped_bundle_still_verify(self):
+        self.assertIs(self.verify(), True)
+        bundle = ConvexPolygonProofBundle(
+            self.cx, self.cy, self.polygon, b"ctx", self.proof
+        )
+        decoded = decode_convex_polygon_proof_bundle(
+            encode_convex_polygon_proof_bundle(bundle)
+        )
+        self.assertIs(verify_convex_polygon_proof_bundle(decoded), True)
+
+
+class VerifyConvexPolygonProofBundleClassificationTests(unittest.TestCase):
+    """The envelope preflights every field type before any semantic
+    verdict, so illegal geometry never masks a later type error."""
+
+    def setUp(self):
+        self.polygon, self.cx, self.cy, self.rx, self.ry = triangle_commit(1, 2)
+        self.proof = prove_convex_polygon(
+            self.cx, self.cy, 1, 2, self.rx, self.ry, self.polygon,
+            b"ctx", randbelow=DetRand(),
+        )
+
+    def bundle(self, **override):
+        fields = dict(x_commitment=self.cx, y_commitment=self.cy,
+                      polygon=self.polygon, context=b"ctx", proof=self.proof)
+        fields.update(override)
+        return ConvexPolygonProofBundle(**fields)
+
+    def test_illegal_geometry_does_not_mask_later_type_errors(self):
+        illegal = forged_polygon(((0, 0), (1, 1), (2, 2), (3, 3)))
+        edge = self.proof.edge_proofs[0]
+        bad_proofs = (
+            "not a proof",
+            ConvexPolygonRegionProof(self.proof.x_proof, self.proof.y_proof,
+                                     (1, 2, 3)),
+            ConvexPolygonRegionProof(
+                RangeProof((True,), (0,), (0,)),
+                self.proof.y_proof,
+                self.proof.edge_proofs,
+            ),
+            ConvexPolygonRegionProof(
+                self.proof.x_proof,
+                self.proof.y_proof,
+                (WideRangeProof((False,) * len(edge.commitments),
+                                edge.challenges, edge.responses),)
+                + self.proof.edge_proofs[1:],
+            ),
+        )
+        for bad_proof in bad_proofs:
+            with self.subTest(bad_proof=bad_proof):
+                with self.assertRaises(TypeError):
+                    verify_convex_polygon_proof_bundle(
+                        self.bundle(polygon=illegal, proof=bad_proof)
+                    )
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_proof_bundle(
+                self.bundle(polygon=illegal, context=7)
+            )
+        with self.assertRaises(TypeError):
+            verify_convex_polygon_proof_bundle(
+                self.bundle(polygon=forged_polygon([(0, 0), (1, 0), (0, 1)]))
+            )
+
+    def test_illegal_geometry_alone_returns_false(self):
+        for vertices in (
+            (),
+            ((0, 0), (1, 0)),
+            ((0, 0), (1, 0), (0, 0)),
+            ((0, 0), (1, 1), (2, 2), (3, 3)),
+            ((0, 0), (3, 0), (1, 1), (3, 3), (0, 3)),
+            ((0, 0), (2, 2), (2, 0), (0, 2)),
+        ):
+            with self.subTest(vertices=vertices):
+                self.assertIs(
+                    verify_convex_polygon_proof_bundle(
+                        self.bundle(polygon=forged_polygon(vertices))
+                    ),
+                    False,
+                )
+
+    def test_semantic_mutations_return_false(self):
+        _, cx2, _, _, _ = triangle_commit(2, 1)
+        self.assertFalse(verify_convex_polygon_proof_bundle(
+            self.bundle(context=b"other")))
+        self.assertFalse(verify_convex_polygon_proof_bundle(
+            self.bundle(x_commitment=self.cy, y_commitment=self.cx)))
+        self.assertFalse(verify_convex_polygon_proof_bundle(
+            self.bundle(x_commitment=cx2)))
+        self.assertFalse(verify_convex_polygon_proof_bundle(
+            self.bundle(proof=ConvexPolygonRegionProof(
+                self.proof.x_proof, self.proof.y_proof,
+                self.proof.edge_proofs[:-1]))))
+
+    def test_valid_bundle_and_round_trip_verify(self):
+        bundle = self.bundle()
+        self.assertIs(verify_convex_polygon_proof_bundle(bundle), True)
+        decoded = decode_convex_polygon_proof_bundle(
+            encode_convex_polygon_proof_bundle(bundle)
+        )
+        self.assertIs(verify_convex_polygon_proof_bundle(decoded), True)
+
+
 class ConvexPolygonProofBundleTests(unittest.TestCase):
     def bundle(
         self,

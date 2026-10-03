@@ -4071,8 +4071,10 @@ def verify_convex_polygon(
     (wrong object or field types at any nesting level, including a ``bool``
     integer or a non-``bytes`` context) raise :class:`TypeError`; every
     semantic failure — mismatched group parameters or declared ranges, a
-    tampered proof field, a forged proof, a different polygon, commitment or
-    context, or swapped axes — returns ``False``. Inputs are never mutated.
+    forged polygon whose well-typed vertices fail the
+    :class:`ConvexPolygonRegion` constructor rules, a tampered proof field,
+    a forged proof, a different polygon, commitment or context, or swapped
+    axes — returns ``False``. Inputs are never mutated.
     """
     if not isinstance(x_commitment, PedersenCommitment):
         raise TypeError("x_commitment must be a PedersenCommitment")
@@ -4082,18 +4084,44 @@ def verify_convex_polygon(
     _check_commitment_fields(y_commitment)
     if not isinstance(polygon, ConvexPolygonRegion):
         raise TypeError("polygon must be a ConvexPolygonRegion")
+    vertices = polygon.vertices
+    if not isinstance(vertices, tuple):
+        raise TypeError("polygon vertices must be a tuple of (x, y) tuples")
+    for vertex_position, vertex in enumerate(vertices):
+        if not isinstance(vertex, tuple) or len(vertex) != 2:
+            raise TypeError(
+                f"polygon vertices[{vertex_position}] must be a (x, y) tuple"
+            )
+        _check_int(vertex[0], f"polygon vertices[{vertex_position}] x")
+        _check_int(vertex[1], f"polygon vertices[{vertex_position}] y")
     if not isinstance(proof, ConvexPolygonRegionProof):
         raise TypeError("proof must be a ConvexPolygonRegionProof")
-    if not isinstance(proof.x_proof, RangeProof):
-        raise TypeError("proof x_proof must be a RangeProof")
-    if not isinstance(proof.y_proof, RangeProof):
-        raise TypeError("proof y_proof must be a RangeProof")
+    for axis_name, sub_proof in (("x", proof.x_proof), ("y", proof.y_proof)):
+        if not isinstance(sub_proof, RangeProof):
+            raise TypeError(f"proof {axis_name}_proof must be a RangeProof")
+        for field_name in ("t", "e", "s"):
+            field = getattr(sub_proof, field_name)
+            if not isinstance(field, tuple):
+                raise TypeError(
+                    f"proof {axis_name}_proof {field_name} must be a "
+                    "tuple of integers"
+                )
+            for item in field:
+                _check_int(item, f"proof {axis_name}_proof {field_name} entry")
     if not isinstance(proof.edge_proofs, tuple):
         raise TypeError("proof edge_proofs must be a tuple of WideRangeProof")
-    for edge_proof in proof.edge_proofs:
-        if not isinstance(edge_proof, WideRangeProof):
-            raise TypeError("proof edge_proofs entries must be WideRangeProof")
+    for edge_position, edge_proof in enumerate(proof.edge_proofs):
+        _check_wide_range_proof_types(
+            edge_proof, f"proof edge_proofs[{edge_position}]"
+        )
     _check_bytes(context, "context")
+    # Every nested type is validated above, so only semantic verdicts
+    # remain: a forged polygon whose well-typed vertices fail the
+    # constructor rules is a plain rejection, never an exception.
+    try:
+        polygon = ConvexPolygonRegion(vertices)
+    except ValueError:
+        return False
     if (
         x_commitment.prime != y_commitment.prime
         or x_commitment.generator != y_commitment.generator
@@ -5688,15 +5716,17 @@ def verify_convex_polygon_proof_bundle(bundle: ConvexPolygonProofBundle) -> bool
         raise TypeError("bundle must be a ConvexPolygonProofBundle")
     _bundle_check_commitment(bundle.x_commitment, "x_commitment")
     _bundle_check_commitment(bundle.y_commitment, "y_commitment")
+    if not isinstance(bundle.context, bytes):
+        raise TypeError("context must be bytes")
+    _bundle_check_polygon_proof(bundle.proof)
     try:
         polygon = _bundle_check_polygon_field_types(bundle.polygon)
     except ValueError:
         # A forged polygon with valid element types but an illegal shape
-        # is a semantic failure, never an exception at this entry point.
+        # is a semantic failure, never an exception at this entry point;
+        # every field type above is checked before this verdict so a bad
+        # type anywhere still raises TypeError.
         return False
-    if not isinstance(bundle.context, bytes):
-        raise TypeError("context must be bytes")
-    _bundle_check_polygon_proof(bundle.proof)
     return verify_convex_polygon(
         bundle.x_commitment,
         bundle.y_commitment,

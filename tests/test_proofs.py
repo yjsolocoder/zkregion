@@ -1,5 +1,6 @@
 import dataclasses
 import hashlib
+import multiprocessing
 import os
 import sqlite3
 import tempfile
@@ -27812,6 +27813,317 @@ class RangeBatchReplayGuardTest(unittest.TestCase):
             )
         )
         store.close()
+
+
+def _holding_randbelow(claimed, release):
+    """A randbelow that blocks inside verification until ``release`` is set.
+
+    ``claimed`` is set on every call (the first call happens only after the
+    store claim transaction has committed); the wait is bounded so a failed
+    parent process can never strand the child.
+    """
+    state = {"value": 1}
+
+    def randbelow(upper):
+        claimed.set()
+        release.wait(30)
+        state["value"] = (state["value"] * 1103515245 + 12345) % upper
+        return state["value"]
+
+    return randbelow
+
+
+def _range_batch_cross_process_worker(
+    result_queue, path, namespace, entries, binding, *,
+    mode, now, lease_seconds, clock_time,
+    go=None, claimed=None, release=None,
+):
+    """Run one guard operation in a child process and report the outcome.
+
+    Opens its own :class:`SQLiteReplayStore` on ``path`` / ``namespace``
+    with a fixed clock, then either rebinds ``binding.session_id``
+    (``mode="bind"``) or calls :meth:`RangeBatchReplayGuard.check`. The
+    outcome is reported as ``("check", value)``, ``("bind-ok",)`` or
+    ``("error", type_name, message)``; ``mode="crash"`` instead exits via
+    ``os._exit`` inside the random source, mid-verification and without
+    any cleanup, so nothing is reported.
+    """
+    try:
+        store = SQLiteReplayStore(
+            path, namespace, lease_seconds=lease_seconds,
+            clock=lambda: clock_time,
+        )
+        try:
+            guard = RangeBatchReplayGuard(store=store)
+            if go is not None:
+                go.wait(30)
+            if mode == "bind":
+                guard.bind_once(entries, binding.session_id)
+                result_queue.put(("bind-ok",))
+                return
+            if mode == "hold":
+                randbelow = _holding_randbelow(claimed, release)
+            elif mode == "boom":
+                def randbelow(upper):
+                    raise RuntimeError("boom")
+            elif mode == "crash":
+                def randbelow(upper):
+                    claimed.set()
+                    os._exit(0)
+            else:
+                randbelow = counter_randbelow()
+            result_queue.put((
+                "check",
+                guard.check(entries, binding, now=now, randbelow=randbelow),
+            ))
+        finally:
+            store.close()
+    except BaseException as exc:
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+
+
+class RangeBatchReplayGuardCrossProcessTest(unittest.TestCase):
+    """Cross-process lease takeover and single-use consumption.
+
+    The parent process generates real commitments, range proofs and
+    :class:`RangeBatchEntry` items through the public entry points and
+    obtains a binding via ``bind_once``; every child process then opens
+    its own :class:`SQLiteReplayStore` on the same database file and
+    namespace and is observed only through ``check`` / ``bind_once``
+    return values and propagated exceptions — never through private
+    database fields. Lease clocks are fixed per process, so lease expiry
+    is driven by the chosen clock values and never by waiting for real
+    time, and the binding's ``expires_at`` is checked through explicit
+    ``now`` arguments.
+    """
+
+    NAMESPACE = b"cross-process"
+    PRIME_A = SMALL_PRIME
+    PRIME_B = 104723
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self._tmp.name, "rbr-cross-process.db")
+        self.entries = [
+            self.make_entry(4, prime=self.PRIME_A, blinding=1001),
+            self.make_entry(7, prime=self.PRIME_A, blinding=1002),
+            self.make_entry(3, prime=self.PRIME_B, blinding=2001),
+        ]
+        self._processes = []
+        start_methods = multiprocessing.get_all_start_methods()
+        self._ctx = multiprocessing.get_context(
+            "fork" if "fork" in start_methods else "spawn"
+        )
+
+    def tearDown(self):
+        for process in self._processes:
+            if process.is_alive():
+                process.terminate()
+            process.join(timeout=10)
+        self._tmp.cleanup()
+
+    def make_entry(self, value, *, prime, blinding, lower=0, upper=10,
+                   context=b"batch"):
+        commitment, r = pedersen_commit(
+            value, lower, upper, prime=prime, generator=3, blinding=blinding,
+        )
+        proof = prove_range(
+            commitment, value, r, context=context,
+            randbelow=counter_randbelow(),
+        )
+        return RangeBatchEntry(commitment, proof, context)
+
+    def bind(self, session_id, expires_at=None):
+        store = SQLiteReplayStore(self.path, self.NAMESPACE)
+        try:
+            return RangeBatchReplayGuard(store=store).bind_once(
+                self.entries, session_id, expires_at=expires_at
+            )
+        finally:
+            store.close()
+
+    def start_child(self, binding, **kwargs):
+        result_queue = self._ctx.Queue()
+        process = self._ctx.Process(
+            target=_range_batch_cross_process_worker,
+            args=(result_queue, self.path, self.NAMESPACE, self.entries, binding),
+            kwargs=kwargs,
+        )
+        process.start()
+        self._processes.append(process)
+        return process, result_queue
+
+    def outcome(self, result_queue):
+        return result_queue.get(timeout=30)
+
+    def join_children(self):
+        for process in self._processes:
+            process.join(timeout=30)
+        for process in self._processes:
+            self.assertFalse(process.is_alive())
+
+    def test_one_process_consumes_competitors_false_and_rebind_raises(self):
+        binding = self.bind(b"race", expires_at=1000)
+        go = self._ctx.Event()
+        queues = [
+            self.start_child(
+                binding, mode="check", now=500, lease_seconds=30,
+                clock_time=100, go=go,
+            )[1]
+            for _ in range(4)
+        ]
+        go.set()
+        results = sorted(
+            self.outcome(result_queue) for result_queue in queues
+        )
+        self.assertEqual(
+            results,
+            [("check", False)] * 3 + [("check", True)],
+        )
+        self.join_children()
+        # a fresh process reopening the same store still gets False
+        _, result_queue = self.start_child(
+            binding, mode="check", now=500, lease_seconds=30, clock_time=200,
+        )
+        self.assertEqual(self.outcome(result_queue), ("check", False))
+        # rebinding the consumed session id raises ValueError in a new process
+        _, result_queue = self.start_child(
+            binding, mode="bind", now=500, lease_seconds=30, clock_time=200,
+        )
+        tag, error_name, _ = self.outcome(result_queue)
+        self.assertEqual((tag, error_name), ("error", "ValueError"))
+        self.join_children()
+
+    def test_live_claim_blocks_takeover_until_lease_deadline(self):
+        binding = self.bind(b"lease", expires_at=5000)
+        claimed = self._ctx.Event()
+        release = self._ctx.Event()
+        # the holder claims at clock 1000 with a 10s lease (deadline 1010)
+        # and then blocks inside the batch verification
+        _, holder_queue = self.start_child(
+            binding, mode="hold", now=1000, lease_seconds=10,
+            clock_time=1000, claimed=claimed, release=release,
+        )
+        self.assertTrue(claimed.wait(30))
+        # while the lease is live another process cannot take it over
+        _, result_queue = self.start_child(
+            binding, mode="check", now=1000, lease_seconds=10, clock_time=1005,
+        )
+        self.assertEqual(self.outcome(result_queue), ("check", False))
+        # at the lease deadline a competitor takes over and consumes the id
+        _, result_queue = self.start_child(
+            binding, mode="check", now=1000, lease_seconds=10, clock_time=1010,
+        )
+        self.assertEqual(self.outcome(result_queue), ("check", True))
+        # the original process resumes with a correct proof, but its claim
+        # token is stale: it returns False and cannot undo the consumption
+        release.set()
+        self.assertEqual(self.outcome(holder_queue), ("check", False))
+        self.join_children()
+        _, result_queue = self.start_child(
+            binding, mode="check", now=1000, lease_seconds=10, clock_time=2000,
+        )
+        self.assertEqual(self.outcome(result_queue), ("check", False))
+        self.join_children()
+
+    def test_takeover_error_propagates_and_old_process_stays_locked_out(self):
+        binding = self.bind(b"boom", expires_at=5000)
+        claimed = self._ctx.Event()
+        release = self._ctx.Event()
+        _, holder_queue = self.start_child(
+            binding, mode="hold", now=1000, lease_seconds=10,
+            clock_time=1000, claimed=claimed, release=release,
+        )
+        self.assertTrue(claimed.wait(30))
+        # the takeover process's random source blows up mid-verification;
+        # check propagates the RuntimeError unchanged
+        _, result_queue = self.start_child(
+            binding, mode="boom", now=1000, lease_seconds=10, clock_time=1010,
+        )
+        tag, error_name, message = self.outcome(result_queue)
+        self.assertEqual((tag, error_name, message),
+                         ("error", "RuntimeError", "boom"))
+        # the failed takeover released its own claim; the resumed holder's
+        # token is stale, so even a correct proof only returns False
+        release.set()
+        self.assertEqual(self.outcome(holder_queue), ("check", False))
+        self.join_children()
+        # the id was not consumed: a later valid check succeeds exactly once
+        _, result_queue = self.start_child(
+            binding, mode="check", now=1000, lease_seconds=10, clock_time=1010,
+        )
+        self.assertEqual(self.outcome(result_queue), ("check", True))
+        _, result_queue = self.start_child(
+            binding, mode="check", now=1000, lease_seconds=10, clock_time=1010,
+        )
+        self.assertEqual(self.outcome(result_queue), ("check", False))
+        self.join_children()
+
+    def test_crash_during_verification_blocks_until_lease_deadline(self):
+        binding = self.bind(b"crash", expires_at=5000)
+        # rebinding an already pending id is rejected in another process
+        _, result_queue = self.start_child(
+            binding, mode="bind", now=1000, lease_seconds=10, clock_time=1000,
+        )
+        tag, error_name, _ = self.outcome(result_queue)
+        self.assertEqual((tag, error_name), ("error", "ValueError"))
+        claimed = self._ctx.Event()
+        # the claimer exits mid-verification without any cleanup
+        crasher, _ = self.start_child(
+            binding, mode="crash", now=1000, lease_seconds=10,
+            clock_time=1000, claimed=claimed,
+        )
+        self.assertTrue(claimed.wait(30))
+        crasher.join(timeout=30)
+        self.assertFalse(crasher.is_alive())
+        # the abandoned claim blocks other processes until its deadline
+        _, result_queue = self.start_child(
+            binding, mode="check", now=1000, lease_seconds=10, clock_time=1005,
+        )
+        self.assertEqual(self.outcome(result_queue), ("check", False))
+        # rebinding stays rejected while the claim is live and after it lapses
+        for clock_time in (1005, 1010):
+            _, result_queue = self.start_child(
+                binding, mode="bind", now=1000, lease_seconds=10,
+                clock_time=clock_time,
+            )
+            tag, error_name, _ = self.outcome(result_queue)
+            self.assertEqual((tag, error_name), ("error", "ValueError"))
+        # at the deadline a new process takes the abandoned claim over
+        _, result_queue = self.start_child(
+            binding, mode="check", now=1000, lease_seconds=10, clock_time=1010,
+        )
+        self.assertEqual(self.outcome(result_queue), ("check", True))
+        _, result_queue = self.start_child(
+            binding, mode="check", now=1000, lease_seconds=10, clock_time=1010,
+        )
+        self.assertEqual(self.outcome(result_queue), ("check", False))
+        self.join_children()
+
+    def test_takeover_does_not_extend_binding_expiry(self):
+        binding = self.bind(b"expiry", expires_at=2000)
+        claimed = self._ctx.Event()
+        release = self._ctx.Event()
+        _, holder_queue = self.start_child(
+            binding, mode="hold", now=1000, lease_seconds=10,
+            clock_time=1000, claimed=claimed, release=release,
+        )
+        self.assertTrue(claimed.wait(30))
+        # a takeover at the lease deadline keeps expires_at: an explicit
+        # now equal to the expiry is rejected and does not consume the id
+        _, result_queue = self.start_child(
+            binding, mode="check", now=2000, lease_seconds=10, clock_time=1010,
+        )
+        self.assertEqual(self.outcome(result_queue), ("check", False))
+        # a still-valid now then succeeds exactly once
+        _, result_queue = self.start_child(
+            binding, mode="check", now=1999, lease_seconds=10, clock_time=1010,
+        )
+        self.assertEqual(self.outcome(result_queue), ("check", True))
+        # the resumed original process cannot undo the consumption
+        release.set()
+        self.assertEqual(self.outcome(holder_queue), ("check", False))
+        self.join_children()
 
 
 class RegionBatchReplayGuardTest(unittest.TestCase):

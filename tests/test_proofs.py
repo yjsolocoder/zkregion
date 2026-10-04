@@ -14,6 +14,7 @@ from zkregion import (
     BoundConsistencyChainBatch,
     BoundConsistencyChainReplayGuard,
     BoundConsistencyReplayGuard,
+    BoundIntervalRangeBatch,
     BoundMerkleInclusionBatch,
     BoundMerkleInclusionBatchReplayGuard,
     BoundMerkleMultiBatch,
@@ -36,6 +37,7 @@ from zkregion import (
     BoundSchnorrReplayGuard,
     BoundWideRangeBatch,
     BoundWideRangeReplayGuard,
+    IntervalRangeBatchEntry,
     IntervalRangeProof,
     MerkleConsistencyBatchEntry,
     MerkleConsistencyBatchReplayGuard,
@@ -116,6 +118,7 @@ from zkregion import (
     prove_pedersen_opening_batch_bound,
     prove_range,
     prove_range_interval,
+    prove_range_interval_batch_bound,
     prove_range_set,
     prove_range_set_batch_bound,
     prove_range_wide,
@@ -151,6 +154,8 @@ from zkregion import (
     verify_range_batch,
     verify_range_bound,
     verify_range_interval,
+    verify_range_interval_batch,
+    verify_range_interval_batch_bound,
     verify_range_set,
     verify_range_set_batch,
     verify_range_set_batch_bound,
@@ -4064,6 +4069,882 @@ class IntervalRangeProofTest(unittest.TestCase):
         verify_range_interval(commitment, proof, b"ctx")
         self.assertEqual((commitment, proof), snapshot)
         self.assertEqual(blinding, 1234)
+
+
+class IntervalRangeBatchTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def commit(self, value=50, lower=0, upper=100, blinding=1234, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    def prove(self, value=50, lower=0, upper=100, blinding=1234, context=b"ctx", **kwargs):
+        commitment, returned = self.commit(value, lower, upper, blinding, **kwargs)
+        proof = prove_range_interval(
+            commitment, value, returned, context, randbelow=counter_randbelow()
+        )
+        return commitment, returned, proof
+
+    def entry(self, value=50, lower=0, upper=100, context=b"ctx", blinding=1234, **kwargs):
+        commitment, returned = self.commit(value, lower, upper, blinding, **kwargs)
+        proof = prove_range_interval(
+            commitment, value, returned, context, randbelow=counter_randbelow()
+        )
+        return IntervalRangeBatchEntry(commitment, proof, context)
+
+    # ---- entry object -------------------------------------------------------
+
+    def test_entry_positional_defaults_equality_and_immutability(self):
+        commitment, blinding = self.commit()
+        proof = prove_range_interval(
+            commitment, 50, blinding, b"", randbelow=counter_randbelow()
+        )
+        entry = IntervalRangeBatchEntry(commitment, proof)
+        self.assertEqual(entry.context, b"")
+        self.assertEqual(IntervalRangeBatchEntry(commitment, proof, b""), entry)
+        self.assertEqual(
+            tuple(getattr(entry, name) for name in ("commitment", "proof", "context")),
+            (commitment, proof, b""),
+        )
+        self.assertNotEqual(entry, IntervalRangeBatchEntry(commitment, proof, b"x"))
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            entry.context = b"x"
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            entry.proof = proof
+
+    def test_entry_construction_does_no_validation(self):
+        entry = IntervalRangeBatchEntry("commitment", ("p",), 123)
+        self.assertEqual(
+            (entry.commitment, entry.proof, entry.context),
+            ("commitment", ("p",), 123),
+        )
+
+    def test_entry_field_types(self):
+        entry = self.entry()
+        self.assertIsInstance(entry.commitment, PedersenCommitment)
+        self.assertIsInstance(entry.proof, IntervalRangeProof)
+        self.assertIsInstance(entry.context, bytes)
+
+    # ---- honest round trip --------------------------------------------------
+
+    def test_honest_batch_verifies(self):
+        entries = [
+            self.entry(value=0, blinding=11),
+            self.entry(value=50, blinding=22),
+            self.entry(value=100, blinding=33),
+        ]
+        self.assertTrue(verify_range_interval_batch(entries))
+        self.assertTrue(verify_range_interval_batch(tuple(entries)))
+
+    def test_single_entry_agrees_with_verify_range_interval(self):
+        commitment, _, proof = self.prove()
+        entry = IntervalRangeBatchEntry(commitment, proof, b"ctx")
+        self.assertTrue(verify_range_interval_batch([entry]))
+        self.assertTrue(verify_range_interval(commitment, proof, b"ctx"))
+
+    def test_empty_batch_returns_false(self):
+        self.assertFalse(verify_range_interval_batch([]))
+        self.assertFalse(verify_range_interval_batch(()))
+
+    def test_duplicate_entries_are_legal(self):
+        entry = self.entry()
+        self.assertTrue(verify_range_interval_batch([entry, entry, entry]))
+
+    def test_entries_verify_in_any_order(self):
+        entries = [
+            self.entry(value=0, blinding=11),
+            self.entry(value=50, blinding=22),
+            self.entry(value=100, blinding=33),
+        ]
+        self.assertTrue(verify_range_interval_batch(entries))
+        self.assertTrue(verify_range_interval_batch(list(reversed(entries))))
+        self.assertTrue(
+            verify_range_interval_batch([entries[2], entries[0], entries[1]])
+        )
+
+    def test_mixed_groups_widths_points_negative_and_crossing_zero(self):
+        entries = [
+            self.entry(value=50, lower=0, upper=100),
+            self.entry(value=-7, lower=-7, upper=-7),       # single point
+            self.entry(value=0, lower=-50, upper=50),        # crosses zero
+            self.entry(value=-900, lower=-1000, upper=2000),
+            self.entry(value=1023, lower=0, upper=1023),     # power of two
+            self.entry(value=3, lower=0, upper=100),         # non-power width
+        ]
+        # an entry on the default group with a different bit width
+        commitment, blinding = pedersen_commit(40000, 0, 65535, blinding=987654321)
+        proof = prove_range_interval(
+            commitment, 40000, blinding, b"demo", randbelow=counter_randbelow()
+        )
+        entries.append(IntervalRangeBatchEntry(commitment, proof, b"demo"))
+        self.assertTrue(verify_range_interval_batch(entries))
+        for entry in entries:
+            self.assertTrue(
+                verify_range_interval(
+                    entry.commitment, entry.proof, entry.context
+                )
+            )
+
+    def test_default_group_million_wide_interval(self):
+        commitment, blinding = pedersen_commit(500000, 0, 1000000, blinding=424242)
+        proof = prove_range_interval(
+            commitment, 500000, blinding, b"big", randbelow=counter_randbelow()
+        )
+        entry = IntervalRangeBatchEntry(commitment, proof, b"big")
+        self.assertTrue(verify_range_interval_batch([entry]))
+
+    # ---- semantic failures return False -------------------------------------
+
+    def test_any_invalid_entry_returns_false(self):
+        good = self.entry(value=50)
+        # wrong context binding
+        self.assertFalse(
+            verify_range_interval_batch(
+                [IntervalRangeBatchEntry(good.commitment, good.proof, b"other")]
+            )
+        )
+        # widened declared range
+        widened = dataclasses.replace(good.commitment, upper=101)
+        self.assertFalse(
+            verify_range_interval_batch(
+                [IntervalRangeBatchEntry(widened, good.proof, b"ctx")]
+            )
+        )
+        # inverted declared range
+        inverted = dataclasses.replace(good.commitment, lower=101, upper=0)
+        self.assertFalse(
+            verify_range_interval_batch(
+                [IntervalRangeBatchEntry(inverted, good.proof, b"ctx")]
+            )
+        )
+        # tampered proof field
+        last_pair = good.proof.low_responses[-1]
+        forged = dataclasses.replace(
+            good.proof,
+            low_responses=good.proof.low_responses[:-1]
+            + ((last_pair[0], last_pair[1] + 1),),
+        )
+        self.assertFalse(
+            verify_range_interval_batch(
+                [IntervalRangeBatchEntry(good.commitment, forged, b"ctx")]
+            )
+        )
+        # missing proof items
+        empty_proof = IntervalRangeProof((), (), (), (), (), ())
+        self.assertFalse(
+            verify_range_interval_batch(
+                [IntervalRangeBatchEntry(good.commitment, empty_proof, b"ctx")]
+            )
+        )
+        # one bad entry spoils the batch regardless of position
+        other = self.entry(value=0, blinding=44)
+        bad = IntervalRangeBatchEntry(good.commitment, empty_proof, b"ctx")
+        self.assertFalse(verify_range_interval_batch([good, other, bad]))
+        self.assertFalse(verify_range_interval_batch([bad, good, other]))
+
+    # ---- type errors ---------------------------------------------------------
+
+    def test_type_errors(self):
+        good = self.entry()
+        for bad in (b"abc", "abc", 123, None, {good}, 4.5, True):
+            with self.assertRaises(TypeError):
+                verify_range_interval_batch(bad)
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch(iter([good]))
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch([good, "entry"])
+        commitment, _, proof = self.prove()
+        cases = [
+            IntervalRangeBatchEntry("c", proof, b""),
+            IntervalRangeBatchEntry(
+                dataclasses.replace(commitment, element=True), proof, b""
+            ),
+            IntervalRangeBatchEntry(commitment, proof, "c"),
+            IntervalRangeBatchEntry(commitment, "p", b""),
+            IntervalRangeBatchEntry(
+                commitment,
+                dataclasses.replace(proof, low_commitments=list(proof.low_commitments)),
+                b"",
+            ),
+            IntervalRangeBatchEntry(
+                commitment,
+                dataclasses.replace(
+                    proof,
+                    low_challenges=proof.low_challenges[:-1]
+                    + ((proof.low_challenges[-1][0], True),),
+                ),
+                b"",
+            ),
+            IntervalRangeBatchEntry(
+                commitment,
+                dataclasses.replace(
+                    proof,
+                    high_responses=proof.high_responses[:-1]
+                    + ([proof.high_responses[-1][0], proof.high_responses[-1][1]],),
+                ),
+                b"",
+            ),
+        ]
+        for bad_entry in cases:
+            with self.assertRaises(TypeError):
+                verify_range_interval_batch([bad_entry])
+            with self.assertRaises(TypeError):
+                verify_range_interval_batch([good, bad_entry])
+
+    def test_type_error_in_last_entry_not_masked_by_invalid_earlier_entry(self):
+        good = self.entry()
+        invalid = IntervalRangeBatchEntry(
+            good.commitment, IntervalRangeProof((), (), (), (), (), ()), b"ctx"
+        )
+        late_bad = IntervalRangeBatchEntry(good.commitment, good.proof, "late")
+        # the whole batch is preflighted: the late TypeError wins over the
+        # earlier entry that would merely verify False
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch([invalid, good, late_bad])
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch([good, invalid, "late"])
+
+    # ---- hygiene -------------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        entries = [self.entry(blinding=11), self.entry(blinding=22)]
+        snapshot = [dataclasses.replace(entry) for entry in entries]
+        sequence_snapshot = list(entries)
+        verify_range_interval_batch(entries)
+        self.assertEqual(entries, snapshot)
+        self.assertEqual(entries, sequence_snapshot)
+        for entry in entries:
+            self.assertIsInstance(entry.proof.low_commitments, tuple)
+            self.assertIsInstance(entry.proof.high_challenges, tuple)
+
+
+class BoundIntervalRangeBatchTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def entry(self, value=50, lower=0, upper=100, context=b"ctx", blinding=1234):
+        commitment, r = pedersen_commit(
+            value, lower, upper, blinding=blinding,
+            prime=self.PRIME, generator=self.G, h=self.H,
+        )
+        proof = prove_range_interval(
+            commitment, value, r, context, randbelow=counter_randbelow()
+        )
+        return IntervalRangeBatchEntry(commitment, proof, context)
+
+    def build(self, entries):
+        leaves = [bound_interval_range_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        batch = BoundIntervalRangeBatch(tuple(entries), len(entries), proof)
+        return batch, root
+
+    def honest(self):
+        entries = [
+            self.entry(value=0, context=b"a", blinding=11),
+            self.entry(value=50, context=b"b", blinding=22),
+            self.entry(value=100, context=b"c", blinding=33),
+        ]
+        return self.build(entries)
+
+    # ---- batch object -------------------------------------------------------
+
+    def test_batch_positional_equality_and_immutability(self):
+        batch, root = self.honest()
+        proof = batch.proof
+        rebuilt = BoundIntervalRangeBatch(batch.entries, 3, proof)
+        self.assertEqual(rebuilt, batch)
+        self.assertEqual(hash(rebuilt), hash(batch))
+        self.assertEqual(
+            tuple(getattr(batch, name) for name in ("entries", "leaf_count", "proof")),
+            (batch.entries, 3, proof),
+        )
+        self.assertIsInstance(batch.entries, tuple)
+        self.assertNotEqual(BoundIntervalRangeBatch(batch.entries, 4, proof), batch)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.leaf_count = 4
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            batch.entries = ()
+
+    def test_entries_must_be_tuple(self):
+        batch, root = self.honest()
+        loose = BoundIntervalRangeBatch(list(batch.entries), 3, batch.proof)
+        self.assertNotIsInstance(loose.entries, tuple)
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(loose, root)
+
+    def test_field_types(self):
+        batch, _ = self.honest()
+        self.assertIsInstance(batch.entries, tuple)
+        for entry in batch.entries:
+            self.assertIsInstance(entry, IntervalRangeBatchEntry)
+        self.assertIsInstance(batch.leaf_count, int)
+        self.assertNotIsInstance(batch.leaf_count, bool)
+        self.assertIsInstance(batch.proof, MerkleMultiProof)
+
+    # ---- honest round trip --------------------------------------------------
+
+    def test_honest_batch_verifies(self):
+        batch, root = self.honest()
+        self.assertTrue(verify_range_interval_batch_bound(batch, root))
+
+    def test_single_entry_and_even_sized_batch_verify(self):
+        entries = [self.entry()]
+        batch, root = self.build(entries)
+        self.assertTrue(verify_range_interval_batch_bound(batch, root))
+        pair = [self.entry(value=0, context=b"a"), self.entry(value=7, context=b"b", lower=0, upper=10)]
+        ebatch, eroot = self.build(pair)
+        self.assertTrue(verify_range_interval_batch_bound(ebatch, eroot))
+
+    def test_mixed_shapes_verify(self):
+        entries = [
+            self.entry(value=50, lower=0, upper=100),
+            self.entry(value=-3, lower=-3, upper=-3),
+            self.entry(value=0, lower=-50, upper=50),
+            self.entry(value=2000, lower=-1000, upper=2000),
+        ]
+        batch, root = self.build(entries)
+        self.assertTrue(verify_range_interval_batch_bound(batch, root))
+
+    def test_full_leaf_proof_has_empty_siblings(self):
+        batch, root = self.honest()
+        self.assertEqual(batch.proof.leaf_count, 3)
+        self.assertEqual(batch.proof.indices, (0, 1, 2))
+        self.assertEqual(batch.proof.siblings, ())
+        self.assertTrue(verify_range_interval_batch_bound(batch, root))
+
+    def test_leaf_layout(self):
+        batch, _ = self.honest()
+        entry = batch.entries[0]
+        items = frame_items(bound_interval_range_leaf(entry))
+        count = entry.commitment.upper - entry.commitment.lower + 1
+        width = max(1, (count - 1).bit_length())
+        expected_count = 1 + 6 + 1 + 2 * (1 + width) + 4 * (1 + 2 * width)
+        self.assertEqual(len(items), expected_count)
+        self.assertEqual(items[0], b"zkregion/irb/v1")
+        cursor = 1
+        for value in (
+            entry.commitment.element, entry.commitment.lower, entry.commitment.upper,
+            entry.commitment.prime, entry.commitment.generator, entry.commitment.h,
+        ):
+            self.assertEqual(items[cursor], str(value).encode("ascii"))
+            cursor += 1
+        self.assertEqual(items[cursor], entry.context)
+        cursor += 1
+        for field_name in (
+            "low_commitments",
+            "low_challenges",
+            "low_responses",
+            "high_commitments",
+            "high_challenges",
+            "high_responses",
+        ):
+            sequence = getattr(entry.proof, field_name)
+            self.assertEqual(items[cursor], str(len(sequence)).encode("ascii"))
+            cursor += 1
+            if field_name.endswith("commitments"):
+                values = sequence
+            else:
+                values = tuple(item for pair in sequence for item in pair)
+            for value in values:
+                self.assertEqual(items[cursor], str(value).encode("ascii"))
+                cursor += 1
+        self.assertEqual(cursor, len(items))
+
+    def test_leaf_uses_merkle_leaf_domain_and_empty_context_framing(self):
+        batch, root = self.honest()
+        self.assertEqual(
+            merkle_root([bound_interval_range_leaf(entry) for entry in batch.entries]),
+            root,
+        )
+        entry = self.entry(context=b"")
+        items = frame_items(bound_interval_range_leaf(entry))
+        self.assertEqual(items[1 + 6], b"")
+
+    # ---- completeness / count checks ---------------------------------------
+
+    def test_empty_batch_returns_false(self):
+        proof = MerkleMultiProof(1, (), ())
+        batch = BoundIntervalRangeBatch((), 0, proof)
+        self.assertFalse(verify_range_interval_batch_bound(batch, bytes(32)))
+
+    def test_leaf_count_must_match_entries_and_proof(self):
+        entries = [self.entry(context=b"a"), self.entry(context=b"b")]
+        leaves = [bound_interval_range_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, (0, 1))
+        for count in (1, 3, 0):
+            batch = BoundIntervalRangeBatch(tuple(entries), count, proof)
+            self.assertFalse(verify_range_interval_batch_bound(batch, root), count)
+        for claimed in (1, 3):
+            bad_proof = dataclasses.replace(proof, leaf_count=claimed)
+            batch = BoundIntervalRangeBatch(tuple(entries), 2, bad_proof)
+            self.assertFalse(verify_range_interval_batch_bound(batch, root), claimed)
+
+    def test_indices_must_cover_zero_to_n_without_gaps(self):
+        batch, root = self.honest()
+        for bad_indices in (
+            (0, 1), (0, 1, 1), (0, 0, 2), (2, 1, 0), (0, 2, 1),
+            (1, 2, 3), (-1, 1, 2), (0, 1, 3), (),
+        ):
+            bad_proof = MerkleMultiProof(3, bad_indices, batch.proof.siblings)
+            bad_batch = BoundIntervalRangeBatch(batch.entries, 3, bad_proof)
+            self.assertFalse(
+                verify_range_interval_batch_bound(bad_batch, root), bad_indices
+            )
+        self.assertEqual(batch.proof.indices, (0, 1, 2))
+
+    def test_missing_or_extra_entry_returns_false(self):
+        entries = [self.entry(context=b"a"), self.entry(context=b"b")]
+        leaves = [bound_interval_range_leaf(entry) for entry in entries]
+        root = merkle_root(leaves)
+        proof = MerkleMultiProof(3, (0, 1, 2), ())
+        # two entries presented as three positions
+        batch = BoundIntervalRangeBatch(tuple(entries), 3, proof)
+        self.assertFalse(verify_range_interval_batch_bound(batch, root))
+        # three entries bound, verify a truncated tuple claiming 2
+        full, full_root = self.honest()
+        truncated = BoundIntervalRangeBatch(full.entries[:2], 2, full.proof)
+        self.assertFalse(verify_range_interval_batch_bound(truncated, full_root))
+
+    # ---- Merkle binding rejection -------------------------------------------
+
+    def test_wrong_or_wrong_length_root_returns_false(self):
+        batch, _ = self.honest()
+        self.assertFalse(verify_range_interval_batch_bound(batch, bytes(32)))
+        self.assertFalse(
+            verify_range_interval_batch_bound(
+                batch, merkle_root([b"a", b"b", b"c"])
+            )
+        )
+        self.assertFalse(verify_range_interval_batch_bound(batch, b""))
+        self.assertFalse(verify_range_interval_batch_bound(batch, b"x" * 31))
+        self.assertFalse(verify_range_interval_batch_bound(batch, b"x" * 33))
+
+    def test_tampered_leaf_returns_false_even_with_matching_proof(self):
+        entries = [self.entry(context=b"a"), self.entry(context=b"b")]
+        batch, root = self.build(entries)
+        good = entries[0]
+        tampered_commitments = good.proof.low_commitments[:-1] + (
+            good.proof.low_commitments[-1] + 1,
+        )
+        last_pair = good.proof.high_challenges[-1]
+        tampered_challenges = good.proof.high_challenges[:-1] + (
+            (last_pair[0], last_pair[1] + 1),
+        )
+        for tampered in (
+            dataclasses.replace(good, context=b"other"),
+            dataclasses.replace(
+                good,
+                commitment=dataclasses.replace(
+                    good.commitment, element=good.commitment.element + 1
+                ),
+            ),
+            dataclasses.replace(
+                good,
+                proof=dataclasses.replace(
+                    good.proof, low_commitments=tampered_commitments
+                ),
+            ),
+            dataclasses.replace(
+                good,
+                proof=dataclasses.replace(
+                    good.proof, high_challenges=tampered_challenges
+                ),
+            ),
+        ):
+            bad_batch = BoundIntervalRangeBatch((tampered, entries[1]), 2, batch.proof)
+            self.assertFalse(verify_range_interval_batch_bound(bad_batch, root))
+
+    def test_appended_removed_or_swapped_entries_return_false(self):
+        batch, root = self.honest()
+        extra = self.entry(value=7, lower=0, upper=10, context=b"d", blinding=55)
+        leaves = [bound_interval_range_leaf(entry) for entry in batch.entries] + [
+            bound_interval_range_leaf(extra)
+        ]
+        grown_proof = prove_multi_inclusion(leaves, tuple(range(4)))
+        grown = BoundIntervalRangeBatch(batch.entries + (extra,), 4, grown_proof)
+        self.assertFalse(verify_range_interval_batch_bound(grown, root))
+        removed = BoundIntervalRangeBatch(
+            batch.entries[1:], 2, prove_multi_inclusion(leaves[1:], (0, 1))
+        )
+        self.assertFalse(verify_range_interval_batch_bound(removed, root))
+        swapped = BoundIntervalRangeBatch(
+            (batch.entries[0], batch.entries[2], batch.entries[1]), 3, batch.proof
+        )
+        self.assertFalse(verify_range_interval_batch_bound(swapped, root))
+
+    def test_committed_but_forged_proof_fails_at_batch_step(self):
+        entries = [self.entry(context=b"a"), self.entry(context=b"b")]
+        good = entries[0]
+        last_pair = good.proof.low_responses[-1]
+        forged_proof = dataclasses.replace(
+            good.proof,
+            low_responses=good.proof.low_responses[:-1]
+            + ((last_pair[0], last_pair[1] + 1),),
+        )
+        forged_entries = [
+            dataclasses.replace(good, proof=forged_proof), entries[1]
+        ]
+        bad_batch, forged_root = self.build(forged_entries)
+        self.assertTrue(  # Merkle step alone passes against the forged root
+            verify_multi_inclusion(
+                [(i, bound_interval_range_leaf(e)) for i, e in enumerate(forged_entries)],
+                bad_batch.proof,
+                forged_root,
+            )
+        )
+        self.assertFalse(verify_range_interval_batch_bound(bad_batch, forged_root))
+
+    def test_tampered_siblings_return_false(self):
+        batch, root = self.honest()
+        bogus = MerkleMultiProof(3, batch.proof.indices, (root,))
+        bad_batch = BoundIntervalRangeBatch(batch.entries, 3, bogus)
+        self.assertFalse(verify_range_interval_batch_bound(bad_batch, root))
+
+    # ---- type errors ---------------------------------------------------------
+
+    def test_type_errors(self):
+        batch, root = self.honest()
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound("batch", root)
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(None, root)
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(
+                BoundIntervalRangeBatch(list(batch.entries), 3, batch.proof), root
+            )
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(
+                BoundIntervalRangeBatch(("x",) * 3, 3, batch.proof), root
+            )
+        for bad_count in (True, 3.0, "3"):
+            with self.assertRaises(TypeError):
+                verify_range_interval_batch_bound(
+                    BoundIntervalRangeBatch(batch.entries, bad_count, batch.proof),
+                    root,
+                )
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(
+                BoundIntervalRangeBatch(batch.entries, 3, "proof"), root
+            )
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(batch, "root")
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(batch, bytearray(root))
+        # malformed nested entry fields
+        good = batch.entries[0]
+        cases = [
+            dataclasses.replace(good, commitment="c"),
+            dataclasses.replace(
+                good, commitment=dataclasses.replace(good.commitment, element=True)
+            ),
+            dataclasses.replace(good, proof="p"),
+            dataclasses.replace(good, context="ctx"),
+            dataclasses.replace(
+                good,
+                proof=dataclasses.replace(
+                    good.proof, low_commitments=list(good.proof.low_commitments)
+                ),
+            ),
+            dataclasses.replace(
+                good,
+                proof=dataclasses.replace(
+                    good.proof,
+                    low_challenges=good.proof.low_challenges[:-1]
+                    + ((good.proof.low_challenges[-1][0], True),),
+                ),
+            ),
+            dataclasses.replace(
+                good,
+                proof=dataclasses.replace(
+                    good.proof,
+                    high_responses=good.proof.high_responses[:-1]
+                    + ([good.proof.high_responses[-1][0], good.proof.high_responses[-1][1]],),
+                ),
+            ),
+        ]
+        for bad_entry in cases:
+            entries = (bad_entry,) + batch.entries[1:]
+            bad_batch = BoundIntervalRangeBatch(entries, 3, batch.proof)
+            with self.assertRaises(TypeError):
+                verify_range_interval_batch_bound(bad_batch, root)
+        # the whole batch is walked: a bad type in the last entry still raises
+        late_bad = (
+            batch.entries[0],
+            batch.entries[1],
+            dataclasses.replace(batch.entries[2], context="late"),
+        )
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(
+                BoundIntervalRangeBatch(late_bad, 3, batch.proof), root
+            )
+        # malformed MerkleMultiProof fields
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(
+                BoundIntervalRangeBatch(
+                    batch.entries, 3, MerkleMultiProof(True, (0, 1, 2), ())
+                ),
+                root,
+            )
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(
+                BoundIntervalRangeBatch(
+                    batch.entries, 3, MerkleMultiProof(3, [0, 1, 2], ())
+                ),
+                root,
+            )
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(
+                BoundIntervalRangeBatch(
+                    batch.entries, 3, MerkleMultiProof(3, (0, 1, 2.0), ())
+                ),
+                root,
+            )
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(
+                BoundIntervalRangeBatch(
+                    batch.entries, 3, MerkleMultiProof(3, (0, 1, 2), ["x"])
+                ),
+                root,
+            )
+
+    def test_type_error_in_last_entry_not_masked_by_invalid_earlier_entry(self):
+        batch, root = self.honest()
+        good = batch.entries[0]
+        invalid = IntervalRangeBatchEntry(
+            good.commitment, IntervalRangeProof((), (), (), (), (), ()), b"ctx"
+        )
+        late_bad = dataclasses.replace(batch.entries[2], context="late")
+        entries = (invalid, batch.entries[1], late_bad)
+        with self.assertRaises(TypeError):
+            verify_range_interval_batch_bound(
+                BoundIntervalRangeBatch(entries, 3, batch.proof), root
+            )
+
+    # ---- hygiene -------------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        batch, root = self.honest()
+        snapshot = BoundIntervalRangeBatch(
+            tuple(dataclasses.replace(entry) for entry in batch.entries),
+            batch.leaf_count,
+            dataclasses.replace(batch.proof),
+        )
+        verify_range_interval_batch_bound(batch, root)
+        self.assertEqual(batch, snapshot)
+
+
+class ProveIntervalRangeBatchBoundTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def entry(self, value=50, lower=0, upper=100, context=b"ctx", blinding=1234):
+        commitment, r = pedersen_commit(
+            value, lower, upper, blinding=blinding,
+            prime=self.PRIME, generator=self.G, h=self.H,
+        )
+        proof = prove_range_interval(
+            commitment, value, r, context, randbelow=counter_randbelow()
+        )
+        return IntervalRangeBatchEntry(commitment, proof, context)
+
+    def honest_entries(self):
+        return [
+            self.entry(value=0, context=b"a", blinding=11),
+            self.entry(value=50, context=b"b", blinding=22),
+            self.entry(value=-3, lower=-50, upper=50, context=b"c", blinding=33),
+        ]
+
+    # ---- round trip ----------------------------------------------------------
+
+    def test_constructed_batch_passes_verify_once(self):
+        entries = self.honest_entries()
+        batch, root = prove_range_interval_batch_bound(entries)
+        self.assertEqual(len(root), 32)
+        self.assertTrue(verify_range_interval_batch_bound(batch, root))
+
+    def test_single_item_odd_even_and_duplicates(self):
+        only = [self.entry()]
+        batch, root = prove_range_interval_batch_bound(only)
+        self.assertEqual(batch.leaf_count, 1)
+        self.assertEqual(batch.entries, tuple(only))
+        self.assertTrue(verify_range_interval_batch_bound(batch, root))
+
+        pair = [self.entry(value=0), self.entry(value=7, lower=0, upper=10)]
+        ebatch, eroot = prove_range_interval_batch_bound(pair)
+        self.assertEqual(ebatch.leaf_count, 2)
+        self.assertTrue(verify_range_interval_batch_bound(ebatch, eroot))
+
+        dup = [only[0], only[0], only[0]]
+        dbatch, droot = prove_range_interval_batch_bound(dup)
+        self.assertEqual(dbatch.leaf_count, 3)
+        self.assertEqual(dbatch.entries, (only[0], only[0], only[0]))
+        self.assertTrue(verify_range_interval_batch_bound(dbatch, droot))
+
+    def test_full_proof_covers_every_position_from_zero(self):
+        batch, _ = prove_range_interval_batch_bound(self.honest_entries())
+        self.assertEqual(batch.leaf_count, 3)
+        self.assertEqual(batch.proof.leaf_count, 3)
+        self.assertEqual(batch.proof.indices, (0, 1, 2))
+        self.assertEqual(batch.proof.siblings, ())
+
+    def test_order_preserved_and_later_input_changes_have_no_effect(self):
+        entries = self.honest_entries()
+        reordered = [entries[2], entries[0], entries[1]]
+        batch, root = prove_range_interval_batch_bound(reordered)
+        self.assertEqual(batch.entries, tuple(reordered))
+        # mutating the input list afterwards leaves the frozen batch untouched
+        source = list(reordered)
+        frozen_batch, frozen_root = prove_range_interval_batch_bound(source)
+        source.append(self.entry(value=100, context=b"z", blinding=77))
+        del source[0]
+        self.assertEqual(frozen_batch, batch)
+        self.assertEqual(frozen_root, root)
+
+    # ---- compatibility and determinism --------------------------------------
+
+    def test_equals_manual_construction_byte_for_byte(self):
+        entries = self.honest_entries()
+        batch, root = prove_range_interval_batch_bound(entries)
+        leaves = [bound_interval_range_leaf(entry) for entry in entries]
+        manual_root = merkle_root(leaves)
+        manual_proof = prove_multi_inclusion(leaves, tuple(range(len(entries))))
+        manual_batch = BoundIntervalRangeBatch(
+            tuple(entries), len(entries), manual_proof
+        )
+        self.assertEqual(root, manual_root)
+        self.assertEqual(batch, manual_batch)
+        self.assertEqual(dataclasses.asdict(batch), dataclasses.asdict(manual_batch))
+
+    def test_same_ordered_inputs_produce_same_root(self):
+        entries = self.honest_entries()
+        batch, root = prove_range_interval_batch_bound(entries)
+        batch2, root2 = prove_range_interval_batch_bound(list(entries))
+        self.assertEqual(batch, batch2)
+        self.assertEqual(root, root2)
+        self.assertEqual(batch.proof, batch2.proof)
+
+    def test_reordered_inputs_produce_different_root(self):
+        entries = self.honest_entries()
+        _, root = prove_range_interval_batch_bound(entries)
+        _, swapped_root = prove_range_interval_batch_bound(
+            [entries[0], entries[2], entries[1]]
+        )
+        self.assertNotEqual(root, swapped_root)
+
+    # ---- input hygiene -------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        entries = self.honest_entries()
+        snapshot = [dataclasses.replace(entry) for entry in entries]
+        prove_range_interval_batch_bound(entries)
+        self.assertEqual(entries, snapshot)
+        self.assertIsInstance(entries, list)
+
+    # ---- rejections ----------------------------------------------------------
+
+    def test_empty_batch_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            prove_range_interval_batch_bound([])
+        with self.assertRaises(ValueError):
+            prove_range_interval_batch_bound(())
+
+    def test_type_errors(self):
+        good = self.honest_entries()
+        for bad in (b"abc", "abc", 123, None, {good[0]}, 4.5, True):
+            with self.assertRaises(TypeError):
+                prove_range_interval_batch_bound(bad)
+        with self.assertRaises(TypeError):
+            prove_range_interval_batch_bound(iter(good))
+        with self.assertRaises(TypeError):
+            prove_range_interval_batch_bound([good[0], 1])
+        proof = good[0].proof
+        cases = [
+            IntervalRangeBatchEntry("c", proof, b""),
+            IntervalRangeBatchEntry(
+                dataclasses.replace(good[0].commitment, element=True),
+                proof,
+                b"",
+            ),
+            IntervalRangeBatchEntry(good[0].commitment, proof, "c"),
+            IntervalRangeBatchEntry(good[0].commitment, "p", b""),
+            IntervalRangeBatchEntry(
+                good[0].commitment,
+                dataclasses.replace(
+                    proof, high_commitments=list(proof.high_commitments)
+                ),
+                b"",
+            ),
+            IntervalRangeBatchEntry(
+                good[0].commitment,
+                dataclasses.replace(
+                    proof,
+                    low_responses=proof.low_responses[:-1]
+                    + ((proof.low_responses[-1][0], True),),
+                ),
+                b"",
+            ),
+        ]
+        for bad_entry in cases:
+            with self.assertRaises(TypeError):
+                prove_range_interval_batch_bound([bad_entry])
+            with self.assertRaises(TypeError):
+                prove_range_interval_batch_bound([good[1], bad_entry])
+
+    def test_inner_batch_failure_raises_value_error(self):
+        good = self.honest_entries()
+        proof = good[0].proof
+        last_pair = proof.low_responses[-1]
+        tampered = dataclasses.replace(
+            good[0],
+            proof=dataclasses.replace(
+                proof,
+                low_responses=proof.low_responses[:-1]
+                + ((last_pair[0], last_pair[1] + 1),),
+            ),
+        )
+        with self.assertRaises(ValueError):
+            prove_range_interval_batch_bound([tampered])
+        # an inverted declared range paired with an otherwise good proof
+        inverted = dataclasses.replace(good[1].commitment, lower=101, upper=0)
+        with self.assertRaises(ValueError):
+            prove_range_interval_batch_bound(
+                [IntervalRangeBatchEntry(inverted, good[1].proof, good[1].context)]
+            )
+        # an empty proof structure
+        with self.assertRaises(ValueError):
+            prove_range_interval_batch_bound(
+                [
+                    IntervalRangeBatchEntry(
+                        good[0].commitment,
+                        IntervalRangeProof((), (), (), (), (), ()),
+                        b"a",
+                    )
+                ]
+            )
+
+    def test_rejections_are_deterministic(self):
+        good = self.honest_entries()
+        proof = good[0].proof
+        last_pair = proof.high_challenges[-1]
+        tampered = dataclasses.replace(
+            good[0],
+            proof=dataclasses.replace(
+                proof,
+                high_challenges=proof.high_challenges[:-1]
+                + ((last_pair[0], last_pair[1] + 1),),
+            ),
+        )
+        for _ in range(3):
+            with self.assertRaises(ValueError):
+                prove_range_interval_batch_bound([tampered])
 
 
 class RegionProofTest(unittest.TestCase):
@@ -9465,6 +10346,42 @@ def bound_wide_range_leaf(entry: WideRangeBatchEntry) -> bytes:
             for pair in pairs
             for value in pair
         ]
+    return b"".join(len(item).to_bytes(4, "big") + item for item in items)
+
+
+def bound_interval_range_leaf(entry: IntervalRangeBatchEntry) -> bytes:
+    items = [b"zkregion/irb/v1"]
+    commitment = entry.commitment
+    items += [
+        str(value).encode("ascii")
+        for value in (
+            commitment.element,
+            commitment.lower,
+            commitment.upper,
+            commitment.prime,
+            commitment.generator,
+            commitment.h,
+        )
+    ]
+    items.append(entry.context)
+    for field_name in (
+        "low_commitments",
+        "low_challenges",
+        "low_responses",
+        "high_commitments",
+        "high_challenges",
+        "high_responses",
+    ):
+        sequence = getattr(entry.proof, field_name)
+        items.append(str(len(sequence)).encode("ascii"))
+        if field_name.endswith("commitments"):
+            items += [str(value).encode("ascii") for value in sequence]
+        else:
+            items += [
+                str(value).encode("ascii")
+                for pair in sequence
+                for value in pair
+            ]
     return b"".join(len(item).to_bytes(4, "big") + item for item in items)
 
 

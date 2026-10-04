@@ -355,6 +355,28 @@ interval_proof = prove_range_interval(
 assert verify_range_interval(interval_commitment, interval_proof, context=b"session-1")
 assert not verify_range_interval(interval_commitment, interval_proof, context=b"other")
 
+# 任意宽度区间证明的批量验证（逐条独立校验，可混合群参数与位宽，顺序与重复项不影响结果）
+from zkregion import IntervalRangeBatchEntry, verify_range_interval_batch
+
+interval_batch = [
+    IntervalRangeBatchEntry(interval_commitment, interval_proof, b"session-1"),
+    IntervalRangeBatchEntry(interval_commitment, interval_proof, b"session-1"),
+]
+assert verify_range_interval_batch(interval_batch)
+assert not verify_range_interval_batch([])  # 空批为 False
+
+# 任意宽度区间证明完整批的 Merkle 绑定：整批 IntervalRangeBatchEntry 先冻结到一棵 Merkle 树
+from zkregion import (
+    prove_range_interval_batch_bound,
+    verify_range_interval_batch_bound,
+)
+
+ir_bound, ir_root = prove_range_interval_batch_bound(interval_batch)
+assert ir_bound.leaf_count == len(interval_batch)
+assert ir_bound.proof.indices == tuple(range(len(interval_batch)))
+assert verify_range_interval_batch_bound(ir_bound, ir_root)
+assert not verify_range_interval_batch_bound(ir_bound, b"\x00" * 32)  # 根不符为 False
+
 # 区间证明的批量验证（按 (prime, generator, h) 分组做随机线性组合）
 from zkregion import RangeBatchEntry, verify_range_batch
 
@@ -1395,6 +1417,11 @@ python3 -m zkregion
 - `prove_range_interval(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> IntervalRangeProof` — 任意宽度闭区间的非交互证明：声明区间可含任意 `1` 到 `2**24` 个整数（单点、负边界、跨零与非二次幂宽度均可），倒置或超限区间抛 `ValueError`；令 `n` 为区间整数个数、`k = max(1, (n-1).bit_length())`、`shift = 2**k - n`，证明由两套按位 Schnorr OR 分解组成——低位半证明偏移 `value - lower` 落在 `[0, 2**k)`（绑定承诺元素本身），高位半证明 `value - lower + shift` 落在 `[0, 2**k)`（绑定 `element * generator**shift mod prime`），两半的加权比特盲因子均闭合到同一承诺盲因子，故区间外值无法借补齐到二次幂被接纳；生成前以 `verify_pedersen_opening` 同一口径重算承诺开合，非法群参数、非法承诺元素、越界值、非法盲因子或开合不符抛 `ValueError`；随机源不可调用或返回非整数（含 `bool`）抛 `TypeError`、抽取值越出该次请求的半开区间抛 `ValueError`；证明不携带明文值或盲因子，整数元素总数为 `10k`（随区间个数的二进制位数线性增长，不随候选整数个数增长）；同一组入参在相同随机序列下生成相等证明，输入不被改写
 - `verify_range_interval(commitment, proof, context=b"") -> bool` — 验证任意宽度闭区间证明：只接收承诺、证明与 context，不接触原值或盲因子，且不消耗随机数；两半比特承诺分别按 `2**i` 加权乘回承诺元素与 `element * generator**shift`，逐位重算每个比特分支两条 OR 分支的公告并核对两个挑战份额之和等于转录挑战（转录绑定承诺全部六个字段、准确上下界与 context）；区间个数超出 `2**24`、证明缺项、结构或数值越界、替换承诺任一字段或上下界、换 context、交换两半、篡改任一比特分支一律返回 `False` 且不抛异常；对象或任一层嵌套字段错型（含用 `bool` 冒充整数、非元组字段、非 `bytes` context）抛 `TypeError`，输入不被改写
 - `IntervalRangeProof(low_commitments, low_challenges, low_responses, high_commitments, high_challenges, high_responses)` — 不可变任意宽度区间证明对象；`low_*` 三个字段为偏移 `value - lower` 的按位分解（低位半），`high_*` 三个字段为偏移加 `shift` 的按位分解（高位半）；`*_commitments` 为按位序（低位在前）的比特承诺 `tuple[int, ...]`，`*_challenges` 与 `*_responses` 为每个比特分支的两个挑战份额、两个响应组成的 `tuple[tuple[int, int], ...]`，六个字段长度均为位宽 `k`；可位置构造、按值相等且冻结，构造时不做任何校验
+- `IntervalRangeBatchEntry(commitment, proof, context=b"")` — 不可变任意宽度区间批验条目，字段类型依次为 `PedersenCommitment`、`IntervalRangeProof`、`bytes`，字段次序与 `verify_range_interval` 入参一致；可位置构造、按值相等且不可变，构造时不做任何校验
+- `verify_range_interval_batch(entries) -> bool` — 任意宽度区间证明的批量验证：只接收条目序列，不接收明文或盲因子，不消耗随机数；先对整批预检嵌套类型（序列本身须为非 `bytes`/`bytearray`/`str` 序列，条目须为 `IntervalRangeBatchEntry`，承诺六字段非 `bool` 整数，证明六字段任一层须为非 `bool` 整数元组、二元组项也必须是元组，`context` 须为 `bytes`），整批走完再验证，末项错型不会被前项无效遮蔽；类型正确后逐条以现有 `verify_range_interval` 同口径独立核对，非空批仅在每条都通过时返回 `True`，空批返回 `False`，倒置或超限区间、证明缺项、数值越界、绑定不符与密码学失败均返回 `False`；允许混合群参数与不同位宽，单点、负边界、跨零区间均可，重复条目合法，条目顺序不影响结果，输入不被改写
+- `verify_range_interval_batch_bound(batch, root) -> bool` — Merkle 承诺的任意宽度区间证明完整批验：先全批类型预检（批对象、条目元组、承诺六字段、证明六字段任一层非 `bool` 整数元组、`leaf_count` 非 `bool` 整数、外层 `MerkleMultiProof` 三字段、`context` 与 `root` 为 `bytes`，错型一律抛唯一的 `TypeError`，末项错型不被前项无效遮蔽），再以 `verify_multi_inclusion` 先验完整根绑定（`leaf_count` 须为正且等于条目数与 `proof.leaf_count`，`indices` 须恰覆盖 `0..leaf_count-1` 而无缺漏、重复或重排，根长度不是三十二字节、错根、空批、计数不符、删减/追加/调换条目、叶字节任一字段被篡改均返回 `False`），根通过后原样调用 `verify_range_interval_batch(batch.entries)`，内层任一证明无效返回 `False`；不消耗随机数，输入不被改写
+- `BoundIntervalRangeBatch(entries, leaf_count, proof)` — 冻结的任意宽度区间完整批对象；字段依次为 `tuple[IntervalRangeBatchEntry, ...]`（保序、保留重复项）、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变；`leaf_count` 须等于条目数及 `proof.leaf_count`，`proof.indices` 须恰为 `tuple(range(leaf_count))`
+- `prove_range_interval_batch_bound(entries) -> tuple[BoundIntervalRangeBatch, bytes]` — 顶层构造 Merkle 承诺的规范任意宽度区间证明完整批：`entries` 沿用 `verify_range_interval_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，输入列表之后增删不影响返回批，输入不被改写；每项外层叶以域 `b"zkregion/irb/v1"`、四字节长度帧与十进制 ASCII 整数，按承诺六字段、`context`、证明六字段（`low_commitments`/`low_challenges`/`low_responses`/`high_commitments`/`high_challenges`/`high_responses`，每个序列先元素数再逐项，配对序列按对顺序摊平）的固定字段顺序成叶（`_bound_interval_range_leaf`），Merkle 摘要规则不变；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到覆盖全部位置的完整多包含证明（`indices` 覆盖每片叶、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_range_interval_batch_bound(batch, root) is True`，相同有序输入产生相同根与逐字节一致的批和证明，单项、奇偶批与重复项均确定；全批或任一嵌套字段错型（含后项错型、非元组证明字段与 `bool` 整数）抛 `TypeError`，空批、批次数越出 uint64 或 `verify_range_interval_batch` 返回 `False`（倒置或超限区间、证明缺项、数值越界、绑定不符或密码学失败）抛 `ValueError`；不消耗随机数
 - `WideRangeBatchEntry(commitment, proof, context=b"")` — 不可变宽区间批验条目，字段类型依次为 `PedersenCommitment`、`WideRangeProof`、`bytes`，字段次序与 `verify_range_wide` 入参一致；可位置构造、按值相等且不可变，构造时不做任何校验
 - `verify_range_wide_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 宽区间证明的批量验证：先整批预检嵌套类型（序列本身、条目、承诺六字段、证明三层元组整数与 `context`，错型含后项错型与用 `bool` 冒充整数，一律抛唯一的 `TypeError`；随机源不可调用或返回非整数同样抛 `TypeError`），预检通过后才逐条核对；空批返回 `False`，任一条无效即短路返回 `False`。比特承诺按 `2**i` 加权的绑定与各比特两个挑战份额之和等于转录挑战逐条核对、不参与聚合；每个比特的两条 OR 子分支各恰取一次非零系数 `a = r + 1`（`r = randbelow(prime - 1)`），按 `(prime, generator, h)` 分组做一次随机线性组合，越界系数抛 `ValueError`；换承诺、换上下文、换声明区间、交换替换比特分支、改动分支内承诺/挑战份额/响应、挪动位序一律返回 `False` 且不抛异常；条目独立、可乱序可重复，固定随机源下结果可重复，输入不被改写
 - `verify_range_wide_batch_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的宽区间证明完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_range_wide_batch` 验证明
@@ -1814,6 +1841,14 @@ h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
 
 随机源不可调用或返回非整数抛 `TypeError`，系数返回值超出 `[0, prime - 1)` 抛 `ValueError`；异常唯一——任何错型情形都只抛 `TypeError`。换承诺、换上下文、换声明区间、交换或替换比特分支、改动分支内的承诺/挑战份额/响应、挪动位序一律返回 `False` 且不抛异常。条目相互独立、可乱序可重复，固定随机源下结果可重复；漏项无法被发现，批次完整性由调用方保证。入口不改写任何输入，不引入落盘或持久化。这里的随机线性组合只供演示。
 
+### 任意宽度区间证明批量验证
+
+`verify_range_interval_batch(entries)` 一次验证一批 `IntervalRangeProof`，每个条目就是 `verify_range_interval` 的三个入参（`commitment`、`proof`、`context`，后者缺省 `b""`）冻结成的不可变数据类 `IntervalRangeBatchEntry`；字段类型依次为 `PedersenCommitment`、`IntervalRangeProof`、`bytes`，构造条目不做任何校验。`entries` 须为非 `bytes`/`bytearray`/`str` 的非空序列：空批返回 `False`，重复条目合法。
+
+与宽区间批验不同，这里**不做随机线性聚合**：先对**整批**做嵌套类型预检（序列本身、任一条目类型、承诺六字段为非 `bool` 整数、证明六字段在任一层均为非 `bool` 整数的元组——配对序列的每一项也必须是二元组而非列表、`context` 为 `bytes`），错型哪怕出现在最后一个条目也照样抛出，末项错型不会被前面条目的无效结论遮蔽；预检通过后再逐条以 `verify_range_interval` 的现有语义独立核对，非空批仅在每一条都通过时返回 `True`，任一条无效即短路返回 `False`。
+
+条目之间相互独立：允许混合群参数（不同 `prime`/`generator`/`h`）与不同位宽，单点区间、负边界与跨零区间均可，调换条目顺序不改变批验结论。验证不接收明文值或盲因子、不消耗随机数、不引入落盘或持久化，也不改写任何输入。倒置或超限（超过 `2**24` 个整数）区间、证明缺项或长度不符、数值越界、承诺/上下文绑定不符与密码学验证失败均返回 `False`；漏项无法被发现，批次完整性由调用方保证。
+
 ### Merkle 承诺的宽区间证明完整批验
 
 `BoundWideRangeBatch(entries, leaf_count, proof)` 把一批**完整**的宽区间证明条目与一棵 Merkle 树的多包含证明冻结在一起，三个字段依次为：
@@ -1834,6 +1869,21 @@ h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
 空批、计数或索引不符、错误根、叶字节被篡改或内层批验拒绝一律返回 `False`；`root` 不是 `bytes` 等错型抛 `TypeError`。入口不改写任何输入。
 
 `prove_range_wide_batch_bound(entries, *, randbelow=secrets.randbelow) -> (batch, root)` 是规范构造入口：`entries` 沿用 `verify_range_wide_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，不改写输入；每项按上述同一叶编码成叶（即验根时重算的同一份叶），以全索引 `tuple(range(n))` 调 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖从零开始的全部位置、`siblings` 为空），返回批与该批编码叶的 `merkle_root`。构造结果一次通过 `verify_range_wide_batch_bound(batch, root)`，单条目、奇数条目与整批重复都给确定结果；同一份输入重复构造所得的批、根与证明逐字节一致。构造预检失败抛 `TypeError`，空批、成帧计数越出 uint64 或内层 `verify_range_wide_batch` 不通过抛 `ValueError`；`randbelow` 原样透传，随机源自身异常按既有边界原样抛出。
+
+### Merkle 承诺的任意宽度区间证明完整批验
+
+`BoundIntervalRangeBatch(entries, leaf_count, proof)` 把一批**完整**的任意宽度区间证明条目与一棵 Merkle 树的多包含证明冻结在一起，字段形状与 `BoundWideRangeBatch` 相同：`entries` 必须是 `IntervalRangeBatchEntry` 的元组（保序、保留重复项），`leaf_count` 是正的非 `bool` 整数且同时等于 `len(entries)` 与 `proof.leaf_count`，`proof` 的 `indices` 必须无缺口、无重复、无乱序地恰好覆盖 `0 .. leaf_count - 1`（即等于 `tuple(range(leaf_count))`）。三字段均可位置构造，对象按值相等且不可变；输入列表在构造之后再增删条目不影响已冻结的批对象。
+
+每个条目的 Merkle 叶字节以新域标签 `b"zkregion/irb/v1"` 开始，再按固定字段顺序展开：承诺六字段（`element`、`lower`、`upper`、`prime`、`generator`、`h`，按数据类字段顺序）与 `context`，随后是 `IntervalRangeProof` 的六个字段——`low_commitments` 与 `high_commitments` 各先写十进制元素数再逐项写比特承诺，`low_challenges`、`low_responses`、`high_challenges`、`high_responses` 各自先写十进制对数再按对顺序把每对的两个整数逐项展开。承诺全部字段、证明全部字段及上下文因此无一遗漏地参与绑定；四字节无符号大端长度成帧、十进制 ASCII（负号保留）与 Merkle 摘要规则逐项沿用其余完整批的同一套约定。
+
+`verify_range_interval_batch_bound(batch, root) -> bool` 的验证分两步、次序固定，全程不接收明文或盲因子、不消耗随机数：
+
+1. 先对**整批**做嵌套类型预检（批对象、元组条目、承诺六字段、`IntervalRangeProof` 任一层非 `bool` 整数元组、`leaf_count`、`MerkleMultiProof` 三字段、`context` 与 `root` 为 `bytes`，错型含后项错型一律抛唯一的 `TypeError`，末项错型不被前项无效遮蔽）；结构校验（空批、计数与 `proof.leaf_count`/条目数相符、`indices` 恰覆盖全部位置）与根长度恰为三十二字节通过后，才以全部 `(index, leaf)` 调用 `verify_multi_inclusion` 校验 Merkle 根；
+2. 根通过后，原样调用 `verify_range_interval_batch(batch.entries)` 逐条独立验证明。
+
+空批、计数不符、索引未恰好覆盖全部位置、错误根或长度不是三十二字节的根、删减/追加/调换不同条目、篡改任一条目的承诺/证明/上下文字段，以及内层批验拒绝，一律返回 `False`。入口不改写任何输入。
+
+`prove_range_interval_batch_bound(entries) -> (batch, root)` 是规范构造入口：`entries` 沿用 `verify_range_interval_batch` 的全批嵌套类型规则且必须非空，完整预检后保序留重转为元组（之后再改动输入列表不影响返回批），每项按上述同一叶编码成叶，以全索引 `tuple(range(n))` 调 `prove_multi_inclusion` 得到覆盖全部位置的完整多包含证明（`siblings` 为空），返回批与该批编码叶的 `merkle_root`。构造结果一次通过 `verify_range_interval_batch_bound(batch, root)`，单项、奇偶批与重复项均确定；相同有序输入产生相同的根、批与证明，调换不同条目会改变根。构造不消耗随机数；预检失败抛 `TypeError`，空批、成帧计数越出 uint64 或内层 `verify_range_interval_batch` 不通过（倒置或超限区间、证明缺项、数值越界、绑定不符或密码学失败）抛 `ValueError`。
 
 ### Merkle 承诺的区间证明完整批验
 

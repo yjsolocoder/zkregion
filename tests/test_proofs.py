@@ -1,5 +1,6 @@
 import dataclasses
 import hashlib
+import itertools
 import multiprocessing
 import os
 import sqlite3
@@ -107,6 +108,7 @@ from zkregion import (
     encode_merkle_multi_proof_bundle,
     encode_region_proof_bundle,
     merkle_root,
+    merge_inclusion_proofs,
     pedersen_commit,
     prove_consistency,
     prove_consistency_chain,
@@ -31840,6 +31842,354 @@ class MerkleMultiProofBundleTest(unittest.TestCase):
         decoded = decode_merkle_multi_proof_bundle(raw)
         self.assertEqual(decoded, bundle)
         self.assertFalse(verify_merkle_multi_proof_bundle(decoded))
+
+
+class MergeInclusionProofsTest(unittest.TestCase):
+    """Synthesizing compact multi-inclusion proofs from single-leaf proofs."""
+
+    LEAVES = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon"]
+
+    def single_entries(self, leaves, indices, root=None):
+        root = merkle_root(leaves) if root is None else root
+        return [
+            MerkleInclusionBatchEntry(
+                leaves[index], prove_inclusion(leaves, index), root
+            )
+            for index in indices
+        ]
+
+    def merge(self, leaves, indices, leaf_count=None, repeat=()):
+        entries = self.single_entries(leaves, indices)
+        entries = entries + [entries[position] for position in repeat]
+        return merge_inclusion_proofs(
+            entries, len(leaves) if leaf_count is None else leaf_count
+        )
+
+    # ---- happy path / equivalence to prove_multi_inclusion --------------
+
+    def test_matches_prove_multi_inclusion_for_every_subset(self):
+        root = merkle_root(self.LEAVES)
+        for mask in range(1, 1 << len(self.LEAVES)):
+            indices = tuple(i for i in range(len(self.LEAVES)) if mask & (1 << i))
+            bundle = self.merge(self.LEAVES, indices)
+            self.assertIsInstance(bundle, MerkleMultiProofBundle)
+            self.assertEqual(bundle.root, root)
+            self.assertEqual(
+                bundle.proof, prove_multi_inclusion(self.LEAVES, indices)
+            )
+            self.assertEqual(
+                bundle.entries,
+                tuple((i, self.LEAVES[i]) for i in indices),
+            )
+            self.assertTrue(verify_merkle_multi_proof_bundle(bundle))
+
+    def test_matches_across_tree_sizes_and_shapes(self):
+        for size in range(1, 13):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            root = merkle_root(leaves)
+            subsets = [
+                (0,),
+                (size - 1,),
+                tuple(sorted({0, size - 1})),
+                tuple(range(size)),
+            ]
+            if size >= 4:
+                subsets.append((1, 2))  # adjacent pair
+                subsets.append(tuple(i for i in range(size) if i % 2 == 1))
+            for indices in subsets:
+                bundle = self.merge(leaves, indices)
+                self.assertEqual(
+                    bundle.proof, prove_multi_inclusion(leaves, indices),
+                    f"size={size} indices={indices}",
+                )
+                self.assertEqual(bundle.root, root)
+                self.assertTrue(
+                    verify_merkle_multi_proof_bundle(bundle),
+                    f"size={size} indices={indices}",
+                )
+
+    def test_single_leaf_tree(self):
+        bundle = self.merge([b"only"], (0,))
+        self.assertEqual(bundle.root, merkle_root([b"only"]))
+        self.assertEqual(
+            bundle.proof, MerkleMultiProof(1, (0,), ())
+        )
+        self.assertEqual(bundle.entries, ((0, b"only"),))
+        self.assertTrue(verify_merkle_multi_proof_bundle(bundle))
+
+    def test_full_coverage_has_empty_siblings(self):
+        for size in (1, 2, 3, 5, 8):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            bundle = self.merge(leaves, tuple(range(size)))
+            self.assertEqual(bundle.proof.siblings, (), size)
+            self.assertTrue(verify_merkle_multi_proof_bundle(bundle))
+
+    def test_non_power_of_two_and_scattered_indices(self):
+        leaves = [f"leaf-{i}".encode() for i in range(13)]
+        bundle = self.merge(leaves, (0, 2, 5, 7, 11, 12))
+        self.assertEqual(
+            bundle.proof, prove_multi_inclusion(leaves, (0, 2, 5, 7, 11, 12))
+        )
+        self.assertTrue(verify_merkle_multi_proof_bundle(bundle))
+
+    def test_adjacent_pair_shares_parent(self):
+        bundle = self.merge([b"a", b"b", b"c", b"d"], (0, 1))
+        self.assertEqual(
+            bundle.proof.siblings,
+            (node_digest(leaf_digest(b"c"), leaf_digest(b"d")),),
+        )
+
+    def test_odd_last_node_self_duplication(self):
+        # three leaves proving 0 and 2: only H(b) is supplied
+        bundle = self.merge([b"a", b"b", b"c"], (0, 2))
+        self.assertEqual(bundle.proof.siblings, (leaf_digest(b"b"),))
+
+    # ---- ordering and duplication ---------------------------------------
+
+    def test_entries_may_arrive_out_of_order(self):
+        leaves = self.LEAVES
+        forward = self.merge(leaves, (0, 2, 4))
+        reversed_entries = list(reversed(self.single_entries(leaves, (0, 2, 4))))
+        shuffled = self.single_entries(leaves, (4, 0, 2))
+        self.assertEqual(
+            merge_inclusion_proofs(reversed_entries, len(leaves)), forward
+        )
+        self.assertEqual(
+            merge_inclusion_proofs(shuffled, len(leaves)), forward
+        )
+        self.assertEqual(forward.proof.indices, (0, 2, 4))
+
+    def test_identical_duplicate_entries_collapse_to_one(self):
+        entries = self.single_entries(self.LEAVES, (1, 3))
+        once = merge_inclusion_proofs(entries, len(self.LEAVES))
+        repeated = merge_inclusion_proofs(
+            [entries[0], entries[1], entries[0], entries[1], entries[0]],
+            len(self.LEAVES),
+        )
+        self.assertEqual(repeated, once)
+        self.assertEqual(repeated.proof.indices, (1, 3))
+        self.assertEqual(len(repeated.entries), 2)
+
+    def test_value_equal_under_any_permutation_or_repetition(self):
+        leaves = [f"leaf-{i}".encode() for i in range(11)]
+        indices = (0, 2, 5, 8, 10)
+        base = self.single_entries(leaves, indices)
+        outcomes = {
+            merge_inclusion_proofs(list(perm), len(leaves))
+            for perm in itertools.permutations(base)
+        }
+        outcomes.add(
+            merge_inclusion_proofs(base + [base[0]] * 3 + [base[-1]], len(leaves))
+        )
+        self.assertEqual(len(outcomes), 1)
+
+    def test_equal_leaf_content_at_distinct_indices_is_kept_twice(self):
+        leaves = [b"same", b"b", b"same", b"d"]
+        bundle = self.merge(leaves, (0, 2))
+        self.assertEqual(bundle.proof.indices, (0, 2))
+        self.assertEqual(
+            bundle.entries, ((0, b"same"), (2, b"same"))
+        )
+        self.assertEqual(
+            bundle.proof, prove_multi_inclusion(leaves, (0, 2))
+        )
+
+    # ---- envelope interop -------------------------------------------------
+
+    def test_bundle_round_trips_and_verifies_after_decoding(self):
+        for indices in ((1,), (0, 4), (1, 2, 3), tuple(range(5))):
+            bundle = self.merge(self.LEAVES, indices)
+            raw = encode_merkle_multi_proof_bundle(bundle)
+            decoded = decode_merkle_multi_proof_bundle(raw)
+            self.assertEqual(decoded, bundle)
+            self.assertTrue(verify_merkle_multi_proof_bundle(decoded))
+            self.assertEqual(
+                encode_merkle_multi_proof_bundle(decoded), raw
+            )
+
+    # ---- type errors ------------------------------------------------------
+
+    def test_entries_container_type_errors(self):
+        good = self.single_entries(self.LEAVES, (1, 3))
+        for bad in ("entries", b"entries", b"\x00\x01", 42, None, 3.14,
+                    {good[0]}, {1: good[0]}, iter(good), frozenset(good)):
+            with self.assertRaises(TypeError):
+                merge_inclusion_proofs(bad, 5)
+
+    def test_leaf_count_type_errors(self):
+        good = self.single_entries(self.LEAVES, (1, 3))
+        for bad in (1.0, "5", None, True, False, 5 + 0j, (5,), [5]):
+            with self.assertRaises(TypeError):
+                merge_inclusion_proofs(good, bad)
+
+    def test_nested_type_errors(self):
+        root = merkle_root(self.LEAVES)
+        good_proof = prove_inclusion(self.LEAVES, 1)
+        bad_batches = [
+            ["not-an-entry"],
+            [MerkleInclusionBatchEntry("leaf", good_proof, root)],
+            [MerkleInclusionBatchEntry(bytearray(b"x"), good_proof, root)],
+            [MerkleInclusionBatchEntry(self.LEAVES[1], (), root)],
+            [MerkleInclusionBatchEntry(self.LEAVES[1],
+                                       MerkleProof(True, ()), root)],
+            [MerkleInclusionBatchEntry(self.LEAVES[1],
+                                       MerkleProof(1.0, ()), root)],
+            [MerkleInclusionBatchEntry(self.LEAVES[1],
+                                       MerkleProof(1, ["x"]), root)],
+            [MerkleInclusionBatchEntry(self.LEAVES[1],
+                                       MerkleProof(1, ("x",)), root)],
+            [MerkleInclusionBatchEntry(self.LEAVES[1], good_proof, "root")],
+            [MerkleInclusionBatchEntry(self.LEAVES[1], good_proof,
+                                       bytearray(root))],
+        ]
+        for batch in bad_batches:
+            with self.assertRaises(TypeError):
+                merge_inclusion_proofs(batch, 5)
+
+    def test_type_errors_take_precedence_over_value_errors(self):
+        # an otherwise-invalid (too-short path) first entry cannot mask a
+        # type error in a later entry or a bad leaf_count type
+        broken = MerkleInclusionBatchEntry(
+            self.LEAVES[1], MerkleProof(1, ()), merkle_root(self.LEAVES)
+        )
+        with self.assertRaises(TypeError):
+            merge_inclusion_proofs([broken, "later"], 5)
+        with self.assertRaises(TypeError):
+            merge_inclusion_proofs([broken], True)
+
+    # ---- value errors -----------------------------------------------------
+
+    def test_empty_entries_is_value_error(self):
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs([], 5)
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs((), 5)
+
+    def test_non_positive_leaf_count_is_value_error(self):
+        good = self.single_entries(self.LEAVES, (1,))
+        for bad_count in (0, -1, -32):
+            with self.assertRaises(ValueError):
+                merge_inclusion_proofs(good, bad_count)
+
+    def test_index_out_of_range_is_value_error(self):
+        root = merkle_root(self.LEAVES)
+        digest32 = b"\x01" * 32
+        for bad_index in (5, 6, 100):
+            entry = MerkleInclusionBatchEntry(
+                b"x", MerkleProof(bad_index, (digest32,) * 3), root
+            )
+            with self.assertRaises(ValueError):
+                merge_inclusion_proofs([entry], 5)
+
+    def test_different_roots_is_value_error(self):
+        first = self.single_entries(self.LEAVES, (1,))
+        other_root = merkle_root([b"a", b"b", b"c", b"d", b"e"])
+        second = self.single_entries(self.LEAVES, (3,), root=other_root)
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs(first + second, 5)
+
+    def test_bad_digest_lengths_are_value_errors(self):
+        root = merkle_root(self.LEAVES)
+        proof = prove_inclusion(self.LEAVES, 1)
+        short_root = MerkleInclusionBatchEntry(
+            self.LEAVES[1], proof, root[:-1]
+        )
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs([short_root], 5)
+        short_sibling = MerkleProof(
+            1, proof.siblings[:-1] + (proof.siblings[-1][:16],)
+        )
+        bad_sibling = MerkleInclusionBatchEntry(
+            self.LEAVES[1], short_sibling, root
+        )
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs([bad_sibling], 5)
+
+    def test_path_length_must_match_declared_height(self):
+        root = merkle_root(self.LEAVES)
+        proof = prove_inclusion(self.LEAVES, 1)
+        too_short = MerkleInclusionBatchEntry(
+            self.LEAVES[1], MerkleProof(1, proof.siblings[:-1]), root
+        )
+        too_long = MerkleInclusionBatchEntry(
+            self.LEAVES[1],
+            MerkleProof(1, proof.siblings + (b"\x02" * 32,)),
+            root,
+        )
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs([too_short], 5)
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs([too_long], 5)
+        # a count with a different height is a value error even when in range
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs(
+                self.single_entries(self.LEAVES, (1,)), 16
+            )
+
+    def test_odd_last_node_must_self_duplicate(self):
+        leaves = [f"leaf-{i}".encode() for i in range(6)]
+        root = merkle_root(leaves)
+        proof = prove_inclusion(leaves, 5)
+        # at the 3-node level the last node must duplicate itself
+        broken = MerkleProof(
+            5, proof.siblings[:1] + (b"\x03" * 32,) + proof.siblings[2:]
+        )
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs(
+                [MerkleInclusionBatchEntry(leaves[5], broken, root)], 6
+            )
+
+    def test_verification_failure_is_value_error(self):
+        root = merkle_root(self.LEAVES)
+        proof = prove_inclusion(self.LEAVES, 1)
+        tampered = MerkleProof(
+            1, (proof.siblings[0][::-1],) + proof.siblings[1:]
+        )
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs(
+                [MerkleInclusionBatchEntry(self.LEAVES[1], tampered, root)], 5
+            )
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs(
+                [MerkleInclusionBatchEntry(b"wrong", proof, root)], 5
+            )
+
+    def test_same_index_with_different_leaf_or_path_is_value_error(self):
+        root = merkle_root(self.LEAVES)
+        first = self.single_entries(self.LEAVES, (1,))[0]
+        proof = prove_inclusion(self.LEAVES, 1)
+        other_leaf = MerkleInclusionBatchEntry(b"other", proof, root)
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs([first, other_leaf], 5)
+        tampered = MerkleProof(
+            1, (proof.siblings[0][::-1],) + proof.siblings[1:]
+        )
+        other_path = MerkleInclusionBatchEntry(
+            self.LEAVES[1], tampered, root
+        )
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs([first, other_path], 5)
+
+    def test_declared_shape_that_changes_local_paths_is_rejected(self):
+        # a 6-tree claiming 5 leaves changes the odd-last behaviour at index 4
+        six = [f"leaf-{i}".encode() for i in range(6)]
+        entries = self.single_entries(six, (1, 4))
+        with self.assertRaises(ValueError):
+            merge_inclusion_proofs(entries, 5)
+
+    # ---- no mutation ------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        leaves = self.LEAVES
+        entries = self.single_entries(leaves, (1, 3, 4))
+        entries_list = list(entries)
+        snapshot = repr(entries_list)
+        merge_inclusion_proofs(entries_list, len(leaves))
+        self.assertEqual(repr(entries_list), snapshot)
+        self.assertEqual(len(entries_list), 3)
+        tuple_snapshot = tuple(entries_list)
+        merge_inclusion_proofs(tuple_snapshot, len(leaves))
+        self.assertEqual(tuple(entries_list), tuple_snapshot)
 
 
 if __name__ == "__main__":

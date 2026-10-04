@@ -229,6 +229,7 @@ __all__ = [
     "encode_merkle_multi_proof_bundle",
     "encode_region_proof_bundle",
     "merkle_root",
+    "merge_inclusion_proofs",
     "pedersen_commit",
     "prove_consistency",
     "prove_consistency_batch_bound",
@@ -8327,6 +8328,187 @@ def verify_merkle_multi_proof_bundle(bundle: MerkleMultiProofBundle) -> bool:
     _check_merkle_multi_bundle_proof_types(bundle.proof)
     _check_merkle_multi_bundle_entries_types(bundle.entries)
     return verify_multi_inclusion(bundle.entries, bundle.proof, bundle.root)
+
+
+def merge_inclusion_proofs(
+    entries: Sequence[MerkleInclusionBatchEntry],
+    leaf_count: int,
+) -> MerkleMultiProofBundle:
+    """Synthesize a compact multi-inclusion proof from single-leaf proofs.
+
+    Each :class:`MerkleInclusionBatchEntry` carries its own valid
+    :class:`MerkleProof` (``index`` plus leaf-to-root ``siblings``), its
+    ``leaf`` and the tree ``root``; the full leaf set and the unselected
+    leaves are never required. ``entries`` must be a list or tuple of
+    entries (strings and ``bytes`` are rejected) and ``leaf_count`` a
+    non-``bool`` integer. Every entry must belong to the same 32-byte
+    root, every index must lie within ``0 .. leaf_count - 1``, every
+    single-leaf path must have exactly the height the declared leaf count
+    implies and obey the odd-last-node duplication rule, and every path
+    must verify to the shared root; duplicate entries (same index, leaf,
+    proof and root) collapse to one, while equal leaf content at distinct
+    indices is kept separately. Entries may arrive in any order.
+
+    The result is a :class:`MerkleMultiProofBundle` with the selected
+    leaves placed in increasing index order; its compact proof uses the
+    existing hashing, odd-node duplication and level-by-level
+    left-to-right sibling ordering, so for valid single proofs generated
+    from the same full leaf set it is field-for-field equal to what
+    :func:`prove_multi_inclusion` produces for the same index set — in
+    particular, covering every leaf yields an empty ``siblings`` tuple.
+    The bundle verifies with :func:`verify_merkle_multi_proof_bundle` and
+    round-trips through :func:`encode_merkle_multi_proof_bundle` /
+    :func:`decode_merkle_multi_proof_bundle`. ``leaf_count`` is a
+    caller-supplied tree shape: it is not claimed that the root and the
+    local paths uniquely determine the original tree's leaf count.
+
+    All nested types of the whole input are preflighted before any value
+    rule runs, so a wrong type — a non-list/tuple ``entries``, a
+    non-:class:`MerkleInclusionBatchEntry` item, a malformed nested field
+    or a ``bool`` / non-integer ``leaf_count`` — raises
+    :class:`TypeError` even when another entry is otherwise invalid.
+    Every other invalidity (an empty batch, a non-positive
+    ``leaf_count``, an out-of-range or negative index, differing roots,
+    a root or sibling digest that is not 32 bytes, a path with the wrong
+    height, a duplicated-node or overlapping-path mismatch, an entry that
+    fails verification, or the same index presented with different leaf
+    bytes or different paths) raises :class:`ValueError`; no partial
+    bundle is ever returned. Inputs are never mutated and nothing is
+    written to the file system or a database.
+    """
+    if not isinstance(entries, (list, tuple)):
+        raise TypeError(
+            "entries must be a list or tuple of MerkleInclusionBatchEntry"
+        )
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("leaf_count must be an integer")
+    # Preflight every nested type in every entry before any value rule.
+    items = _check_inclusion_batch_entries_types(entries)
+
+    if not items:
+        raise ValueError("entries must not be empty")
+    if leaf_count < 1:
+        raise ValueError("leaf_count must be positive")
+
+    expected_height = 0
+    level_size = leaf_count
+    while level_size > 1:
+        expected_height += 1
+        level_size = (level_size + 1) // 2
+
+    root = items[0].root
+    if len(root) != _MERKLE_DIGEST_SIZE:
+        raise ValueError("root must be a 32-byte digest")
+
+    # index -> (leaf, per-level sibling digests leaf-to-root); duplicate
+    # entries collapse, conflicting entries for the same index are rejected.
+    paths: dict[int, tuple[bytes, tuple[bytes, ...]]] = {}
+    for position, entry in enumerate(items):
+        if len(entry.root) != _MERKLE_DIGEST_SIZE:
+            raise ValueError(f"entries[{position}] root must be a 32-byte digest")
+        if entry.root != root:
+            raise ValueError("all entries must commit to the same root")
+        proof = entry.proof
+        if proof.index < 0 or proof.index >= leaf_count:
+            raise ValueError(
+                f"entries[{position}] index {proof.index} out of range for "
+                f"{leaf_count} leaves"
+            )
+        if any(len(sibling) != _MERKLE_DIGEST_SIZE for sibling in proof.siblings):
+            raise ValueError(
+                f"entries[{position}] proof siblings must be 32-byte digests"
+            )
+        if len(proof.siblings) != expected_height:
+            raise ValueError(
+                f"entries[{position}] proof path length {len(proof.siblings)} "
+                f"does not match the height {expected_height} of a "
+                f"{leaf_count}-leaf tree"
+            )
+        # Walk the single-leaf path while replaying the declared tree shape:
+        # at an odd-sized level the last node duplicates itself, so its
+        # sibling slot must carry that same node, and every other slot's
+        # sibling must hash to the node one level up.
+        digest = _leaf_digest(entry.leaf)
+        node_position = proof.index
+        size = leaf_count
+        for level, sibling in enumerate(proof.siblings):
+            if node_position == size - 1 and size % 2 == 1:
+                if sibling != digest:
+                    raise ValueError(
+                        f"entries[{position}] proof level {level} must "
+                        "duplicate the odd last node"
+                    )
+                parent = _node_digest(digest, digest)
+            else:
+                if node_position % 2 == 0:
+                    parent = _node_digest(digest, sibling)
+                else:
+                    parent = _node_digest(sibling, digest)
+            digest = parent
+            node_position //= 2
+            size = (size + 1) // 2
+        if not hmac.compare_digest(digest, root):
+            raise ValueError(f"entries[{position}] proof does not verify to root")
+        signature = (entry.leaf, proof.siblings)
+        existing = paths.get(proof.index)
+        if existing is not None and existing != signature:
+            raise ValueError(
+                f"entries[{position}] disagrees with an earlier entry for "
+                f"index {proof.index}"
+            )
+        paths.setdefault(proof.index, signature)
+
+    # Every overlapping (level, sibling-position) slot across the paths
+    # must carry the same digest; the single-leaf replays above only
+    # constrain each path on its own.
+    slot_digests: dict[tuple[int, int], bytes] = {}
+    for index, (_, siblings) in paths.items():
+        node_position = index
+        size = leaf_count
+        for level, sibling in enumerate(siblings):
+            slot = (level, node_position ^ 1)
+            previous = slot_digests.get(slot)
+            if previous is not None and previous != sibling:
+                raise ValueError(
+                    "overlapping proof paths disagree on a shared sibling"
+                )
+            slot_digests.setdefault(slot, sibling)
+            node_position //= 2
+            size = (size + 1) // 2
+
+    indices = tuple(sorted(paths))
+    # Rebuild the compact sibling stream exactly as prove_multi_inclusion
+    # orders it: level by level leaf-to-root, left to right within a
+    # level, skipping siblings that are themselves proven and the
+    # self-duplication of an odd last node. Every collected digest is
+    # taken from the single-leaf paths (checked above), keyed by level
+    # and sibling position.
+    compact_siblings: list[bytes] = []
+    known = list(indices)
+    size = leaf_count
+    level = 0
+    while size > 1:
+        known_set = set(known)
+        for node_position in known:  # ascending: left to right
+            sibling_position = node_position ^ 1
+            if sibling_position in known_set:
+                continue  # sibling is proven too, nothing to collect
+            if node_position == size - 1 and size % 2 == 1:
+                continue  # odd last node duplicates itself
+            compact_siblings.append(slot_digests[(level, sibling_position)])
+        size = (size + 1) // 2
+        known = sorted({position // 2 for position in known})
+        level += 1
+
+    proof = MerkleMultiProof(
+        leaf_count=leaf_count,
+        indices=indices,
+        siblings=tuple(compact_siblings),
+    )
+    bundle_entries = tuple((index, paths[index][0]) for index in indices)
+    return MerkleMultiProofBundle(
+        root=root, proof=proof, entries=bundle_entries
+    )
 
 
 @dataclass(frozen=True)

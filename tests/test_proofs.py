@@ -76,6 +76,7 @@ from zkregion import (
     RegionContainsBatchReplayGuard,
     RegionContainsEntry,
     RegionContainsReplayGuard,
+    RegionIntervalProof,
     RegionProof,
     RegionProofBundle,
     RegionReplayGuard,
@@ -121,6 +122,7 @@ from zkregion import (
     prove_range_wide_batch_bound,
     prove_region,
     prove_region_contains_bound,
+    prove_region_interval,
     prove_region_wide,
     prove_region_wide_batch_bound,
     prove_schnorr_batch_bound,
@@ -160,6 +162,7 @@ from zkregion import (
     verify_region_bound,
     verify_region_contains_batch,
     verify_region_contains_bound,
+    verify_region_interval,
     verify_region_proof_bundle,
     verify_region_wide,
     verify_region_wide_batch,
@@ -4786,6 +4789,709 @@ class RegionWideProofTest(unittest.TestCase):
         )
         verify_region_wide(x_commitment, y_commitment, region, proof, b"ctx")
         self.assertEqual((x_commitment, y_commitment, proof), snapshot)
+
+
+class RegionIntervalProofTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def commit_small(self, value, lower, upper, blinding, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    # The two axes deliberately use different legal group parameters: x uses
+    # the small demonstration prime and y uses the default large group.
+    def commit_axis(self, axis, value, lower, upper, blinding):
+        if axis == "x":
+            return self.commit_small(value, lower, upper, blinding)
+        return pedersen_commit(value, lower, upper, blinding=blinding)
+
+    # x axis: 106 integers (non-power-of-two, k = 7); y axis: 3001 integers
+    # under the default group (non-power-of-two, k = 12).
+    def prove(
+        self,
+        x=40,
+        y=-300,
+        region=None,
+        context=b"ctx",
+        x_blinding=1234,
+        y_blinding=4321,
+        randbelow_factory=counter_randbelow,
+    ):
+        region = Region(-5, 100, -1000, 2000) if region is None else region
+        x_commitment, x_r = self.commit_axis(
+            "x", x, region.min_x, region.max_x, x_blinding
+        )
+        y_commitment, y_r = self.commit_axis(
+            "y", y, region.min_y, region.max_y, y_blinding
+        )
+        proof = prove_region_interval(
+            x_commitment, y_commitment, x, y, x_r, y_r, region, context,
+            randbelow=randbelow_factory(),
+        )
+        return x_commitment, y_commitment, region, proof
+
+    @staticmethod
+    def sub_context(axis, context, region, x_commitment, y_commitment):
+        items = [b"zkregion/region/v1", axis, context]
+        items.extend(
+            str(bound).encode("ascii")
+            for bound in (region.min_x, region.max_x, region.min_y, region.max_y)
+        )
+        for commitment in (x_commitment, y_commitment):
+            items.extend(
+                str(getattr(commitment, name)).encode("ascii")
+                for name in ("element", "lower", "upper", "prime", "generator", "h")
+            )
+        transcript = b""
+        for item in items:
+            transcript += len(item).to_bytes(4, "big") + item
+        return transcript
+
+    @staticmethod
+    def integer_count(proof):
+        total = 0
+        for sub_proof in (proof.x_proof, proof.y_proof):
+            for field in dataclasses.astuple(sub_proof):
+                for entry in field:
+                    total += len(entry) if isinstance(entry, tuple) else 1
+        return total
+
+    # ---- object -------------------------------------------------------------
+
+    def test_positional_construction_equality_and_no_validation(self):
+        raw = RegionIntervalProof("x", "y")
+        self.assertEqual((raw.x_proof, raw.y_proof), ("x", "y"))
+        x_commitment, y_commitment, region, proof = self.prove()
+        rebuilt = RegionIntervalProof(proof.x_proof, proof.y_proof)
+        self.assertEqual(rebuilt, proof)
+        self.assertEqual(
+            {field.name for field in dataclasses.fields(proof)},
+            {"x_proof", "y_proof"},
+        )
+        self.assertIsInstance(proof.x_proof, IntervalRangeProof)
+        self.assertIsInstance(proof.y_proof, IntervalRangeProof)
+
+    def test_proof_is_immutable(self):
+        _, _, _, proof = self.prove()
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            proof.x_proof = proof.y_proof
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            proof.y_proof = proof.x_proof
+
+    def test_proof_carries_neither_coordinates_nor_blindings(self):
+        _, _, _, proof = self.prove(x=40, y=-300)
+        # only the two sub-proofs, whose own fields are group elements
+        for sub_proof in (proof.x_proof, proof.y_proof):
+            self.assertEqual(
+                {field.name for field in dataclasses.fields(sub_proof)},
+                {
+                    "low_commitments",
+                    "low_challenges",
+                    "low_responses",
+                    "high_commitments",
+                    "high_challenges",
+                    "high_responses",
+                },
+            )
+
+    # ---- honest round trips -------------------------------------------------
+
+    def test_honest_non_power_of_two_proof_verifies(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+        self.assertEqual(len(proof.x_proof.low_commitments), 7)
+        self.assertEqual(len(proof.y_proof.low_commitments), 12)
+        self.assertTrue(verify_region_interval(x_commitment, y_commitment, region, proof, b"ctx"))
+        self.assertTrue(
+            verify_region_interval(x_commitment, y_commitment, region, proof, context=b"ctx")
+        )
+        # 10k integers per axis: size grows in the bit length of the counts,
+        # never in the number of rectangle points.
+        self.assertEqual(self.integer_count(proof), 10 * (7 + 12))
+
+    def test_region_corners_edges_and_center_prove(self):
+        region = Region(-5, 100, -1000, 2000)
+        for x, y in (
+            (-5, -1000),
+            (100, 2000),
+            (-5, 2000),
+            (100, -1000),
+            (40, -300),
+            (-5, 333),   # left edge interior
+            (100, 333),  # right edge interior
+            (40, -1000), # bottom edge interior
+            (40, 2000),  # top edge interior
+        ):
+            x_commitment, y_commitment, region, proof = self.prove(x=x, y=y, region=region)
+            self.assertTrue(
+                verify_region_interval(x_commitment, y_commitment, region, proof, b"ctx"),
+                f"({x}, {y})",
+            )
+
+    def test_negative_and_crossing_zero_regions(self):
+        for bounds, point in (
+            ((-1000, -1, -1000, -1), (-1, -1000)),
+            ((-128, 127, -50, 49), (0, 0)),
+            ((-3, 3, -3, 3), (-3, 3)),
+        ):
+            region = Region(*bounds)
+            x_commitment, y_commitment, region, proof = self.prove(
+                x=point[0], y=point[1], region=region
+            )
+            self.assertTrue(
+                verify_region_interval(x_commitment, y_commitment, region, proof, b"ctx"),
+                bounds,
+            )
+
+    def test_degenerate_point_rectangle(self):
+        region = Region(7, 7, -9, -9)
+        x_commitment, y_commitment, region, proof = self.prove(x=7, y=-9, region=region)
+        self.assertEqual(len(proof.x_proof.low_commitments), 1)
+        self.assertEqual(len(proof.y_proof.low_commitments), 1)
+        self.assertEqual(self.integer_count(proof), 20)
+        self.assertTrue(verify_region_interval(x_commitment, y_commitment, region, proof, b"ctx"))
+
+    def test_degenerate_line_segments(self):
+        for region, point in (
+            (Region(0, 100, 5, 5), (100, 5)),    # horizontal segment
+            (Region(-3, -3, -100, 100), (-3, 0)),  # vertical segment
+        ):
+            x_commitment, y_commitment, region, proof = self.prove(
+                x=point[0], y=point[1], region=region
+            )
+            self.assertTrue(
+                verify_region_interval(x_commitment, y_commitment, region, proof, b"ctx"),
+                point,
+            )
+
+    def test_various_non_power_of_two_widths(self):
+        for n_x, n_y in ((1, 101), (2, 1000), (127, 129), (1000, 257), (4095, 4097)):
+            region = Region(0, n_x - 1, 0, n_y - 1)
+            x_commitment, y_commitment, region, proof = self.prove(
+                x=n_x - 1, y=n_y - 1, region=region
+            )
+            expected_kx = max(1, (n_x - 1).bit_length())
+            expected_ky = max(1, (n_y - 1).bit_length())
+            self.assertEqual(len(proof.x_proof.low_commitments), expected_kx, n_x)
+            self.assertEqual(len(proof.y_proof.low_commitments), expected_ky, n_y)
+            self.assertTrue(
+                verify_region_interval(x_commitment, y_commitment, region, proof, b"ctx"),
+                (n_x, n_y),
+            )
+
+    def test_power_of_two_widths_still_prove(self):
+        region = Region(0, 255, -2048, 2047)
+        x_commitment, y_commitment, region, proof = self.prove(
+            x=255, y=-2048, region=region
+        )
+        self.assertEqual(len(proof.x_proof.low_commitments), 8)
+        self.assertEqual(len(proof.y_proof.low_commitments), 12)
+        self.assertTrue(verify_region_interval(x_commitment, y_commitment, region, proof, b"ctx"))
+
+    def test_large_non_power_of_two_rectangle_with_default_group(self):
+        region = Region(0, 999999, -500000, 500000)
+        x_commitment, x_r = pedersen_commit(500000, 0, 999999, blinding=987654321)
+        y_commitment, y_r = pedersen_commit(-1, -500000, 500000, blinding=123456789)
+        proof = prove_region_interval(
+            x_commitment, y_commitment, 500000, -1, x_r, y_r, region, b"big",
+            randbelow=counter_randbelow(),
+        )
+        self.assertEqual(len(proof.x_proof.low_commitments), 20)
+        self.assertEqual(len(proof.y_proof.low_commitments), 20)
+        self.assertTrue(verify_region_interval(x_commitment, y_commitment, region, proof, b"big"))
+
+    def test_maximum_count_2_pow_24_accepted(self):
+        region = Region(0, (1 << 24) - 1, 0, 100)
+        x_commitment, x_r = pedersen_commit(1234567, 0, (1 << 24) - 1, blinding=424242)
+        y_commitment, y_r = pedersen_commit(50, 0, 100, prime=self.PRIME,
+                                             generator=self.G, h=self.H, blinding=777)
+        proof = prove_region_interval(
+            x_commitment, y_commitment, 1234567, 50, x_r, y_r, region,
+            randbelow=counter_randbelow(),
+        )
+        self.assertEqual(len(proof.x_proof.low_commitments), 24)
+        self.assertEqual(self.integer_count(proof), 10 * (24 + 7))
+        self.assertTrue(verify_region_interval(x_commitment, y_commitment, region, proof))
+
+    def test_default_empty_context_round_trips(self):
+        x_commitment, y_commitment, region, proof = self.prove(context=b"")
+        self.assertTrue(verify_region_interval(x_commitment, y_commitment, region, proof))
+
+    def test_fixed_randbelow_is_reproducible(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+        x_r, y_r = 1234, 4321
+        first = prove_region_interval(
+            x_commitment, y_commitment, 40, -300, x_r, y_r, region, b"c",
+            randbelow=counter_randbelow(),
+        )
+        second = prove_region_interval(
+            x_commitment, y_commitment, 40, -300, x_r, y_r, region, b"c",
+            randbelow=counter_randbelow(),
+        )
+        self.assertEqual(first, second)
+
+    # ---- transcript ----------------------------------------------------------
+
+    def test_sub_proofs_use_the_specified_context(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+        x_context = self.sub_context(b"x", b"ctx", region, x_commitment, y_commitment)
+        y_context = self.sub_context(b"y", b"ctx", region, x_commitment, y_commitment)
+        self.assertTrue(verify_range_interval(x_commitment, proof.x_proof, x_context))
+        self.assertTrue(verify_range_interval(y_commitment, proof.y_proof, y_context))
+        # axes are not interchangeable
+        self.assertFalse(verify_range_interval(x_commitment, proof.x_proof, y_context))
+        self.assertFalse(verify_range_interval(y_commitment, proof.y_proof, x_context))
+        # the plain external context alone does not verify a sub-proof
+        self.assertFalse(verify_range_interval(x_commitment, proof.x_proof, b"ctx"))
+
+    # ---- prove-time validation ----------------------------------------------
+
+    def test_commitment_range_must_match_region(self):
+        x_commitment, x_r = self.commit_axis("x", 40, -5, 100, 1234)
+        y_commitment, y_r = self.commit_axis("y", -300, -1000, 2000, 4321)
+        args = (x_commitment, y_commitment, 40, -300, x_r, y_r)
+        with self.assertRaises(ValueError):
+            prove_region_interval(*args, Region(-5, 99, -1000, 2000))
+        with self.assertRaises(ValueError):
+            prove_region_interval(*args, Region(-4, 100, -1000, 2000))
+        with self.assertRaises(ValueError):
+            prove_region_interval(*args, Region(-5, 100, -1000, 1999))
+        with self.assertRaises(ValueError):
+            prove_region_interval(*args, Region(-5, 100, -999, 2000))
+
+    def test_invalid_opening_rejected(self):
+        x_commitment, y_commitment, region, _ = self.prove()
+        x_r, y_r = 1234, 4321
+        with self.assertRaises(ValueError):
+            prove_region_interval(x_commitment, y_commitment, 41, -300, x_r, y_r, region)
+        with self.assertRaises(ValueError):
+            prove_region_interval(x_commitment, y_commitment, 40, -300, x_r + 1, y_r, region)
+        with self.assertRaises(ValueError):
+            prove_region_interval(x_commitment, y_commitment, 40, -299, x_r, y_r, region)
+        with self.assertRaises(ValueError):
+            prove_region_interval(x_commitment, y_commitment, 40, -300, x_r, y_r + 1, region)
+
+    def test_coordinate_outside_declared_range_rejected(self):
+        x_commitment, y_commitment, region, _ = self.prove()
+        with self.assertRaises(ValueError):
+            prove_region_interval(x_commitment, y_commitment, 101, -300, 1234, 4321, region)
+        with self.assertRaises(ValueError):
+            prove_region_interval(x_commitment, y_commitment, -6, -300, 1234, 4321, region)
+        with self.assertRaises(ValueError):
+            prove_region_interval(x_commitment, y_commitment, 40, 2001, 1234, 4321, region)
+
+    def test_count_over_2_pow_24_rejected(self):
+        region = Region(0, 1 << 24, 0, 100)
+        x_commitment, x_r = pedersen_commit(0, 0, 1 << 24, blinding=1234)
+        y_commitment, y_r = self.commit_axis("y", 50, 0, 100, 4321)
+        with self.assertRaises(ValueError):
+            prove_region_interval(
+                x_commitment, y_commitment, 0, 50, x_r, y_r, region,
+                randbelow=counter_randbelow(),
+            )
+
+    def test_illegal_commitment_parameters_rejected(self):
+        x_commitment, y_commitment, region, _ = self.prove()
+        bad = dataclasses.replace(x_commitment, prime=3)
+        with self.assertRaises(ValueError):
+            prove_region_interval(bad, y_commitment, 40, -300, 1234, 4321, region)
+        bad = dataclasses.replace(y_commitment, generator=1)
+        with self.assertRaises(ValueError):
+            prove_region_interval(x_commitment, bad, 40, -300, 1234, 4321, region)
+
+    def test_validation_failures_consume_no_randomness(self):
+        x_commitment, y_commitment, region, _ = self.prove()
+
+        class RandSpy:
+            def __init__(self):
+                self.calls = 0
+
+            def __call__(self, upper):
+                self.calls += 1
+                return 0
+
+        cases = (
+            (x_commitment, y_commitment, 41, -300, 1234, 4321, region),
+            (x_commitment, y_commitment, 40, -300, 1234, 9999, region),
+            (x_commitment, y_commitment, 40, -300, 1234, 4321,
+             Region(-5, 99, -1000, 2000)),
+        )
+        for case in cases:
+            spy = RandSpy()
+            with self.assertRaises(ValueError):
+                prove_region_interval(*case, randbelow=spy)
+            self.assertEqual(spy.calls, 0)
+        bad = dataclasses.replace(x_commitment, prime=3)
+        spy = RandSpy()
+        with self.assertRaises(ValueError):
+            prove_region_interval(bad, y_commitment, 40, -300, 1, 4321, region, randbelow=spy)
+        self.assertEqual(spy.calls, 0)
+
+    def test_prove_type_errors(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+        with self.assertRaises(TypeError):
+            prove_region_interval("commitment", y_commitment, 40, -300, 1234, 4321, region)
+        with self.assertRaises(TypeError):
+            prove_region_interval(x_commitment, "commitment", 40, -300, 1234, 4321, region)
+        bad = dataclasses.replace(x_commitment, element=1.5)
+        with self.assertRaises(TypeError):
+            prove_region_interval(bad, y_commitment, 40, -300, 1234, 4321, region)
+        bad = dataclasses.replace(y_commitment, h=True)
+        with self.assertRaises(TypeError):
+            prove_region_interval(x_commitment, bad, 40, -300, 1234, 4321, region)
+        for bad_value in (1.5, "40", True, False, None):
+            with self.assertRaises(TypeError):
+                prove_region_interval(x_commitment, y_commitment, bad_value, -300, 1234, 4321, region)
+            with self.assertRaises(TypeError):
+                prove_region_interval(x_commitment, y_commitment, 40, bad_value, 1234, 4321, region)
+            with self.assertRaises(TypeError):
+                prove_region_interval(x_commitment, y_commitment, 40, -300, bad_value, 4321, region)
+            with self.assertRaises(TypeError):
+                prove_region_interval(x_commitment, y_commitment, 40, -300, 1234, bad_value, region)
+        with self.assertRaises(TypeError):
+            prove_region_interval(x_commitment, y_commitment, 40, -300, 1234, 4321, "region")
+        with self.assertRaises(TypeError):
+            prove_region_interval(x_commitment, y_commitment, 40, -300, 1234, 4321,
+                                  (-5, 100, -1000, 2000))
+        with self.assertRaises(TypeError):
+            prove_region_interval(x_commitment, y_commitment, 40, -300, 1234, 4321,
+                                  region, "ctx")
+        with self.assertRaises(TypeError):
+            prove_region_interval(x_commitment, y_commitment, 40, -300, 1234, 4321,
+                                  region, randbelow=7)
+        # bool region bounds are rejected even though Region itself allows them
+        bool_region = Region(True, 100, -1000, 2000)
+        with self.assertRaises(TypeError):
+            prove_region_interval(x_commitment, y_commitment, 40, -300, 1234, 4321, bool_region)
+        # a draw that is not a non-bool integer raises TypeError
+        with self.assertRaises(TypeError):
+            prove_region_interval(
+                x_commitment, y_commitment, 40, -300, 1234, 4321, region,
+                randbelow=lambda upper: True,
+            )
+        with self.assertRaises(TypeError):
+            prove_region_interval(
+                x_commitment, y_commitment, 40, -300, 1234, 4321, region,
+                randbelow=lambda upper: 1.5,
+            )
+        # an out-of-range draw raises ValueError
+        with self.assertRaises(ValueError):
+            prove_region_interval(
+                x_commitment, y_commitment, 40, -300, 1234, 4321, region,
+                randbelow=lambda upper: upper,
+            )
+        with self.assertRaises(ValueError):
+            prove_region_interval(
+                x_commitment, y_commitment, 40, -300, 1234, 4321, region,
+                randbelow=lambda upper: -1,
+            )
+
+    def test_random_source_exception_propagates_unchanged(self):
+        x_commitment, y_commitment, region, _ = self.prove()
+
+        class CustomError(Exception):
+            pass
+
+        def raising(upper):
+            raise CustomError("from the source")
+
+        with self.assertRaises(CustomError):
+            prove_region_interval(
+                x_commitment, y_commitment, 40, -300, 1234, 4321, region,
+                randbelow=raising,
+            )
+
+    # ---- verify-time rejection ------------------------------------------------
+
+    def test_tampering_fails(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+        tampered_x = IntervalRangeProof(
+            proof.x_proof.low_commitments[:-1]
+            + ((proof.x_proof.low_commitments[-1] % self.PRIME) + 1,),
+            proof.x_proof.low_challenges,
+            proof.x_proof.low_responses,
+            proof.x_proof.high_commitments,
+            proof.x_proof.high_challenges,
+            proof.x_proof.high_responses,
+        )
+        self.assertFalse(
+            verify_region_interval(
+                x_commitment, y_commitment, region,
+                RegionIntervalProof(tampered_x, proof.y_proof), b"ctx",
+            )
+        )
+        last_y = proof.y_proof.low_responses[-1]
+        tampered_last = (
+            (last_y[0] + 1) % (y_commitment.prime - 1),
+            last_y[1],
+        )
+        tampered_y = IntervalRangeProof(
+            proof.y_proof.low_commitments,
+            proof.y_proof.low_challenges,
+            proof.y_proof.low_responses[:-1] + (tampered_last,),
+            proof.y_proof.high_commitments,
+            proof.y_proof.high_challenges,
+            proof.y_proof.high_responses,
+        )
+        self.assertFalse(
+            verify_region_interval(
+                x_commitment, y_commitment, region,
+                RegionIntervalProof(proof.x_proof, tampered_y), b"ctx",
+            )
+        )
+
+    def test_replacing_one_sub_proof_fails(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+        other_x_commitment, other_x_r = self.commit_axis("x", 41, -5, 100, 5555)
+        other_x = prove_range_interval(
+            other_x_commitment, 41, other_x_r,
+            self.sub_context(b"x", b"ctx", region, other_x_commitment, y_commitment),
+            randbelow=counter_randbelow(),
+        )
+        self.assertFalse(
+            verify_region_interval(
+                x_commitment, y_commitment, region,
+                RegionIntervalProof(other_x, proof.y_proof), b"ctx",
+            )
+        )
+        other_y_commitment, other_y_r = self.commit_axis("y", -299, -1000, 2000, 6666)
+        other_y = prove_range_interval(
+            other_y_commitment, -299, other_y_r,
+            self.sub_context(b"y", b"ctx", region, x_commitment, other_y_commitment),
+            randbelow=counter_randbelow(),
+        )
+        self.assertFalse(
+            verify_region_interval(
+                x_commitment, y_commitment, region,
+                RegionIntervalProof(proof.x_proof, other_y), b"ctx",
+            )
+        )
+
+    def test_context_binds_proof(self):
+        x_commitment, y_commitment, region, proof = self.prove(context=b"ctx")
+        self.assertFalse(verify_region_interval(x_commitment, y_commitment, region, proof))
+        self.assertFalse(verify_region_interval(x_commitment, y_commitment, region, proof, b"other"))
+
+    def test_region_binds_proof(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+        self.assertFalse(verify_region_interval(x_commitment, y_commitment, Region(-5, 99, -1000, 2000), proof, b"ctx"))
+        self.assertFalse(verify_region_interval(x_commitment, y_commitment, Region(-4, 100, -1000, 2000), proof, b"ctx"))
+        self.assertFalse(verify_region_interval(x_commitment, y_commitment, Region(-5, 100, -1000, 1999), proof, b"ctx"))
+        self.assertFalse(verify_region_interval(x_commitment, y_commitment, Region(-5, 100, -999, 2000), proof, b"ctx"))
+
+    def test_foreign_commitment_fails(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+        other_x, _ = self.commit_axis("x", 41, -5, 100, 777)
+        other_y, _ = self.commit_axis("y", -299, -1000, 2000, 888)
+        self.assertFalse(verify_region_interval(other_x, y_commitment, region, proof, b"ctx"))
+        self.assertFalse(verify_region_interval(x_commitment, other_y, region, proof, b"ctx"))
+        shifted = dataclasses.replace(x_commitment, element=(x_commitment.element + 1) % self.PRIME)
+        self.assertFalse(verify_region_interval(shifted, y_commitment, region, proof, b"ctx"))
+
+    def test_swapped_axes_fail(self):
+        # both axes use the small group here so ranges alone cannot catch the swap
+        region = Region(0, 100, 0, 100)
+        x_commitment, x_r = self.commit_small(40, 0, 100, 1234)
+        y_commitment, y_r = self.commit_small(60, 0, 100, 4321)
+        proof = prove_region_interval(
+            x_commitment, y_commitment, 40, 60, x_r, y_r, region, b"ctx",
+            randbelow=counter_randbelow(),
+        )
+        swapped = RegionIntervalProof(x_proof=proof.y_proof, y_proof=proof.x_proof)
+        self.assertFalse(verify_region_interval(x_commitment, y_commitment, region, swapped, b"ctx"))
+        self.assertFalse(verify_region_interval(y_commitment, x_commitment, region, proof, b"ctx"))
+        self.assertFalse(verify_region_interval(y_commitment, x_commitment, region, swapped, b"ctx"))
+
+    def test_padded_range_point_outside_bounds_not_accepted(self):
+        # x = 120 lies inside the power-of-two padded range of the real
+        # bounds [0, 100] (101 integers, padded to 128 with shift 27) but
+        # well outside those bounds. The honest commitment declares
+        # [0, 127] (128 integers, same padded width k = 7, shift 0), so the
+        # rejection must come from the high-half shift check, not a shape
+        # mismatch: the proof's high half binds element * g**0, while the
+        # redeclared range demands element * g**27.
+        wide_commitment, wide_r = self.commit_small(120, 0, 127, 222)
+        y_commitment, y_r = self.commit_axis("y", -300, -1000, 2000, 4321)
+        wide_region = Region(0, 127, -1000, 2000)
+        proof = prove_region_interval(
+            wide_commitment, y_commitment, 120, -300, wide_r, y_r,
+            wide_region, b"z", randbelow=counter_randbelow(),
+        )
+        self.assertEqual(len(proof.x_proof.low_commitments), 7)
+        real_region = Region(0, 100, -1000, 2000)
+        redeclared = dataclasses.replace(wide_commitment, lower=0, upper=100)
+        self.assertFalse(verify_range_interval(
+            redeclared,
+            proof.x_proof,
+            self.sub_context(b"x", b"z", real_region, redeclared, y_commitment),
+        ))
+        self.assertFalse(
+            verify_region_interval(
+                redeclared, y_commitment, real_region,
+                RegionIntervalProof(proof.x_proof, proof.y_proof), b"z",
+            )
+        )
+
+    def test_structural_errors_return_false(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+        short = IntervalRangeProof(
+            proof.x_proof.low_commitments[:-1],
+            proof.x_proof.low_challenges,
+            proof.x_proof.low_responses,
+            proof.x_proof.high_commitments,
+            proof.x_proof.high_challenges,
+            proof.x_proof.high_responses,
+        )
+        self.assertFalse(
+            verify_region_interval(
+                x_commitment, y_commitment, region,
+                RegionIntervalProof(short, proof.y_proof), b"ctx",
+            )
+        )
+        empty = IntervalRangeProof((), (), (), (), (), ())
+        self.assertFalse(
+            verify_region_interval(
+                x_commitment, y_commitment, region,
+                RegionIntervalProof(empty, proof.y_proof), b"ctx",
+            )
+        )
+        bad_pair = IntervalRangeProof(
+            proof.x_proof.low_commitments,
+            proof.x_proof.low_challenges[:-1] + ((),),
+            proof.x_proof.low_responses,
+            proof.x_proof.high_commitments,
+            proof.x_proof.high_challenges,
+            proof.x_proof.high_responses,
+        )
+        self.assertFalse(
+            verify_region_interval(
+                x_commitment, y_commitment, region,
+                RegionIntervalProof(bad_pair, proof.y_proof), b"ctx",
+            )
+        )
+        # an oversized axis range on verify returns False
+        big_region = Region(0, 1 << 24, -1000, 2000)
+        big_x, _ = pedersen_commit(0, 0, 1 << 24, blinding=1234)
+        self.assertFalse(verify_region_interval(big_x, y_commitment, big_region, proof, b"ctx"))
+        # illegal group parameters return False rather than raising
+        bad = dataclasses.replace(x_commitment, prime=3)
+        self.assertFalse(verify_region_interval(bad, y_commitment, region, proof, b"ctx"))
+
+    def test_verify_type_errors(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+        with self.assertRaises(TypeError):
+            verify_region_interval("commitment", y_commitment, region, proof, b"ctx")
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, (y_commitment.element, -1000, 2000),
+                                   region, proof, b"ctx")
+        bad = dataclasses.replace(x_commitment, lower=1.5)
+        with self.assertRaises(TypeError):
+            verify_region_interval(bad, y_commitment, region, proof, b"ctx")
+        bad = dataclasses.replace(y_commitment, generator=False)
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, bad, region, proof, b"ctx")
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, y_commitment, "region", proof, b"ctx")
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, y_commitment, region,
+                                   (proof.x_proof, proof.y_proof), b"ctx")
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, y_commitment, region,
+                                   RegionIntervalProof("proof", proof.y_proof), b"ctx")
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, y_commitment, region,
+                                   RegionIntervalProof(proof.x_proof, None), b"ctx")
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, y_commitment, region, proof, "ctx")
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, y_commitment,
+                                   Region(-5, 100, -1000, True), proof, b"ctx")
+        # other region-proof types are not an IntervalRangeProof
+        foreign = RegionProof(None, None)
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, y_commitment, region, foreign, b"ctx")
+        foreign_wide = RegionWideProof(None, None)
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, y_commitment, region, foreign_wide, b"ctx")
+        # malformed nested sub-proof fields raise TypeError through verify_range_interval
+        bad_proof = RegionIntervalProof(
+            IntervalRangeProof(
+                list(proof.x_proof.low_commitments),
+                proof.x_proof.low_challenges,
+                proof.x_proof.low_responses,
+                proof.x_proof.high_commitments,
+                proof.x_proof.high_challenges,
+                proof.x_proof.high_responses,
+            ),
+            proof.y_proof,
+        )
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, y_commitment, region, bad_proof, b"ctx")
+        bad_proof = RegionIntervalProof(
+            IntervalRangeProof(
+                proof.x_proof.low_commitments,
+                proof.x_proof.low_challenges,
+                proof.x_proof.low_responses,
+                proof.x_proof.high_commitments,
+                proof.x_proof.high_challenges[:-1] + (((True, 0),)),
+                proof.x_proof.high_responses,
+            ),
+            proof.y_proof,
+        )
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, y_commitment, region, bad_proof, b"ctx")
+        # nested types are preflighted even when the declared ranges already
+        # mismatch: TypeError still wins over the semantic False result
+        mismatched_region = Region(-5, 99, -1000, 2000)
+        with self.assertRaises(TypeError):
+            verify_region_interval(x_commitment, y_commitment, mismatched_region, bad_proof, b"ctx")
+
+    def test_verify_consumes_no_randomness(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+
+        def boom(upper):
+            raise AssertionError("verification must not draw randomness")
+
+        import zkregion
+        original = zkregion.secrets.randbelow
+        zkregion.secrets.randbelow = boom
+        try:
+            self.assertTrue(
+                verify_region_interval(x_commitment, y_commitment, region, proof, b"ctx")
+            )
+        finally:
+            zkregion.secrets.randbelow = original
+
+    def test_inputs_are_not_mutated(self):
+        x_commitment, y_commitment, region, proof = self.prove()
+
+        def copy_interval(sub_proof):
+            return IntervalRangeProof(
+                tuple(sub_proof.low_commitments),
+                tuple(tuple(pair) for pair in sub_proof.low_challenges),
+                tuple(tuple(pair) for pair in sub_proof.low_responses),
+                tuple(sub_proof.high_commitments),
+                tuple(tuple(pair) for pair in sub_proof.high_challenges),
+                tuple(tuple(pair) for pair in sub_proof.high_responses),
+            )
+
+        snapshot = (
+            dataclasses.replace(x_commitment),
+            dataclasses.replace(y_commitment),
+            dataclasses.replace(region),
+            RegionIntervalProof(copy_interval(proof.x_proof), copy_interval(proof.y_proof)),
+        )
+        prove_region_interval(
+            x_commitment, y_commitment, 40, -300, 1234, 4321, region, b"ctx",
+            randbelow=counter_randbelow(),
+        )
+        verify_region_interval(x_commitment, y_commitment, region, proof, b"ctx")
+        self.assertEqual(
+            (x_commitment, y_commitment, region, proof), snapshot
+        )
 
 
 class RegionWideBatchTest(unittest.TestCase):

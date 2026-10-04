@@ -452,6 +452,28 @@ region_proof = prove_region(
 assert verify_region(x_commitment, y_commitment, region, region_proof, context=b"session-1")
 assert not verify_region(x_commitment, y_commitment, region, region_proof, context=b"other")
 
+# 任意宽度二维矩形成员非交互证明：每轴独立含 1 到 2**24 个整数，非二次幂、负边界、
+# 跨零及退化为线段或单点均可，两轴还可使用各自合法的群参数
+from zkregion import RegionIntervalProof, prove_region_interval, verify_region_interval
+
+wide_region = Region(-5, 100, -1000, 2000)  # x 轴 106 个整数、y 轴 3001 个，均非二次幂
+ix_commitment, ix_blinding = pedersen_commit(
+    40, wide_region.min_x, wide_region.max_x, prime=104729, generator=3, h=5
+)
+iy_commitment, iy_blinding = pedersen_commit(
+    -300, wide_region.min_y, wide_region.max_y  # 默认群参数
+)
+region_interval_proof = prove_region_interval(
+    ix_commitment, iy_commitment, 40, -300,
+    ix_blinding, iy_blinding, wide_region, context=b"session-1",
+)
+assert verify_region_interval(
+    ix_commitment, iy_commitment, wide_region, region_interval_proof, context=b"session-1"
+)
+assert not verify_region_interval(
+    ix_commitment, iy_commitment, wide_region, region_interval_proof, context=b"other"
+)
+
 # 闭凸多边形区域成员非交互证明：顶点按边界顺序给出，旋转或反向会规范化为同一序列
 from zkregion import (
     ConvexPolygonRegion,
@@ -1400,6 +1422,8 @@ python3 -m zkregion
 - `verify_convex_polygon_proof_bundle(bundle) -> bool` — 只接受 `ConvexPolygonProofBundle`，原样委托 `verify_convex_polygon` 的单条验证语义，只使用两个承诺、多边形、证明与 context，不接收也不读取坐标或盲因子；群参数、声明区间、context、坐标轴、多边形、边证明或验证等式不匹配返回 `False`；对象或任一字段类型错误抛 `TypeError`；编码后解码保持验证结论
 - `prove_region_wide(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionWideProof` — 按位分解的宽区间版二维矩形区域成员非交互证明：两轴承诺的声明区间须分别恰为 `(region.min_x, region.max_x)` 与 `(region.min_y, region.max_y)`，生成前先逐轴按 `verify_pedersen_opening` 同一开合校验口径重算比对，两轴都通过后才生成子证明；每轴区间个数与位宽沿用 `prove_range_wide` 的同一套约束（恰含 `2**k` 个整数、`1 <= k <= 24`），两轴位宽可各自不同；子证明逐轴原样复用 `prove_range_wide`，比特顺序、加权绑定与挑战口径一概不改，派生上下文沿用二维区域证明的既有绑定（轴标签、区域四边界、外部上下文与两份承诺均在其中）；开合不符、坐标越界、区间与区域不匹配或位宽约束不满足一律抛 `ValueError`，任一层字段错型（含用 `bool` 冒充整数、上下文不是字节串）或随机源不可调用抛 `TypeError`，随机源返回非整数抛 `TypeError`、抽取值越界抛 `ValueError`；同一组入参在相同随机源下重复生成逐字节一致，随机源可注入且原样透传，输入不被改写
 - `verify_region_wide(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证宽区间版区域成员证明，只需两个承诺、区域与证明，无需坐标或盲因子；两轴承诺声明区间须恰为区域对应轴上下界，子证明逐轴以 `verify_range_wide` 同一口径核对；任一层字段错型（含用 `bool` 冒充整数、上下文不是字节串）抛唯一的 `TypeError`，换区域、换上下文、换任一承诺、交换两轴、替换任一子证明、非法结构或位宽越界一律返回 `False` 且不抛异常，输入不被改写
+- `prove_region_interval(x_commitment, y_commitment, x, y, x_blinding, y_blinding, region, context=b"", *, randbelow=secrets.randbelow) -> RegionIntervalProof` — 任意宽度二维矩形区域成员非交互证明：两轴承诺的声明区间须分别恰为 `(region.min_x, region.max_x)` 与 `(region.min_y, region.max_y)`；每轴独立含 `1` 到 `2**24` 个整数即可，非二次幂、负边界、跨零及退化为线段或单点的闭矩形均支持，边界上的点也通过，两轴可使用各自合法的群参数（`prime`/`generator`/`h` 各自遵循承诺合法性规则）。生成前先确认两轴开合与区间约束均有效：先校验声明区间与区域一致、每轴整数个数在 `[1, 2**24]`，再逐轴按 `verify_pedersen_opening` 同一口径重算开合（非法承诺参数、倒置或超限声明、声明不匹配、坐标越界、错误盲因子均在此失败），全部通过后才抽取任何随机数并生成子证明；上述失败一律抛 `ValueError` 且不消耗随机数。两轴子证明逐轴原样复用 `prove_range_interval`，比特顺序、加权绑定、补齐 `shift` 与挑战口径一概不改，故落在补齐后二次幂范围内但超出原边界的点不能获准；派生上下文沿用二维区域证明的既有绑定（区域四边界、两承诺全部六字段、轴标签与外部 context 均在其中），交换两轴子证明或从不同坐标对的证明拼接子证明均无法通过。任一层字段错型（含用 `bool` 冒充整数、上下文不是字节串）或随机源不可调用抛 `TypeError`，随机源返回非整数抛 `TypeError`、抽取值越界抛 `ValueError`，随机源自身的异常原样传播；证明只以 `x_proof`/`y_proof` 承载两个 `IntervalRangeProof`，不含坐标或盲因子，大小随两轴区间个数的二进制位数（`10(k_x + k_y)` 个整数）线性增长、不枚举矩形内的点；同一组入参在相同随机序列下生成相等证明，输入不被改写
+- `verify_region_interval(x_commitment, y_commitment, region, proof, context=b"") -> bool` — 验证任意宽度二维矩形区域成员证明，只需两个承诺、区域、证明与 context，从不接触坐标或盲因子，且不消耗随机数；两轴承诺声明区间须分别恰为区域对应轴上下界，两轴子证明逐轴以 `verify_range_interval` 同一口径核对（含非二次幂补齐 `shift` 高位半的加权绑定），两轴可使用各自合法的群参数；对象或任一层嵌套字段错型（错对象、非元组证明字段、非整数或 `bool` 冒充整数、非 `bytes` context）抛唯一的 `TypeError`；两入口先完整检查嵌套类型，其余语义失败、证明缺项或数值越界（声明区间不匹配、区间个数超过 `2**24`、非法承诺参数、换区域/上下文/承诺、交换两轴、替换或拼接子证明、补齐范围内越界点、篡改任一比特分支）一律返回 `False` 且不抛异常，输入不被改写
 - `RegionWideBatchEntry(x_commitment, y_commitment, region, proof, context=b"")` — 不可变宽区间二维区域批验条目，字段次序与 `verify_region_wide` 入参一致（两承诺、`Region`、`RegionWideProof`、`bytes` 上下文）；可位置构造、按值相等且不可变，构造时不做任何校验
 - `verify_region_wide_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 宽区间版二维区域证明的批量验证：先整批预检嵌套类型（序列本身、条目、两承诺各六字段、区域四边界、两轴 `WideRangeProof` 三层元组整数与 `context`，错型含后项错型、用 `bool` 冒充整数与上下文不是字节串，一律抛唯一的 `TypeError`；随机源不可调用或返回非整数同样抛 `TypeError`），哪怕错型出现在最后一个条目也照抛，预检通过后才逐条核对；空批返回 `False`，首条无效即短路返回 `False`。每轴声明区间须恰为区域对应边界；比特承诺按 `2**i` 加权的绑定与各比特两个挑战份额之和等于转录挑战（逐轴派生 context 与单条验证逐字节一致）逐条核对、不参与聚合；两轴子证明的每个比特两条 OR 子分支各恰取一次非零系数 `a = r + 1`（`r = randbelow(prime - 1)`），跨轴跨条目按 `(prime, generator, h)` 分组只做一次聚合等式，越界系数抛 `ValueError`；换承诺、换区域、换上下文、交换两轴或替换任一子证明一律返回 `False` 且不抛异常；条目独立、可乱序可重复，固定随机源下结果可重复，输入不被改写
 - `verify_region_wide_batch_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的宽区间二维区域证明完整批验：先 `verify_multi_inclusion` 验外层根，根通过后才把同一 `randbelow` 交给 `verify_region_wide_batch`
@@ -1413,6 +1437,7 @@ python3 -m zkregion
 - `prove_region_contains_bound(entries) -> tuple[BoundRegionContainsBatch, bytes]` — 顶层构造 Merkle 承诺的规范区域判定完整批：`entries` 沿用 `verify_region_contains_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，输入不变；每项外层叶逐字节复用 `_bound_region_contains_leaf` 编码，域分隔、长度帧、十进制 ASCII 整数约定、字段顺序及 Merkle 哈希规则不变；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖从零开始的全部位置、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_region_contains_bound(batch, root) is True`，单项、奇偶批与重复项均确定，重复构造逐字节一致；全批或任一嵌套字段错型（含用 `bool` 冒充整数与后项错型）抛 `TypeError`，空批、U 成帧批次数越出 uint64 或 `verify_region_contains_batch` 返回 `False`（开合不符、声明区间与区域边界不一致或坐标越出矩形）抛 `ValueError`
 - `RegionProof(x_proof, y_proof)` — 不可变区域证明对象，两字段均为 `RangeProof`
 - `RegionWideProof(x_proof, y_proof)` — 不可变宽区间版区域证明对象，两字段分别为 x 轴与 y 轴的 `WideRangeProof`（两轴位宽可各自不同）；可位置构造、按值相等且不可变
+- `RegionIntervalProof(x_proof, y_proof)` — 不可变任意宽度二维矩形区域证明对象，两字段分别为 x 轴与 y 轴的 `IntervalRangeProof`（每轴独立含 1 到 `2**24` 个整数，两轴位宽与群参数可各自不同）；可位置构造、按值相等且冻结，构造时不做任何校验
 - `RegionProofBundle(x_commitment, y_commitment, region, context, proof)` — 跨进程传递的规范化二进制信封数据类，字段按 `x_commitment`、`y_commitment`、`region`、`context`、`proof` 固定次序承载；`proof` 仅接受 `RegionProof` 或 `RegionWideProof`；冻结、可位置构造、按值相等，构造时不做校验
 - `encode_region_proof_bundle(bundle) -> bytes` — 对同一对象稳定输出同一字节串；输出依次为四字节魔数 `b"zrgn"`、一字节格式版本、一字节证明类型标签，随后按固定字段次序承载五个字段，每个字段前置四字节大端长度前缀；整数（含负数与任意精度）使用符号字节加最短大端绝对值编码，元组显式承载四字节基数；承诺六字段、Region 四边界、`RangeProof`/`WideRangeProof` 的递归元组结构无歧义编码；只返回 `bytes`，不写文件或数据库；对象或字段类型错误（含 `bool` 整数、非元组证明字段、宽证明对不是二元组、既非 `RegionProof` 也非 `RegionWideProof` 的 proof）抛 `TypeError`；区域倒置（`min > max`，公共 `Region` 构造器本身已拒绝）抛 `ValueError`
 - `decode_region_proof_bundle(data) -> RegionProofBundle` — 只接受 `bytes`（非 `bytes` 抛 `TypeError`），逐层核对魔数、版本、证明类型、长度前缀、元组基数、整数规范形与嵌套结构，完整消费载荷且无尾随数据后按字段次序重建与原对象逐字段相等的信封；截断、越界、未知版本或类型、非规范整数、非法字段值（含不合法的承诺群参数与声明区间、区域 min > max）、非法证明形状、尾随数据一律抛 `ValueError`，失败不返回部分对象；头部的证明类型标签决定解释方式，`RegionProof` 与 `RegionWideProof` 载荷不能互换解释
@@ -1860,6 +1885,8 @@ h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
 每条轴的子证明在派生 context 下进行，派生 context 按以下项目逐项前置四字节无符号大端长度拼接：域 `b"zkregion/region/v1"`、轴标签 `b"x"` 或 `b"y"`、外部 `context`、Region 四边界（`min_x`、`max_x`、`min_y`、`max_y`）、x 承诺六字段、y 承诺六字段（均按数据类字段顺序）；整数编码为十进制 ASCII。因此证明同时绑定区域、外部 context、两个承诺与轴分配——更换区域、context、承诺或交换两轴（含交换子证明、交换承诺）都验证失败。
 
 `context` 只接受 `bytes`，所有整数拒绝 `bool`；承诺、区域、证明对象或其字段、数值类型错误抛 `TypeError`。生成时区间不匹配、开合无效或轴区间超过 256 个整数抛 `ValueError`；验证时上述非类型错误、结构非法、篡改或绑定不符一律返回 `False`。入口均不改写输入。
+
+`prove_region_interval(...) -> RegionIntervalProof` / `verify_region_interval(...)` 是同一绑定结构下的任意宽度版本：入参的含义与顺序与上面两个入口一致，区别只在于两轴子证明改为 `IntervalRangeProof`，每轴独立允许 `1` 到 `2**24` 个整数——非二次幂、负边界、跨零及退化为线段或单点的闭矩形均支持，四边界上的点也通过，两轴还可使用各自合法的群参数。生成时在抽取任何随机数之前先确认两轴声明区间分别恰等于对应轴边界、区间个数有效且两轴开合均按 `verify_pedersen_opening` 口径重算通过（倒置、超限、声明不匹配、非法承诺参数、坐标越界、错误盲因子均抛 `ValueError` 且不消耗随机数）；随后逐轴原样复用 `prove_range_interval`，其高/低两半按位分解保证补齐到二次幂只是证明内部手段，落在补齐范围内但超出原边界的点不能获准。证明只以 `x_proof`/`y_proof` 承载两个子证明，不含坐标或盲因子，大小为随两轴区间个数二进制位数增长的 `10(k_x + k_y)` 个整数，从不枚举矩形内的点。派生 context 与上逐字节相同，故更换区域四边界、任一承诺字段、外部 context、交换两轴子证明，或把另一组坐标对证明中的子证明拼接进来，都会改变转录而验证失败。验证只需两个承诺、区域、证明与 context，不消耗随机数；嵌套类型错误抛 `TypeError`，其余语义失败、缺项或数值越界一律返回 `False`。
 
 ### 闭凸多边形区域成员非交互证明
 

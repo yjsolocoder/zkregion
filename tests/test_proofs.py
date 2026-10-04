@@ -36,6 +36,7 @@ from zkregion import (
     BoundSchnorrReplayGuard,
     BoundWideRangeBatch,
     BoundWideRangeReplayGuard,
+    IntervalRangeProof,
     MerkleConsistencyBatchEntry,
     MerkleConsistencyBatchReplayGuard,
     MerkleConsistencyChain,
@@ -113,6 +114,7 @@ from zkregion import (
     prove_opening_batch_bound,
     prove_pedersen_opening_batch_bound,
     prove_range,
+    prove_range_interval,
     prove_range_set,
     prove_range_set_batch_bound,
     prove_range_wide,
@@ -146,6 +148,7 @@ from zkregion import (
     verify_range,
     verify_range_batch,
     verify_range_bound,
+    verify_range_interval,
     verify_range_set,
     verify_range_set_batch,
     verify_range_set_batch_bound,
@@ -2265,6 +2268,370 @@ class BoundRangeSetBatchTest(RangeSetBatchTest):
         for bad in cases:
             with self.assertRaises(TypeError):
                 verify_range_set_batch_bound(bad, root)
+
+
+class IntervalRangeProofTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def commit(self, value=50, lower=0, upper=100, blinding=1234, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    def prove(self, value=50, lower=0, upper=100, blinding=1234, context=b"ctx", **kwargs):
+        commitment, returned = self.commit(value, lower, upper, blinding, **kwargs)
+        proof = prove_range_interval(
+            commitment, value, returned, context, randbelow=counter_randbelow()
+        )
+        return commitment, returned, proof
+
+    @staticmethod
+    def proof_size(proof):
+        return (
+            len(proof.lower_commitments)
+            + len(proof.upper_commitments)
+            + sum(len(pair) for pair in proof.lower_challenges)
+            + sum(len(pair) for pair in proof.upper_challenges)
+            + sum(len(pair) for pair in proof.lower_responses)
+            + sum(len(pair) for pair in proof.upper_responses)
+        )
+
+    # ---- honest round trip -------------------------------------------------
+
+    def test_honest_proof_verifies(self):
+        commitment, _, proof = self.prove()
+        self.assertIsInstance(proof, IntervalRangeProof)
+        self.assertTrue(verify_range_interval(commitment, proof, b"ctx"))
+        self.assertTrue(verify_range_interval(commitment, proof, context=b"ctx"))
+
+    def test_endpoints_and_interior_values_prove(self):
+        for value in (-1000, -1, 0, 1, 999, 2000):
+            commitment, _, proof = self.prove(value=value, lower=-1000, upper=2000)
+            self.assertTrue(
+                verify_range_interval(commitment, proof, b"ctx"), f"value={value}"
+            )
+
+    def test_large_non_power_of_two_interval(self):
+        for value in (0, 1, 500000, 999999, 1000000):
+            commitment, blinding = pedersen_commit(value, 0, 1000000, blinding=987654321)
+            proof = prove_range_interval(
+                commitment, value, blinding, b"ctx", randbelow=counter_randbelow()
+            )
+            self.assertTrue(
+                verify_range_interval(commitment, proof, b"ctx"), f"value={value}"
+            )
+
+    def test_single_point_interval(self):
+        commitment, _, proof = self.prove(value=7, lower=7, upper=7)
+        self.assertEqual(len(proof.lower_commitments), 1)  # one-bit decomposition
+        self.assertTrue(verify_range_interval(commitment, proof, b"ctx"))
+
+    def test_power_of_two_width_also_accepted(self):
+        commitment, _, proof = self.prove(value=10, lower=0, upper=15)
+        self.assertTrue(verify_range_interval(commitment, proof, b"ctx"))
+
+    def test_maximum_width_interval(self):
+        top = (1 << 24) - 1
+        commitment, blinding = pedersen_commit(top, 0, top, blinding=987654321)
+        proof = prove_range_interval(
+            commitment, top, blinding, b"ctx", randbelow=counter_randbelow()
+        )
+        self.assertEqual(len(proof.lower_commitments), 24)
+        self.assertTrue(verify_range_interval(commitment, proof, b"ctx"))
+
+    def test_oversized_interval_rejected(self):
+        commitment, blinding = pedersen_commit(0, 0, 1 << 24, blinding=1234)
+        with self.assertRaises(ValueError):
+            prove_range_interval(
+                commitment, 0, blinding, randbelow=counter_randbelow()
+            )
+        self.assertFalse(
+            verify_range_interval(
+                commitment, IntervalRangeProof((), (), (), (), (), ()), b"ctx"
+            )
+        )
+
+    def test_proof_size_grows_with_bit_length_not_count(self):
+        _, _, small = self.prove(value=5, lower=0, upper=10)  # 11 values, 4 bits
+        _, _, wider = self.prove(value=5, lower=0, upper=15)  # 16 values, 4 bits
+        self.assertEqual(self.proof_size(small), self.proof_size(wider))
+        _, _, bigger = self.prove(value=100, lower=0, upper=255)  # 8 bits
+        self.assertEqual(self.proof_size(bigger), 2 * self.proof_size(small))
+        self.assertEqual(self.proof_size(small), 10 * 4)
+
+    def test_proof_shape_and_immutability(self):
+        _, _, proof = self.prove(value=15, lower=10, upper=20)  # 11 values, 4 bits
+        for field in (
+            proof.lower_commitments,
+            proof.upper_commitments,
+            proof.lower_challenges,
+            proof.upper_challenges,
+            proof.lower_responses,
+            proof.upper_responses,
+        ):
+            self.assertIsInstance(field, tuple)
+            self.assertEqual(len(field), 4)
+        for field in (proof.lower_commitments, proof.upper_commitments):
+            for item in field:
+                self.assertIsInstance(item, int)
+                self.assertNotIsInstance(item, bool)
+        for field in (
+            proof.lower_challenges,
+            proof.upper_challenges,
+            proof.lower_responses,
+            proof.upper_responses,
+        ):
+            for pair in field:
+                self.assertIsInstance(pair, tuple)
+                self.assertEqual(len(pair), 2)
+                for item in pair:
+                    self.assertIsInstance(item, int)
+                    self.assertNotIsInstance(item, bool)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            proof.lower_commitments = proof.lower_commitments + (1,)
+
+    def test_fixed_randbelow_is_reproducible(self):
+        commitment, blinding = self.commit()
+        first = prove_range_interval(
+            commitment, 50, blinding, b"c", randbelow=counter_randbelow()
+        )
+        second = prove_range_interval(
+            commitment, 50, blinding, b"c", randbelow=counter_randbelow()
+        )
+        self.assertEqual(first, second)
+
+    def test_default_group_parameters_are_usable(self):
+        commitment, blinding = pedersen_commit(40, 0, 100, blinding=987654321)
+        proof = prove_range_interval(commitment, 40, blinding, b"demo")
+        self.assertTrue(verify_range_interval(commitment, proof, b"demo"))
+
+    # ---- transcript and binding ---------------------------------------------
+
+    def test_challenge_matches_transcript(self):
+        commitment, _, proof = self.prove()
+        items = [b"zkregion/pedersen-range-interval/v1"]
+        for field in (
+            commitment.element,
+            commitment.lower,
+            commitment.upper,
+            commitment.prime,
+            commitment.generator,
+            commitment.h,
+        ):
+            items.append(str(field).encode("ascii"))
+        items.append(b"ctx")
+        items.append(b"7")  # bit width of 101 values
+        inverse = pow(self.G, -1, self.PRIME)
+        for label, commitments, challenges, responses in (
+            ("lower", proof.lower_commitments, proof.lower_challenges, proof.lower_responses),
+            ("upper", proof.upper_commitments, proof.upper_challenges, proof.upper_responses),
+        ):
+            items.append(label.encode("ascii"))
+            for bit_commitment, pair_e, pair_s in zip(commitments, challenges, responses):
+                items.append(str(bit_commitment).encode("ascii"))
+                for branch in (0, 1):
+                    statement = bit_commitment
+                    if branch:
+                        statement = statement * inverse % self.PRIME
+                    announcement = (
+                        pow(self.H, pair_s[branch], self.PRIME)
+                        * pow(statement, -pair_e[branch], self.PRIME)
+                        % self.PRIME
+                    )
+                    items.append(str(announcement).encode("ascii"))
+        transcript = hashlib.sha256()
+        for item in items:
+            transcript.update(len(item).to_bytes(4, "big"))
+            transcript.update(item)
+        challenge = int.from_bytes(transcript.digest(), "big") % self.PRIME
+        for pair_e in proof.lower_challenges + proof.upper_challenges:
+            self.assertEqual((pair_e[0] + pair_e[1]) % self.PRIME, challenge)
+
+    def test_bit_commitments_bind_to_the_element(self):
+        commitment, _, proof = self.prove(value=50, lower=0, upper=100)
+        count, width = 101, 7
+        product = 1
+        for i, bit_commitment in enumerate(proof.lower_commitments):
+            product = product * pow(bit_commitment, 1 << i, self.PRIME) % self.PRIME
+        self.assertEqual(product, commitment.element)
+        product = 1
+        for i, bit_commitment in enumerate(proof.upper_commitments):
+            product = product * pow(bit_commitment, 1 << i, self.PRIME) % self.PRIME
+        expected = (
+            commitment.element * pow(self.G, (1 << width) - count, self.PRIME) % self.PRIME
+        )
+        self.assertEqual(product, expected)
+
+    def test_context_is_bound(self):
+        commitment, _, proof = self.prove()
+        self.assertFalse(verify_range_interval(commitment, proof, b"other"))
+        self.assertFalse(verify_range_interval(commitment, proof, b""))
+
+    def test_commitment_fields_are_bound(self):
+        commitment, _, proof = self.prove()
+        for field, replacement in (
+            ("element", commitment.element % (self.PRIME - 1) + 1),
+            ("lower", commitment.lower + 1),
+            ("upper", commitment.upper + 1),
+            ("h", 7),
+        ):
+            bad = dataclasses.replace(commitment, **{field: replacement})
+            self.assertFalse(
+                verify_range_interval(bad, proof, b"ctx"), f"field={field}"
+            )
+
+    def test_tampered_proof_fails(self):
+        commitment, _, proof = self.prove()
+        cases = [
+            dataclasses.replace(
+                proof,
+                lower_commitments=proof.lower_commitments[:-1]
+                + (proof.lower_commitments[-1] % 7 + 2,),
+            ),
+            dataclasses.replace(
+                proof,
+                upper_commitments=proof.upper_commitments[:-1]
+                + (proof.upper_commitments[-1] % 7 + 2,),
+            ),
+            dataclasses.replace(
+                proof,
+                lower_challenges=proof.lower_challenges[:-1] + ((1, 2),),
+            ),
+            dataclasses.replace(
+                proof,
+                upper_responses=proof.upper_responses[:-1] + ((0, 0),),
+            ),
+            dataclasses.replace(  # missing items
+                proof, lower_commitments=proof.lower_commitments[:-1]
+            ),
+            dataclasses.replace(proof, upper_challenges=()),
+        ]
+        for position, bad in enumerate(cases):
+            self.assertFalse(
+                verify_range_interval(commitment, bad, b"ctx"), f"case {position}"
+            )
+
+    def test_proof_from_another_commitment_fails(self):
+        commitment, _, proof = self.prove(value=50)
+        other, _ = self.commit(value=50, blinding=4321)
+        self.assertFalse(verify_range_interval(other, proof, b"ctx"))
+
+    # ---- prove-time validation ----------------------------------------------
+
+    def test_prove_requires_a_valid_opening(self):
+        commitment, blinding = self.commit()
+        with self.assertRaises(ValueError):
+            prove_range_interval(commitment, 51, blinding, randbelow=counter_randbelow())
+        with self.assertRaises(ValueError):
+            prove_range_interval(
+                commitment, 50, blinding + 1, randbelow=counter_randbelow()
+            )
+
+    def test_prove_rejects_out_of_range_values(self):
+        # a value outside the declared interval cannot be padded into range
+        commitment, blinding = self.commit(value=0, lower=0, upper=10)
+        for value in (-1, 11, 16):
+            with self.assertRaises(ValueError):
+                prove_range_interval(
+                    commitment, value, blinding, randbelow=counter_randbelow()
+                )
+
+    def test_prove_rejects_inverted_interval(self):
+        commitment, blinding = self.commit()
+        inverted = dataclasses.replace(commitment, lower=10, upper=0)
+        with self.assertRaises(ValueError):
+            prove_range_interval(inverted, 5, blinding, randbelow=counter_randbelow())
+
+    def test_prove_type_errors(self):
+        commitment, blinding = self.commit()
+        with self.assertRaises(TypeError):
+            prove_range_interval("commitment", 50, blinding)
+        bad = dataclasses.replace(commitment, element=1.5)
+        with self.assertRaises(TypeError):
+            prove_range_interval(bad, 50, blinding)
+        for bad_value in (1.5, "50", True, None):
+            with self.assertRaises(TypeError):
+                prove_range_interval(commitment, bad_value, blinding)
+            with self.assertRaises(TypeError):
+                prove_range_interval(commitment, 50, bad_value)
+        with self.assertRaises(TypeError):
+            prove_range_interval(commitment, 50, blinding, "ctx")
+        with self.assertRaises(TypeError):
+            prove_range_interval(commitment, 50, blinding, randbelow=42)
+
+    def test_prove_randbelow_contract(self):
+        commitment, blinding = self.commit()
+        with self.assertRaises(TypeError):
+            prove_range_interval(commitment, 50, blinding, randbelow=lambda upper: "x")
+        with self.assertRaises(ValueError):
+            prove_range_interval(commitment, 50, blinding, randbelow=lambda upper: upper)
+        with self.assertRaises(ValueError):
+            prove_range_interval(commitment, 50, blinding, randbelow=lambda upper: -1)
+
+    # ---- verify-time validation ----------------------------------------------
+
+    def test_verify_type_errors(self):
+        commitment, _, proof = self.prove()
+        with self.assertRaises(TypeError):
+            verify_range_interval("commitment", proof, b"ctx")
+        with self.assertRaises(TypeError):
+            verify_range_interval(commitment, "proof", b"ctx")
+        with self.assertRaises(TypeError):
+            verify_range_interval(commitment, proof, "ctx")
+        bad_commitment = dataclasses.replace(commitment, element=True)
+        with self.assertRaises(TypeError):
+            verify_range_interval(bad_commitment, proof, b"ctx")
+        nested_cases = [
+            dataclasses.replace(proof, lower_commitments=list(proof.lower_commitments)),
+            dataclasses.replace(proof, upper_commitments=(True,) + proof.upper_commitments[1:]),
+            dataclasses.replace(proof, lower_challenges=list(proof.lower_challenges)),
+            dataclasses.replace(
+                proof, upper_challenges=proof.upper_challenges[:-1] + ([0, 1],)
+            ),
+            dataclasses.replace(
+                proof, lower_responses=proof.lower_responses[:-1] + ((0, "x"),)
+            ),
+        ]
+        for position, bad in enumerate(nested_cases):
+            with self.assertRaises(TypeError, msg=f"case {position}"):
+                verify_range_interval(commitment, bad, b"ctx")
+
+    def test_verify_value_problems_return_false(self):
+        commitment, _, proof = self.prove()
+        bad_commitments = [
+            dataclasses.replace(commitment, prime=3),
+            dataclasses.replace(commitment, generator=1),
+            dataclasses.replace(commitment, h=commitment.prime),
+            dataclasses.replace(commitment, element=0),
+            dataclasses.replace(commitment, lower=10, upper=0),
+        ]
+        for position, bad in enumerate(bad_commitments):
+            self.assertFalse(
+                verify_range_interval(bad, proof, b"ctx"), f"case {position}"
+            )
+        out_of_range = [
+            dataclasses.replace(
+                proof, lower_commitments=(0,) + proof.lower_commitments[1:]
+            ),
+            dataclasses.replace(
+                proof, upper_challenges=((-1, 0),) + proof.upper_challenges[1:]
+            ),
+            dataclasses.replace(
+                proof, lower_responses=((-1, 0),) + proof.lower_responses[1:]
+            ),
+        ]
+        for position, bad in enumerate(out_of_range):
+            self.assertFalse(
+                verify_range_interval(commitment, bad, b"ctx"), f"case {position}"
+            )
+
+    def test_verify_draws_no_randomness(self):
+        commitment, _, proof = self.prove()
+        # verify_range_interval takes no random source at all
+        self.assertTrue(verify_range_interval(commitment, proof, b"ctx"))
 
 
 class WideRangeBatchTest(unittest.TestCase):

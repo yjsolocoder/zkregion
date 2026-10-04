@@ -345,6 +345,17 @@ wide_proof = prove_range_wide(wide_commitment, 40000, wide_blinding, context=b"s
 assert verify_range_wide(wide_commitment, wide_proof, context=b"session-1")
 assert not verify_range_wide(wide_commitment, wide_proof, context=b"other")
 
+# 任意宽度闭区间非交互证明：声明区间含 1 到 2**24 个整数即可（允许负边界、
+# 跨零、单点与非二次幂宽度），证明大小随区间个数的二进制位数线性增长
+from zkregion import prove_range_interval, verify_range_interval
+
+interval_commitment, interval_blinding = pedersen_commit(500, -1000, 2000)
+interval_proof = prove_range_interval(
+    interval_commitment, 500, interval_blinding, context=b"session-1"
+)
+assert verify_range_interval(interval_commitment, interval_proof, context=b"session-1")
+assert not verify_range_interval(interval_commitment, interval_proof, context=b"other")
+
 # 区间证明的批量验证（按 (prime, generator, h) 分组做随机线性组合）
 from zkregion import RangeBatchEntry, verify_range_batch
 

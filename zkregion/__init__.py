@@ -85,6 +85,7 @@ verify_inclusion_batch_bound /
 BoundMerkleInclusionBatchReplayGuard /
 MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion / merge_inclusion_proofs /
+select_merkle_multi_proof /
 MerkleMultiProofBundle /
 MerkleMultiBatchEntry /
 verify_multi_inclusion_batch / BoundMerkleMultiBatch /
@@ -263,6 +264,7 @@ __all__ = [
     "quantize_coordinate",
     "quantize_region",
     "region_contains_committed",
+    "select_merkle_multi_proof",
     "verify_bound",
     "verify_consistency",
     "verify_consistency_batch",
@@ -8555,6 +8557,160 @@ def merge_inclusion_proofs(
     if not verify_multi_inclusion(bundle_entries, proof, root):
         raise ValueError("merged proof does not verify under the root")
     return bundle
+
+
+def select_merkle_multi_proof(
+    bundle: MerkleMultiProofBundle,
+    indices: Sequence[int],
+) -> MerkleMultiProofBundle:
+    """Reveal only selected leaves of a :class:`MerkleMultiProofBundle`.
+
+    Selective disclosure shrinks an existing multi-proof envelope in place:
+    given *bundle* and the original-tree *indices* to keep, it returns a new
+    immutable :class:`MerkleMultiProofBundle` of the same shape with the same
+    ``root`` and ``leaf_count``, whose ``entries`` and ``proof.indices`` list
+    only the selected indices — never renumbered — in strictly increasing
+    order. Equal leaf contents at different indices stay separate entries.
+    The caller supplies only the envelope: no full leaf set, no single-leaf
+    proofs and no external storage are needed, and no leaf byte string or
+    sibling digest of an unselected index is carried over. The retained
+    siblings follow the same leaf/internal digests, odd-last-node
+    self-duplication and level-by-level, left-to-right ordering as a proof
+    built from scratch, so for a bundle valid for one complete leaf set the
+    pruned result is field-for-field equal to the bundle
+    :func:`prove_multi_inclusion` produces for the target indices (wrapped
+    with the same root and entries). Keeping every index returns a bundle
+    equal by value to the original; selecting all of a previously selected
+    subset, in one call or repeatedly, reaches the same result. The result
+    verifies with :func:`verify_merkle_multi_proof_bundle` and round-trips
+    through :func:`encode_merkle_multi_proof_bundle` /
+    :func:`decode_merkle_multi_proof_bundle`, and repeated calls on the same
+    inputs return equal results.
+
+    *indices* accepts a list or tuple of non-``bool`` integers in any order
+    with repeats allowed; the output sorts the unique values. All argument
+    and nested-field types — the bundle field types enforced by
+    :func:`encode_merkle_multi_proof_bundle`, plus a non-``bytes`` /
+    ``bytearray`` / ``str`` list-or-tuple ``indices`` of non-``bool``
+    integers — are checked across the whole input first, so a wrong type
+    raises :class:`TypeError` even when a semantic error is present too.
+    After that, an empty selection, a negative or out-of-range index, an
+    index the original envelope does not prove, or any bundle condition
+    :func:`verify_merkle_multi_proof_bundle` rejects — a root or sibling of
+    the wrong length, a tampered leaf or root, index/entries mismatch,
+    misordered or duplicate proof indices, a missing sibling or an extra,
+    unconsumed sibling — raises :class:`ValueError`, including when the
+    offending leaf would have been removed; no partial result is returned.
+    The tree shape keeps the declared ``proof.leaf_count`` rather than
+    inferring a unique leaf count from the root. Inputs are never mutated
+    and nothing is written to the file system or a database.
+    """
+    if not isinstance(bundle, MerkleMultiProofBundle):
+        raise TypeError("bundle must be a MerkleMultiProofBundle")
+    if not isinstance(bundle.root, bytes):
+        raise TypeError("root must be bytes")
+    _check_merkle_multi_bundle_proof_types(bundle.proof)
+    _check_merkle_multi_bundle_entries_types(bundle.entries)
+    if not isinstance(indices, (list, tuple)) or isinstance(
+        indices, (bytes, bytearray)
+    ):
+        raise TypeError("indices must be a list or tuple of integers")
+    for position, index in enumerate(indices):
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError(f"indices[{position}] must be an integer")
+
+    if not verify_multi_inclusion(bundle.entries, bundle.proof, bundle.root):
+        raise ValueError("bundle proof does not verify under the root")
+
+    requested = sorted(set(indices))
+    if not requested:
+        raise ValueError("indices must not be empty")
+    leaf_count = bundle.proof.leaf_count
+    if requested[0] < 0 or requested[-1] >= leaf_count:
+        raise ValueError("index out of range for proof leaf_count")
+    proven = set(bundle.proof.indices)
+    for index in requested:
+        if index not in proven:
+            raise ValueError(f"index {index} is not proven by the bundle")
+
+    leaves_by_index = dict(bundle.entries)
+    selected_entries = tuple(
+        (index, leaves_by_index[index]) for index in requested
+    )
+
+    # First re-walk every proven leaf level by level, recording at each
+    # level every node digest available from the envelope: the proven
+    # leaves themselves, the parents recomputed from them and the sibling
+    # digests the compact tuple supplies, keyed by tree position. A
+    # bundle that passed verification binds all of them to the root, and
+    # the sibling tuple must be consumed exactly.
+    known = {
+        index: _leaf_digest(leaf) for index, leaf in bundle.entries
+    }
+    size = leaf_count
+    source = bundle.proof.siblings
+    cursor = 0
+    level_available: list[dict[int, bytes]] = []
+    while size > 1:
+        available = dict(known)
+        next_known: dict[int, bytes] = {}
+        for position in sorted(known):
+            sibling = position ^ 1
+            if sibling in known:
+                sibling_digest = known[sibling]
+            elif position == size - 1 and size % 2 == 1:
+                sibling_digest = known[position]  # duplicates itself
+            else:
+                if cursor >= len(source):
+                    raise ValueError(
+                        "bundle proof is missing a sibling digest"
+                    )
+                sibling_digest = source[cursor]
+                cursor += 1
+                available[sibling] = sibling_digest
+            if position % 2 == 0:
+                digest = _node_digest(known[position], sibling_digest)
+            else:
+                digest = _node_digest(sibling_digest, known[position])
+            next_known[position // 2] = digest
+        level_available.append(available)
+        known = next_known
+        size = (size + 1) // 2
+    if cursor != len(source):
+        raise ValueError("bundle proof carries extra sibling digests")
+
+    # Then collect the minimal sibling sequence for the target set with
+    # the same rule prove_multi_inclusion uses — level by level from leaf
+    # to root, retained positions left to right, skipping siblings that
+    # are also retained and odd last nodes duplicating themselves —
+    # pulling each required digest from the closure above. The result is
+    # exactly the compact tuple a proof built for the target indices
+    # would carry.
+    retained = set(requested)
+    size = leaf_count
+    compact: list[bytes] = []
+    for level, available in enumerate(level_available):
+        for position in sorted(retained):
+            sibling = position ^ 1
+            if sibling in retained:
+                continue  # sibling is retained too, nothing to collect
+            if position == size - 1 and size % 2 == 1:
+                continue  # odd last node duplicates itself
+            compact.append(available[sibling])
+        retained = {position // 2 for position in retained}
+        size = (size + 1) // 2
+
+    proof = MerkleMultiProof(
+        leaf_count=leaf_count,
+        indices=tuple(requested),
+        siblings=tuple(compact),
+    )
+    selected = MerkleMultiProofBundle(
+        root=bundle.root, proof=proof, entries=selected_entries
+    )
+    if not verify_multi_inclusion(selected_entries, proof, bundle.root):
+        raise ValueError("selected proof does not verify under the root")
+    return selected
 
 
 @dataclass(frozen=True)

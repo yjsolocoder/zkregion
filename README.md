@@ -157,6 +157,25 @@ multi = prove_multi_inclusion(leaves, (0, 2))
 entries = [(0, b"alpha"), (2, b"gamma")]
 assert verify_multi_inclusion(entries, multi, root)
 
+# 仅凭既有单叶包含证明合成紧凑多包含证明信封：乱序、完全相同重复项均可
+from zkregion import (
+    MerkleInclusionBatchEntry,
+    merge_inclusion_proofs,
+    verify_merkle_multi_proof_bundle,
+    encode_merkle_multi_proof_bundle,
+    decode_merkle_multi_proof_bundle,
+)
+
+singles = [
+    MerkleInclusionBatchEntry(leaves[i], prove_inclusion(leaves, i), root)
+    for i in (2, 0, 0)  # 可乱序；索引 0 的完全相同条目重复，只保留一次
+]
+merged = merge_inclusion_proofs(singles, len(leaves))
+assert merged.proof.indices == (0, 2)
+assert merged.proof == multi
+assert verify_merkle_multi_proof_bundle(merged)
+assert decode_merkle_multi_proof_bundle(encode_merkle_multi_proof_bundle(merged)) == merged
+
 # 独立多叶紧凑包含证明批验：一次检查多组互不相关的 entries、proof 与 root
 from zkregion import MerkleMultiBatchEntry, verify_multi_inclusion_batch
 
@@ -1616,6 +1635,7 @@ python3 -m zkregion
 - `MerkleProof(index, siblings)` — 不可变证明对象，`siblings` 为按叶到根排列的 `tuple[bytes, ...]`
 - `prove_multi_inclusion(leaves, indices) -> MerkleMultiProof` — 为多片叶子生成紧凑的合并包含证明
 - `verify_multi_inclusion(entries, proof, root) -> bool` — 无需完整叶集验证多包含证明；`entries` 按 `proof.indices` 顺序给出 `(index, leaf)`
+- `merge_inclusion_proofs(entries, leaf_count) -> MerkleMultiProofBundle` — 仅凭同一棵树下既有的单叶包含证明合成紧凑多包含证明信封，无需任何未选中叶子的原文或完整树；`entries` 为 `MerkleInclusionBatchEntry` 的列表或元组，可乱序，同一索引的完全相同条目（索引、叶与路径一致）可重复并只保留一次，不同索引即使叶内容相同也分别保留；输出保留共同根、按索引递增排列 `(index, leaf)`，其 `MerkleMultiProof` 只使用单叶证明中已有的摘要，沿用既有叶/节点哈希、奇数末项复制与逐层从左到右的兄弟摘要顺序，可直接交给 `verify_merkle_multi_proof_bundle` 与信封编解码入口；对同一完整叶集生成的有效单叶证明，结果与 `prove_multi_inclusion` 对相同索引集合的输出逐字段相等；单叶树、非二次幂叶数、相邻与分散索引均支持，覆盖全部叶子时 `siblings` 为空；`leaf_count` 是调用方声明的树形约束，决定每条路径的高度与末项复制安排，不宣称仅凭根与局部路径能唯一确定原树叶数；类型先于值做整批预检——`entries` 非 list/tuple（含 `bytes`/`bytearray`/`str`）、条目或嵌套字段不符单叶批验类型、`leaf_count` 为 `bool` 或非整数时一律抛 `TypeError`，即使另有无效证明也不掩盖类型错误；类型通过后，空输入、`leaf_count` 非正、索引越界、根不一致、根或兄弟摘要非三十二字节、路径相对声明高度缺失或多余、复制节点或重叠路径同位置摘要冲突、验证失败，以及同一索引携带不同叶或不同路径，一律抛 `ValueError` 且不返回部分信封；成功结果经信封编码解码后逐字段相等且验证为 `True`；函数不改写输入、不写文件或数据库
 - `MerkleMultiBatchEntry(entries, proof, root)` — 不可变多包含批验条目，字段依次为 `tuple[tuple[int, bytes], ...]`、`MerkleMultiProof`、`bytes`，次序与 `verify_multi_inclusion` 入参一致；三字段均可位置构造、按值相等且不可变
 - `verify_multi_inclusion_batch(batch) -> bool` — 独立多叶紧凑包含证明的批量验证：先预检整批嵌套类型（任一物品错型——含 `bool` 索引、`entries` 非元组、对非二元元组、证明嵌套字段错型——均抛 `TypeError`，后项错型同样抛出），空批返回 `False`，再逐项以 `entries`、`proof`、`root` 调 `verify_multi_inclusion`，首拒短路；物品彼此独立、可乱序重复，不做密码学聚合，输入不变
 - `BoundMerkleMultiBatch(entries, leaf_count, proof)` — 冻结的多包含证明完整批对象；字段依次为非空 `tuple[MerkleMultiBatchEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变；`leaf_count` 须等于条目数及 `proof.leaf_count`，`proof.indices` 须为 `tuple(range(leaf_count))`，空批、缺项、计数不符或索引不完整均返回 `False`
@@ -1987,6 +2007,8 @@ h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
 字节布局复用区域证明信封的成帧原语但域分隔独立：头部固定为四字节魔数 `b"zmmp"` 与一字节格式版本（当前为 `1`），随后按字段次序承载三个字段，每个字段体前置四字节无符号大端长度前缀。`root` 为原始 `bytes` 字段体；`proof` 体为三元组（`leaf_count`、`indices`、`siblings`），其中 `indices` 为整数元组、`siblings` 为字节串元组；`entries` 体为元组，每项为 `(index, leaf)` 二元组。整数沿用符号字节加最短大端绝对值的规范形，元组显式承载四字节基数，多叶信封不会被解释为区域证明信封，反之亦然。
 
 `encode_merkle_multi_proof_bundle` 只检查类型：对象或字段类型错误（含 `bool` 整数、非元组的 `indices`/`siblings`/`entries`、条目非二元组）抛 `TypeError`；证明语义不一致（索引乱序或重复、entries 与索引不符、索引越界、`leaf_count` 非正）的信封仍正常编码返回 `bytes`。`decode_merkle_multi_proof_bundle(data)` 只接受 `bytes`（否则抛 `TypeError`），逐层核对魔数、版本、长度前缀、元组基数与整数规范形，载荷必须被完整消费；截断、越界长度、未知版本、非规范整数、非法元组形状、尾随数据一律抛 `ValueError`，失败不返回部分对象；可表示但证明不成立的信封仍解码成功，重建对象与原对象逐字段相等。`verify_merkle_multi_proof_bundle(bundle)` 把 `entries`、`proof`、`root` 原样交给 `verify_multi_inclusion`，沿用既有多叶包含验证语义；对象或字段类型错误抛 `TypeError`，叶或根被篡改、索引重复或乱序、索引越界、entries 数目不符、拼接或截断的 siblings 等语义不一致一律返回 `False`。编码后解码保持验证结论。
+
+`merge_inclusion_proofs(entries, leaf_count)` 不经过完整叶集即可产出这样的信封：它只消费同一根下既有的单叶 `MerkleProof`（条目类型与 `verify_inclusion_batch` 一致），按声明的 `leaf_count` 逐条复核路径高度、三十二字节摘要、奇数末项自复制与根一致，再把各路径已有摘要按既有生成入口的逐层从左到右顺序压缩为一份 `MerkleMultiProof`，选中叶子按索引递增放入信封；乱序输入与完全相同重复项不影响结果值，不同索引（即使叶内容相同）分别保留。`leaf_count` 是调用方声明的树形约束而非由根推导：当局部路径不触及被声明多出的位置时，同一组哈希也可能在更大的声明叶数下走到同根，函数不声称根与局部路径能唯一确定原树叶数。
 
 ### Merkle 承诺的宽区间二维区域证明完整批验
 

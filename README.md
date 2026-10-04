@@ -345,6 +345,16 @@ wide_proof = prove_range_wide(wide_commitment, 40000, wide_blinding, context=b"s
 assert verify_range_wide(wide_commitment, wide_proof, context=b"session-1")
 assert not verify_range_wide(wide_commitment, wide_proof, context=b"other")
 
+# 任意宽度闭区间的非交互证明：声明区间含 1 到 2**24 个整数即可，不必为 2 的幂
+from zkregion import prove_range_interval, verify_range_interval
+
+interval_commitment, interval_blinding = pedersen_commit(500000, 0, 1000000)
+interval_proof = prove_range_interval(
+    interval_commitment, 500000, interval_blinding, context=b"session-1"
+)
+assert verify_range_interval(interval_commitment, interval_proof, context=b"session-1")
+assert not verify_range_interval(interval_commitment, interval_proof, context=b"other")
+
 # 区间证明的批量验证（按 (prime, generator, h) 分组做随机线性组合）
 from zkregion import RangeBatchEntry, verify_range_batch
 
@@ -1360,6 +1370,9 @@ python3 -m zkregion
 - `prove_range_wide(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> WideRangeProof` — 按位分解的宽区间非交互证明：声明区间内整数个数须恰为 2 的幂，且以 2 为底的位宽须在 1 到 24 之间，越界或个数非 2 的幂抛 `ValueError`；生成前以 `verify_pedersen_opening` 同一口径重算承诺开合，开合不符或值越出声明区间抛 `ValueError`；随机源不可调用或返回非整数（含 `bool`）抛 `TypeError`、抽取值越界抛 `ValueError`；同一组承诺、值、盲因子与上下文在相同随机源下重复生成的证明逐字节一致，输入不被改写
 - `verify_range_wide(commitment, proof, context=b"") -> bool` — 验证宽区间证明：各比特承诺按位加权（`2**i`）的乘积须等于承诺值，逐位重算每个比特分支两条 OR 分支的公告并核对两个挑战份额之和等于转录挑战；位宽越界、个数非 2 的幂、换承诺、换上下文、换声明区间、交换或替换任意比特分支、改动分支内的承诺/挑战份额/响应、挪动位序一律返回 `False` 且不抛异常；任一层字段错型（含用 `bool` 冒充整数）抛 `TypeError`，输入不被改写
 - `WideRangeProof(commitments, challenges, responses)` — 不可变宽区间证明对象；`commitments` 为按位序（低位在前）的比特承诺 `tuple[int, ...]`，`challenges` 与 `responses` 为每个比特分支的两个挑战份额、两个响应组成的 `tuple[tuple[int, int], ...]`，三者长度均为位宽 `k`；可位置构造、按值相等且不可变
+- `prove_range_interval(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> IntervalRangeProof` — 任意宽度闭区间的非交互证明：声明区间可含任意 `1` 到 `2**24` 个整数（单点、负边界、跨零与非二次幂宽度均可），倒置或超限区间抛 `ValueError`；令 `n` 为区间整数个数、`k = max(1, (n-1).bit_length())`、`shift = 2**k - n`，证明由两套按位 Schnorr OR 分解组成——低位半证明偏移 `value - lower` 落在 `[0, 2**k)`（绑定承诺元素本身），高位半证明 `value - lower + shift` 落在 `[0, 2**k)`（绑定 `element * generator**shift mod prime`），两半的加权比特盲因子均闭合到同一承诺盲因子，故区间外值无法借补齐到二次幂被接纳；生成前以 `verify_pedersen_opening` 同一口径重算承诺开合，非法群参数、非法承诺元素、越界值、非法盲因子或开合不符抛 `ValueError`；随机源不可调用或返回非整数（含 `bool`）抛 `TypeError`、抽取值越出该次请求的半开区间抛 `ValueError`；证明不携带明文值或盲因子，整数元素总数为 `10k`（随区间个数的二进制位数线性增长，不随候选整数个数增长）；同一组入参在相同随机序列下生成相等证明，输入不被改写
+- `verify_range_interval(commitment, proof, context=b"") -> bool` — 验证任意宽度闭区间证明：只接收承诺、证明与 context，不接触原值或盲因子，且不消耗随机数；两半比特承诺分别按 `2**i` 加权乘回承诺元素与 `element * generator**shift`，逐位重算每个比特分支两条 OR 分支的公告并核对两个挑战份额之和等于转录挑战（转录绑定承诺全部六个字段、准确上下界与 context）；区间个数超出 `2**24`、证明缺项、结构或数值越界、替换承诺任一字段或上下界、换 context、交换两半、篡改任一比特分支一律返回 `False` 且不抛异常；对象或任一层嵌套字段错型（含用 `bool` 冒充整数、非元组字段、非 `bytes` context）抛 `TypeError`，输入不被改写
+- `IntervalRangeProof(low_commitments, low_challenges, low_responses, high_commitments, high_challenges, high_responses)` — 不可变任意宽度区间证明对象；`low_*` 三个字段为偏移 `value - lower` 的按位分解（低位半），`high_*` 三个字段为偏移加 `shift` 的按位分解（高位半）；`*_commitments` 为按位序（低位在前）的比特承诺 `tuple[int, ...]`，`*_challenges` 与 `*_responses` 为每个比特分支的两个挑战份额、两个响应组成的 `tuple[tuple[int, int], ...]`，六个字段长度均为位宽 `k`；可位置构造、按值相等且冻结，构造时不做任何校验
 - `WideRangeBatchEntry(commitment, proof, context=b"")` — 不可变宽区间批验条目，字段类型依次为 `PedersenCommitment`、`WideRangeProof`、`bytes`，字段次序与 `verify_range_wide` 入参一致；可位置构造、按值相等且不可变，构造时不做任何校验
 - `verify_range_wide_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 宽区间证明的批量验证：先整批预检嵌套类型（序列本身、条目、承诺六字段、证明三层元组整数与 `context`，错型含后项错型与用 `bool` 冒充整数，一律抛唯一的 `TypeError`；随机源不可调用或返回非整数同样抛 `TypeError`），预检通过后才逐条核对；空批返回 `False`，任一条无效即短路返回 `False`。比特承诺按 `2**i` 加权的绑定与各比特两个挑战份额之和等于转录挑战逐条核对、不参与聚合；每个比特的两条 OR 子分支各恰取一次非零系数 `a = r + 1`（`r = randbelow(prime - 1)`），按 `(prime, generator, h)` 分组做一次随机线性组合，越界系数抛 `ValueError`；换承诺、换上下文、换声明区间、交换替换比特分支、改动分支内承诺/挑战份额/响应、挪动位序一律返回 `False` 且不抛异常；条目独立、可乱序可重复，固定随机源下结果可重复，输入不被改写
 - `verify_range_wide_batch_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的宽区间证明完整批验：先 `verify_multi_inclusion` 验根，再以同一 `randbelow` 调 `verify_range_wide_batch` 验证明

@@ -29,6 +29,7 @@ WideRangeProof / prove_range_wide / verify_range_wide /
 WideRangeBatchEntry / verify_range_wide_batch /
 BoundWideRangeBatch / prove_range_wide_batch_bound /
 verify_range_wide_batch_bound /
+IntervalRangeProof / prove_range_interval / verify_range_interval /
 prove_region / verify_region / region_contains_committed /
 quantize_coordinate / quantize_region /
 RegionWideProof / prove_region_wide / verify_region_wide /
@@ -149,6 +150,7 @@ __all__ = [
     "ConvexPolygonRegion",
     "ConvexPolygonRegionProof",
     "ConvexPolygonReplayGuard",
+    "IntervalRangeProof",
     "MerkleConsistencyBatchEntry",
     "MerkleConsistencyBatchReplayGuard",
     "MerkleConsistencyChain",
@@ -236,6 +238,7 @@ __all__ = [
     "prove_pedersen_opening_batch_bound",
     "prove_range",
     "prove_range_batch_bound",
+    "prove_range_interval",
     "prove_range_set",
     "prove_range_set_batch_bound",
     "prove_range_wide",
@@ -276,6 +279,7 @@ __all__ = [
     "verify_range",
     "verify_range_batch",
     "verify_range_bound",
+    "verify_range_interval",
     "verify_range_set",
     "verify_range_set_batch",
     "verify_range_set_batch_bound",
@@ -2455,6 +2459,402 @@ def prove_range_wide_batch_bound(
         proof=proof,
     )
     return batch, root
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive arbitrary-width interval Pedersen range proofs
+#
+# prove_range_interval proves that a commitment opens at a value inside its
+# declared range [lower, upper] when the count n = upper - lower + 1 of
+# integers in the range is arbitrary — 1 <= n <= 2**24, not necessarily a
+# power of two. Let k = max(1, ceil(log2(n))) and shift = 2**k - n. The
+# offset m = value - lower lies in [0, n) exactly when both m and m + shift
+# lie in [0, 2**k): the first disjunction contributes m >= 0, the second
+# m < n, and together they pin m to [0, n) with no padding slack. Each of
+# the two power-of-two ranges is proven with the same per-bit Schnorr OR
+# decomposition as prove_range_wide: the low half decomposes m against the
+# commitment element itself, the high half decomposes m + shift against
+# element * generator**shift mod prime, and both halves close their weighted
+# bit blindings to the same commitment blinding. The proof carries 2k bit
+# commitments, 2k challenge-share pairs and 2k response pairs, so its size
+# grows with the bit width of the range count — never with the count
+# itself — and a value outside [lower, upper] cannot be smuggled in by
+# padding the range up to a power of two.
+
+_INTERVAL_RANGE_DOMAIN = b"zkregion/pedersen-range-interval/v1"
+_MAX_INTERVAL_RANGE_BITS = 24
+
+
+@dataclass(frozen=True)
+class IntervalRangeProof:
+    """A non-interactive arbitrary-width interval proof over a commitment.
+
+    The ``low_*`` fields prove the bit decomposition of the offset
+    ``value - lower``; the ``high_*`` fields prove the bit decomposition of
+    ``value - lower + 2**k - n``, where ``n`` is the number of integers in
+    the declared range and ``k`` its padded bit width. ``low_commitments``
+    and ``high_commitments`` hold the per-bit Pedersen commitments in bit
+    order (least significant bit first); ``low_challenges`` /
+    ``high_challenges`` and ``low_responses`` / ``high_responses`` hold, per
+    bit, the two challenge shares and the two responses of the Schnorr OR
+    that proves the committed bit to be 0 or 1. All six are tuples of ``k``
+    entries, where ``k = max(1, (n - 1).bit_length())``.
+    """
+
+    low_commitments: tuple[int, ...]
+    low_challenges: tuple[tuple[int, int], ...]
+    low_responses: tuple[tuple[int, int], ...]
+    high_commitments: tuple[int, ...]
+    high_challenges: tuple[tuple[int, int], ...]
+    high_responses: tuple[tuple[int, int], ...]
+
+
+def _interval_range_bit_width(count: int) -> int:
+    """Padded bit width for a range of ``count >= 1`` integers."""
+    return max(1, (count - 1).bit_length())
+
+
+def _interval_range_challenge(
+    commitment: PedersenCommitment,
+    context: bytes,
+    width: int,
+    low_commitments: tuple[int, ...],
+    low_announcements: tuple[tuple[int, int], ...],
+    high_commitments: tuple[int, ...],
+    high_announcements: tuple[tuple[int, int], ...],
+) -> int:
+    """SHA-256 transcript challenge as a big-endian integer mod ``prime``.
+
+    The transcript is the domain separator, the six commitment fields, the
+    context, the padded bit width ``k`` and, per half (low then high) and
+    per bit in bit order, the bit commitment and the two recomputed
+    announcements; each item is prefixed with its four-byte big-endian
+    length and integers are encoded as decimal ASCII, mirroring
+    :func:`_wide_range_challenge`.
+    """
+    fields = (
+        commitment.element,
+        commitment.lower,
+        commitment.upper,
+        commitment.prime,
+        commitment.generator,
+        commitment.h,
+    )
+    items = [_INTERVAL_RANGE_DOMAIN]
+    items.extend(str(field).encode("ascii") for field in fields)
+    items.append(context)
+    items.append(str(width).encode("ascii"))
+    for commitments, announcements in (
+        (low_commitments, low_announcements),
+        (high_commitments, high_announcements),
+    ):
+        for bit_commitment, pair in zip(commitments, announcements):
+            items.append(str(bit_commitment).encode("ascii"))
+            items.append(str(pair[0]).encode("ascii"))
+            items.append(str(pair[1]).encode("ascii"))
+    transcript = hashlib.sha256()
+    for item in items:
+        transcript.update(len(item).to_bytes(4, "big"))
+        transcript.update(item)
+    return int.from_bytes(transcript.digest(), "big") % commitment.prime
+
+
+def prove_range_interval(
+    commitment: PedersenCommitment,
+    value: int,
+    blinding: int,
+    context: bytes = b"",
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> IntervalRangeProof:
+    """Prove that ``commitment`` opens at some value inside its declared range.
+
+    The declared range may contain any number ``n`` of integers with
+    ``1 <= n <= 2**24`` — single points, negative bounds, ranges crossing
+    zero and non-power-of-two widths included; an inverted or wider range
+    raises :class:`ValueError`. ``value`` and ``blinding`` must be a valid
+    opening of ``commitment``; the opening is verified with
+    :func:`verify_pedersen_opening` before any proving work happens and a
+    mismatch — including a value outside the declared range — raises
+    :class:`ValueError`, mirroring :func:`prove_range_wide`. Randomness is
+    drawn from ``randbelow`` (default :func:`secrets.randbelow`); a
+    non-callable source or a draw that is not a non-bool integer raises
+    :class:`TypeError`, an out-of-range draw raises :class:`ValueError`.
+    The same inputs under the same random source produce an equal proof,
+    and the proof carries neither ``value`` nor ``blinding``. Inputs are
+    never mutated.
+    """
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment")
+    _check_commitment_fields(commitment)
+    _check_int(value, "value")
+    _check_int(blinding, "blinding")
+    _check_bytes(context, "context")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    count = commitment.upper - commitment.lower + 1
+    if not 1 <= count <= (1 << _MAX_INTERVAL_RANGE_BITS):
+        raise ValueError(
+            "range must contain between 1 and "
+            f"2**{_MAX_INTERVAL_RANGE_BITS} integers"
+        )
+    if not verify_pedersen_opening(commitment, value, blinding):
+        raise ValueError("commitment does not open at (value, blinding)")
+    prime = commitment.prime
+    generator = commitment.generator
+    h = commitment.h
+
+    def draw(upper: int) -> int:
+        drawn = randbelow(upper)
+        _check_int(drawn, "randbelow return value")
+        if not 0 <= drawn < upper:
+            raise ValueError(f"randbelow must return a value in [0, {upper})")
+        return drawn
+
+    width = _interval_range_bit_width(count)
+    shift = (1 << width) - count
+    offset = value - commitment.lower
+    generator_inverse = pow(generator, -1, prime)
+
+    def prove_half(shifted: int):
+        # Bit blindings: r_1 .. r_{k-1} are random, r_0 closes the weighted
+        # sum so sum(2**i * r_i) == blinding (mod prime - 1); its weight is
+        # 1, so the correction is always an integer.
+        bit_blindings = [0] + [draw(prime - 1) for _ in range(width - 1)]
+        bit_blindings[0] = (
+            blinding - sum((1 << i) * r for i, r in enumerate(bit_blindings))
+        ) % (prime - 1)
+        bit_commitments: list[int] = []
+        challenges: list[list[int]] = []
+        responses: list[list[int]] = []
+        announcements: list[list[int]] = []
+        nonces: list[int] = []
+        bits: list[int] = []
+        for i in range(width):
+            bit = (shifted >> i) & 1
+            bits.append(bit)
+            bit_commitment = (
+                pow(generator, bit, prime) * pow(h, bit_blindings[i], prime) % prime
+            )
+            bit_commitments.append(bit_commitment)
+            simulated = 1 - bit
+            pair_e = [0, 0]
+            pair_s = [0, 0]
+            pair_t = [0, 0]
+            pair_e[simulated] = draw(prime)  # challenge share in [0, prime)
+            pair_s[simulated] = draw(prime - 1)  # response in [0, prime - 1)
+            nonce = draw(prime - 1)  # Schnorr nonce for the real branch
+            nonces.append(nonce)
+            pair_t[bit] = pow(h, nonce, prime)
+            statement = bit_commitment
+            if simulated:
+                statement = statement * generator_inverse % prime
+            pair_t[simulated] = (
+                pow(h, pair_s[simulated], prime)
+                * pow(statement, -pair_e[simulated], prime)
+                % prime
+            )
+            challenges.append(pair_e)
+            responses.append(pair_s)
+            announcements.append(pair_t)
+        return (
+            bit_commitments,
+            challenges,
+            responses,
+            announcements,
+            nonces,
+            bits,
+            bit_blindings,
+        )
+
+    low = prove_half(offset)
+    high = prove_half(offset + shift)
+    challenge = _interval_range_challenge(
+        commitment,
+        context,
+        width,
+        tuple(low[0]),
+        tuple(tuple(pair) for pair in low[3]),
+        tuple(high[0]),
+        tuple(tuple(pair) for pair in high[3]),
+    )
+    for _, challenges, responses, _, nonces, bits, bit_blindings in (low, high):
+        for i in range(width):
+            bit = bits[i]
+            challenges[i][bit] = (challenge - challenges[i][1 - bit]) % prime
+            responses[i][bit] = (
+                nonces[i] + challenges[i][bit] * bit_blindings[i]
+            ) % (prime - 1)
+    return IntervalRangeProof(
+        low_commitments=tuple(low[0]),
+        low_challenges=tuple(tuple(pair) for pair in low[1]),
+        low_responses=tuple(tuple(pair) for pair in low[2]),
+        high_commitments=tuple(high[0]),
+        high_challenges=tuple(tuple(pair) for pair in high[1]),
+        high_responses=tuple(tuple(pair) for pair in high[2]),
+    )
+
+
+def _check_interval_range_proof_types(proof: object, label: str) -> IntervalRangeProof:
+    """Validate the nested types of one :class:`IntervalRangeProof`.
+
+    ``label`` is the caller's name for the proof in error messages
+    (``"proof"`` for :func:`verify_range_interval`). The proof must be an
+    :class:`IntervalRangeProof` whose ``low_commitments`` and
+    ``high_commitments`` are tuples of non-``bool`` integers and whose
+    ``low_challenges`` / ``low_responses`` / ``high_challenges`` /
+    ``high_responses`` are tuples of tuples of non-``bool`` integers;
+    anything else raises :class:`TypeError`. Returns the proof unchanged.
+    """
+    if not isinstance(proof, IntervalRangeProof):
+        raise TypeError(f"{label} must be an IntervalRangeProof")
+    for field_name in ("low_commitments", "high_commitments"):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(f"{label} {field_name} must be a tuple of integers")
+        for item in field:
+            _check_int(item, f"{label} {field_name} entry")
+    for field_name in (
+        "low_challenges",
+        "low_responses",
+        "high_challenges",
+        "high_responses",
+    ):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(
+                f"{label} {field_name} must be a tuple of integer pairs"
+            )
+        for pair in field:
+            if not isinstance(pair, tuple):
+                raise TypeError(
+                    f"{label} {field_name} entry must be a tuple of integers"
+                )
+            for item in pair:
+                _check_int(item, f"{label} {field_name} entry item")
+    return proof
+
+
+def verify_range_interval(
+    commitment: PedersenCommitment,
+    proof: IntervalRangeProof,
+    context: bytes = b"",
+) -> bool:
+    """Verify an :class:`IntervalRangeProof` against ``commitment`` and ``context``.
+
+    The declared range must contain between 1 and ``2**24`` integers; any
+    other size returns ``False``. With ``k`` the padded bit width of the
+    range count ``n`` and ``shift = 2**k - n``, the low-half bit
+    commitments must multiply back to the commitment element and the
+    high-half bit commitments to ``element * generator**shift (mod prime)``
+    (``product(C_i**(2**i))`` in both cases); per bit and per half the two
+    announcements are recomputed as ``h**s * D**(-e) (mod prime)`` with
+    ``D`` the bit commitment or the bit commitment divided by
+    ``generator``, and the two challenge shares of every bit must sum to
+    the transcript challenge modulo ``prime``. Type errors (wrong object,
+    non-tuple or non-integer proof fields at any nesting level — including
+    ``bool`` integers — or a non-bytes context) raise :class:`TypeError`;
+    any other invalid structure, missing proof items, tampering or binding
+    mismatch returns ``False``. Verification draws no randomness and never
+    sees the committed value or the blinding. Inputs are never mutated.
+    """
+    if not isinstance(commitment, PedersenCommitment):
+        raise TypeError("commitment must be a PedersenCommitment")
+    _check_commitment_fields(commitment)
+    _check_interval_range_proof_types(proof, "proof")
+    _check_bytes(context, "context")
+    prime = commitment.prime
+    generator = commitment.generator
+    h = commitment.h
+    if prime <= 3:
+        return False
+    if not 1 < generator < prime or not 1 < h < prime:
+        return False
+    if not 0 < commitment.element < prime:
+        return False
+    if commitment.lower > commitment.upper:
+        return False
+    if commitment.upper - commitment.lower >= prime - 1:
+        return False
+    count = commitment.upper - commitment.lower + 1
+    if count > (1 << _MAX_INTERVAL_RANGE_BITS):
+        return False
+    width = _interval_range_bit_width(count)
+    shift = (1 << width) - count
+    halves = (
+        (
+            proof.low_commitments,
+            proof.low_challenges,
+            proof.low_responses,
+            commitment.element,
+        ),
+        (
+            proof.high_commitments,
+            proof.high_challenges,
+            proof.high_responses,
+            commitment.element * pow(generator, shift, prime) % prime,
+        ),
+    )
+    for commitments, challenges, responses, _ in halves:
+        if not (len(commitments) == len(challenges) == len(responses) == width):
+            return False
+        if any(len(pair) != 2 for pair in challenges):
+            return False
+        if any(len(pair) != 2 for pair in responses):
+            return False
+        if any(not 1 <= c_i < prime for c_i in commitments):
+            return False
+        if any(not 0 <= share < prime for pair in challenges for share in pair):
+            return False
+        if any(
+            not 0 <= response < prime - 1
+            for pair in responses
+            for response in pair
+        ):
+            return False
+    try:
+        generator_inverse = pow(generator, -1, prime)
+    except ValueError:
+        return False  # generator not invertible modulo prime
+    announcements_per_half: list[tuple[tuple[int, int], ...]] = []
+    for commitments, challenges, responses, target in halves:
+        product = 1
+        for i, bit_commitment in enumerate(commitments):
+            product = product * pow(bit_commitment, 1 << i, prime) % prime
+        if product != target:
+            return False
+        announcements: list[tuple[int, int]] = []
+        for i in range(width):
+            pair: list[int] = []
+            for branch in (0, 1):
+                statement = commitments[i]
+                if branch:
+                    statement = statement * generator_inverse % prime
+                try:
+                    announcement = (
+                        pow(h, responses[i][branch], prime)
+                        * pow(statement, -challenges[i][branch], prime)
+                        % prime
+                    )
+                except ValueError:
+                    return False  # statement not invertible modulo prime
+                pair.append(announcement)
+            announcements.append((pair[0], pair[1]))
+        announcements_per_half.append(tuple(announcements))
+    challenge = _interval_range_challenge(
+        commitment,
+        context,
+        width,
+        proof.low_commitments,
+        announcements_per_half[0],
+        proof.high_commitments,
+        announcements_per_half[1],
+    )
+    for _, challenges, _, _ in halves:
+        for pair_e in challenges:
+            if (pair_e[0] + pair_e[1]) % prime != challenge:
+                return False
+    return True
 
 
 @dataclass(frozen=True)

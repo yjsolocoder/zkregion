@@ -33,6 +33,8 @@ IntervalRangeProof / prove_range_interval / verify_range_interval /
 prove_region / verify_region / region_contains_committed /
 quantize_coordinate / quantize_region /
 RegionWideProof / prove_region_wide / verify_region_wide /
+RegionIntervalProof / prove_region_interval /
+verify_region_interval /
 RegionProofBundle / encode_region_proof_bundle /
 decode_region_proof_bundle / verify_region_proof_bundle /
 RegionWideBatchEntry / verify_region_wide_batch /
@@ -191,6 +193,7 @@ __all__ = [
     "RegionContainsBatchReplayGuard",
     "RegionContainsEntry",
     "RegionContainsReplayGuard",
+    "RegionIntervalProof",
     "RegionProof",
     "RegionProofBundle",
     "RegionReplayGuard",
@@ -246,6 +249,7 @@ __all__ = [
     "prove_region",
     "prove_region_batch_bound",
     "prove_region_contains_bound",
+    "prove_region_interval",
     "prove_region_wide",
     "prove_region_wide_batch_bound",
     "prove_schnorr_batch_bound",
@@ -291,6 +295,7 @@ __all__ = [
     "verify_region_bound",
     "verify_region_contains_batch",
     "verify_region_contains_bound",
+    "verify_region_interval",
     "verify_region_proof_bundle",
     "verify_region_wide",
     "verify_region_wide_batch",
@@ -5280,6 +5285,174 @@ def verify_region_wide(
         proof.x_proof,
         _region_sub_context(b"x", context, region, x_commitment, y_commitment),
     ) and verify_range_wide(
+        y_commitment,
+        proof.y_proof,
+        _region_sub_context(b"y", context, region, x_commitment, y_commitment),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive 2-D region membership proofs over arbitrary-width intervals
+#
+# The arbitrary-width variant of a region proof: a pair of interval range
+# proofs, one per axis, reusing prove_range_interval / verify_range_interval
+# so each axis may independently span any number n of integers with
+# 1 <= n <= 2**24 — non-power-of-two widths, single points and line segments
+# included — without weakening membership to the padded power-of-two box.
+# The declared ranges and the derived per-axis contexts follow exactly the
+# prove_region binding (via _region_sub_context): the region domain
+# separator, the axis label, the external context, the four region bounds
+# and both commitments.
+
+
+@dataclass(frozen=True)
+class RegionIntervalProof:
+    """A non-interactive 2-D region membership proof over arbitrary intervals.
+
+    ``x_proof`` and ``y_proof`` are :class:`IntervalRangeProof` objects over
+    the x and y :class:`PedersenCommitment` respectively; the verifier
+    learns nothing about the coordinates or blinding factors. The proof is
+    immutable, supports positional construction and compares by value.
+    """
+
+    x_proof: IntervalRangeProof
+    y_proof: IntervalRangeProof
+
+
+def prove_region_interval(
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    x: int,
+    y: int,
+    x_blinding: int,
+    y_blinding: int,
+    region: Region,
+    context: bytes = b"",
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> RegionIntervalProof:
+    """Prove that the committed ``(x, y)`` lies inside ``region``.
+
+    Each axis may independently contain any number ``n`` of integers with
+    ``1 <= n <= 2**24`` — single points, line segments, negative bounds,
+    ranges crossing zero and non-power-of-two widths included — so closed
+    rectangles that degenerate to a segment or a point are supported and
+    boundary points pass. ``x_commitment`` must be declared over exactly
+    ``[region.min_x, region.max_x]`` and ``y_commitment`` over exactly
+    ``[region.min_y, region.max_y]``; a mismatch raises
+    :class:`ValueError`. Before any proving work happens — and therefore
+    before any randomness is drawn — the group parameters of both
+    commitments (the existing :func:`pedersen_commit` legality rules; the
+    two axes may use different legal parameters), both declared ranges and
+    both openings are validated: each opening is recomputed and compared
+    with :func:`verify_pedersen_opening`, so an inverted or oversized
+    declaration, an out-of-range coordinate or a wrong blinding raises
+    :class:`ValueError`. An out-of-range draw from ``randbelow`` likewise
+    raises :class:`ValueError`. Type errors (wrong objects, non-integer or
+    ``bool`` numbers, non-``bytes`` context, a non-callable ``randbelow``
+    or a non-integer draw) raise :class:`TypeError`; an exception raised by
+    the random source itself propagates unchanged. The per-axis sub-proofs
+    reuse :func:`prove_range_interval` unchanged under the same derived
+    contexts as :func:`prove_region`; the same inputs under the same random
+    sequence produce an equal proof, and the proof carries neither
+    coordinates nor blindings. Inputs are never mutated.
+    """
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError("x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError("y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    _check_int(x, "x")
+    _check_int(y, "y")
+    _check_int(x_blinding, "x_blinding")
+    _check_int(y_blinding, "y_blinding")
+    if not isinstance(region, Region):
+        raise TypeError("region must be a Region")
+    _check_region_fields(region)
+    _check_bytes(context, "context")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if (x_commitment.lower, x_commitment.upper) != (region.min_x, region.max_x):
+        raise ValueError("x commitment range must equal (region.min_x, region.max_x)")
+    if (y_commitment.lower, y_commitment.upper) != (region.min_y, region.max_y):
+        raise ValueError("y commitment range must equal (region.min_y, region.max_y)")
+    # Validate both axes' interval counts before either sub-proof is
+    # produced, so an oversized second axis fails without drawing any
+    # randomness for the first.
+    for axis, commitment in (("x", x_commitment), ("y", y_commitment)):
+        count = commitment.upper - commitment.lower + 1
+        if not 1 <= count <= (1 << _MAX_INTERVAL_RANGE_BITS):
+            raise ValueError(
+                f"{axis} range must contain between 1 and "
+                f"2**{_MAX_INTERVAL_RANGE_BITS} integers"
+            )
+    if not verify_pedersen_opening(x_commitment, x, x_blinding):
+        raise ValueError("x commitment does not open at (x, x_blinding)")
+    if not verify_pedersen_opening(y_commitment, y, y_blinding):
+        raise ValueError("y commitment does not open at (y, y_blinding)")
+    x_proof = prove_range_interval(
+        x_commitment,
+        x,
+        x_blinding,
+        _region_sub_context(b"x", context, region, x_commitment, y_commitment),
+        randbelow=randbelow,
+    )
+    y_proof = prove_range_interval(
+        y_commitment,
+        y,
+        y_blinding,
+        _region_sub_context(b"y", context, region, x_commitment, y_commitment),
+        randbelow=randbelow,
+    )
+    return RegionIntervalProof(x_proof=x_proof, y_proof=y_proof)
+
+
+def verify_region_interval(
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    region: Region,
+    proof: RegionIntervalProof,
+    context: bytes = b"",
+) -> bool:
+    """Verify a :class:`RegionIntervalProof` against both commitments and ``region``.
+
+    The verifier needs only the two commitments, the region, the proof and
+    the context — never the coordinates or blinding factors. Nested types
+    are checked first and completely: a wrong object anywhere, a
+    non-:class:`IntervalRangeProof` sub-proof, non-tuple proof fields at any
+    nesting level, non-integers (including ``bool``) or a non-``bytes``
+    context raise :class:`TypeError`. Every other failure — a commitment
+    range that does not equal the region bounds, an axis with more than
+    ``2**24`` integers, a missing or malformed proof item, an out-of-range
+    value, tampering, a changed region/context/commitment, sub-proofs taken
+    from another axis or spliced from a proof over a different coordinate
+    pair — returns ``False`` without raising. Verification draws no
+    randomness and inputs are never mutated.
+    """
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError("x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError("y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    if not isinstance(region, Region):
+        raise TypeError("region must be a Region")
+    _check_region_fields(region)
+    if not isinstance(proof, RegionIntervalProof):
+        raise TypeError("proof must be a RegionIntervalProof")
+    _check_interval_range_proof_types(proof.x_proof, "proof x_proof")
+    _check_interval_range_proof_types(proof.y_proof, "proof y_proof")
+    _check_bytes(context, "context")
+    if (x_commitment.lower, x_commitment.upper) != (region.min_x, region.max_x):
+        return False
+    if (y_commitment.lower, y_commitment.upper) != (region.min_y, region.max_y):
+        return False
+    return verify_range_interval(
+        x_commitment,
+        proof.x_proof,
+        _region_sub_context(b"x", context, region, x_commitment, y_commitment),
+    ) and verify_range_interval(
         y_commitment,
         proof.y_proof,
         _region_sub_context(b"y", context, region, x_commitment, y_commitment),

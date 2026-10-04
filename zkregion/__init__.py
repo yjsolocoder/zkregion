@@ -30,6 +30,9 @@ WideRangeBatchEntry / verify_range_wide_batch /
 BoundWideRangeBatch / prove_range_wide_batch_bound /
 verify_range_wide_batch_bound /
 IntervalRangeProof / prove_range_interval / verify_range_interval /
+IntervalRangeBatchEntry / verify_range_interval_batch /
+BoundIntervalRangeBatch / prove_range_interval_batch_bound /
+verify_range_interval_batch_bound /
 prove_region / verify_region / region_contains_committed /
 quantize_coordinate / quantize_region /
 RegionWideProof / prove_region_wide / verify_region_wide /
@@ -122,6 +125,7 @@ __all__ = [
     "BoundConsistencyReplayGuard",
     "BoundConvexPolygonBatch",
     "BoundConvexPolygonReplayGuard",
+    "BoundIntervalRangeBatch",
     "BoundMerkleInclusionBatch",
     "BoundMerkleInclusionBatchReplayGuard",
     "BoundMerkleMultiBatch",
@@ -150,6 +154,7 @@ __all__ = [
     "ConvexPolygonRegion",
     "ConvexPolygonRegionProof",
     "ConvexPolygonReplayGuard",
+    "IntervalRangeBatchEntry",
     "IntervalRangeProof",
     "MerkleConsistencyBatchEntry",
     "MerkleConsistencyBatchReplayGuard",
@@ -240,6 +245,7 @@ __all__ = [
     "prove_range",
     "prove_range_batch_bound",
     "prove_range_interval",
+    "prove_range_interval_batch_bound",
     "prove_range_set",
     "prove_range_set_batch_bound",
     "prove_range_wide",
@@ -282,6 +288,8 @@ __all__ = [
     "verify_range_batch",
     "verify_range_bound",
     "verify_range_interval",
+    "verify_range_interval_batch",
+    "verify_range_interval_batch_bound",
     "verify_range_set",
     "verify_range_set_batch",
     "verify_range_set_batch_bound",
@@ -2858,6 +2866,330 @@ def verify_range_interval(
             if (pair_e[0] + pair_e[1]) % prime != challenge:
                 return False
     return True
+
+
+@dataclass(frozen=True)
+class IntervalRangeBatchEntry:
+    """One item of an interval range batch verification.
+
+    Fields are the :class:`PedersenCommitment`, the
+    :class:`IntervalRangeProof` and the ``context`` (empty by default) —
+    exactly the arguments of :func:`verify_range_interval`, in the same
+    order. All three are positional construction arguments; entries
+    compare by value and are immutable. Construction never validates the
+    fields: type and value checks belong to the batch verification and
+    batch-binding entry points.
+    """
+
+    commitment: PedersenCommitment
+    proof: IntervalRangeProof
+    context: bytes = b""
+
+
+def _check_interval_range_batch_entries_types(
+    entries: object,
+) -> list[IntervalRangeBatchEntry]:
+    """Validate the interval-range-batch ``entries`` argument types.
+
+    Mirrors the type expectations of :func:`verify_range_interval` for
+    *every* entry before any verification runs: ``entries`` must be a
+    non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`IntervalRangeBatchEntry` objects whose ``commitment`` is a
+    :class:`PedersenCommitment` with non-``bool`` integer
+    ``element`` / ``lower`` / ``upper`` / ``prime`` / ``generator`` /
+    ``h`` fields, whose ``proof`` is an :class:`IntervalRangeProof` with
+    tuple fields of non-``bool`` integers at every nesting level and
+    whose ``context`` is ``bytes``. The whole batch is walked (a bad
+    type in the last entry still raises and is not hidden by an earlier
+    invalid entry), and the entries are copied into a fresh list so the
+    inputs are never mutated. An empty batch is left to the callers to
+    reject; structural and value problems are left to the per-entry
+    checks during verification.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of IntervalRangeBatchEntry")
+    items: list[IntervalRangeBatchEntry] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, IntervalRangeBatchEntry):
+            raise TypeError(
+                f"entries[{position}] must be an IntervalRangeBatchEntry"
+            )
+        commitment = entry.commitment
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(
+                f"entries[{position}] commitment must be a PedersenCommitment"
+            )
+        _check_commitment_fields(commitment)
+        _check_interval_range_proof_types(
+            entry.proof, f"entries[{position}] proof"
+        )
+        _check_bytes(entry.context, f"entries[{position}] context")
+        items.append(entry)
+    return items
+
+
+def verify_range_interval_batch(entries: Sequence[IntervalRangeBatchEntry]) -> bool:
+    """Verify a non-empty batch of :class:`IntervalRangeProof` objects.
+
+    ``entries`` must be a non-empty, non-string sequence of
+    :class:`IntervalRangeBatchEntry`; an empty batch returns ``False``
+    and duplicate entries are legal. The nested types of the *whole*
+    batch are preflighted first, so a wrong type in any entry —
+    including the last one (it cannot be hidden by an earlier invalid
+    entry), and including a ``bool`` passed as an integer, a non-tuple
+    proof field or a non-bytes context — raises :class:`TypeError`;
+    only then are the entries checked one by one with the unchanged
+    :func:`verify_range_interval` semantics, and the first invalid
+    entry short-circuits the batch.
+
+    Entries are independent: they may mix group parameters and bit
+    widths, single points, negative bounds and ranges crossing zero,
+    appear in any order and repeat, and reordering never changes the
+    result. Verification draws no randomness, never sees a committed
+    value or a blinding factor, and never mutates its inputs.
+    """
+    items = _check_interval_range_batch_entries_types(entries)
+    if not items:
+        return False
+    for entry in items:
+        if not verify_range_interval(
+            entry.commitment, entry.proof, entry.context
+        ):
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed arbitrary-width interval range batches
+#
+# A complete interval range batch frozen together with the Merkle proof
+# that commits to every entry. Each Merkle leaf starts from the domain
+# separator b"zkregion/irb/v1" and frames, in order, the six commitment
+# fields, the context and the six proof fields: each of the four pair
+# sequences as its decimal pair count followed by every pair item
+# flattened in pair order, and each of the two bit-commitment sequences
+# as its decimal element count followed by every bit commitment.
+# Verification first checks every leaf against the Merkle root, then
+# runs the unchanged interval range batch verification.
+
+_INTERVAL_RANGE_BOUND_DOMAIN = b"zkregion/irb/v1"
+
+
+@dataclass(frozen=True)
+class BoundIntervalRangeBatch:
+    """A complete interval range batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of
+    :class:`IntervalRangeBatchEntry`; ``leaf_count`` — a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``; ``proof`` — the :class:`MerkleMultiProof`
+    whose indices cover ``0 .. leaf_count - 1`` without gaps or
+    duplicates. All three are positional construction arguments;
+    batches compare by value and are immutable. Construction never
+    validates the fields: type and value checks belong to
+    :func:`verify_range_interval_batch_bound` and
+    :func:`prove_range_interval_batch_bound`.
+    """
+
+    entries: tuple[IntervalRangeBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_interval_range_leaf(entry: IntervalRangeBatchEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`IntervalRangeBatchEntry`.
+
+    Items, in order: the domain separator, the six commitment fields
+    (dataclass field order), the context, then each of the proof's six
+    fields in dataclass order — pair sequences framed as their decimal
+    pair count followed by every pair item flattened in pair order,
+    bit-commitment sequences framed as their decimal element count
+    followed by every bit commitment. Every item is prefixed with its
+    four-byte unsigned big-endian length; integers are encoded as
+    decimal ASCII (negative sign kept).
+    """
+    commitment = entry.commitment
+    items = [_INTERVAL_RANGE_BOUND_DOMAIN]
+    items.extend(
+        str(getattr(commitment, name)).encode("ascii")
+        for name in ("element", "lower", "upper", "prime", "generator", "h")
+    )
+    items.append(entry.context)
+    proof = entry.proof
+    for field_name in (
+        "low_commitments",
+        "low_challenges",
+        "low_responses",
+        "high_commitments",
+        "high_challenges",
+        "high_responses",
+    ):
+        sequence = getattr(proof, field_name)
+        items.append(str(len(sequence)).encode("ascii"))
+        if field_name.endswith("commitments"):
+            items.extend(str(value).encode("ascii") for value in sequence)
+        else:
+            items.extend(
+                str(item).encode("ascii") for pair in sequence for item in pair
+            )
+    leaf = bytearray()
+    for item in items:
+        leaf += len(item).to_bytes(4, "big")
+        leaf += item
+    return bytes(leaf)
+
+
+def verify_range_interval_batch_bound(
+    batch: BoundIntervalRangeBatch,
+    root: bytes,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundIntervalRangeBatch`.
+
+    The nested types of the whole batch are preflighted first — a
+    :class:`BoundIntervalRangeBatch` whose ``entries`` are a tuple of
+    :class:`IntervalRangeBatchEntry` objects with valid commitment,
+    proof (all six fields, tuple fields at every nesting level) and
+    context types, whose ``leaf_count`` is a non-``bool`` integer and
+    whose ``proof`` is a :class:`MerkleMultiProof` with integer
+    indices and bytes siblings; ``root`` must be ``bytes``. Anything
+    else, including a ``bool`` count or a wrong type in the last
+    entry, raises :class:`TypeError`.
+
+    The Merkle binding is checked next: every entry is encoded to its
+    leaf exactly as specified by :func:`_bound_interval_range_leaf`
+    and the whole batch is checked against ``root`` with
+    :func:`verify_multi_inclusion`. ``leaf_count`` must be positive
+    and equal to both ``len(entries)`` and ``proof.leaf_count``, and
+    ``proof.indices`` must cover ``0 .. leaf_count - 1`` with no gaps,
+    duplicates or reordering; an empty batch, a count or index
+    mismatch, a root whose length is not 32 bytes, a wrong root or
+    tampered leaf bytes returns ``False``. Only after the root checks
+    does the batch go through :func:`verify_range_interval_batch`,
+    whose per-entry semantics reject inverted or oversized ranges,
+    missing proof items, out-of-range values and cryptographic
+    failures. Verification draws no randomness, never sees a
+    committed value or a blinding factor, and never mutates its
+    inputs.
+    """
+    if not isinstance(batch, BoundIntervalRangeBatch):
+        raise TypeError("batch must be a BoundIntervalRangeBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(
+            "batch entries must be a tuple of IntervalRangeBatchEntry"
+        )
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, IntervalRangeBatchEntry):
+            raise TypeError(
+                f"entries[{position}] must be an IntervalRangeBatchEntry"
+            )
+        commitment = entry.commitment
+        entry_proof = entry.proof
+        if not isinstance(commitment, PedersenCommitment):
+            raise TypeError(
+                f"entries[{position}] commitment must be a PedersenCommitment"
+            )
+        _check_commitment_fields(commitment)
+        _check_interval_range_proof_types(
+            entry_proof, f"entries[{position}] proof"
+        )
+        _check_bytes(entry.context, f"entries[{position}] context")
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if len(root) != _MERKLE_DIGEST_SIZE:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_interval_range_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf, then
+    # 2) the unchanged interval range batch verification checks the proofs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_range_interval_batch(entries)
+
+
+def prove_range_interval_batch_bound(
+    entries: Sequence[IntervalRangeBatchEntry],
+) -> tuple[BoundIntervalRangeBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundIntervalRangeBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`IntervalRangeBatchEntry` rules as
+    :func:`verify_range_interval_batch` and must be non-empty; every
+    entry is copied into a tuple in its original order with duplicates
+    preserved, and later additions or removals in the caller's list do
+    not affect the returned batch. Each entry is encoded to its outer
+    leaf byte for byte with :func:`_bound_interval_range_leaf`; the
+    domain separator ``b"zkregion/irb/v1"``, the length framing,
+    decimal integer encoding and field order stay unchanged, and the
+    leaf digests and internal nodes follow the existing SHA-256 Merkle
+    rules. With ``n = len(entries)``, the complete multi-inclusion
+    proof is built with :func:`prove_multi_inclusion` over the encoded
+    leaves and the full indices ``tuple(range(n))`` — so its
+    ``indices`` cover every leaf from zero and its ``siblings`` are
+    empty — and the returned batch carries ``leaf_count = n``
+    alongside that proof. The second return value is the outer tree's
+    :func:`merkle_root` of the encoded leaves, which is exactly the
+    root the batch verifies under:
+    ``verify_range_interval_batch_bound(batch, root)`` returns
+    ``True``. Single-item, odd- and even-sized batches and duplicate
+    entries are all deterministic: the same ordered inputs rebuild a
+    byte-identical batch, root and proof, and every commitment field,
+    every proof field and every context participates in the leaf
+    binding, so deleting, appending, swapping or altering any of them
+    changes the root.
+
+    A type preflight over the whole batch — every entry and every
+    nested field, including ``bool`` integers and later entries —
+    raises :class:`TypeError` before anything is built; an empty
+    batch, a batch length outside uint64, or
+    :func:`verify_range_interval_batch` returning ``False`` (an
+    invalid inner interval range proof, an inverted or oversized
+    range, a missing proof item, an out-of-range value or a
+    cryptographic failure) raises :class:`ValueError`. No randomness
+    is drawn, no committed value or blinding factor is accepted, and
+    the inputs are never mutated.
+    """
+    items = _check_interval_range_batch_entries_types(entries)
+    if not items:
+        raise ValueError("entries must not be empty")
+    if len(items) > _UINT64_MAX:
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    if not verify_range_interval_batch(items):
+        raise ValueError("entries must pass verify_range_interval_batch")
+    ordered = tuple(items)
+    leaves = [_bound_interval_range_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundIntervalRangeBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
 
 
 @dataclass(frozen=True)

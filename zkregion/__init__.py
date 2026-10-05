@@ -15,6 +15,7 @@ PedersenOpeningBatchReplayGuard /
 BoundPedersenOpeningReplayGuard /
 RangeProof / prove_range /
 verify_range / RangeBatchEntry / verify_range_batch /
+EqualValueProof / prove_equal_value / verify_equal_value /
 RangeSetProof / prove_range_set /
 verify_range_set / RangeSetBatchEntry / verify_range_set_batch /
 BoundRangeSetBatch / prove_range_set_batch_bound /
@@ -158,6 +159,7 @@ __all__ = [
     "ConvexPolygonRegion",
     "ConvexPolygonRegionProof",
     "ConvexPolygonReplayGuard",
+    "EqualValueProof",
     "IntervalRangeBatchEntry",
     "IntervalRangeProof",
     "MerkleConsistencyBatchEntry",
@@ -242,6 +244,7 @@ __all__ = [
     "prove_consistency_chain_batch_bound",
     "prove_convex_polygon",
     "prove_convex_polygon_batch_bound",
+    "prove_equal_value",
     "prove_inclusion",
     "prove_inclusion_batch_bound",
     "prove_multi_inclusion",
@@ -279,6 +282,7 @@ __all__ = [
     "verify_convex_polygon_batch",
     "verify_convex_polygon_batch_bound",
     "verify_convex_polygon_proof_bundle",
+    "verify_equal_value",
     "verify_inclusion",
     "verify_inclusion_batch",
     "verify_inclusion_batch_bound",
@@ -976,6 +980,356 @@ def verify_range(
         left = pow(h, proof.s[i], prime)
         right = proof.t[i] * pow(offset, proof.e[i], prime) % prime
         if left != right:
+            return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive equal-value proofs over two Pedersen commitments
+#
+# prove_equal_value proves that two commitments over the same group
+# (same prime, generator and h, possibly different declared ranges) both
+# open at the same actual integer. Enumerate the intersection of the two
+# declared ranges as points x_0 .. x_{n-1} (ascending, 1 <= n <= 256); for
+# each side define D_i = element * generator**(lower - x_i) mod prime, which
+# is a base-h power of that side's blinding exactly when x_i is the
+# committed value. The proof is a Schnorr OR over the intersection points
+# of an AND of two discrete-log knowledge statements: branch i is real only
+# if the prover knows both blindings at the same point x_i. Equal offsets
+# into different ranges therefore cannot pass — the branches are indexed by
+# the actual integer, not by the offset. The transcript binds both
+# commitments in left/right order, the context and every announcement, so
+# swapping the sides, replacing any public field or splicing branches from
+# different proofs changes the challenge and fails verification. The
+# verifier learns neither the common value, nor the blindings, nor the hit
+# position.
+
+_EQUAL_VALUE_DOMAIN = b"zkregion/pedersen-equal-value/v1"
+
+
+@dataclass(frozen=True)
+class EqualValueProof:
+    """A non-interactive equal-value proof over two Pedersen commitments.
+
+    ``t_left`` / ``t_right`` hold the per-branch announcements of the left
+    and right sides, ``e`` the challenge shares shared by both sides of a
+    branch, and ``s_left`` / ``s_right`` the responses; all five are tuples
+    of one integer per integer in the intersection of the two declared
+    ranges, in ascending order. The proof carries neither the common value,
+    nor the blindings, nor the hit position; instances are immutable and
+    compare by value.
+    """
+
+    t_left: tuple[int, ...]
+    t_right: tuple[int, ...]
+    e: tuple[int, ...]
+    s_left: tuple[int, ...]
+    s_right: tuple[int, ...]
+
+
+def _equal_value_challenge(
+    left: PedersenCommitment,
+    right: PedersenCommitment,
+    context: bytes,
+    size: int,
+    t_left: tuple[int, ...],
+    t_right: tuple[int, ...],
+) -> int:
+    """SHA-256 transcript challenge as a big-endian integer mod ``prime``.
+
+    The transcript is the domain separator, the six fields of the left
+    commitment, the six fields of the right commitment, the context, the
+    intersection size ``n`` and, per branch in ascending order, the left
+    and right announcements; each item is prefixed with its four-byte
+    big-endian length and integers are encoded as decimal ASCII, mirroring
+    :func:`_range_challenge`. Binding is by actual public-field values:
+    two commitments with identical fields contribute identical transcripts.
+    """
+    items = [_EQUAL_VALUE_DOMAIN]
+    for commitment in (left, right):
+        fields = (
+            commitment.element,
+            commitment.lower,
+            commitment.upper,
+            commitment.prime,
+            commitment.generator,
+            commitment.h,
+        )
+        items.extend(str(field).encode("ascii") for field in fields)
+    items.append(context)
+    items.append(str(size).encode("ascii"))
+    for left_t, right_t in zip(t_left, t_right):
+        items.append(str(left_t).encode("ascii"))
+        items.append(str(right_t).encode("ascii"))
+    transcript = hashlib.sha256()
+    for item in items:
+        transcript.update(len(item).to_bytes(4, "big"))
+        transcript.update(item)
+    return int.from_bytes(transcript.digest(), "big") % left.prime
+
+
+def _equal_value_commitment_legal(commitment: PedersenCommitment) -> bool:
+    """The commitment legality rules of :func:`verify_pedersen_opening`."""
+    prime = commitment.prime
+    if prime <= 3:
+        return False
+    if not 1 < commitment.generator < prime or not 1 < commitment.h < prime:
+        return False
+    if not 0 < commitment.element < prime:
+        return False
+    if commitment.lower > commitment.upper:
+        return False
+    if commitment.upper - commitment.lower >= prime - 1:
+        return False
+    return True
+
+
+def _equal_value_intersection(
+    left: PedersenCommitment, right: PedersenCommitment
+) -> tuple[int, int]:
+    """Inclusive ``(lower, upper)`` bounds of the declared-range overlap."""
+    return max(left.lower, right.lower), min(left.upper, right.upper)
+
+
+def _check_equal_value_proof_types(proof: object, label: str) -> EqualValueProof:
+    """Validate the nested types of one :class:`EqualValueProof`.
+
+    ``label`` is the caller's name for the proof in error messages
+    (``"proof"`` for :func:`verify_equal_value`). The proof must be an
+    :class:`EqualValueProof` whose five fields are tuples of non-``bool``
+    integers; anything else raises :class:`TypeError`. Returns the proof
+    unchanged.
+    """
+    if not isinstance(proof, EqualValueProof):
+        raise TypeError(f"{label} must be an EqualValueProof")
+    for field_name in ("t_left", "t_right", "e", "s_left", "s_right"):
+        field = getattr(proof, field_name)
+        if not isinstance(field, tuple):
+            raise TypeError(f"{label} {field_name} must be a tuple of integers")
+        for item in field:
+            _check_int(item, f"{label} {field_name} entry")
+    return proof
+
+
+def prove_equal_value(
+    left: PedersenCommitment,
+    right: PedersenCommitment,
+    value: int,
+    blinding_left: int,
+    blinding_right: int,
+    context: bytes = b"",
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> EqualValueProof:
+    """Prove that ``left`` and ``right`` both open at the same integer ``value``.
+
+    Both commitments must share the same ``prime``, ``generator`` and
+    ``h``; their declared ranges may differ and each side follows the
+    usual commitment legality rules without any extra width limit, but
+    their intersection must contain between 1 and 256 integers — negative
+    bounds, ranges crossing zero, single-point intersections, endpoint
+    values and identical left/right commitments are all supported.
+    ``value`` must lie in the intersection and ``(value, blinding_left)``
+    / ``(value, blinding_right)`` must be valid openings of the two
+    commitments; both openings are recomputed with
+    :func:`verify_pedersen_opening` before any proving work happens. An
+    illegal commitment, mismatched group parameters, an empty or oversized
+    intersection, an out-of-intersection value, an illegal blinding or an
+    opening mismatch raises :class:`ValueError` before any randomness is
+    drawn. Randomness is drawn from ``randbelow`` (default
+    :func:`secrets.randbelow`); a non-callable source or a draw that is
+    not a non-bool integer raises :class:`TypeError`, an out-of-range draw
+    raises :class:`ValueError`, and exceptions raised by the source itself
+    propagate unchanged. The same inputs under the same random sequence
+    produce an equal proof. Inputs are never mutated.
+    """
+    if not isinstance(left, PedersenCommitment):
+        raise TypeError("left must be a PedersenCommitment")
+    for name in ("element", "lower", "upper", "prime", "generator", "h"):
+        _check_int(getattr(left, name), f"left commitment {name}")
+    if not isinstance(right, PedersenCommitment):
+        raise TypeError("right must be a PedersenCommitment")
+    for name in ("element", "lower", "upper", "prime", "generator", "h"):
+        _check_int(getattr(right, name), f"right commitment {name}")
+    _check_int(value, "value")
+    _check_int(blinding_left, "blinding_left")
+    _check_int(blinding_right, "blinding_right")
+    _check_bytes(context, "context")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not _equal_value_commitment_legal(left):
+        raise ValueError("left commitment is not a legal commitment")
+    if not _equal_value_commitment_legal(right):
+        raise ValueError("right commitment is not a legal commitment")
+    if (left.prime, left.generator, left.h) != (
+        right.prime,
+        right.generator,
+        right.h,
+    ):
+        raise ValueError("commitments must share prime, generator and h")
+    lower, upper = _equal_value_intersection(left, right)
+    size = upper - lower + 1
+    if size < 1:
+        raise ValueError("declared ranges do not intersect")
+    if size > _MAX_RANGE_VALUES:
+        raise ValueError(
+            f"intersection must contain at most {_MAX_RANGE_VALUES} integers"
+        )
+    if not lower <= value <= upper:
+        raise ValueError("value must lie in the intersection of the declared ranges")
+    if not verify_pedersen_opening(left, value, blinding_left):
+        raise ValueError("left commitment does not open at (value, blinding_left)")
+    if not verify_pedersen_opening(right, value, blinding_right):
+        raise ValueError("right commitment does not open at (value, blinding_right)")
+    prime = left.prime
+    generator = left.generator
+    h = left.h
+
+    def draw(upper: int) -> int:
+        drawn = randbelow(upper)
+        _check_int(drawn, "randbelow return value")
+        if not 0 <= drawn < upper:
+            raise ValueError(f"randbelow must return a value in [0, {upper})")
+        return drawn
+
+    index = value - lower
+    offsets_left = [
+        left.element * pow(generator, left.lower - (lower + i), prime) % prime
+        for i in range(size)
+    ]
+    offsets_right = [
+        right.element * pow(generator, right.lower - (lower + i), prime) % prime
+        for i in range(size)
+    ]
+    t_left: list[int] = [0] * size
+    t_right: list[int] = [0] * size
+    e: list[int] = [0] * size
+    s_left: list[int] = [0] * size
+    s_right: list[int] = [0] * size
+    for i in range(size):
+        if i == index:
+            continue
+        e[i] = draw(prime)  # challenge share in [0, prime)
+        s_left[i] = draw(prime - 1) + 1  # non-negative response
+        s_right[i] = draw(prime - 1) + 1  # non-negative response
+        t_left[i] = pow(h, s_left[i], prime) * pow(offsets_left[i], -e[i], prime) % prime
+        t_right[i] = (
+            pow(h, s_right[i], prime) * pow(offsets_right[i], -e[i], prime) % prime
+        )
+    k_left = draw(prime - 1) + 1
+    k_right = draw(prime - 1) + 1
+    t_left[index] = pow(h, k_left, prime)
+    t_right[index] = pow(h, k_right, prime)
+    challenge = _equal_value_challenge(
+        left, right, context, size, tuple(t_left), tuple(t_right)
+    )
+    e[index] = (challenge - sum(e)) % prime
+    s_left[index] = k_left + e[index] * blinding_left
+    s_right[index] = k_right + e[index] * blinding_right
+    return EqualValueProof(
+        t_left=tuple(t_left),
+        t_right=tuple(t_right),
+        e=tuple(e),
+        s_left=tuple(s_left),
+        s_right=tuple(s_right),
+    )
+
+
+def verify_equal_value(
+    left: PedersenCommitment,
+    right: PedersenCommitment,
+    proof: EqualValueProof,
+    context: bytes = b"",
+) -> bool:
+    """Verify an :class:`EqualValueProof` against both commitments and ``context``.
+
+    Both commitments must be legal and share ``prime``, ``generator`` and
+    ``h``, and their declared-range intersection must contain between 1
+    and 256 integers. Every branch must satisfy both Schnorr equations
+    ``h**s_left_i == t_left_i * D_left_i**e_i (mod prime)`` and
+    ``h**s_right_i == t_right_i * D_right_i**e_i (mod prime)`` with
+    ``D_side_i = element_side * generator**(lower_side - x_i) mod prime``
+    over the ascending intersection points ``x_i``; the challenge shares
+    must lie in ``[0, prime)`` and sum to the transcript challenge modulo
+    ``prime``, and the responses must be non-negative. Type errors (wrong
+    objects, non-tuple or non-integer proof fields — including ``bool``
+    integers — or a non-bytes context) raise :class:`TypeError`; any other
+    invalid public input, structural mismatch, tampering or binding
+    mismatch returns ``False``. Verification draws no randomness and never
+    sees the common value or the blindings. Inputs are never mutated.
+    """
+    if not isinstance(left, PedersenCommitment):
+        raise TypeError("left must be a PedersenCommitment")
+    for name in ("element", "lower", "upper", "prime", "generator", "h"):
+        _check_int(getattr(left, name), f"left commitment {name}")
+    if not isinstance(right, PedersenCommitment):
+        raise TypeError("right must be a PedersenCommitment")
+    for name in ("element", "lower", "upper", "prime", "generator", "h"):
+        _check_int(getattr(right, name), f"right commitment {name}")
+    _check_equal_value_proof_types(proof, "proof")
+    _check_bytes(context, "context")
+    if not _equal_value_commitment_legal(left):
+        return False
+    if not _equal_value_commitment_legal(right):
+        return False
+    if (left.prime, left.generator, left.h) != (
+        right.prime,
+        right.generator,
+        right.h,
+    ):
+        return False
+    prime = left.prime
+    generator = left.generator
+    h = left.h
+    lower, upper = _equal_value_intersection(left, right)
+    size = upper - lower + 1
+    if not 1 <= size <= _MAX_RANGE_VALUES:
+        return False
+    if not (
+        len(proof.t_left)
+        == len(proof.t_right)
+        == len(proof.e)
+        == len(proof.s_left)
+        == len(proof.s_right)
+        == size
+    ):
+        return False
+    if any(not 1 <= t_i < prime for t_i in proof.t_left):
+        return False
+    if any(not 1 <= t_i < prime for t_i in proof.t_right):
+        return False
+    if any(not 0 <= e_i < prime for e_i in proof.e):
+        return False
+    if any(s_i < 0 for s_i in proof.s_left):
+        return False
+    if any(s_i < 0 for s_i in proof.s_right):
+        return False
+    challenge = _equal_value_challenge(
+        left, right, context, size, proof.t_left, proof.t_right
+    )
+    if sum(proof.e) % prime != challenge:
+        return False
+    try:
+        offsets_left = [
+            left.element * pow(generator, left.lower - (lower + i), prime) % prime
+            for i in range(size)
+        ]
+        offsets_right = [
+            right.element * pow(generator, right.lower - (lower + i), prime) % prime
+            for i in range(size)
+        ]
+    except ValueError:
+        return False  # generator not invertible modulo prime
+    for i in range(size):
+        left_right_side = (
+            proof.t_left[i] * pow(offsets_left[i], proof.e[i], prime) % prime
+        )
+        right_right_side = (
+            proof.t_right[i] * pow(offsets_right[i], proof.e[i], prime) % prime
+        )
+        if pow(h, proof.s_left[i], prime) != left_right_side:
+            return False
+        if pow(h, proof.s_right[i], prime) != right_right_side:
             return False
     return True
 

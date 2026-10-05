@@ -367,6 +367,20 @@ proof = prove_range(commitment, 40, blinding, context=b"session-1")
 assert verify_range(commitment, proof, context=b"session-1")
 assert not verify_range(commitment, proof, context=b"other")
 
+# 两份承诺的非交互同值证明：证明左右承诺开合到同一个实际整数（声明区间可不同，
+# 只要求同 prime/generator/h 且交集含 1 到 256 个整数）
+from zkregion import prove_equal_value, verify_equal_value
+
+left_commitment, left_blinding = pedersen_commit(5, -10, 10)
+right_commitment, right_blinding = pedersen_commit(5, 0, 20)
+equal_proof = prove_equal_value(
+    left_commitment, right_commitment, 5, left_blinding, right_blinding,
+    context=b"session-1",
+)
+assert verify_equal_value(left_commitment, right_commitment, equal_proof, context=b"session-1")
+assert not verify_equal_value(right_commitment, left_commitment, equal_proof, b"session-1")
+assert not verify_equal_value(left_commitment, right_commitment, equal_proof, context=b"other")
+
 # 按位分解的宽区间非交互证明：声明区间恰含 2**k 个整数（1 <= k <= 24），可超过 256 个
 from zkregion import prove_range_wide, verify_range_wide
 
@@ -1419,6 +1433,9 @@ python3 -m zkregion
 - `prove_range(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> RangeProof` — 生成 Pedersen 承诺的非交互区间证明（Schnorr OR）
 - `verify_range(commitment, proof, context=b"") -> bool` — 验证区间证明
 - `RangeProof(t, e, s)` — 不可变区间证明对象，三个字段均为长度 `upper - lower + 1` 的 `tuple[int, ...]`
+- `prove_equal_value(left, right, value, blinding_left, blinding_right, context=b"", *, randbelow=secrets.randbelow) -> EqualValueProof` — 两份 Pedersen 承诺的非交互同值证明：依次接收左右承诺、共同整数值与左右盲因子；两承诺须共享 `prime`/`generator`/`h`，声明区间可不同且单侧不额外限制为 256 个值，但交集须含 1 到 256 个整数（负边界、跨零、单点交集、端点值与左右完全相同均支持）；证明的是两份承诺开合到同一个实际整数而非相同的下界偏移。生成前按 `verify_pedersen_opening` 同一口径核对两份开合，非法承诺、群参数不一致、交集为空或超限、共同值越界、盲因子非法或开合不符均抛 `ValueError` 且不消耗随机数；随机源不可调用或返回非整数（含 `bool`）抛 `TypeError`、抽取值越出该次请求的半开区间抛 `ValueError`，随机源自身异常原样传播；同一组入参在相同随机序列下生成相等证明，输入不被改写
+- `verify_equal_value(left, right, proof, context=b"") -> bool` — 验证同值证明：只接收左右承诺、证明与 context，不接触共同值或盲因子，不消耗随机数；验证绑定左右顺序、两份承诺全部公开字段与 context（以公开字段是否实际变化为准），替换任一项、篡改证明或拼接不同证明的内容均返回 `False`；对象或任一层嵌套字段错型（含 `bool` 整数、非元组证明字段、非 `bytes` context）抛 `TypeError`，公开输入无效、证明结构长度错误或数值非法均返回 `False`，输入不被改写
+- `EqualValueProof(t_left, t_right, e, s_left, s_right)` — 不可变同值证明对象，五个字段均为长度等于交集整数个数的 `tuple[int, ...]`（按交集整数升序逐点排列，`e` 为两侧共享的挑战份额）；可位置构造、按值相等且冻结，不携带明文值、盲因子或命中位置，构造时不做任何校验
 - `prove_range_wide(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> WideRangeProof` — 按位分解的宽区间非交互证明：声明区间内整数个数须恰为 2 的幂，且以 2 为底的位宽须在 1 到 24 之间，越界或个数非 2 的幂抛 `ValueError`；生成前以 `verify_pedersen_opening` 同一口径重算承诺开合，开合不符或值越出声明区间抛 `ValueError`；随机源不可调用或返回非整数（含 `bool`）抛 `TypeError`、抽取值越界抛 `ValueError`；同一组承诺、值、盲因子与上下文在相同随机源下重复生成的证明逐字节一致，输入不被改写
 - `verify_range_wide(commitment, proof, context=b"") -> bool` — 验证宽区间证明：各比特承诺按位加权（`2**i`）的乘积须等于承诺值，逐位重算每个比特分支两条 OR 分支的公告并核对两个挑战份额之和等于转录挑战；位宽越界、个数非 2 的幂、换承诺、换上下文、换声明区间、交换或替换任意比特分支、改动分支内的承诺/挑战份额/响应、挪动位序一律返回 `False` 且不抛异常；任一层字段错型（含用 `bool` 冒充整数）抛 `TypeError`，输入不被改写
 - `WideRangeProof(commitments, challenges, responses)` — 不可变宽区间证明对象；`commitments` 为按位序（低位在前）的比特承诺 `tuple[int, ...]`，`challenges` 与 `responses` 为每个比特分支的两个挑战份额、两个响应组成的 `tuple[tuple[int, int], ...]`，三者长度均为位宽 `k`；可位置构造、按值相等且不可变
@@ -1818,6 +1835,20 @@ D_i = element * g**(-i) mod prime
 挑战 `c` 为 SHA-256 摘要的大端整数模 `prime`。转录依次写入域 `b"zkregion/pedersen-range/v1"`、承诺六字段（`element`、`lower`、`upper`、`prime`、`generator`、`h`）、`context`、`n` 与全部 `t_i`；每项前置四字节无符号大端长度，整数编码为十进制 ASCII。
 
 验证要求：每个 `t_i ∈ [1, prime)`、`e_i ∈ [0, prime)`、`s_i ≥ 0`，`sum(e) mod prime == c`，且每个分支满足 Schnorr 等式 `h**s_i == t_i * D_i**e_i (mod prime)`。生成前会先复用 `verify_pedersen_opening` 校验开合，开合不符抛 `ValueError`；类型错误（含 `bool` 整数、非元组证明字段、非 `bytes` 的 `context`、不可调用的 `randbelow`）抛 `TypeError`；其他非法结构、篡改或绑定不符（错误的承诺、`context` 或证明）一律返回 `False`。入口均不改写输入。
+
+### 两承诺同值证明
+
+`prove_equal_value(left, right, value, blinding_left, blinding_right, context=b"")` 证明两份 Pedersen 承诺开合到**同一个实际整数**，`verify_equal_value(left, right, proof, context=b"")` 验证。两承诺须共享 `prime`、`generator` 与 `h`，声明区间可不同；把两区间的交集按升序枚举为 `x_0 .. x_(n-1)`（**1 到 256 个整数**，空交集或超限生成抛 `ValueError`、验证返回 `False`），对每侧分别定义
+
+```
+D_side_i = element_side * g**(lower_side - x_i) mod prime
+```
+
+`D_side_i = h**r_side` 当且仅当该侧承诺值就是 `x_i`，因此同值证明是"存在某个交点 `x_i`，我同时知道两侧 `D_side_i` 以 `h` 为底的离散对数"的 OR-of-AND 证明：每个分支是共享同一挑战份额 `e_i` 的两条 Schnorr 证明（左右各一），真实分支走诚实 Schnorr，其余分支模拟。分支按**实际整数**而非下界偏移索引，所以偏移相同但实际值不同的两份承诺无法通过。证明为冻结的 `EqualValueProof(t_left, t_right, e, s_left, s_right)`，五个字段都是长度 `n` 的整数元组，不携带明文值、盲因子或命中位置。
+
+挑战 `c` 的转录依次写入域 `b"zkregion/pedersen-equal-value/v1"`、左承诺六字段、右承诺六字段、`context`、`n` 与逐分支的左右公告；编码与长度帧规则同区间证明。由此验证绑定左右顺序、两份承诺全部公开字段与 `context`——以公开字段是否实际变化为准，替换任一项、篡改证明或拼接不同证明的内容都使挑战不符而返回 `False`。
+
+验证要求每侧 `t_i ∈ [1, prime)`、`e_i ∈ [0, prime)`、`s_i ≥ 0`，`sum(e) mod prime == c`，且每个分支同时满足左右两条 Schnorr 等式。生成的错误口径（非法承诺、群参数不一致、交集为空或超限、共同值越界、盲因子非法、开合不符）一律抛 `ValueError` 且不消耗随机数；类型错误（含 `bool` 整数）抛 `TypeError`；验证侧对应的公开输入无效、证明结构长度错误或数值非法均返回 `False`。两入口均不改写输入。与 `prove_range` 一样，该证明沿用演示群与默认陷门承诺的安全边界，不声称承诺只有唯一开合。
 
 ### 区间证明批量验证
 

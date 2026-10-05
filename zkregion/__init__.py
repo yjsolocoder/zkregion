@@ -85,7 +85,7 @@ verify_inclusion_batch_bound /
 BoundMerkleInclusionBatchReplayGuard /
 MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion / merge_inclusion_proofs /
-select_merkle_multi_proof /
+select_merkle_multi_proof / merge_multi_proofs /
 MerkleMultiProofBundle /
 MerkleMultiBatchEntry /
 verify_multi_inclusion_batch / BoundMerkleMultiBatch /
@@ -232,6 +232,7 @@ __all__ = [
     "encode_merkle_multi_proof_bundle",
     "encode_region_proof_bundle",
     "merge_inclusion_proofs",
+    "merge_multi_proofs",
     "merkle_root",
     "pedersen_commit",
     "prove_consistency",
@@ -8748,6 +8749,213 @@ def select_merkle_multi_proof(
     if not verify_multi_inclusion(entries, proof, bundle.root):
         raise ValueError("selected proof does not verify under the root")
     return selected
+
+
+def merge_multi_proofs(
+    bundles: Sequence[MerkleMultiProofBundle],
+) -> MerkleMultiProofBundle:
+    """Merge several multi-proof envelopes into one compact envelope.
+
+    Every input is an existing, valid :class:`MerkleMultiProofBundle` for
+    *the same* Merkle tree — the caller supplies only the envelopes: no
+    full leaf set, no single-leaf proofs and no external storage are
+    needed. All envelopes must carry the same ``root`` and declare the
+    same ``proof.leaf_count``; the returned envelope keeps both. Its
+    ``entries`` (and ``proof.indices``) hold the union of every proven
+    index, paired with the original leaf bytes, in strictly increasing
+    original-index order without renumbering. The same index arriving
+    with the same leaf bytes — whether repeated inside one input order,
+    across duplicate envelopes or across overlapping index sets — is
+    kept once; distinct indices always stay separate, even when their
+    leaf contents are equal. The input order, exact duplicate envelopes
+    and the way index sets overlap never change the output value.
+
+    The merged proof reuses the existing leaf and internal digest rules,
+    the odd-last-node self-duplication and the compact, level-by-level,
+    left-to-right sibling ordering, drawing every sibling digest from
+    the input envelopes themselves. For envelopes generated from one
+    complete leaf set the output ``proof`` is field-for-field equal to
+    the proof :func:`prove_multi_inclusion` builds directly for the
+    union index set: it carries no extra sibling digest and no leaf
+    bytes outside the union. Merging a single envelope returns a bundle
+    equal by value to that envelope, and merging groups separately and
+    then merging the partial results equals merging every input at once.
+    The result verifies with :func:`verify_merkle_multi_proof_bundle`,
+    round-trips through :func:`encode_merkle_multi_proof_bundle` /
+    :func:`decode_merkle_multi_proof_bundle` and can be cropped further
+    with :func:`select_merkle_multi_proof`. Single-leaf trees, odd and
+    even leaf counts, inputs proving only the last leaf and a union
+    covering every leaf (whose ``siblings`` are empty) all apply. The
+    declared ``leaf_count`` fixes the tree shape; the true leaf count is
+    never inferred from the root, and envelopes declaring different leaf
+    counts are never mixed, even when their roots match.
+
+    All argument and nested-field types — ``bundles`` a list or tuple of
+    :class:`MerkleMultiProofBundle` objects, each with a ``bytes`` root,
+    a :class:`MerkleMultiProof` with a non-``bool`` integer
+    ``leaf_count``, a tuple of non-``bool`` integer ``indices`` and a
+    tuple-of-``bytes`` ``siblings``, and a tuple of two-item
+    ``(index, leaf)`` entries with a non-``bool`` integer index and
+    ``bytes`` leaf — are checked across the *whole* input first,
+    mirroring the type constraints of
+    :func:`encode_merkle_multi_proof_bundle`, so a wrong type (including
+    a ``bool`` in an integer position) raises :class:`TypeError` even
+    when a semantic error is present at the same time. After the type
+    preflight, an empty input, mismatched roots or declared leaf counts,
+    two envelopes carrying different leaf bytes for the same index, or
+    any envelope that :func:`verify_merkle_multi_proof_bundle` rejects —
+    a wrong root or sibling digest length, a non-positive
+    ``leaf_count``, misordered, duplicate or out-of-range indices, an
+    entries/indices mismatch, a tampered leaf, or a missing or extra
+    sibling digest — raises :class:`ValueError`, and no partial result
+    is returned. Duplicate envelopes are verified in full like any
+    other; a defect is never ignored because the merge would not need
+    that envelope's digests. Inputs are never mutated and nothing is
+    written to the file system or a database.
+    """
+    if not isinstance(bundles, (list, tuple)):
+        raise TypeError(
+            "bundles must be a list or tuple of MerkleMultiProofBundle"
+        )
+    items: list[MerkleMultiProofBundle] = []
+    for position, bundle in enumerate(bundles):
+        if not isinstance(bundle, MerkleMultiProofBundle):
+            raise TypeError(
+                f"bundles[{position}] must be a MerkleMultiProofBundle"
+            )
+        if not isinstance(bundle.root, bytes):
+            raise TypeError(f"bundles[{position}] root must be bytes")
+        _check_merkle_multi_bundle_proof_types(bundle.proof)
+        _check_merkle_multi_bundle_entries_types(bundle.entries)
+        items.append(bundle)
+
+    if not items:
+        raise ValueError("bundles must not be empty")
+
+    root = items[0].root
+    leaf_count = items[0].proof.leaf_count
+    for bundle in items[1:]:
+        if bundle.root != root:
+            raise ValueError("all bundles must prove under the same root")
+        if bundle.proof.leaf_count != leaf_count:
+            raise ValueError("all bundles must declare the same leaf_count")
+
+    # Every envelope must verify as a whole, duplicates included; a
+    # tampered or malformed input must not be hidden because the merge
+    # would not need its digests.
+    for bundle in items:
+        if not verify_multi_inclusion(
+            bundle.entries, bundle.proof, bundle.root
+        ):
+            raise ValueError("bundle proof does not verify under the root")
+
+    # Union of the proven indices. The same index with the same leaf
+    # bytes collapses to one entry; the same index with different leaf
+    # bytes is an inconsistency, not a duplicate.
+    leaf_by_index: dict[int, bytes] = {}
+    for bundle in items:
+        for index, leaf in bundle.entries:
+            previous = leaf_by_index.get(index)
+            if previous is None:
+                leaf_by_index[index] = leaf
+            elif previous != leaf:
+                raise ValueError(
+                    f"bundles carry different leaves for index {index}"
+                )
+    indices = sorted(leaf_by_index)
+
+    # Reconstruct, level by level, every node digest the envelopes make
+    # available: the ancestors each verification walk recomputes from
+    # the proven leaves, and the external sibling digests each envelope
+    # supplies. verify_multi_inclusion above already pins every walk to
+    # the declared shape and the shared root, so two envelopes can only
+    # disagree here through a hash collision; the cross-checks reject
+    # that explicitly instead of silently picking one side.
+    recomputed: dict[int, dict[int, bytes]] = {}
+    supplied: dict[int, dict[int, bytes]] = {}
+    for bundle in items:
+        known: dict[int, bytes] = {
+            index: _leaf_digest(leaf) for index, leaf in bundle.entries
+        }
+        size = leaf_count
+        cursor = 0
+        level = 0
+        while size > 1:
+            level_recomputed = recomputed.setdefault(level, {})
+            for position, digest in known.items():
+                earlier = level_recomputed.get(position)
+                if earlier is not None and not hmac.compare_digest(
+                    earlier, digest
+                ):
+                    raise ValueError("bundles recompute conflicting nodes")
+                level_recomputed[position] = digest
+            level_supplied = supplied.setdefault(level, {})
+            next_known: dict[int, bytes] = {}
+            for position in sorted(known):
+                sibling = position ^ 1
+                if sibling in known:
+                    sibling_digest = known[sibling]
+                elif position == size - 1 and size % 2 == 1:
+                    sibling_digest = known[position]  # odd last node duplicates itself
+                else:
+                    sibling_digest = bundle.proof.siblings[cursor]
+                    cursor += 1
+                    earlier = level_supplied.get(sibling)
+                    if earlier is not None and not hmac.compare_digest(
+                        earlier, sibling_digest
+                    ):
+                        raise ValueError("bundles supply conflicting siblings")
+                    level_supplied[sibling] = sibling_digest
+                if position % 2 == 0:
+                    digest = _node_digest(known[position], sibling_digest)
+                else:
+                    digest = _node_digest(sibling_digest, known[position])
+                next_known[position // 2] = digest
+            known = next_known
+            size = (size + 1) // 2
+            level += 1
+
+    # Assemble the compact sibling tuple for the union index set in the
+    # existing prover order — level by level from leaf to root, left to
+    # right within a level — skipping siblings that are themselves in the
+    # union and odd last nodes duplicating themselves. Every needed
+    # digest comes from the reconstructed maps above, so no leaf bytes
+    # outside the union and no extra digest leaves in the result.
+    selected = indices
+    size = leaf_count
+    level = 0
+    compact: list[bytes] = []
+    while size > 1:
+        selected_set = set(selected)
+        level_recomputed = recomputed.get(level, {})
+        level_supplied = supplied.get(level, {})
+        for position in selected:
+            sibling = position ^ 1
+            if sibling in selected_set:
+                continue  # sibling is in the union too, nothing to collect
+            if position == size - 1 and size % 2 == 1:
+                continue  # odd last node duplicates itself
+            digest = level_recomputed.get(sibling)
+            if digest is None:
+                digest = level_supplied.get(sibling)
+            if digest is None:
+                raise ValueError("merged proof is missing a sibling digest")
+            compact.append(digest)
+        selected = sorted({position // 2 for position in selected})
+        size = (size + 1) // 2
+        level += 1
+
+    ordered_indices = tuple(indices)
+    proof = MerkleMultiProof(
+        leaf_count=leaf_count,
+        indices=ordered_indices,
+        siblings=tuple(compact),
+    )
+    entries = tuple((index, leaf_by_index[index]) for index in indices)
+    merged = MerkleMultiProofBundle(root=root, proof=proof, entries=entries)
+    if not verify_multi_inclusion(entries, proof, root):
+        raise ValueError("merged proof does not verify under the root")
+    return merged
 
 
 @dataclass(frozen=True)

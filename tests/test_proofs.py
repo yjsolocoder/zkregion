@@ -36,6 +36,7 @@ from zkregion import (
     BoundSchnorrReplayGuard,
     BoundWideRangeBatch,
     BoundWideRangeReplayGuard,
+    EqualValueProof,
     IntervalRangeProof,
     MerkleConsistencyBatchEntry,
     MerkleConsistencyBatchReplayGuard,
@@ -112,6 +113,7 @@ from zkregion import (
     pedersen_commit,
     prove_consistency,
     prove_consistency_chain,
+    prove_equal_value,
     prove_inclusion,
     prove_multi_inclusion,
     prove_opening_batch_bound,
@@ -137,6 +139,7 @@ from zkregion import (
     verify_consistency_chain,
     verify_consistency_chain_batch,
     verify_consistency_chain_batch_bound,
+    verify_equal_value,
     verify_inclusion,
     verify_inclusion_batch,
     verify_inclusion_batch_bound,
@@ -1882,6 +1885,574 @@ class RangeSetProofTest(unittest.TestCase):
         self.assertEqual(proof, snapshot_proof)
         self.assertEqual(intervals, self.INTERVALS)
         self.assertEqual(blinding, 1234)
+
+
+class EqualValueProofTest(unittest.TestCase):
+    PRIME = SMALL_PRIME
+    G = 3
+    H = 5
+
+    def commit(self, value=5, lower=-10, upper=10, blinding=1234, **kwargs):
+        kwargs.setdefault("prime", self.PRIME)
+        kwargs.setdefault("generator", self.G)
+        kwargs.setdefault("h", self.H)
+        return pedersen_commit(value, lower, upper, blinding=blinding, **kwargs)
+
+    def prove(self, value=5, left_range=(-10, 10), right_range=(0, 20),
+             left_blinding=111, right_blinding=222, context=b"ctx"):
+        left, returned_left = self.commit(
+            value, *left_range, blinding=left_blinding
+        )
+        right, returned_right = self.commit(
+            value, *right_range, blinding=right_blinding
+        )
+        proof = prove_equal_value(
+            left, right, value, returned_left, returned_right, context,
+            randbelow=counter_randbelow(),
+        )
+        return left, right, proof
+
+    # ---- honest round trip -------------------------------------------------
+
+    def test_honest_proof_verifies(self):
+        left, right, proof = self.prove()
+        self.assertIsInstance(proof, EqualValueProof)
+        self.assertTrue(verify_equal_value(left, right, proof, b"ctx"))
+        self.assertTrue(
+            verify_equal_value(left, right, proof, context="ctx".encode())
+        )
+
+    def test_proof_shape_and_immutability(self):
+        left, right, proof = self.prove()
+        # the intersection of [-10, 10] and [0, 20] is [0, 10] -> 11 branches
+        self.assertEqual((len(proof.t), len(proof.e), len(proof.s)), (11, 11, 11))
+        self.assertEqual(
+            [field.name for field in dataclasses.fields(proof)], ["t", "e", "s"]
+        )
+        for pair in proof.t + proof.s:
+            self.assertIsInstance(pair, tuple)
+            self.assertEqual(len(pair), 2)
+            for item in pair:
+                self.assertIsInstance(item, int)
+                self.assertNotIsInstance(item, bool)
+        for item in proof.e:
+            self.assertIsInstance(item, int)
+            self.assertNotIsInstance(item, bool)
+        self.assertEqual(proof, EqualValueProof(proof.t, proof.e, proof.s))
+        self.assertNotEqual(
+            proof, EqualValueProof(proof.t, proof.e, proof.s[:-1] + ((0, 0),))
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            proof.e = proof.e + (1,)
+
+    def test_every_intersection_value_proves(self):
+        for value in range(0, 11):
+            left, right, proof = self.prove(value=value)
+            self.assertTrue(
+                verify_equal_value(left, right, proof, b"ctx"), f"value={value}"
+            )
+
+    def test_endpoint_values(self):
+        for value in (0, 10):  # endpoints of the intersection [0, 10]
+            left, right, proof = self.prove(value=value)
+            self.assertTrue(
+                verify_equal_value(left, right, proof, b"ctx"), f"value={value}"
+            )
+
+    def test_single_point_intersection(self):
+        left, right, proof = self.prove(
+            value=5, left_range=(5, 5), right_range=(0, 10)
+        )
+        self.assertEqual(len(proof.t), 1)
+        self.assertTrue(verify_equal_value(left, right, proof, b"ctx"))
+
+    def test_negative_and_zero_crossing_ranges(self):
+        left, right, proof = self.prove(
+            value=-25, left_range=(-50, -20), right_range=(-30, 10)
+        )
+        self.assertTrue(verify_equal_value(left, right, proof, b"ctx"))
+
+    def test_identical_commitments(self):
+        left, left_b = self.commit(5, -10, 10, blinding=1234)
+        proof = prove_equal_value(
+            left, left, 5, left_b, left_b, b"ctx",
+            randbelow=counter_randbelow(),
+        )
+        self.assertEqual(len(proof.t), 21)
+        self.assertTrue(verify_equal_value(left, left, proof, b"ctx"))
+
+    def test_maximum_intersection_256(self):
+        left, right, proof = self.prove(
+            value=100, left_range=(0, 300), right_range=(44, 299)
+        )
+        self.assertEqual(len(proof.t), 256)
+        self.assertTrue(verify_equal_value(left, right, proof, b"ctx"))
+
+    def test_intersection_over_256_rejected(self):
+        left, left_b = self.commit(100, 0, 300, blinding=111)
+        right, right_b = self.commit(100, 0, 300, blinding=222)
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, right, 100, left_b, right_b, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+        self.assertFalse(
+            verify_equal_value(left, right, EqualValueProof((), (), ()), b"ctx")
+        )
+
+    def test_empty_intersection_rejected(self):
+        left, left_b = self.commit(5, 0, 10, blinding=111)
+        right, right_b = self.commit(50, 40, 60, blinding=222)
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, right, 5, left_b, right_b, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+        self.assertFalse(
+            verify_equal_value(left, right, EqualValueProof((), (), ()), b"ctx")
+        )
+
+    def test_fixed_randbelow_reproducible(self):
+        left, left_b = self.commit(5, -10, 10, blinding=111)
+        right, right_b = self.commit(5, 0, 20, blinding=222)
+        first = prove_equal_value(
+            left, right, 5, left_b, right_b, b"c", randbelow=counter_randbelow()
+        )
+        second = prove_equal_value(
+            left, right, 5, left_b, right_b, b"c", randbelow=counter_randbelow()
+        )
+        self.assertEqual(first, second)
+
+    def test_default_group_parameters_are_usable(self):
+        left, left_b = pedersen_commit(40, 0, 100, blinding=111)
+        right, right_b = pedersen_commit(40, 10, 90, blinding=222)
+        proof = prove_equal_value(left, right, 40, left_b, right_b, b"demo")
+        self.assertTrue(verify_equal_value(left, right, proof, b"demo"))
+
+    def test_default_context_is_empty(self):
+        left, left_b = self.commit(5, -10, 10, blinding=111)
+        right, right_b = self.commit(5, 0, 20, blinding=222)
+        proof = prove_equal_value(
+            left, right, 5, left_b, right_b, randbelow=counter_randbelow()
+        )
+        self.assertTrue(verify_equal_value(left, right, proof))
+
+    # ---- transcript / branch equations ----------------------------------
+
+    def test_challenge_matches_transcript(self):
+        left, right, proof = self.prove()
+        items = [b"zkregion/pedersen-equal-value/v1"]
+        for commitment in (left, right):
+            for field in (
+                commitment.element,
+                commitment.lower,
+                commitment.upper,
+                commitment.prime,
+                commitment.generator,
+                commitment.h,
+            ):
+                items.append(str(field).encode("ascii"))
+        items.append(b"ctx")
+        items.append(b"11")
+        for t_left, t_right in proof.t:
+            items.append(str(t_left).encode("ascii"))
+            items.append(str(t_right).encode("ascii"))
+        transcript = hashlib.sha256()
+        for item in items:
+            transcript.update(len(item).to_bytes(4, "big"))
+            transcript.update(item)
+        c = int.from_bytes(transcript.digest(), "big") % self.PRIME
+        self.assertEqual(sum(proof.e) % self.PRIME, c)
+        for share in proof.e:
+            self.assertTrue(0 <= share < self.PRIME)
+        for pair in proof.s:
+            self.assertGreaterEqual(pair[0], 0)
+            self.assertGreaterEqual(pair[1], 0)
+
+    def test_branch_equations(self):
+        left, right, proof = self.prove()
+        lo = max(left.lower, right.lower)
+        hi = min(left.upper, right.upper)
+        for i, x in enumerate(range(lo, hi + 1)):
+            d_left = (
+                left.element * pow(self.G, left.lower - x, self.PRIME) % self.PRIME
+            )
+            d_right = (
+                right.element * pow(self.G, right.lower - x, self.PRIME) % self.PRIME
+            )
+            t_left, t_right = proof.t[i]
+            s_left, s_right = proof.s[i]
+            e = proof.e[i]
+            self.assertEqual(
+                pow(self.H, s_left, self.PRIME),
+                t_left * pow(d_left, e, self.PRIME) % self.PRIME,
+                f"branch {i} left",
+            )
+            self.assertEqual(
+                pow(self.H, s_right, self.PRIME),
+                t_right * pow(d_right, e, self.PRIME) % self.PRIME,
+                f"branch {i} right",
+            )
+
+    # ---- prove-time validation -------------------------------------------
+
+    def test_prove_type_errors(self):
+        left, left_b = self.commit(5, -10, 10, blinding=111)
+        right, right_b = self.commit(5, 0, 20, blinding=222)
+        with self.assertRaises(TypeError):
+            prove_equal_value("left", right, 5, left_b, right_b, b"ctx")
+        with self.assertRaises(TypeError):
+            prove_equal_value(left, "right", 5, left_b, right_b, b"ctx")
+        with self.assertRaises(TypeError):
+            prove_equal_value(
+                dataclasses.replace(left, element=1.5), right, 5, left_b,
+                right_b, b"ctx",
+            )
+        with self.assertRaises(TypeError):
+            prove_equal_value(
+                left, dataclasses.replace(right, h=True), 5, left_b, right_b,
+                b"ctx",
+            )
+        for bad_value in (1.5, "5", True, None):
+            with self.assertRaises(TypeError):
+                prove_equal_value(left, right, bad_value, left_b, right_b, b"ctx")
+            with self.assertRaises(TypeError):
+                prove_equal_value(left, right, 5, bad_value, right_b, b"ctx")
+            with self.assertRaises(TypeError):
+                prove_equal_value(left, right, 5, left_b, bad_value, b"ctx")
+        with self.assertRaises(TypeError):
+            prove_equal_value(left, right, 5, left_b, right_b, "ctx")
+        with self.assertRaises(TypeError):
+            prove_equal_value(left, right, 5, left_b, right_b, b"ctx", randbelow=7)
+
+    def test_prove_openings_must_match(self):
+        left, left_b = self.commit(5, -10, 10, blinding=111)
+        right, right_b = self.commit(5, 0, 20, blinding=222)
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, right, 6, left_b, right_b, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, right, 5, left_b + 1, right_b, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, right, 5, left_b, right_b + 1, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+        # value inside only one declared range
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, right, -5, left_b, right_b, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, right, 15, left_b, right_b, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+
+    def test_prove_mismatched_group_parameters(self):
+        left, left_b = self.commit(5, -10, 10, blinding=111)
+        other_group, other_group_b = pedersen_commit(5, 0, 20, blinding=222)
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, other_group, 5, left_b, other_group_b, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+        other_h, other_h_b = self.commit(5, 0, 20, blinding=222, h=7)
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, other_h, 5, left_b, other_h_b, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+        other_g, other_g_b = self.commit(5, 0, 20, blinding=222, generator=4)
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, other_g, 5, left_b, other_g_b, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+
+    def test_prove_draws_nothing_on_invalid_inputs(self):
+        def no_draw(upper):
+            raise AssertionError("randbelow must not be called")
+
+        left, left_b = self.commit(5, -10, 10, blinding=111)
+        right, right_b = self.commit(5, 0, 20, blinding=222)
+        with self.assertRaises(TypeError):
+            prove_equal_value("left", right, 5, left_b, right_b, b"ctx",
+                             randbelow=no_draw)
+        with self.assertRaises(TypeError):
+            prove_equal_value(left, right, True, left_b, right_b, b"ctx",
+                             randbelow=no_draw)
+        with self.assertRaises(TypeError):
+            prove_equal_value(left, right, 5, left_b, right_b, "ctx",
+                             randbelow=no_draw)
+        far, far_b = self.commit(50, 40, 60, blinding=333)
+        with self.assertRaises(ValueError):  # empty intersection
+            prove_equal_value(left, far, 5, left_b, far_b, b"ctx",
+                             randbelow=no_draw)
+        with self.assertRaises(ValueError):  # bad opening
+            prove_equal_value(left, right, 6, left_b, right_b, b"ctx",
+                             randbelow=no_draw)
+        other_group, other_group_b = pedersen_commit(5, 0, 20, blinding=222)
+        with self.assertRaises(ValueError):  # group mismatch
+            prove_equal_value(left, other_group, 5, left_b, other_group_b,
+                             b"ctx", randbelow=no_draw)
+        wide, wide_b = self.commit(5, 0, 300, blinding=111)
+        wide2, wide2_b = self.commit(5, 0, 300, blinding=222)
+        with self.assertRaises(ValueError):  # oversized intersection
+            prove_equal_value(wide, wide2, 5, wide_b, wide2_b, b"ctx",
+                             randbelow=no_draw)
+
+    def test_prove_randbelow_draws_are_validated(self):
+        left, left_b = self.commit(5, -10, 10, blinding=111)
+        right, right_b = self.commit(5, 0, 20, blinding=222)
+        for bad in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                prove_equal_value(
+                    left, right, 5, left_b, right_b, b"ctx",
+                    randbelow=lambda upper, bad=bad: bad,
+                )
+        for bad in (-1, self.PRIME):
+            with self.assertRaises(ValueError):
+                prove_equal_value(
+                    left, right, 5, left_b, right_b, b"ctx",
+                    randbelow=lambda upper, bad=bad: bad,
+                )
+
+    # ---- verify-time rejection -------------------------------------------
+
+    def test_tampering_fails(self):
+        left, right, proof = self.prove()
+        t_left, t_right = proof.t[-1]
+        bad = EqualValueProof(
+            proof.t[:-1] + (((t_left % (self.PRIME - 1)) + 1, t_right),),
+            proof.e,
+            proof.s,
+        )
+        self.assertFalse(verify_equal_value(left, right, bad, b"ctx"))
+        bad = EqualValueProof(
+            proof.t[:-1] + ((t_left, (t_right % (self.PRIME - 1)) + 1),),
+            proof.e,
+            proof.s,
+        )
+        self.assertFalse(verify_equal_value(left, right, bad, b"ctx"))
+        bad = EqualValueProof(
+            proof.t, proof.e[:-1] + ((proof.e[-1] + 1) % self.PRIME,), proof.s
+        )
+        self.assertFalse(verify_equal_value(left, right, bad, b"ctx"))
+        s_left, s_right = proof.s[-1]
+        bad = EqualValueProof(
+            proof.t, proof.e, proof.s[:-1] + ((s_left + 1, s_right),)
+        )
+        self.assertFalse(verify_equal_value(left, right, bad, b"ctx"))
+        bad = EqualValueProof(
+            proof.t, proof.e, proof.s[:-1] + ((s_left, s_right + 1),)
+        )
+        self.assertFalse(verify_equal_value(left, right, bad, b"ctx"))
+
+    def test_binding(self):
+        left, right, proof = self.prove()
+        # swapped commitments
+        self.assertFalse(verify_equal_value(right, left, proof, b"ctx"))
+        # replaced commitments
+        other_left, _ = self.commit(6, -10, 10, blinding=999)
+        self.assertFalse(verify_equal_value(other_left, right, proof, b"ctx"))
+        other_right, _ = self.commit(6, 0, 20, blinding=888)
+        self.assertFalse(verify_equal_value(left, other_right, proof, b"ctx"))
+        # changed public fields on either side
+        for field, left_value, right_value in (
+            ("element", (left.element + 1) % self.PRIME,
+             (right.element + 1) % self.PRIME),
+            ("lower", -9, -9),
+            ("upper", 9, 9),
+            ("prime", DEFAULT_PRIME, DEFAULT_PRIME),
+            ("generator", 4, 4),
+            ("h", 7, 7),
+        ):
+            bad = dataclasses.replace(left, **{field: left_value})
+            self.assertFalse(
+                verify_equal_value(bad, right, proof, b"ctx"), f"left {field}"
+            )
+            bad = dataclasses.replace(right, **{field: right_value})
+            self.assertFalse(
+                verify_equal_value(left, bad, proof, b"ctx"), f"right {field}"
+            )
+        # wrong context
+        self.assertFalse(verify_equal_value(left, right, proof))
+        self.assertFalse(verify_equal_value(left, right, proof, b"other"))
+
+    def test_spliced_proofs_fail(self):
+        left, right, proof_a = self.prove(value=5)
+        _, _, proof_b = self.prove(value=7)
+        for mixed in (
+            EqualValueProof(proof_a.t, proof_b.e, proof_a.s),
+            EqualValueProof(proof_a.t, proof_a.e, proof_b.s),
+            EqualValueProof(proof_b.t, proof_a.e, proof_a.s),
+        ):
+            self.assertFalse(verify_equal_value(left, right, mixed, b"ctx"))
+
+    def test_same_offset_different_value_fails(self):
+        # both commitments encode offset 10, but the actual values differ
+        left, left_b = self.commit(10, 0, 20, blinding=111)
+        right, right_b = self.commit(15, 5, 25, blinding=222)
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, right, 10, left_b, right_b, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+        with self.assertRaises(ValueError):
+            prove_equal_value(
+                left, right, 15, left_b, right_b, b"ctx",
+                randbelow=counter_randbelow(),
+            )
+        # a proof for a matching pair does not transfer to the mismatched one
+        right2, right2_b = self.commit(10, 5, 25, blinding=333)
+        proof = prove_equal_value(
+            left, right2, 10, left_b, right2_b, b"ctx",
+            randbelow=counter_randbelow(),
+        )
+        self.assertTrue(verify_equal_value(left, right2, proof, b"ctx"))
+        self.assertFalse(verify_equal_value(right, right2, proof, b"ctx"))
+
+    def test_structural_errors_return_false(self):
+        left, right, proof = self.prove()
+        # wrong tuple lengths
+        self.assertFalse(
+            verify_equal_value(
+                left, right,
+                EqualValueProof(proof.t[:-1], proof.e, proof.s), b"ctx",
+            )
+        )
+        self.assertFalse(
+            verify_equal_value(
+                left, right,
+                EqualValueProof(proof.t, proof.e, proof.s + ((1, 1),)), b"ctx",
+            )
+        )
+        self.assertFalse(
+            verify_equal_value(left, right, EqualValueProof((), (), ()), b"ctx")
+        )
+        # t entries outside [1, prime)
+        for bad_t in (0, self.PRIME, self.PRIME + 1, -1):
+            bad = EqualValueProof(proof.t[:-1] + ((bad_t, 1),), proof.e, proof.s)
+            self.assertFalse(
+                verify_equal_value(left, right, bad, b"ctx"), f"t={bad_t}"
+            )
+            bad = EqualValueProof(proof.t[:-1] + ((1, bad_t),), proof.e, proof.s)
+            self.assertFalse(
+                verify_equal_value(left, right, bad, b"ctx"), f"t={bad_t}"
+            )
+        # e outside [0, prime)
+        for bad_e in (-1, self.PRIME, self.PRIME + 1):
+            bad = EqualValueProof(proof.t, proof.e[:-1] + (bad_e,), proof.s)
+            self.assertFalse(
+                verify_equal_value(left, right, bad, b"ctx"), f"e={bad_e}"
+            )
+        # negative responses
+        bad = EqualValueProof(proof.t, proof.e, proof.s[:-1] + ((-1, 1),))
+        self.assertFalse(verify_equal_value(left, right, bad, b"ctx"))
+        bad = EqualValueProof(proof.t, proof.e, proof.s[:-1] + ((1, -1),))
+        self.assertFalse(verify_equal_value(left, right, bad, b"ctx"))
+        # challenge shares that do not sum to c
+        bad = EqualValueProof(
+            proof.t, ((proof.e[0] + 1) % self.PRIME,) + proof.e[1:], proof.s
+        )
+        self.assertFalse(verify_equal_value(left, right, bad, b"ctx"))
+
+    def test_bad_embedded_parameters_return_false(self):
+        left, right, proof = self.prove()
+        for field, bad_value in (
+            ("prime", 3),
+            ("generator", 1),
+            ("generator", self.PRIME),
+            ("h", 1),
+            ("h", self.PRIME),
+            ("element", 0),
+            ("element", self.PRIME),
+            ("lower", 11),           # inverted declared range
+            ("lower", -self.PRIME),  # width >= prime - 1
+        ):
+            bad = dataclasses.replace(left, **{field: bad_value})
+            self.assertFalse(
+                verify_equal_value(bad, right, proof, b"ctx"), f"{field}={bad_value}"
+            )
+            bad = dataclasses.replace(right, **{field: bad_value})
+            self.assertFalse(
+                verify_equal_value(left, bad, proof, b"ctx"), f"{field}={bad_value}"
+            )
+        # mismatched group parameters
+        other_group, _ = pedersen_commit(5, 0, 20, blinding=222)
+        self.assertFalse(verify_equal_value(left, other_group, proof, b"ctx"))
+        other_h, _ = self.commit(5, 0, 20, blinding=222, h=7)
+        self.assertFalse(verify_equal_value(left, other_h, proof, b"ctx"))
+
+    def test_verify_type_errors(self):
+        left, right, proof = self.prove()
+        with self.assertRaises(TypeError):
+            verify_equal_value("left", right, proof, b"ctx")
+        with self.assertRaises(TypeError):
+            verify_equal_value(left, "right", proof, b"ctx")
+        with self.assertRaises(TypeError):
+            verify_equal_value(left, right, (proof.t, proof.e, proof.s), b"ctx")
+        with self.assertRaises(TypeError):
+            verify_equal_value(left, right, proof, "ctx")
+        with self.assertRaises(TypeError):
+            verify_equal_value(
+                left, right, EqualValueProof(list(proof.t), proof.e, proof.s),
+                b"ctx",
+            )
+        with self.assertRaises(TypeError):
+            verify_equal_value(
+                left, right, EqualValueProof(proof.t, list(proof.e), proof.s),
+                b"ctx",
+            )
+        with self.assertRaises(TypeError):
+            verify_equal_value(
+                left, right, EqualValueProof(proof.t, proof.e, list(proof.s)),
+                b"ctx",
+            )
+        # pairs must be two-element tuples of integers
+        for bad_pair in ([1, 2], (1,), (1, 2, 3), (1.5, 2), (1, "2"), (True, 2),
+                        (1, None)):
+            with self.assertRaises(TypeError, msg=repr(bad_pair)):
+                verify_equal_value(
+                    left, right,
+                    EqualValueProof(proof.t[:-1] + (bad_pair,), proof.e, proof.s),
+                    b"ctx",
+                )
+            with self.assertRaises(TypeError, msg=repr(bad_pair)):
+                verify_equal_value(
+                    left, right,
+                    EqualValueProof(proof.t, proof.e, proof.s[:-1] + (bad_pair,)),
+                    b"ctx",
+                )
+        for bad_item in (1.5, "0", True, None):
+            with self.assertRaises(TypeError):
+                verify_equal_value(
+                    left, right,
+                    EqualValueProof(proof.t, proof.e[:-1] + (bad_item,), proof.s),
+                    b"ctx",
+                )
+        bad_commitment = dataclasses.replace(left, h=True)
+        with self.assertRaises(TypeError):
+            verify_equal_value(bad_commitment, right, proof, b"ctx")
+
+    # ---- hygiene -----------------------------------------------------------
+
+    def test_inputs_are_not_mutated(self):
+        left, right, proof = self.prove()
+        snapshot = (
+            dataclasses.replace(left),
+            dataclasses.replace(right),
+            EqualValueProof(proof.t, proof.e, proof.s),
+        )
+        verify_equal_value(left, right, proof, b"ctx")
+        self.assertEqual((left, right, proof), snapshot)
 
 
 class RangeSetBatchTest(unittest.TestCase):

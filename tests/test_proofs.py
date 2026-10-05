@@ -107,6 +107,7 @@ from zkregion import (
     encode_merkle_multi_proof_bundle,
     encode_region_proof_bundle,
     merge_inclusion_proofs,
+    merge_multi_proofs,
     merkle_root,
     pedersen_commit,
     prove_consistency,
@@ -12491,6 +12492,502 @@ class SelectMerkleMultiProofTest(unittest.TestCase):
                 ),
                 [1],
             )
+
+
+class MergeMultiProofsTest(unittest.TestCase):
+    """merge_multi_proofs: merge several multi-proof envelopes into one."""
+
+    LEAVES = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon"]
+
+    def envelope(self, leaves, indices):
+        indices = tuple(sorted(indices))
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, indices)
+        entries = tuple((i, leaves[i]) for i in indices)
+        return MerkleMultiProofBundle(root, proof, entries)
+
+    def reference(self, leaves, indices):
+        return self.envelope(leaves, tuple(sorted(set(indices))))
+
+    def test_matches_prove_multi_for_every_partition(self):
+        for size in range(1, 8):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            masks = range(1, 1 << size)
+            for first_mask in masks:
+                first = tuple(i for i in range(size) if first_mask & (1 << i))
+                first_bundle = self.envelope(leaves, first)
+                for second_mask in masks:
+                    second = tuple(
+                        i for i in range(size) if second_mask & (1 << i)
+                    )
+                    with self.subTest(
+                        size=size, first=first, second=second
+                    ):
+                        got = merge_multi_proofs(
+                            [first_bundle, self.envelope(leaves, second)]
+                        )
+                        self.assertEqual(
+                            got, self.reference(leaves, first + second)
+                        )
+                        self.assertTrue(
+                            verify_merkle_multi_proof_bundle(got)
+                        )
+
+    def test_matches_prove_multi_for_larger_trees_sampled(self):
+        for size in (8, 9, 11):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            full = (1 << size) - 1
+            for first_mask in range(1, full, 5):
+                second_mask = (full - first_mask) | (first_mask & 0b1010)
+                if not second_mask:
+                    continue
+                first = tuple(i for i in range(size) if first_mask & (1 << i))
+                second = tuple(
+                    i for i in range(size) if second_mask & (1 << i)
+                )
+                with self.subTest(size=size, first=first, second=second):
+                    got = merge_multi_proofs(
+                        (
+                            self.envelope(leaves, first),
+                            self.envelope(leaves, second),
+                        )
+                    )
+                    self.assertEqual(
+                        got, self.reference(leaves, first + second)
+                    )
+
+    def test_root_leaf_count_and_union_indices_are_preserved(self):
+        leaves = list(self.LEAVES)
+        merged = merge_multi_proofs(
+            [self.envelope(leaves, (4, 0)), self.envelope(leaves, (2,))]
+        )
+        self.assertEqual(merged.root, merkle_root(leaves))
+        self.assertEqual(merged.proof.leaf_count, 5)
+        self.assertEqual(merged.proof.indices, (0, 2, 4))
+        self.assertEqual(
+            merged.entries,
+            ((0, leaves[0]), (2, leaves[2]), (4, leaves[4])),
+        )
+        # indices are original tree positions, never renumbered
+        self.assertEqual(
+            [index for index, _ in merged.entries], [0, 2, 4]
+        )
+
+    def test_single_bundle_merges_to_itself(self):
+        for size in range(1, 9):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            for proven in (
+                tuple(range(size)),
+                (size - 1,),
+                tuple(i for i in range(size) if i % 2 == 0),
+            ):
+                bundle = self.envelope(leaves, proven)
+                with self.subTest(size=size, proven=proven):
+                    self.assertEqual(merge_multi_proofs([bundle]), bundle)
+                    self.assertEqual(
+                        merge_multi_proofs((bundle,)), bundle
+                    )
+
+    def test_grouped_merge_equals_flat_merge(self):
+        leaves = list(self.LEAVES)
+        bundles = [
+            self.envelope(leaves, proven)
+            for proven in ((0, 3), (1,), (2, 4), (0, 2), (4,))
+        ]
+        flat = merge_multi_proofs(list(bundles))
+        left = merge_multi_proofs(bundles[:2])
+        right = merge_multi_proofs(bundles[2:])
+        self.assertEqual(merge_multi_proofs([left, right]), flat)
+        self.assertEqual(
+            merge_multi_proofs(
+                [merge_multi_proofs([bundles[0]]), merge_multi_proofs(bundles[1:])]
+            ),
+            flat,
+        )
+        self.assertEqual(flat, self.reference(leaves, (0, 1, 2, 3, 4)))
+
+    def test_order_duplicates_and_overlap_do_not_matter(self):
+        leaves = list(self.LEAVES)
+        a = self.envelope(leaves, (0, 2))
+        b = self.envelope(leaves, (1, 2, 4))
+        c = self.envelope(leaves, (2, 3))
+        expected = merge_multi_proofs([a, b, c])
+        variants = [
+            [c, b, a],
+            [a, a, b, c],
+            [a, b, c, a, b, c],
+            [b, c, a, a],
+            [merge_multi_proofs([a, b]), c, a],
+        ]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                self.assertEqual(merge_multi_proofs(variant), expected)
+                self.assertEqual(
+                    merge_multi_proofs(tuple(variant)), expected
+                )
+        self.assertEqual(
+            expected, self.reference(leaves, (0, 1, 2, 3, 4))
+        )
+
+    def test_single_leaf_tree(self):
+        bundle = self.envelope([b"only"], (0,))
+        merged = merge_multi_proofs([bundle, bundle])
+        self.assertEqual(merged, bundle)
+        self.assertEqual(merged.proof, MerkleMultiProof(1, (0,), ()))
+        self.assertEqual(merged.entries, ((0, b"only"),))
+
+    def test_odd_and_even_counts_and_last_leaf_only(self):
+        for size in (2, 3, 4, 5, 6, 7, 8):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            last = self.envelope(leaves, (size - 1,))
+            rest = self.envelope(leaves, (0, 1))
+            with self.subTest(size=size):
+                merged = merge_multi_proofs([last, rest])
+                self.assertEqual(
+                    merged, self.reference(leaves, (0, 1, size - 1))
+                )
+                self.assertTrue(verify_merkle_multi_proof_bundle(merged))
+                only_last = merge_multi_proofs([last, last])
+                self.assertEqual(only_last, last)
+
+    def test_union_covering_every_leaf_has_empty_siblings(self):
+        for size in range(1, 9):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            evens = tuple(i for i in range(size) if i % 2 == 0)
+            odds = tuple(i for i in range(size) if i % 2 == 1)
+            pieces = [self.envelope(leaves, p) for p in (evens, odds) if p]
+            with self.subTest(size=size):
+                merged = merge_multi_proofs(pieces)
+                self.assertEqual(merged.proof.indices, tuple(range(size)))
+                self.assertEqual(merged.proof.siblings, ())
+                self.assertEqual(
+                    merged, self.reference(leaves, tuple(range(size)))
+                )
+
+    def test_duplicate_leaf_contents_kept_separately(self):
+        leaves = [b"same", b"middle", b"same"]
+        first = self.envelope(leaves, (0,))
+        second = self.envelope(leaves, (2,))
+        merged = merge_multi_proofs([first, second])
+        self.assertEqual(merged.entries, ((0, b"same"), (2, b"same")))
+        self.assertEqual(merged.proof.indices, (0, 2))
+        self.assertEqual(merged, self.reference(leaves, (0, 2)))
+        self.assertNotEqual(merged, self.reference(leaves, (0,)))
+        self.assertNotEqual(merged, self.reference(leaves, (2,)))
+
+    def test_result_round_trips_and_stays_usable(self):
+        leaves = list(self.LEAVES)
+        merged = merge_multi_proofs(
+            [self.envelope(leaves, (0, 1)), self.envelope(leaves, (3, 4))]
+        )
+        raw = encode_merkle_multi_proof_bundle(merged)
+        decoded = decode_merkle_multi_proof_bundle(raw)
+        self.assertEqual(decoded, merged)
+        self.assertTrue(verify_merkle_multi_proof_bundle(decoded))
+        # the merged envelope crops like any other envelope
+        self.assertEqual(
+            select_merkle_multi_proof(decoded, [4, 1]),
+            self.reference(leaves, (1, 4)),
+        )
+        # and merges further like any other envelope
+        self.assertEqual(
+            merge_multi_proofs(
+                [decoded, self.envelope(leaves, (2,))]
+            ),
+            self.reference(leaves, (0, 1, 2, 3, 4)),
+        )
+
+    def test_works_on_merged_single_proof_envelopes(self):
+        leaves = list(self.LEAVES)
+        root = merkle_root(leaves)
+
+        def singles(*indices):
+            return merge_inclusion_proofs(
+                [
+                    MerkleInclusionBatchEntry(
+                        leaves[i], prove_inclusion(leaves, i), root
+                    )
+                    for i in indices
+                ],
+                len(leaves),
+            )
+
+        merged = merge_multi_proofs([singles(0, 2), singles(3, 4)])
+        self.assertEqual(merged, self.reference(leaves, (0, 2, 3, 4)))
+
+    def test_carries_no_extra_sibling_digests(self):
+        leaves = list(self.LEAVES)
+        merged = merge_multi_proofs(
+            [self.envelope(leaves, (0, 4)), self.envelope(leaves, (1,))]
+        )
+        direct = self.reference(leaves, (0, 1, 4))
+        self.assertEqual(merged.proof.siblings, direct.proof.siblings)
+        self.assertEqual(merged.proof, direct.proof)
+
+    def test_repeated_calls_are_equal_and_inputs_are_not_mutated(self):
+        leaves = list(self.LEAVES)
+        a = self.envelope(leaves, (0, 3))
+        b = self.envelope(leaves, (1, 4))
+        a_snapshot = dataclasses.replace(a)
+        b_snapshot = dataclasses.replace(b)
+        bundles = [a, b]
+        first = merge_multi_proofs(bundles)
+        second = merge_multi_proofs((b, a))
+        self.assertEqual(first, second)
+        self.assertEqual(a, a_snapshot)
+        self.assertEqual(b, b_snapshot)
+        self.assertEqual(bundles, [a_snapshot, b_snapshot])
+
+    def test_type_errors(self):
+        leaves = list(self.LEAVES)
+        bundle = self.envelope(leaves, (1, 3))
+        other = self.envelope(leaves, (4,))
+        for bad in (object(), None, 1, b"bytes", bytearray(b"\x01"),
+                    "seq", {bundle}, frozenset([bundle]), iter([bundle])):
+            with self.assertRaises(TypeError):
+                merge_multi_proofs(bad)
+        for bad in (object(), None, 1, b"bytes", "seq", [bundle], (bundle,)):
+            with self.assertRaises(TypeError):
+                merge_multi_proofs([bundle, bad])
+            with self.assertRaises(TypeError):
+                merge_multi_proofs([bad, bundle])
+        root = merkle_root(leaves)
+        proof = bundle.proof
+        entries = bundle.entries
+        bad_bundles = [
+            MerkleMultiProofBundle("not-bytes", proof, entries),
+            MerkleMultiProofBundle(bytearray(root), proof, entries),
+            MerkleMultiProofBundle(root, object(), entries),
+            MerkleMultiProofBundle(
+                root, MerkleMultiProof("5", (1, 3), proof.siblings), entries
+            ),
+            MerkleMultiProofBundle(
+                root, MerkleMultiProof(True, (1, 3), proof.siblings), entries
+            ),
+            MerkleMultiProofBundle(
+                root, MerkleMultiProof(5, [1, 3], proof.siblings), entries
+            ),
+            MerkleMultiProofBundle(
+                root, MerkleMultiProof(5, (True, 3), proof.siblings), entries
+            ),
+            MerkleMultiProofBundle(
+                root,
+                MerkleMultiProof(5, (1, 3), ["x"] * len(proof.siblings)),
+                entries,
+            ),
+            MerkleMultiProofBundle(root, proof, list(entries)),
+            MerkleMultiProofBundle(root, proof, ((1, leaves[1]), (3, "x"))),
+            MerkleMultiProofBundle(
+                root, proof, ((1, leaves[1]), [3, leaves[3]])
+            ),
+            MerkleMultiProofBundle(
+                root, proof, ((1, leaves[1]), (True, leaves[3]))
+            ),
+        ]
+        for bad in bad_bundles:
+            with self.subTest(bad=bad):
+                with self.assertRaises(TypeError):
+                    merge_multi_proofs([other, bad])
+
+    def test_type_errors_take_precedence_over_value_errors(self):
+        leaves = list(self.LEAVES)
+        root = merkle_root(leaves)
+        good = self.envelope(leaves, (1, 3))
+        # semantically invalid (root too short) but well-typed
+        bad_root = MerkleMultiProofBundle(
+            b"r" * 31, good.proof, good.entries
+        )
+        # a type error anywhere in the input wins over the semantic error
+        with self.assertRaises(TypeError):
+            merge_multi_proofs([bad_root, "nope"])
+        with self.assertRaises(TypeError):
+            merge_multi_proofs(["nope", bad_root])
+        with self.assertRaises(TypeError):
+            merge_multi_proofs(
+                [bad_root, MerkleMultiProofBundle(root, object(), ())]
+            )
+        # not a list/tuple container, even with a semantic error inside
+        with self.assertRaises(TypeError):
+            merge_multi_proofs({bad_root: True})
+        # a bad nested type late in the list still raises before semantics
+        with self.assertRaises(TypeError):
+            merge_multi_proofs(
+                [
+                    MerkleMultiProofBundle(
+                        root,
+                        MerkleMultiProof(5, (1, False), good.proof.siblings),
+                        good.entries,
+                    ),
+                    bad_root,
+                ]
+            )
+
+    def test_value_errors(self):
+        leaves = list(self.LEAVES)
+        root = merkle_root(leaves)
+        bundle = self.envelope(leaves, (1, 3))
+        other = self.envelope(leaves, (4,))
+        proof = bundle.proof
+        entries = bundle.entries
+        with self.assertRaises(ValueError):
+            merge_multi_proofs([])
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(())
+        # different roots
+        other_leaves = [b"x-" + leaf for leaf in leaves]
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [bundle, self.envelope(other_leaves, (1, 3))]
+            )
+        # same root bytes but a different declared leaf_count
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [
+                    bundle,
+                    MerkleMultiProofBundle(
+                        root,
+                        MerkleMultiProof(6, (1, 3), proof.siblings),
+                        entries,
+                    ),
+                ]
+            )
+        # same index carried with conflicting leaf bytes
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [
+                    bundle,
+                    MerkleMultiProofBundle(
+                        root,
+                        proof,
+                        ((1, b"tampered"), (3, leaves[3])),
+                    ),
+                ]
+            )
+        # wrong root length
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [MerkleMultiProofBundle(b"r" * 31, proof, entries), other]
+            )
+        # tampered root
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [MerkleMultiProofBundle(b"\xff" * 32, proof, entries), other]
+            )
+        # non-positive declared leaf_count
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [
+                    MerkleMultiProofBundle(
+                        root, MerkleMultiProof(0, (1,), ()), ((1, leaves[1]),)
+                    ),
+                    other,
+                ]
+            )
+        # misordered / duplicate / out-of-range indices
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [
+                    MerkleMultiProofBundle(
+                        root,
+                        MerkleMultiProof(5, (3, 1), proof.siblings),
+                        ((3, leaves[3]), (1, leaves[1])),
+                    ),
+                    other,
+                ]
+            )
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [
+                    MerkleMultiProofBundle(
+                        root,
+                        MerkleMultiProof(5, (1, 1), ()),
+                        ((1, leaves[1]), (1, leaves[1])),
+                    ),
+                    other,
+                ]
+            )
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [
+                    MerkleMultiProofBundle(
+                        root,
+                        MerkleMultiProof(5, (1, 5), proof.siblings),
+                        ((1, leaves[1]), (5, leaves[4])),
+                    ),
+                    other,
+                ]
+            )
+        # entries/indices mismatch
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [
+                    MerkleMultiProofBundle(
+                        root, proof, ((1, leaves[1]),)
+                    ),
+                    other,
+                ]
+            )
+        # wrong sibling digest length
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [
+                    MerkleMultiProofBundle(
+                        root,
+                        MerkleMultiProof(
+                            5, (1, 3), (b"x",) * len(proof.siblings)
+                        ),
+                        entries,
+                    ),
+                    other,
+                ]
+            )
+        # missing / extra sibling digest
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [
+                    MerkleMultiProofBundle(
+                        root,
+                        MerkleMultiProof(5, (1, 3), proof.siblings[:-1]),
+                        entries,
+                    ),
+                    other,
+                ]
+            )
+        with self.assertRaises(ValueError):
+            merge_multi_proofs(
+                [
+                    MerkleMultiProofBundle(
+                        root,
+                        MerkleMultiProof(
+                            5, (1, 3), proof.siblings + (b"\x00" * 32,)
+                        ),
+                        entries,
+                    ),
+                    other,
+                ]
+            )
+
+    def test_invalid_duplicates_are_fully_checked(self):
+        leaves = list(self.LEAVES)
+        root = merkle_root(leaves)
+        good = self.envelope(leaves, (1, 3))
+        proof = good.proof
+        # a tampered duplicate must not be excused because the merge
+        # would drop its digests anyway
+        tampered = MerkleMultiProofBundle(
+            root, proof, ((1, b"tampered"), (3, leaves[3]))
+        )
+        for bundles in (
+            [good, tampered],
+            [tampered, good],
+            [tampered, tampered],
+            [good, good, tampered],
+        ):
+            with self.subTest(bundles=bundles):
+                with self.assertRaises(ValueError):
+                    merge_multi_proofs(bundles)
+        # no partial result: the valid envelope alone would merge fine
+        self.assertEqual(merge_multi_proofs([good, good]), good)
 
 
 class MerkleMultiInclusionBatchTest(unittest.TestCase):

@@ -86,6 +86,7 @@ BoundMerkleInclusionBatchReplayGuard /
 MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion / merge_inclusion_proofs /
 select_merkle_multi_proof / merge_multi_proofs /
+split_merkle_multi_proof /
 MerkleMultiProofBundle /
 MerkleMultiBatchEntry /
 verify_multi_inclusion_batch / BoundMerkleMultiBatch /
@@ -266,6 +267,7 @@ __all__ = [
     "quantize_region",
     "region_contains_committed",
     "select_merkle_multi_proof",
+    "split_merkle_multi_proof",
     "verify_bound",
     "verify_consistency",
     "verify_consistency_batch",
@@ -9138,6 +9140,163 @@ def merge_multi_proofs(
     if not verify_multi_inclusion(entries, proof, root):
         raise ValueError("merged proof does not verify under the root")
     return merged
+
+
+def split_merkle_multi_proof(
+    bundle: MerkleMultiProofBundle,
+) -> tuple[MerkleInclusionBatchEntry, ...]:
+    """Split a multi-proof envelope into independent single-leaf proofs.
+
+    Given an existing, valid :class:`MerkleMultiProofBundle`, return one
+    :class:`MerkleInclusionBatchEntry` per proven leaf — exactly the items
+    the single-leaf entry points :func:`verify_inclusion` and
+    :func:`verify_inclusion_batch` consume — as a tuple ordered by
+    strictly increasing original index and covering every leaf the
+    envelope proves. The caller supplies only the envelope: no full leaf
+    set, no other proofs and no external storage are needed. Each entry
+    keeps the original leaf bytes, the original zero-based ``index``
+    (never renumbered) and the shared ``root``; two distinct indices
+    carrying equal leaf contents are returned as separate entries.
+
+    Every emitted path is field-for-field equal to the :class:`MerkleProof`
+    :func:`prove_inclusion` builds for the same complete leaf set and the
+    same index: siblings are ordered from leaf to root, and the odd last
+    node of a level contributes its self-duplicated digest to the path
+    exactly as the single-leaf prover records it. A sibling digest the
+    compact proof does not carry explicitly — because it is itself proven
+    or recomputed from proven leaves — is reconstructed from the envelope,
+    so a valid envelope is always splittable. Single-leaf trees yield one
+    entry with an empty path; non-power-of-two leaf counts, envelopes
+    proving only the last leaf, adjacent or scattered indices and
+    envelopes covering every leaf all apply. Each entry verifies with
+    :func:`verify_inclusion`, the whole tuple verifies with
+    :func:`verify_inclusion_batch`, and handing the tuple back to
+    :func:`merge_inclusion_proofs` with the original ``leaf_count``
+    rebuilds a bundle equal by value to the input. Repeated calls, and
+    calls on an envelope round-tripped through
+    :func:`encode_merkle_multi_proof_bundle` /
+    :func:`decode_merkle_multi_proof_bundle` or cropped with
+    :func:`select_merkle_multi_proof`, return equal results.
+
+    All argument and nested-field types — ``bundle`` a
+    :class:`MerkleMultiProofBundle` with ``bytes`` root, a
+    :class:`MerkleMultiProof` with a non-``bool`` integer ``leaf_count``,
+    a tuple of non-``bool`` integer ``indices`` and a tuple-of-``bytes``
+    ``siblings``, and a tuple of two-item ``(index, leaf)`` entries with
+    a non-``bool`` integer index and ``bytes`` leaf — are checked across
+    the whole envelope first, mirroring the type constraints of
+    :func:`encode_merkle_multi_proof_bundle`, so a wrong type (including
+    a ``bool`` standing in for an integer) raises :class:`TypeError` even
+    when a semantic error is present at the same time. After the type
+    preflight, any envelope that :func:`verify_merkle_multi_proof_bundle`
+    rejects — empty entries, a non-positive ``leaf_count``, duplicate or
+    misordered indices, an out-of-range index, an entries/indices
+    mismatch, a wrong root or sibling digest length, a tampered leaf or
+    root, a missing or extra sibling digest — raises :class:`ValueError`
+    and no partial tuple is returned. The declared ``leaf_count`` fixes
+    the tree shape; the true leaf count is never inferred from the root.
+    Inputs are never mutated and nothing is written to the file system or
+    a database.
+    """
+    if not isinstance(bundle, MerkleMultiProofBundle):
+        raise TypeError("bundle must be a MerkleMultiProofBundle")
+    if not isinstance(bundle.root, bytes):
+        raise TypeError("root must be bytes")
+    _check_merkle_multi_bundle_proof_types(bundle.proof)
+    _check_merkle_multi_bundle_entries_types(bundle.entries)
+
+    # The envelope must verify as a whole before anything is split out;
+    # the declared leaf_count fixes the tree shape for the walk.
+    if not verify_multi_inclusion(
+        bundle.entries, bundle.proof, bundle.root
+    ):
+        raise ValueError("bundle proof does not verify under the root")
+
+    # Reconstruct, level by level, every node digest the envelope makes
+    # available: the ancestors its verification walk recomputes from the
+    # proven leaves, and the external sibling digests it supplies. A
+    # single-leaf path sibling may be either kind — the compact proof
+    # never carries a digest it can recompute, but the split paths need
+    # them all. verify_multi_inclusion above already pins this walk to
+    # the declared shape and root; re-running it here also rejects a
+    # missing or surplus sibling explicitly instead of yielding one.
+    original_siblings = bundle.proof.siblings
+    level_recomputed: dict[int, dict[int, bytes]] = {}
+    level_supplied: dict[int, dict[int, bytes]] = {}
+    known: dict[int, bytes] = {
+        index: _leaf_digest(leaf) for index, leaf in bundle.entries
+    }
+    size = bundle.proof.leaf_count
+    cursor = 0
+    level = 0
+    while size > 1:
+        level_recomputed[level] = dict(known)
+        supplied: dict[int, bytes] = {}
+        next_known: dict[int, bytes] = {}
+        for position in sorted(known):
+            sibling = position ^ 1
+            if sibling in known:
+                sibling_digest = known[sibling]
+            elif position == size - 1 and size % 2 == 1:
+                sibling_digest = known[position]  # odd last node duplicates itself
+            else:
+                if cursor >= len(original_siblings):
+                    raise ValueError("bundle proof is missing a sibling digest")
+                sibling_digest = original_siblings[cursor]
+                cursor += 1
+                supplied[sibling] = sibling_digest
+            if position % 2 == 0:
+                digest = _node_digest(known[position], sibling_digest)
+            else:
+                digest = _node_digest(sibling_digest, known[position])
+            next_known[position // 2] = digest
+        level_supplied[level] = supplied
+        known = next_known
+        size = (size + 1) // 2
+        level += 1
+    if cursor != len(original_siblings):
+        raise ValueError("bundle proof carries an extra sibling digest")
+
+    # Emit one single-leaf path per proven leaf. bundle.entries follows
+    # proof.indices, which the verification above pinned to strictly
+    # increasing order, so the output is ordered by ascending original
+    # index. Each path lists siblings from leaf to root exactly as
+    # prove_inclusion records them, including the self-duplicated digest
+    # of an odd last node.
+    result: list[MerkleInclusionBatchEntry] = []
+    for index, leaf in bundle.entries:
+        path: list[bytes] = []
+        position = index
+        size = bundle.proof.leaf_count
+        level = 0
+        while size > 1:
+            recomputed = level_recomputed[level]
+            if position == size - 1 and size % 2 == 1:
+                # The odd last node duplicates itself; the single-leaf
+                # path carries the self-copy prove_inclusion records.
+                sibling_digest = recomputed[position]
+            else:
+                sibling = position ^ 1
+                sibling_digest = recomputed.get(sibling)
+                if sibling_digest is None:
+                    sibling_digest = level_supplied[level].get(sibling)
+                if sibling_digest is None:
+                    raise ValueError("split proof is missing a sibling digest")
+            path.append(sibling_digest)
+            position //= 2
+            size = (size + 1) // 2
+            level += 1
+        result.append(
+            MerkleInclusionBatchEntry(
+                leaf=leaf,
+                proof=MerkleProof(index=index, siblings=tuple(path)),
+                root=bundle.root,
+            )
+        )
+    entries = tuple(result)
+    if not verify_inclusion_batch(entries):
+        raise ValueError("split proofs do not verify under the root")
+    return entries
 
 
 @dataclass(frozen=True)

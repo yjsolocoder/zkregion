@@ -5906,6 +5906,26 @@ class _WireReader:
             raise ValueError(f"{what} tuple has trailing data")
         return tuple(items)
 
+    def integer_pair_tuple(self, what: str) -> tuple[tuple[int, int], ...]:
+        body = self.frame(what)
+        inner = _WireReader(body)
+        count = inner.tuple_cardinality(what)
+        pairs: list[tuple[int, int]] = []
+        for index in range(count):
+            item_body = inner.frame(f"{what}[{index}]")
+            item_reader = _WireReader(item_body)
+            item_count = item_reader.tuple_cardinality(f"{what}[{index}]")
+            if item_count != 2:
+                raise ValueError(f"{what}[{index}] must be an integer pair")
+            first = item_reader.int_value(f"{what}[{index}][0]")
+            second = item_reader.int_value(f"{what}[{index}][1]")
+            if not item_reader.at_end():
+                raise ValueError(f"{what}[{index}] has trailing data")
+            pairs.append((first, second))
+        if not inner.at_end():
+            raise ValueError(f"{what} tuple has trailing data")
+        return tuple(pairs)
+
 
 # ---------------------------------------------------------------------------
 # Shared proof-structure codecs
@@ -5963,6 +5983,27 @@ def _wire_wide_range_proof_body(proof: WideRangeProof) -> bytes:
     )
 
 
+def _wire_integer_pairs_body(pairs: Sequence[tuple[int, int]]) -> bytes:
+    """A tuple body of two-integer tuples, one per pair."""
+    return _wire_tuple(
+        [_wire_tuple([_wire_int(pair[0]), _wire_int(pair[1])]) for pair in pairs]
+    )
+
+
+def _wire_interval_range_proof_body(proof: IntervalRangeProof) -> bytes:
+    """An IntervalRangeProof body: its six tuples, in field order."""
+    return _wire_tuple(
+        [
+            _wire_tuple([_wire_int(item) for item in proof.low_commitments]),
+            _wire_integer_pairs_body(proof.low_challenges),
+            _wire_integer_pairs_body(proof.low_responses),
+            _wire_tuple([_wire_int(item) for item in proof.high_commitments]),
+            _wire_integer_pairs_body(proof.high_challenges),
+            _wire_integer_pairs_body(proof.high_responses),
+        ]
+    )
+
+
 def _check_commitment_types(commitment: object, name: str) -> None:
     if not isinstance(commitment, PedersenCommitment):
         raise TypeError(f"{name} must be a PedersenCommitment")
@@ -6003,6 +6044,51 @@ def _check_bundle_wide_range_proof(proof: object, name: str) -> None:
                 )
             _check_int(pair[0], f"{name} {field_name}[{index}][0]")
             _check_int(pair[1], f"{name} {field_name}[{index}][1]")
+
+
+_INTERVAL_RANGE_PROOF_PAIR_FIELDS = (
+    "low_challenges",
+    "low_responses",
+    "high_challenges",
+    "high_responses",
+)
+
+
+def _check_bundle_interval_range_proof(proof: object, name: str) -> None:
+    """Full encode-time check of one :class:`IntervalRangeProof`.
+
+    Nested type errors (wrong object, non-tuple fields, non-integer or
+    ``bool`` entries) raise :class:`TypeError` via
+    :func:`_check_interval_range_proof_types`; with types established, a
+    proof whose six fields differ in length, whose common length falls
+    outside ``1.._MAX_INTERVAL_RANGE_BITS`` or whose challenge/response
+    entries are not integer pairs raises :class:`ValueError`.
+    """
+    _check_interval_range_proof_types(proof, name)
+    width = len(proof.low_commitments)
+    field_names = (
+        "low_commitments",
+        "low_challenges",
+        "low_responses",
+        "high_commitments",
+        "high_challenges",
+        "high_responses",
+    )
+    if any(len(getattr(proof, field_name)) != width for field_name in field_names):
+        raise ValueError(
+            f"{name} interval range proof fields must be equal-length tuples"
+        )
+    if not 1 <= width <= _MAX_INTERVAL_RANGE_BITS:
+        raise ValueError(
+            f"{name} interval range proof must hold "
+            f"1..{_MAX_INTERVAL_RANGE_BITS} matching bit entries"
+        )
+    for field_name in _INTERVAL_RANGE_PROOF_PAIR_FIELDS:
+        for index, pair in enumerate(getattr(proof, field_name)):
+            if len(pair) != 2:
+                raise ValueError(
+                    f"{name} {field_name}[{index}] must be an integer pair"
+                )
 
 
 class _ProofStructureReader(_WireReader):
@@ -6106,13 +6192,52 @@ class _ProofStructureReader(_WireReader):
             responses=tuple(pairs["responses"]),
         )
 
+    def interval_range_proof(self, what: str) -> IntervalRangeProof:
+        body = self.frame(what)
+        inner = _ProofStructureReader(body)
+        count = inner.tuple_cardinality(what)
+        if count != 6:
+            raise ValueError(
+                f"{what} interval range proof must have exactly six fields"
+            )
+        low_commitments = inner.integer_tuple(f"{what} low_commitments")
+        low_challenges = inner.integer_pair_tuple(f"{what} low_challenges")
+        low_responses = inner.integer_pair_tuple(f"{what} low_responses")
+        high_commitments = inner.integer_tuple(f"{what} high_commitments")
+        high_challenges = inner.integer_pair_tuple(f"{what} high_challenges")
+        high_responses = inner.integer_pair_tuple(f"{what} high_responses")
+        if not inner.at_end():
+            raise ValueError(f"{what} interval range proof has trailing data")
+        width = len(low_commitments)
+        if not (
+            1 <= width <= _MAX_INTERVAL_RANGE_BITS
+            and len(low_challenges) == width
+            and len(low_responses) == width
+            and len(high_commitments) == width
+            and len(high_challenges) == width
+            and len(high_responses) == width
+        ):
+            raise ValueError(
+                f"{what} interval range proof must hold "
+                f"1..{_MAX_INTERVAL_RANGE_BITS} matching bit entries"
+            )
+        return IntervalRangeProof(
+            low_commitments=low_commitments,
+            low_challenges=low_challenges,
+            low_responses=low_responses,
+            high_commitments=high_commitments,
+            high_challenges=high_challenges,
+            high_responses=high_responses,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Canonical binary envelope for cross-process region proof transport
 #
 # A RegionProofBundle freezes the five verification-relevant objects (both
 # PedersenCommitment objects, the Region, the external context and the
-# RegionProof / RegionWideProof) into a self-describing byte string. The wire
+# RegionProof / RegionWideProof / RegionIntervalProof) into a
+# self-describing byte string. The wire
 # format is versioned and proof-type tagged; it composes the generic wire
 # primitives and shared proof structures above.
 #
@@ -6123,14 +6248,15 @@ class _ProofStructureReader(_WireReader):
 #   frame(context) || frame(proof)
 #
 # Structured bodies carry an explicit tuple cardinality; the one-byte
-# proof-type tag in the header makes RegionProof and RegionWideProof
-# byte-distinguishable, and the proof body is always the two axis sub-proofs
-# in (x, y) order.
+# proof-type tag in the header makes RegionProof, RegionWideProof and
+# RegionIntervalProof byte-distinguishable, and the proof body is always
+# the two axis sub-proofs in (x, y) order.
 
 _REGION_BUNDLE_MAGIC = b"zrgn"
 _REGION_BUNDLE_VERSION = 1
 _REGION_BUNDLE_PROOF_TYPE_RANGE = 1
 _REGION_BUNDLE_PROOF_TYPE_WIDE = 2
+_REGION_BUNDLE_PROOF_TYPE_INTERVAL = 3
 
 
 @dataclass(frozen=True)
@@ -6139,10 +6265,11 @@ class RegionProofBundle:
 
     Fields, in the fixed wire order: ``x_commitment`` / ``y_commitment``
     (:class:`PedersenCommitment`), ``region`` (:class:`Region`),
-    ``context`` (``bytes``) and ``proof`` (a :class:`RegionProof` or
-    :class:`RegionWideProof`). Bundles are positional construction
-    arguments, compare by value and are immutable; construction performs no
-    validation — use :func:`encode_region_proof_bundle` /
+    ``context`` (``bytes``) and ``proof`` (a :class:`RegionProof`,
+    :class:`RegionWideProof` or :class:`RegionIntervalProof`). Bundles are
+    positional construction arguments, compare by value and are immutable;
+    construction performs no validation — use
+    :func:`encode_region_proof_bundle` /
     :func:`verify_region_proof_bundle` to check.
     """
 
@@ -6150,7 +6277,7 @@ class RegionProofBundle:
     y_commitment: PedersenCommitment
     region: Region
     context: bytes
-    proof: RegionProof | RegionWideProof
+    proof: RegionProof | RegionWideProof | RegionIntervalProof
 
 
 def _wire_region_body(region: Region) -> bytes:
@@ -6164,7 +6291,7 @@ def _wire_region_body(region: Region) -> bytes:
 
 
 def _region_proof_body_and_tag(
-    proof: RegionProof | RegionWideProof,
+    proof: RegionProof | RegionWideProof | RegionIntervalProof,
 ) -> tuple[int, bytes]:
     """Return ``(proof_type_tag, proof body)`` for the region bundle payload.
 
@@ -6179,13 +6306,21 @@ def _region_proof_body_and_tag(
             ]
         )
         return _REGION_BUNDLE_PROOF_TYPE_RANGE, body
+    if isinstance(proof, RegionWideProof):
+        body = _wire_tuple(
+            [
+                _wire_wide_range_proof_body(proof.x_proof),
+                _wire_wide_range_proof_body(proof.y_proof),
+            ]
+        )
+        return _REGION_BUNDLE_PROOF_TYPE_WIDE, body
     body = _wire_tuple(
         [
-            _wire_wide_range_proof_body(proof.x_proof),
-            _wire_wide_range_proof_body(proof.y_proof),
+            _wire_interval_range_proof_body(proof.x_proof),
+            _wire_interval_range_proof_body(proof.y_proof),
         ]
     )
-    return _REGION_BUNDLE_PROOF_TYPE_WIDE, body
+    return _REGION_BUNDLE_PROOF_TYPE_INTERVAL, body
 
 
 def _check_region_types(region: object, *, enforce_order: bool) -> None:
@@ -6215,10 +6350,14 @@ def encode_region_proof_bundle(bundle: RegionProofBundle) -> bytes:
     A wrong object or field type (including a ``bool`` integer, a
     non-tuple proof field, a wide-proof pair that is not a two-tuple, or a
     proof that is neither a :class:`RegionProof` nor a
-    :class:`RegionWideProof`) raises :class:`TypeError`. A region with
-    ``min > max`` on an axis cannot be built through the public
-    :class:`Region` constructor; if such an object is forged bypassing the
-    constructor, it is rejected with :class:`ValueError`.
+    :class:`RegionWideProof` nor a :class:`RegionIntervalProof`) raises
+    :class:`TypeError`. An interval proof whose six fields differ in
+    length, whose common length falls outside ``1..24`` or whose
+    challenge/response entries are not integer pairs raises
+    :class:`ValueError`. A region with ``min > max`` on an axis cannot be
+    built through the public :class:`Region` constructor; if such an
+    object is forged bypassing the constructor, it is rejected with
+    :class:`ValueError`.
     """
     if not isinstance(bundle, RegionProofBundle):
         raise TypeError("bundle must be a RegionProofBundle")
@@ -6234,8 +6373,13 @@ def encode_region_proof_bundle(bundle: RegionProofBundle) -> bytes:
     elif isinstance(proof, RegionWideProof):
         _check_bundle_wide_range_proof(proof.x_proof, "proof x_proof")
         _check_bundle_wide_range_proof(proof.y_proof, "proof y_proof")
+    elif isinstance(proof, RegionIntervalProof):
+        _check_bundle_interval_range_proof(proof.x_proof, "proof x_proof")
+        _check_bundle_interval_range_proof(proof.y_proof, "proof y_proof")
     else:
-        raise TypeError("proof must be a RegionProof or RegionWideProof")
+        raise TypeError(
+            "proof must be a RegionProof, RegionWideProof or RegionIntervalProof"
+        )
     proof_type, proof_body = _region_proof_body_and_tag(proof)
     out = bytearray()
     out += _REGION_BUNDLE_MAGIC
@@ -6265,7 +6409,7 @@ class _RegionBundleReader(_ProofStructureReader):
             raise ValueError("region has trailing data")
         return Region(min_x=min_x, max_x=max_x, min_y=min_y, max_y=max_y)
 
-    def proof(self, tag: int) -> RegionProof | RegionWideProof:
+    def proof(self, tag: int) -> RegionProof | RegionWideProof | RegionIntervalProof:
         body = self.frame("proof")
         inner = _RegionBundleReader(body)
         count = inner.tuple_cardinality("proof")
@@ -6283,6 +6427,12 @@ class _RegionBundleReader(_ProofStructureReader):
             if not inner.at_end():
                 raise ValueError("region wide proof has trailing data")
             return RegionWideProof(x_proof=x_proof, y_proof=y_proof)
+        if tag == _REGION_BUNDLE_PROOF_TYPE_INTERVAL:
+            x_proof = inner.interval_range_proof("region interval proof x_proof")
+            y_proof = inner.interval_range_proof("region interval proof y_proof")
+            if not inner.at_end():
+                raise ValueError("region interval proof has trailing data")
+            return RegionIntervalProof(x_proof=x_proof, y_proof=y_proof)
         raise ValueError("unknown region proof bundle proof type")
 
 
@@ -6298,8 +6448,9 @@ def decode_region_proof_bundle(data: bytes) -> RegionProofBundle:
     type, a non-canonical integer, an illegal region or an unexpected
     nested proof shape raises :class:`ValueError`; a non-``bytes`` input
     raises :class:`TypeError`. A decoded bundle compares equal field-for-
-    field to the original and a :class:`RegionProof` payload can never be
-    rebuilt as a :class:`RegionWideProof` (or vice versa).
+    field to the original and a payload of one proof type can never be
+    rebuilt as another (:class:`RegionProof`, :class:`RegionWideProof` and
+    :class:`RegionIntervalProof` are byte-distinguishable).
     """
     if not isinstance(data, bytes):
         raise TypeError("data must be bytes")
@@ -6312,6 +6463,7 @@ def decode_region_proof_bundle(data: bytes) -> RegionProofBundle:
     if tag not in (
         _REGION_BUNDLE_PROOF_TYPE_RANGE,
         _REGION_BUNDLE_PROOF_TYPE_WIDE,
+        _REGION_BUNDLE_PROOF_TYPE_INTERVAL,
     ):
         raise ValueError("unknown region proof bundle proof type")
     x_commitment = reader.commitment("x_commitment")
@@ -6335,15 +6487,16 @@ def verify_region_proof_bundle(bundle: RegionProofBundle) -> bool:
 
     Verification follows the existing single-proof semantics exactly,
     dispatching on the ``proof`` type: :class:`RegionProof` is checked with
-    :func:`verify_region` and :class:`RegionWideProof` with
-    :func:`verify_region_wide`, using only the two
+    :func:`verify_region`, :class:`RegionWideProof` with
+    :func:`verify_region_wide` and :class:`RegionIntervalProof` with
+    :func:`verify_region_interval`, using only the two
     :class:`PedersenCommitment` objects, the :class:`Region` and the
     ``context`` — never coordinates or blinding factors. A wrong object or
-    field type (including a proof of neither region-proof type) raises
-    :class:`TypeError`; every other failure — a declared range mismatch,
-    a context mismatch, swapped axes or commitments, a tampered proof or a
-    failed verification equation — returns ``False``. Encoding and then
-    decoding a bundle preserves the verification verdict.
+    field type (including a proof of none of the three region-proof types)
+    raises :class:`TypeError`; every other failure — a declared range
+    mismatch, a context mismatch, swapped axes or commitments, a tampered
+    proof or a failed verification equation — returns ``False``. Encoding
+    and then decoding a bundle preserves the verification verdict.
     """
     if not isinstance(bundle, RegionProofBundle):
         raise TypeError("bundle must be a RegionProofBundle")
@@ -6371,7 +6524,17 @@ def verify_region_proof_bundle(bundle: RegionProofBundle) -> bool:
             proof,
             bundle.context,
         )
-    raise TypeError("proof must be a RegionProof or RegionWideProof")
+    if isinstance(proof, RegionIntervalProof):
+        return verify_region_interval(
+            bundle.x_commitment,
+            bundle.y_commitment,
+            bundle.region,
+            proof,
+            bundle.context,
+        )
+    raise TypeError(
+        "proof must be a RegionProof, RegionWideProof or RegionIntervalProof"
+    )
 
 
 # ---------------------------------------------------------------------------

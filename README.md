@@ -187,6 +187,18 @@ assert disclosed.proof == prove_multi_inclusion(leaves, (2,))
 assert verify_merkle_multi_proof_bundle(disclosed)
 assert decode_merkle_multi_proof_bundle(encode_merkle_multi_proof_bundle(disclosed)) == disclosed
 
+# 信封拆分：仅凭紧凑信封还原全部已证叶的独立单叶证明条目
+from zkregion import split_merkle_multi_proof
+
+single_entries = split_merkle_multi_proof(merged)
+assert [entry.proof.index for entry in single_entries] == list(merged.proof.indices)
+assert all(
+    entry.proof == prove_inclusion(leaves, entry.proof.index)
+    for entry in single_entries
+)
+assert verify_inclusion_batch(single_entries)
+assert merge_inclusion_proofs(single_entries, merged.proof.leaf_count) == merged
+
 # 独立多叶紧凑包含证明批验：一次检查多组互不相关的 entries、proof 与 root
 from zkregion import MerkleMultiBatchEntry, verify_multi_inclusion_batch
 
@@ -1648,6 +1660,7 @@ python3 -m zkregion
 - `verify_multi_inclusion(entries, proof, root) -> bool` — 无需完整叶集验证多包含证明；`entries` 按 `proof.indices` 顺序给出 `(index, leaf)`
 - `merge_inclusion_proofs(entries, leaf_count) -> MerkleMultiProofBundle` — 仅凭同一棵树下既有的单叶包含证明合成紧凑多包含证明信封，无需任何未选中叶子的原文或完整树；`entries` 为 `MerkleInclusionBatchEntry` 的列表或元组，可乱序，同一索引的完全相同条目（索引、叶与路径一致）可重复并只保留一次，不同索引即使叶内容相同也分别保留；输出保留共同根、按索引递增排列 `(index, leaf)`，其 `MerkleMultiProof` 只使用单叶证明中已有的摘要，沿用既有叶/节点哈希、奇数末项复制与逐层从左到右的兄弟摘要顺序，可直接交给 `verify_merkle_multi_proof_bundle` 与信封编解码入口；对同一完整叶集生成的有效单叶证明，结果与 `prove_multi_inclusion` 对相同索引集合的输出逐字段相等；单叶树、非二次幂叶数、相邻与分散索引均支持，覆盖全部叶子时 `siblings` 为空；`leaf_count` 是调用方声明的树形约束，决定每条路径的高度与末项复制安排，不宣称仅凭根与局部路径能唯一确定原树叶数；类型先于值做整批预检——`entries` 非 list/tuple（含 `bytes`/`bytearray`/`str`）、条目或嵌套字段不符单叶批验类型、`leaf_count` 为 `bool` 或非整数时一律抛 `TypeError`，即使另有无效证明也不掩盖类型错误；类型通过后，空输入、`leaf_count` 非正、索引越界、根不一致、根或兄弟摘要非三十二字节、路径相对声明高度缺失或多余、复制节点或重叠路径同位置摘要冲突、验证失败，以及同一索引携带不同叶或不同路径，一律抛 `ValueError` 且不返回部分信封；成功结果经信封编码解码后逐字段相等且验证为 `True`；函数不改写输入、不写文件或数据库
 - `select_merkle_multi_proof(bundle, indices) -> MerkleMultiProofBundle` — 对既有多叶包含证明信封做选择性披露：调用方只需提供已有 `MerkleMultiProofBundle` 与待保留的原树索引，无需完整叶集、其他单叶证明或外部存储；`indices` 接受列表或元组的非 `bool` 整数，可乱序、可重复，输出按索引递增去重，保留原 `root` 与 `leaf_count`，`entries` 只含选中的原索引与原叶字节、不重新编号，相同内容的不同索引仍分别保留；新证明所需兄弟摘要全部从原信封的已证叶与已供摘要逐层重建，沿用既有叶/节点哈希、奇数末项自复制与逐层从左到右的兄弟摘要排序，对于同一完整叶集产生的有效信封，裁剪结果与直接对目标索引调用 `prove_multi_inclusion` 逐字段相等，不附带多余摘要或未选中叶子的原文；保留全部索引时结果与原信封按值相等，连续裁剪与直接裁剪到最终子集相等，同一输入重复调用结果相等；单叶树、奇偶叶数、只选末叶与重复叶内容均适用，结果可直接交给 `verify_merkle_multi_proof_bundle` 与信封二进制编解码入口，往返后对象值与验证结论保持；所有参数及信封嵌套字段先整批类型预检，信封对象/字段类型不符或 `indices` 容器非 list/tuple、元素不是非 `bool` 整数（含 `bool`）一律抛 `TypeError`，即使同时存在语义错误也优先报告类型错误；类型通过后，空选择、负数或越界索引、请求原信封未证明的索引抛 `ValueError`，原信封任何不能通过现有验证的情况——根或兄弟摘要长度错误、叶被篡改、索引与条目不一致、证明缺失或携带多余摘要，即使错误只涉及将被移除的叶子——也统一抛 `ValueError`，绝不返回部分结果；树形以声明的 `leaf_count` 为准，不推断根唯一对应的真实叶数；调用不改写输入、不落盘
+- `split_merkle_multi_proof(bundle) -> tuple[MerkleInclusionBatchEntry, ...]` — 把紧凑多叶包含证明信封拆成各自独立的单叶包含证明条目，供现有单叶验证入口直接使用：调用只需提供已有 `MerkleMultiProofBundle`，无需完整叶集、其他证明或外部存储；返回元组按原索引严格递增（即 `bundle.proof.indices` 的次序），恰好覆盖信封全部已证叶，每项保留原叶字节、原索引（不重新编号）与共同根，内容相同而索引不同的叶分别返回；每条单叶路径与对同一完整叶集、同一索引调用 `prove_inclusion` 的结果逐字段相等，兄弟摘要按从叶到根排列并保留单叶路径所需的奇数末项自复制摘要，即使该摘要未显式出现在原紧凑证明中（原本由另一片已证叶配对或自复制），也从信封的已证叶与已供摘要逐层重放重算得到，有效信封不会因此无法拆分；单叶树返回一条空路径证明，非二次幂叶数、仅含末叶、相邻或分散叶以及覆盖全部叶子的信封均适用；每项经 `verify_inclusion` 为 `True`、整组经 `verify_inclusion_batch` 为 `True`，整组连同原 `leaf_count` 交给 `merge_inclusion_proofs` 后与原信封按值相等；重复调用、信封编码解码后调用以及对裁剪后有效信封调用均返回相等结果；所有信封嵌套字段先整批类型预检，沿用信封编码入口的类型约束——对象或字段类型不符、`bool` 充当整数、非元组字段或非二元 `(index, leaf)` 条目一律抛 `TypeError`，且优先于语义错误；类型通过后，只要原信封不能通过现有信封验证——空条目、非正 `leaf_count`、索引重复或乱序、越界、条目与索引不一致、根或兄弟摘要长度错误、叶或根被篡改、摘要缺失或多余——一律抛 `ValueError`，不返回部分条目；树形以声明的 `leaf_count` 为准，不推断根唯一对应的真实叶数；转换不改写输入、不落盘
 - `MerkleMultiBatchEntry(entries, proof, root)` — 不可变多包含批验条目，字段依次为 `tuple[tuple[int, bytes], ...]`、`MerkleMultiProof`、`bytes`，次序与 `verify_multi_inclusion` 入参一致；三字段均可位置构造、按值相等且不可变
 - `verify_multi_inclusion_batch(batch) -> bool` — 独立多叶紧凑包含证明的批量验证：先预检整批嵌套类型（任一物品错型——含 `bool` 索引、`entries` 非元组、对非二元元组、证明嵌套字段错型——均抛 `TypeError`，后项错型同样抛出），空批返回 `False`，再逐项以 `entries`、`proof`、`root` 调 `verify_multi_inclusion`，首拒短路；物品彼此独立、可乱序重复，不做密码学聚合，输入不变
 - `BoundMerkleMultiBatch(entries, leaf_count, proof)` — 冻结的多包含证明完整批对象；字段依次为非空 `tuple[MerkleMultiBatchEntry, ...]`、正的非 `bool` `int`、`MerkleMultiProof`，均可位置构造、按值相等且不可变；`leaf_count` 须等于条目数及 `proof.leaf_count`，`proof.indices` 须为 `tuple(range(leaf_count))`，空批、缺项、计数不符或索引不完整均返回 `False`
@@ -2023,6 +2036,8 @@ h**Σ(a*s) == Π(t**a * D**(a*e))   (mod prime)
 `merge_inclusion_proofs(entries, leaf_count)` 不经过完整叶集即可产出这样的信封：它只消费同一根下既有的单叶 `MerkleProof`（条目类型与 `verify_inclusion_batch` 一致），按声明的 `leaf_count` 逐条复核路径高度、三十二字节摘要、奇数末项自复制与根一致，再把各路径已有摘要按既有生成入口的逐层从左到右顺序压缩为一份 `MerkleMultiProof`，选中叶子按索引递增放入信封；乱序输入与完全相同重复项不影响结果值，不同索引（即使叶内容相同）分别保留。`leaf_count` 是调用方声明的树形约束而非由根推导：当局部路径不触及被声明多出的位置时，同一组哈希也可能在更大的声明叶数下走到同根，函数不声称根与局部路径能唯一确定原树叶数。
 
 `select_merkle_multi_proof(bundle, indices)` 在既有信封上做选择性披露：持有信封的一方只保留指定的原树叶子，仍能向接收方证明这些叶子属于原来的根。调用方只需提供已有 `MerkleMultiProofBundle` 和待保留索引的列表或元组（可乱序、可重复），无需完整叶集、其他单叶证明或外部存储；输出为同类型的不可变信封，保留原 `root` 与 `leaf_count`，`entries` 只含选中的原索引与原叶字节、不重新编号、按索引递增去重，相同内容的不同索引仍分别保留。实现先按现有信封验证入口对整个原信封做类型预检与验证，再逐层重放原证明的验证走法，重建原信封所有可重算节点与已供兄弟摘要，随后按目标索引以既有叶/节点哈希、奇数末项自复制和逐层从左到右顺序压缩出最小兄弟元组；裁剪所需摘要即使不在原 `siblings` 中（原本由另一片已证叶直接配对），也从原信封的已证叶重算得到，绝不夹带多余摘要或未选中叶子的原文。对于同一完整叶集产生的有效信封，裁剪结果与直接对目标索引调用 `prove_multi_inclusion` 逐字段相等；保留全部索引时与原信封按值相等，连续裁剪与直接裁剪到最终子集相等，同一输入重复调用结果相等，单叶树、奇偶叶数、只选末叶与重复叶内容均适用。类型先于值做整批预检：信封或嵌套字段不符现有编码入口类型约束、`indices` 容器非列表/元组或元素不是非 `bool` 整数（含 `bool`）一律抛 `TypeError`，即使同时存在语义错误也优先报告类型错误；类型通过后，空选择、负数或越界索引、请求原信封未证明的索引，以及原信封任何不能通过现有验证的情况——根或兄弟摘要长度错误、叶被篡改、索引与条目不一致、证明缺失或携带多余摘要，即使错误只涉及将被移除的叶子——一律抛 `ValueError`，不返回部分结果。树形继续以声明的 `leaf_count` 为准，不推断根唯一对应的真实叶数；结果可直接交给现有信封验证与二进制编解码入口，编码解码往返后对象值与验证结论保持；调用不改写输入、不落盘。
+
+`split_merkle_multi_proof(bundle)` 是信封的反向操作：持有紧凑信封的一方不依赖完整叶集、其他证明或外部存储，就能把全部已证叶还原成现有单叶验证入口可直接消费的 `MerkleInclusionBatchEntry` 元组。输出按原索引严格递增排列，恰好对应 `bundle.proof.indices`，每项保留原叶字节、原索引（不重新编号）与信封的共同根；内容相同而索引不同的叶仍分别返回。实现先按现有信封验证入口对整个信封做类型预检与验证，再逐层重放原证明的验证走法，在每层重建该信封能够确定的全部节点摘要——由已证叶重算的节点与紧凑证明显式供给的兄弟节点合并到同一张逐层映射中；随后对每个已证索引沿叶到根直接取各层 `position ^ 1` 处的摘要作为其独立单叶路径，因此兄弟摘要保持从叶到根的次序，奇数末项的自复制摘要也原样保留，而原本未显式携带、由另一片已证叶直接配对的兄弟摘要则从已证叶重算得到，不会使任何有效信封无法拆分。对同一完整叶集、同一索引，拆出的路径与直接调用 `prove_inclusion` 逐字段相等；单叶树给出一条空路径证明，非二次幂叶数、仅含末叶、相邻或分散索引以及覆盖全部叶子（紧凑 `siblings` 为空）均适用。每项经 `verify_inclusion` 为 `True`、整组经 `verify_inclusion_batch` 为 `True`；把整组连同原 `leaf_count` 交给 `merge_inclusion_proofs` 得到与原信封按值相等的信封，形成单叶与紧凑表示之间的双向往返；重复调用、信封编码解码后调用以及对 `select_merkle_multi_proof` 裁剪后的有效信封调用均返回相等结果。类型先于值做整批预检，沿用信封编码入口的类型约束：信封对象或其嵌套字段类型不符（含 `bool` 充当整数、非元组字段、非二元 `(index, leaf)` 条目）一律抛 `TypeError`，即使同时存在语义错误也优先报告类型错误；类型通过后，原信封任何不能通过现有信封验证的情况——空条目、非正 `leaf_count`、索引重复或乱序、越界、条目与索引不一致、根或兄弟摘要长度错误、叶或根被篡改、摘要缺失或多余——一律抛 `ValueError`，绝不返回部分条目。树形继续以声明的 `leaf_count` 为准，不推断根唯一对应的真实叶数；转换不改写输入、不落盘。
 
 ### Merkle 承诺的宽区间二维区域证明完整批验
 

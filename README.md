@@ -392,6 +392,17 @@ equal_batch = [
 assert verify_equal_value_batch(equal_batch)
 assert not verify_equal_value_batch([])  # 空批次为 False
 
+# 同值证明完整批的 Merkle 绑定：整批 EqualValueBatchEntry（顺序、数量与重复项）冻结到
+# 一棵 Merkle 树；叶子绑定左右承诺全部公开字段、context 与完整同值证明，域分隔符与
+# 其他批根类别不同。构造入口不接收明文值或盲因子，只逐项确认既有证明有效
+from zkregion import prove_equal_value_batch_bound, verify_equal_value_batch_bound
+
+ev_bound, ev_root = prove_equal_value_batch_bound(equal_batch)
+assert ev_bound.leaf_count == len(equal_batch)
+assert ev_bound.proof.indices == tuple(range(len(equal_batch)))
+assert verify_equal_value_batch_bound(ev_bound, ev_root)  # 先验完整根绑定，再走裸批随机线性校验
+assert not verify_equal_value_batch_bound(ev_bound, b"\x00" * 32)  # 根不符为 False
+
 # 按位分解的宽区间非交互证明：声明区间恰含 2**k 个整数（1 <= k <= 24），可超过 256 个
 from zkregion import prove_range_wide, verify_range_wide
 

@@ -157,6 +157,7 @@ __all__ = [
     "BoundWideRangeReplayGuard",
     "ConvexPolygonBatchEntry",
     "ConvexPolygonBatchReplayGuard",
+    "ConvexPolygonIntervalProof",
     "ConvexPolygonProofBundle",
     "ConvexPolygonRegion",
     "ConvexPolygonRegionProof",
@@ -247,6 +248,7 @@ __all__ = [
     "prove_consistency_chain_batch_bound",
     "prove_convex_polygon",
     "prove_convex_polygon_batch_bound",
+    "prove_convex_polygon_interval",
     "prove_equal_value",
     "prove_inclusion",
     "prove_inclusion_batch_bound",
@@ -285,6 +287,7 @@ __all__ = [
     "verify_convex_polygon",
     "verify_convex_polygon_batch",
     "verify_convex_polygon_batch_bound",
+    "verify_convex_polygon_interval",
     "verify_convex_polygon_proof_bundle",
     "verify_equal_value",
     "verify_equal_value_batch",
@@ -4959,6 +4962,7 @@ def region_contains_committed(
 # context.
 
 _CONVEX_POLYGON_DOMAIN = b"zkregion/convex-polygon/v1"
+_CONVEX_POLYGON_INTERVAL_DOMAIN = b"zkregion/convex-polygon-interval/v1"
 
 
 @dataclass(frozen=True)
@@ -5269,15 +5273,18 @@ def _polygon_transcript_items(
     polygon: ConvexPolygonRegion,
     x_commitment: PedersenCommitment,
     y_commitment: PedersenCommitment,
+    *,
+    domain: bytes = _CONVEX_POLYGON_DOMAIN,
 ) -> list[bytes]:
     """Shared transcript items: domain, context, vertices, both commitments.
 
     Item order: the polygon domain separator, the external context, the
     vertex count, every canonical vertex's x then y coordinate, and the six
     fields of the x then the y commitment (dataclass field order). Integers
-    are encoded as decimal ASCII.
+    are encoded as decimal ASCII. ``domain`` selects the protocol variant
+    the transcript binds to.
     """
-    items: list[bytes] = [_CONVEX_POLYGON_DOMAIN, context]
+    items: list[bytes] = [domain, context]
     items.append(str(len(polygon.vertices)).encode("ascii"))
     for vertex in polygon.vertices:
         items.append(str(vertex[0]).encode("ascii"))
@@ -6113,6 +6120,361 @@ def prove_convex_polygon_batch_bound(
         proof=proof,
     )
     return batch, root
+
+
+# ---------------------------------------------------------------------------
+# Non-interactive convex-polygon membership proofs over interval ranges
+#
+# The interval variant of the convex polygon proof: the two bounding-box
+# sub-proofs are arbitrary-width interval range proofs (prove_range_interval
+# / verify_range_interval), so each axis of the bounding box may span up to
+# 2**24 integers — non-power-of-two widths, negative coordinates and ranges
+# crossing zero included — instead of 256. The per-edge non-negativity layer
+# is unchanged: one WideRangeProof per edge, in canonical boundary order,
+# over [0, 2**k) with 1 <= k <= 24 and 2**k - 1 < prime - 1. Every
+# transcript sits under its own domain separator, so a proof of one variant
+# cannot be replayed against the other.
+
+
+@dataclass(frozen=True)
+class ConvexPolygonIntervalProof:
+    """A non-interactive convex-polygon membership proof over interval ranges.
+
+    ``x_proof`` and ``y_proof`` are :class:`IntervalRangeProof` objects
+    pinning the x and y commitments to the polygon's bounding box;
+    ``edge_proofs`` holds one :class:`WideRangeProof` per polygon edge in
+    canonical boundary order, each proving the edge cross-product offset to
+    be non-negative. The verifier sees only commitments, polygon and proof —
+    never the coordinates or blinding factors.
+    """
+
+    x_proof: IntervalRangeProof
+    y_proof: IntervalRangeProof
+    edge_proofs: tuple[WideRangeProof, ...]
+
+
+def prove_convex_polygon_interval(
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    x: int,
+    y: int,
+    x_blinding: int,
+    y_blinding: int,
+    polygon: ConvexPolygonRegion,
+    context: bytes = b"",
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> ConvexPolygonIntervalProof:
+    """Prove that the committed quantized point ``(x, y)`` lies in ``polygon``.
+
+    Both commitments must use the same group parameters (``prime``,
+    ``generator`` and ``h``) and must be declared over exactly the polygon's
+    closed integer bounding box — the x commitment over
+    ``[polygon.min_x, polygon.max_x]`` and the y commitment over
+    ``[polygon.min_y, polygon.max_y]``. ``x`` / ``y`` and
+    ``x_blinding`` / ``y_blinding`` must open the two commitments and the
+    point must belong to the closed polygon (its vertices and edges
+    included). Each axis of the bounding box may contain between 1 and
+    ``2**24`` integers — non-power-of-two widths, negative coordinates and
+    ranges crossing zero included — and every edge's offset span must fit a
+    wide range proof (``2**k - 1`` with ``1 <= k <= 24`` and
+    ``2**k - 1 < prime - 1``); the verifier learns neither the coordinates
+    nor the blinding factors.
+
+    Wrong object or field types (including a ``bool`` integer), a
+    non-``bytes`` context or a non-callable ``randbelow`` raise
+    :class:`TypeError`. Mismatched group parameters or declared ranges, a
+    failed opening, a point outside the polygon, geometrically invalid
+    vertices on a forged polygon object, an edge offset span wider than the
+    wide-range limit or an out-of-range draw from ``randbelow`` raise
+    :class:`ValueError`; every one of these checks runs before any
+    randomness is drawn. The same public inputs under the same random
+    source produce an identical proof. Inputs are never mutated.
+    """
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError("x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError("y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    _check_int(x, "x")
+    _check_int(y, "y")
+    _check_int(x_blinding, "x_blinding")
+    _check_int(y_blinding, "y_blinding")
+    if not isinstance(polygon, ConvexPolygonRegion):
+        raise TypeError("polygon must be a ConvexPolygonRegion")
+    _check_bytes(context, "context")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    # Re-run canonicalization before anything else: a forged polygon object
+    # carrying ill-typed vertices raises TypeError here, geometrically
+    # invalid ones ValueError, and rotations or reversals of one boundary
+    # normalize to the same canonical polygon — all before any randomness
+    # is drawn.
+    polygon = ConvexPolygonRegion(polygon.vertices)
+    if (
+        x_commitment.prime != y_commitment.prime
+        or x_commitment.generator != y_commitment.generator
+        or x_commitment.h != y_commitment.h
+    ):
+        raise ValueError("both commitments must use the same group parameters")
+    if (x_commitment.lower, x_commitment.upper) != (polygon.min_x, polygon.max_x):
+        raise ValueError("x commitment range must equal the polygon x bounding box")
+    if (y_commitment.lower, y_commitment.upper) != (polygon.min_y, polygon.max_y):
+        raise ValueError("y commitment range must equal the polygon y bounding box")
+    if (polygon.max_x - polygon.min_x + 1) > (1 << _MAX_INTERVAL_RANGE_BITS):
+        raise ValueError(
+            "x bounding box must contain at most "
+            f"2**{_MAX_INTERVAL_RANGE_BITS} integers"
+        )
+    if (polygon.max_y - polygon.min_y + 1) > (1 << _MAX_INTERVAL_RANGE_BITS):
+        raise ValueError(
+            "y bounding box must contain at most "
+            f"2**{_MAX_INTERVAL_RANGE_BITS} integers"
+        )
+    if not verify_pedersen_opening(x_commitment, x, x_blinding):
+        raise ValueError("x commitment does not open at (x, x_blinding)")
+    if not verify_pedersen_opening(y_commitment, y, y_blinding):
+        raise ValueError("y commitment does not open at (y, y_blinding)")
+    if not polygon.contains(x, y):
+        raise ValueError("point must lie inside the polygon")
+    prime = x_commitment.prime
+    edges = polygon._interior_edges()
+    # Pre-compute every edge's padded wide-range upper bound so a span or
+    # prime - 1 violation raises before any randomness is drawn. An edge
+    # flush with the bounding box attains offset 0 only; pad to the
+    # smallest admissible wide range (2 integers).
+    edge_uppers: list[int] = []
+    for edge in edges:
+        offset_upper = _edge_offset_upper(polygon, edge)
+        width = max(1, offset_upper.bit_length())
+        if width > _MAX_WIDE_RANGE_BITS:
+            raise ValueError(
+                "edge offset span must fit a wide range of at most "
+                f"2**{_MAX_WIDE_RANGE_BITS} integers"
+            )
+        edge_upper = (1 << width) - 1
+        if edge_upper >= prime - 1:
+            raise ValueError("edge offset upper bound must be smaller than prime - 1")
+        edge_uppers.append(edge_upper)
+    items = _polygon_transcript_items(
+        context,
+        polygon,
+        x_commitment,
+        y_commitment,
+        domain=_CONVEX_POLYGON_INTERVAL_DOMAIN,
+    )
+    x_proof = prove_range_interval(
+        x_commitment,
+        x,
+        x_blinding,
+        _polygon_sub_context(b"bbox-x", items),
+        randbelow=randbelow,
+    )
+    y_proof = prove_range_interval(
+        y_commitment,
+        y,
+        y_blinding,
+        _polygon_sub_context(b"bbox-y", items),
+        randbelow=randbelow,
+    )
+    edge_proofs: list[WideRangeProof] = []
+    for edge_index, (edge, edge_upper) in enumerate(zip(edges, edge_uppers)):
+        edge_commitment = _edge_commitment(
+            x_commitment, y_commitment, edge, edge_upper
+        )
+        offset = _edge_signed_offset(edge, x, y)
+        if offset < 0:
+            # Defensive: the membership check above guarantees this.
+            raise ValueError("point must lie inside the polygon")
+        dx, dy, _, _ = edge
+        edge_blinding = (dx * y_blinding - dy * x_blinding) % (prime - 1)
+        if not verify_pedersen_opening(edge_commitment, offset, edge_blinding):
+            # Defensive: the geometric and opening checks above guarantee
+            # this opening; a failure means inconsistent public inputs.
+            raise ValueError("edge offset commitment does not open")
+        edge_items = [*items, str(edge_index).encode("ascii")]
+        edge_proofs.append(
+            prove_range_wide(
+                edge_commitment,
+                offset,
+                edge_blinding,
+                _polygon_sub_context(b"edge", edge_items),
+                randbelow=randbelow,
+            )
+        )
+    return ConvexPolygonIntervalProof(
+        x_proof=x_proof,
+        y_proof=y_proof,
+        edge_proofs=tuple(edge_proofs),
+    )
+
+
+def _check_convex_polygon_interval_input_types(
+    x_commitment: object,
+    y_commitment: object,
+    polygon: object,
+    proof: object,
+    context: object,
+    *,
+    label: str = "",
+) -> None:
+    """Preflight every nested input type of :func:`verify_convex_polygon_interval`.
+
+    Walks the complete input shape before any semantic verdict is
+    allowed: both commitments must be :class:`PedersenCommitment`
+    objects with non-``bool`` integer fields, the polygon must be a
+    :class:`ConvexPolygonRegion` whose vertices are a tuple of
+    two-element non-``bool`` integer tuples, the proof must be a
+    :class:`ConvexPolygonIntervalProof` whose two bounding-box
+    :class:`IntervalRangeProof` objects carry non-``bool`` integer
+    tuple fields at every nesting level and whose ``edge_proofs`` is a
+    tuple of :class:`WideRangeProof` objects with tuple fields of
+    non-``bool`` integers at every nesting level, and the context must
+    be ``bytes``. The whole shape is always walked, so a wrong type in
+    a late field raises :class:`TypeError` even when an earlier field
+    is already doomed to fail semantically. ``label`` prefixes
+    messages for batch-style callers (``""`` for the single-entry
+    verifier).
+    """
+    prefix = f"{label} " if label else ""
+    if not isinstance(x_commitment, PedersenCommitment):
+        raise TypeError(f"{prefix}x_commitment must be a PedersenCommitment")
+    if not isinstance(y_commitment, PedersenCommitment):
+        raise TypeError(f"{prefix}y_commitment must be a PedersenCommitment")
+    _check_commitment_fields(x_commitment)
+    _check_commitment_fields(y_commitment)
+    if not isinstance(polygon, ConvexPolygonRegion):
+        raise TypeError(f"{prefix}polygon must be a ConvexPolygonRegion")
+    vertices = polygon.vertices
+    if not isinstance(vertices, tuple):
+        raise TypeError(
+            f"{prefix}polygon vertices must be a tuple of (x, y) tuples"
+        )
+    for vertex_position, vertex in enumerate(vertices):
+        if not isinstance(vertex, tuple) or len(vertex) != 2:
+            raise TypeError(
+                f"{prefix}polygon vertices[{vertex_position}] must be a "
+                "(x, y) tuple"
+            )
+        _check_int(
+            vertex[0], f"{prefix}polygon vertices[{vertex_position}] x"
+        )
+        _check_int(
+            vertex[1], f"{prefix}polygon vertices[{vertex_position}] y"
+        )
+    if not isinstance(proof, ConvexPolygonIntervalProof):
+        raise TypeError(f"{prefix}proof must be a ConvexPolygonIntervalProof")
+    _check_interval_range_proof_types(proof.x_proof, f"{prefix}proof x_proof")
+    _check_interval_range_proof_types(proof.y_proof, f"{prefix}proof y_proof")
+    edge_proofs = proof.edge_proofs
+    if not isinstance(edge_proofs, tuple):
+        raise TypeError(
+            f"{prefix}proof edge_proofs must be a tuple of WideRangeProof"
+        )
+    for edge_position, edge_proof in enumerate(edge_proofs):
+        _check_wide_range_proof_types(
+            edge_proof, f"{prefix}proof edge_proofs[{edge_position}]"
+        )
+    _check_bytes(context, f"{prefix}context")
+
+
+def verify_convex_polygon_interval(
+    x_commitment: PedersenCommitment,
+    y_commitment: PedersenCommitment,
+    polygon: ConvexPolygonRegion,
+    proof: ConvexPolygonIntervalProof,
+    context: bytes = b"",
+) -> bool:
+    """Verify a :class:`ConvexPolygonIntervalProof` against public inputs only.
+
+    The verifier needs just the two commitments, the polygon, the proof and
+    the context — never the coordinates or blinding factors. Every nested
+    input type is checked across the *whole* input shape first, so a wrong
+    type anywhere (a ``bool`` passed as an integer, a non-tuple vertex or
+    proof container, a malformed sub-proof element, or a non-``bytes``
+    context) raises :class:`TypeError` no matter which field it sits in —
+    a late field's wrong type still raises even after an earlier
+    commitment, range or sub-proof mismatch has doomed the verdict.
+    Every semantic failure — mismatched group parameters or declared
+    ranges, a bounding-box axis wider than ``2**24`` integers, a tampered
+    proof field, a forged proof, a different polygon, commitment or
+    context, swapped axes, a sub-proof spliced from another proof (the
+    256-integer variant included), a dropped, reordered or replaced edge
+    proof, or a forged polygon object whose well-typed vertices violate
+    the constructor rules — returns ``False``. Verification draws no
+    randomness. Inputs are never mutated.
+    """
+    # Full nested type preflight over every field: TypeError must never be
+    # masked by an earlier semantic rejection.
+    _check_convex_polygon_interval_input_types(
+        x_commitment, y_commitment, polygon, proof, context
+    )
+    # Re-run canonicalization on the as-stored vertices: an object forged
+    # bypassing __post_init__ with well-typed but geometrically invalid
+    # vertices (too few, repeated, collinear, concave or self-intersecting)
+    # is a semantic failure (False), never a leaked ValueError/IndexError.
+    # Rotations and reversals normalize to the same canonical region, so the
+    # verdict is representation-independent and the input object is untouched.
+    try:
+        polygon = ConvexPolygonRegion(polygon.vertices)
+    except ValueError:
+        return False
+    if (
+        x_commitment.prime != y_commitment.prime
+        or x_commitment.generator != y_commitment.generator
+        or x_commitment.h != y_commitment.h
+    ):
+        return False
+    if (x_commitment.lower, x_commitment.upper) != (polygon.min_x, polygon.max_x):
+        return False
+    if (y_commitment.lower, y_commitment.upper) != (polygon.min_y, polygon.max_y):
+        return False
+    if len(proof.edge_proofs) != len(polygon.vertices):
+        return False
+    if (polygon.max_x - polygon.min_x + 1) > (1 << _MAX_INTERVAL_RANGE_BITS):
+        return False
+    if (polygon.max_y - polygon.min_y + 1) > (1 << _MAX_INTERVAL_RANGE_BITS):
+        return False
+    items = _polygon_transcript_items(
+        context,
+        polygon,
+        x_commitment,
+        y_commitment,
+        domain=_CONVEX_POLYGON_INTERVAL_DOMAIN,
+    )
+    if not verify_range_interval(
+        x_commitment,
+        proof.x_proof,
+        _polygon_sub_context(b"bbox-x", items),
+    ):
+        return False
+    if not verify_range_interval(
+        y_commitment,
+        proof.y_proof,
+        _polygon_sub_context(b"bbox-y", items),
+    ):
+        return False
+    prime = x_commitment.prime
+    for edge_index, edge in enumerate(polygon._interior_edges()):
+        offset_upper = _edge_offset_upper(polygon, edge)
+        width = max(1, offset_upper.bit_length())
+        if width > _MAX_WIDE_RANGE_BITS:
+            return False
+        edge_upper = (1 << width) - 1
+        if edge_upper >= prime - 1:
+            return False
+        edge_commitment = _edge_commitment(
+            x_commitment, y_commitment, edge, edge_upper
+        )
+        edge_items = [*items, str(edge_index).encode("ascii")]
+        if not verify_range_wide(
+            edge_commitment,
+            proof.edge_proofs[edge_index],
+            _polygon_sub_context(b"edge", edge_items),
+        ):
+            return False
+    return True
 
 
 # ---------------------------------------------------------------------------

@@ -18,6 +18,9 @@ verify_range / RangeBatchEntry / verify_range_batch /
 EqualValueBatchEntry / EqualValueProof /
 prove_equal_value / verify_equal_value /
 verify_equal_value_batch /
+BoundEqualValueBatch /
+prove_equal_value_batch_bound /
+verify_equal_value_batch_bound /
 RangeSetProof / prove_range_set /
 verify_range_set / RangeSetBatchEntry / verify_range_set_batch /
 BoundRangeSetBatch / prove_range_set_batch_bound /
@@ -132,6 +135,7 @@ __all__ = [
     "BoundConsistencyReplayGuard",
     "BoundConvexPolygonBatch",
     "BoundConvexPolygonReplayGuard",
+    "BoundEqualValueBatch",
     "BoundIntervalRangeBatch",
     "BoundMerkleInclusionBatch",
     "BoundMerkleInclusionBatchReplayGuard",
@@ -250,6 +254,7 @@ __all__ = [
     "prove_convex_polygon_batch_bound",
     "prove_convex_polygon_interval",
     "prove_equal_value",
+    "prove_equal_value_batch_bound",
     "prove_inclusion",
     "prove_inclusion_batch_bound",
     "prove_multi_inclusion",
@@ -291,6 +296,7 @@ __all__ = [
     "verify_convex_polygon_proof_bundle",
     "verify_equal_value",
     "verify_equal_value_batch",
+    "verify_equal_value_batch_bound",
     "verify_inclusion",
     "verify_inclusion_batch",
     "verify_inclusion_batch_bound",
@@ -1611,6 +1617,259 @@ def verify_equal_value_batch(
         if pow(h, right_state["sum"], prime) != right_state["product"]:
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Merkle-committed equal-value batches
+#
+# A complete equal-value batch frozen together with the Merkle proof that
+# commits to every entry. Each Merkle leaf starts from the domain
+# separator b"zkregion/evb/v1" and frames, in order, the six public
+# fields of the left then the right commitment, the context and the five
+# proof sequences: each of t_left / t_right / e / s_left / s_right is
+# framed as its decimal element count followed by every value. The
+# distinct domain separator keeps these roots apart from the batch roots
+# of every other proof category. Verification first checks every leaf
+# against the Merkle root, then runs the unchanged equal-value batch
+# verification.
+
+_EQUAL_VALUE_BOUND_DOMAIN = b"zkregion/evb/v1"
+
+
+@dataclass(frozen=True)
+class BoundEqualValueBatch:
+    """A complete equal-value batch bound to a Merkle multi-inclusion proof.
+
+    Fields, in order: ``entries`` — a tuple of
+    :class:`EqualValueBatchEntry`; ``leaf_count`` — a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``; ``proof`` — the :class:`MerkleMultiProof`
+    whose indices cover ``0 .. leaf_count - 1`` without gaps or
+    duplicates. All three are positional construction arguments;
+    batches compare by value and are immutable. Construction never
+    validates the fields: type and value checks belong to
+    :func:`verify_equal_value_batch_bound` and
+    :func:`prove_equal_value_batch_bound`.
+    """
+
+    entries: tuple[EqualValueBatchEntry, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_equal_value_leaf(entry: EqualValueBatchEntry) -> bytes:
+    """Build the Merkle leaf committed for one :class:`EqualValueBatchEntry`.
+
+    Items, in order: the domain separator, the six public fields of the
+    left then the right commitment (dataclass field order: ``element``,
+    ``lower``, ``upper``, ``prime``, ``generator``, ``h``), the context,
+    then each of the proof's five fields in dataclass order
+    (``t_left``, ``t_right``, ``e``, ``s_left``, ``s_right``) framed as
+    its decimal element count followed by every value. Every item is
+    prefixed with its four-byte unsigned big-endian length; integers are
+    encoded as decimal ASCII (negative sign kept).
+    """
+    items = [_EQUAL_VALUE_BOUND_DOMAIN]
+    for commitment in (entry.left, entry.right):
+        items.extend(
+            str(getattr(commitment, name)).encode("ascii")
+            for name in ("element", "lower", "upper", "prime", "generator", "h")
+        )
+    items.append(entry.context)
+    proof = entry.proof
+    for field_name in ("t_left", "t_right", "e", "s_left", "s_right"):
+        sequence = getattr(proof, field_name)
+        items.append(str(len(sequence)).encode("ascii"))
+        items.extend(str(value).encode("ascii") for value in sequence)
+    leaf = bytearray()
+    for item in items:
+        leaf += len(item).to_bytes(4, "big")
+        leaf += item
+    return bytes(leaf)
+
+
+def verify_equal_value_batch_bound(
+    batch: BoundEqualValueBatch,
+    root: bytes,
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundEqualValueBatch`.
+
+    The nested types of the whole batch are preflighted first — a
+    :class:`BoundEqualValueBatch` whose ``entries`` are a tuple of
+    :class:`EqualValueBatchEntry` objects whose ``left`` and ``right``
+    are :class:`PedersenCommitment` objects with non-``bool`` integer
+    fields, whose ``proof`` is an :class:`EqualValueProof` with tuple
+    fields of non-``bool`` integers at every nesting level and whose
+    ``context`` is ``bytes``, whose ``leaf_count`` is a non-``bool``
+    integer and whose ``proof`` is a :class:`MerkleMultiProof` with
+    integer indices and bytes siblings; ``root`` must be ``bytes`` and
+    ``randbelow`` callable. Anything else, including a ``bool`` count,
+    a non-callable random source or a wrong type in the last entry,
+    raises :class:`TypeError` — every entry is walked, so a bad later
+    type is not hidden by an earlier invalid entry.
+
+    The Merkle binding is checked next, before any randomness is drawn:
+    every entry is encoded to its leaf exactly as specified by
+    :func:`_bound_equal_value_leaf` — the twelve left/right commitment
+    public fields, the context and the complete proof, plus the entry
+    order and count through the leaf positions — and the whole batch is
+    checked against ``root`` with :func:`verify_multi_inclusion`.
+    ``leaf_count`` must be positive and equal to both ``len(entries)``
+    and ``proof.leaf_count``, the root must be 32 bytes, and
+    ``proof.indices`` must cover ``0 .. leaf_count - 1`` with no gaps,
+    duplicates or reordering, so a legal subset cannot stand in for the
+    whole batch; an empty batch, a count or index mismatch, a wrong or
+    tampered root, reordered, inserted or deleted entries, or any
+    replacement of a commitment field, context or proof field returns
+    ``False`` without consuming randomness. Only after the outer
+    inclusion checks does the batch go through
+    :func:`verify_equal_value_batch` with the same ``randbelow``, under
+    its unchanged randomness contract — entry order, then ascending
+    intersection order, then independent left/right weights, grouped
+    across entries sharing one group — and its per-entry semantics
+    reject illegal commitments, mismatched in-entry group parameters,
+    empty or oversized intersections, wrong-length or out-of-range
+    proofs, challenge binding mismatches, missing modular inverses and
+    cryptographic failures. Verification never sees a committed value
+    or a blinding factor and never mutates its inputs.
+    """
+    if not isinstance(batch, BoundEqualValueBatch):
+        raise TypeError("batch must be a BoundEqualValueBatch")
+    _check_bytes(root, "root")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(
+            "batch entries must be a tuple of EqualValueBatchEntry"
+        )
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, EqualValueBatchEntry):
+            raise TypeError(
+                f"entries[{position}] must be an EqualValueBatchEntry"
+            )
+        left = entry.left
+        right = entry.right
+        if not isinstance(left, PedersenCommitment):
+            raise TypeError(
+                f"entries[{position}] left must be a PedersenCommitment"
+            )
+        _check_commitment_fields(left)
+        if not isinstance(right, PedersenCommitment):
+            raise TypeError(
+                f"entries[{position}] right must be a PedersenCommitment"
+            )
+        _check_commitment_fields(right)
+        _check_equal_value_proof_types(
+            entry.proof, f"entries[{position}] proof"
+        )
+        _check_bytes(entry.context, f"entries[{position}] context")
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if len(root) != _MERKLE_DIGEST_SIZE:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    leaves = [_bound_equal_value_leaf(entry) for entry in entries]
+
+    # 1) the Merkle root commits to every entry leaf in order, then
+    # 2) the unchanged equal-value batch verification checks the proofs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_equal_value_batch(entries, randbelow=randbelow)
+
+
+def prove_equal_value_batch_bound(
+    entries: Sequence[EqualValueBatchEntry],
+) -> tuple[BoundEqualValueBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundEqualValueBatch`.
+
+    ``entries`` follows the same non-``bytes`` / ``bytearray`` / ``str``
+    sequence-of-:class:`EqualValueBatchEntry` rules as
+    :func:`verify_equal_value_batch` and must be non-empty; every entry
+    is copied into a tuple in its original order with duplicates
+    preserved, and later additions or removals in the caller's list do
+    not affect the returned batch. Each entry is encoded to its outer
+    leaf byte for byte with :func:`_bound_equal_value_leaf`; the domain
+    separator ``b"zkregion/evb/v1"`` (distinct from every other batch
+    category), the length framing, the decimal integer encoding and the
+    field order stay unchanged, and the leaf digests and internal nodes
+    follow the existing SHA-256 Merkle rules. With ``n = len(entries)``,
+    the complete multi-inclusion proof is built with
+    :func:`prove_multi_inclusion` over the encoded leaves and the full
+    indices ``tuple(range(n))`` — so its ``indices`` cover every leaf
+    from zero and its ``siblings`` are empty — and the returned batch
+    carries ``leaf_count = n`` alongside that proof. The second return
+    value is the outer tree's :func:`merkle_root` of the encoded
+    leaves, which is exactly the root the batch verifies under:
+    ``verify_equal_value_batch_bound(batch, root)`` returns ``True``.
+    Single-item, odd- and even-sized batches and duplicate entries are
+    all deterministic: the same ordered inputs rebuild a byte-identical
+    batch, root and proof, and each of the twelve left/right commitment
+    public fields, the context and every proof field participates in
+    the leaf binding — together with the entry order and count — so
+    deleting, appending, swapping or altering any of them changes the
+    root.
+
+    A type preflight over the whole batch — every entry and every
+    nested field, including ``bool`` integers and later entries —
+    raises :class:`TypeError` before anything is built; each entry is
+    then confirmed item by item with the deterministic
+    :func:`verify_equal_value` (the same per-branch equations the
+    batch verifier aggregates, so no random coefficient source is
+    needed), and an empty batch, a batch length outside uint64 or any
+    entry whose individual proof is invalid (an illegal commitment,
+    mismatched in-entry group parameters, an empty or oversized
+    intersection, wrong-length or out-of-range proof values, a
+    challenge binding mismatch or a cryptographic failure) raises
+    :class:`ValueError`. No randomness is drawn, no committed value or
+    blinding factor is accepted, and the inputs are never mutated.
+    """
+    items = _check_equal_value_batch_entries_types(entries)
+    if not items:
+        raise ValueError("entries must not be empty")
+    if len(items) > _UINT64_MAX:
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    for position, entry in enumerate(items):
+        if not verify_equal_value(
+            entry.left, entry.right, entry.proof, entry.context
+        ):
+            raise ValueError(
+                f"entries[{position}] must pass verify_equal_value"
+            )
+    ordered = tuple(items)
+    leaves = [_bound_equal_value_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundEqualValueBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
 
 
 # ---------------------------------------------------------------------------

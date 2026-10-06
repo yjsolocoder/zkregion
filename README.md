@@ -392,6 +392,16 @@ equal_batch = [
 assert verify_equal_value_batch(equal_batch)
 assert not verify_equal_value_batch([])  # 空批次为 False
 
+# 同值证明完整批的 Merkle 绑定：整批 EqualValueBatchEntry 先冻结到一棵 Merkle 树，
+# 根绑定左右承诺全部公开字段、context、完整同值证明、顺序与数量（域 b"zkregion/evb/v1"）
+from zkregion import prove_equal_value_batch_bound, verify_equal_value_batch_bound
+
+ev_bound, ev_root = prove_equal_value_batch_bound(equal_batch)
+assert ev_bound.leaf_count == len(equal_batch)
+assert ev_bound.proof.indices == tuple(range(len(equal_batch)))
+assert verify_equal_value_batch_bound(ev_bound, ev_root)   # 先验完整根绑定，再按裸批次规则做随机聚合校验
+assert not verify_equal_value_batch_bound(ev_bound, b"\x00" * 32)  # 根不符为 False 且不消耗随机数
+
 # 按位分解的宽区间非交互证明：声明区间恰含 2**k 个整数（1 <= k <= 24），可超过 256 个
 from zkregion import prove_range_wide, verify_range_wide
 
@@ -1449,6 +1459,9 @@ python3 -m zkregion
 - `EqualValueProof(t_left, t_right, e, s_left, s_right)` — 不可变同值证明对象，五个字段均为长度等于交集整数个数的 `tuple[int, ...]`（按交集整数升序逐点排列，`e` 为两侧共享的挑战份额）；可位置构造、按值相等且冻结，不携带明文值、盲因子或命中位置，构造时不做任何校验
 - `EqualValueBatchEntry(left, right, proof, context=b"")` — 不可变同值批验条目，字段依次为左 `PedersenCommitment`、右 `PedersenCommitment`、`EqualValueProof`、`bytes`（context 缺省为空字节串），字段次序与 `verify_equal_value` 入参一致、左右顺序保留；可位置构造、按值相等且不可变，构造时不做任何校验
 - `verify_equal_value_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 同值证明的批量验证：`entries` 为非字符串的非空 `Sequence`（列表、元组、自定义序列均可，字符串/字节串/字节数组/集合等抛 `TypeError`），空批返回 `False`，重复条目合法且各自独立抽取权重；条目可跨不同 `(prime, generator, h)` 群参数与不同 context，但同一条目的左右承诺仍须共享群参数；交集仍限 1 到 256 个整数，负边界、跨零、单点交集与不同声明区间均支持；直接接受 `prove_equal_value` 生成的证明，左右顺序、两份承诺全部公开字段与 context 的绑定逐字节复用 `verify_equal_value` 转录。先整批预检嵌套类型（序列本身、条目、左右承诺六字段、证明五层元组整数与 `context`，错型含末项错型且不能被前项无效遮蔽、用 `bool` 冒充整数、非元组证明字段、非 `bytes` context 与不可调用随机源，一律抛唯一的 `TypeError`），类型正确后再整批做结构预检：非法承诺、条目内群参数不一致、交集为空或超限、证明长度或数值非法、挑战绑定不符及所需模逆不存在均返回 `False`，两个预检阶段都不抽取随机数。预检全部通过后，按条目顺序、交集整数升序、先左后右的顺序，每条左右等式各恰取一次非零权重 `a = r + 1`（`r = randbelow(prime - 1)`，重复条目也单独抽取），同一群的左式与右式分别独立加权聚合成两条群等式 `h**Σ(a*s) == Π(t**a * D**(a*e)) (mod prime)`，两侧不共享权重，一侧错误无法抵消另一侧；随机源返回非整数或 `bool` 抛 `TypeError`、返回值不在请求的半开区间内抛 `ValueError`、随机源自身异常原样传播；全部聚合等式成立返回 `True`，否则返回 `False`；不承诺发现调用方漏交条目，输入不被改写，演示级安全边界不变
+- `verify_equal_value_batch_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` — Merkle 承诺的同值证明完整批验：先整批检查嵌套类型——批对象本身、非元组 entries、非 `EqualValueBatchEntry` 条目（含末项错型不被前项无效遮蔽）、左右承诺六字段非 `bool` 整数、证明五层元组整数、非 `bytes` context、非整数或 `bool` `leaf_count`、错证明对象、非整数索引、非 bytes 兄弟、非 bytes `root` 与不可调用 `randbelow` 一律抛 `TypeError`；再以 `_bound_equal_value_leaf` 逐字节重算每片叶（域 `b"zkregion/evb/v1"` 与其他批根域分隔不同；每项按左再右承诺六字段、context、证明五序列各以十进制元素数加逐项值的顺序，四字节长度帧、十进制 ASCII 整数成叶），并经 `verify_multi_inclusion` 完整核根——条目顺序与数量随叶位置一并绑定；空批、`leaf_count` 非正或不等于条目数/`proof.leaf_count`、根长度不是三十二字节、错误根、`proof.indices` 未恰好覆盖 `0 .. leaf_count-1`（缺漏、重复、乱序）、包含证明无效、删减追加换序条目或替换承诺/context/证明任一字段均返回 `False`，外层失败不消耗随机数且合法子集不能冒充整批；仅外层包含关系通过后才以同一 `randbelow` 原样调用 `verify_equal_value_batch`，其抽取顺序、左右独立权重、跨群分组与随机源异常行为不变（非法承诺、条目内群参数不一致、交集为空或超过 256 个整数、证明结构或数值非法及密码学校验失败返回 `False`）；不接触明文值或盲因子，输入不被改写
+- `BoundEqualValueBatch(entries, leaf_count, proof)` — 冻结的同值证明完整批对象；字段依次为 `tuple[EqualValueBatchEntry, ...]`（保序、保留重复项）、正的非 `bool` `int`、`MerkleMultiProof`（覆盖全部位置），均可位置构造、按值相等且不可变，构造时不校验
+- `prove_equal_value_batch_bound(entries) -> tuple[BoundEqualValueBatch, bytes]` — 顶层构造 Merkle 承诺的规范同值证明完整批：`entries` 沿用 `verify_equal_value_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，调用方列表之后的增删不影响批对象，输入不变；每项外层叶以域 `b"zkregion/evb/v1"`、四字节长度帧与十进制 ASCII 整数，按左再右承诺六字段、`context`、证明五序列（各字段先十进制元素数再逐项）的字段顺序成叶（`_bound_equal_value_leaf`），Merkle 摘要规则不变；令 `n = len(entries)`，对编码叶按全索引 `tuple(range(n))` 调用 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖每片叶、`siblings` 为空），返回批的 `leaf_count = n`、`proof` 为该证明，第二返回值为编码叶的 `merkle_root`；返回批满足 `verify_equal_value_batch_bound(batch, root) is True`；相同有序输入重复构造的批、根与证明逐字节一致，单项、奇偶批与重复项均确定，负边界、跨零、单点交集、不同声明区间、条目间不同群与 context 均支持；逐项以确定性的 `verify_equal_value` 确认既有证明有效，不抽取随机数、不接收明文值或盲因子；全批或任一嵌套字段错型（含末项错型与 `bool` 整数）抛 `TypeError`，空批、批次数越出 uint64 或任一同值证明无效抛 `ValueError`
 - `prove_range_wide(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> WideRangeProof` — 按位分解的宽区间非交互证明：声明区间内整数个数须恰为 2 的幂，且以 2 为底的位宽须在 1 到 24 之间，越界或个数非 2 的幂抛 `ValueError`；生成前以 `verify_pedersen_opening` 同一口径重算承诺开合，开合不符或值越出声明区间抛 `ValueError`；随机源不可调用或返回非整数（含 `bool`）抛 `TypeError`、抽取值越界抛 `ValueError`；同一组承诺、值、盲因子与上下文在相同随机源下重复生成的证明逐字节一致，输入不被改写
 - `verify_range_wide(commitment, proof, context=b"") -> bool` — 验证宽区间证明：各比特承诺按位加权（`2**i`）的乘积须等于承诺值，逐位重算每个比特分支两条 OR 分支的公告并核对两个挑战份额之和等于转录挑战；位宽越界、个数非 2 的幂、换承诺、换上下文、换声明区间、交换或替换任意比特分支、改动分支内的承诺/挑战份额/响应、挪动位序一律返回 `False` 且不抛异常；任一层字段错型（含用 `bool` 冒充整数）抛 `TypeError`，输入不被改写
 - `WideRangeProof(commitments, challenges, responses)` — 不可变宽区间证明对象；`commitments` 为按位序（低位在前）的比特承诺 `tuple[int, ...]`，`challenges` 与 `responses` 为每个比特分支的两个挑战份额、两个响应组成的 `tuple[tuple[int, int], ...]`，三者长度均为位宽 `k`；可位置构造、按值相等且不可变
@@ -1877,6 +1890,21 @@ h**Σ(a*s_right) == Π(t_right**a * D_right_i**(a*e_i))  (mod prime)
 ```
 
 左右不共享权重，因此两侧的误差无法互相抵消；不同群之间不跨组聚合，全部聚合等式成立才返回 `True`。随机源返回非整数或 `bool` 抛 `TypeError`，返回值不在该次请求的半开区间 `[0, prime - 1)` 内抛 `ValueError`，随机源自身抛出的异常原样传播。缺省随机源为 `secrets.randbelow`，传入固定源结果可重复。批验不改变演示级安全边界，输入不被改写。
+
+### Merkle 承诺的同值证明完整批验
+
+`BoundEqualValueBatch(entries, leaf_count, proof)` 把一批**完整**的同值证明条目与一棵 Merkle 树的多包含证明冻结在一起，三字段约定（元组 entries、正的非 `bool` `leaf_count` 同时等于条目数与 `proof.leaf_count`、`proof.indices` 恰好覆盖 `0 .. leaf_count - 1`）、按值相等与不可变语义逐项沿用其他完整批对象，构造时不做任何校验。
+
+每个条目的 Merkle 叶字节以该类别专属域标签 `b"zkregion/evb/v1"` 开始（与其他证明类别的批根域分隔互不相同），再按字段顺序展开：先左承诺后右承诺各六个公开字段（`element`、`lower`、`upper`、`prime`、`generator`、`h`，按数据类字段顺序），随后是 `context`，最后是同值证明的五个字段 `t_left`、`t_right`、`e`、`s_left`、`s_right`，每个序列先写十进制元素数再逐项写值。成帧与整数口径（每个原子项前置四字节无符号大端长度、整数编码为十进制 ASCII 且负号保留）及 Merkle 摘要规则沿用既有完整批的同一套约定，不改帧不重排。条目顺序与数量由叶位置一并绑定：从零连续覆盖全部位置的包含证明才通过，合法子集不能冒充整批。
+
+`verify_equal_value_batch_bound(batch, root, *, randbelow=secrets.randbelow) -> bool` 的验证分两步、次序固定：
+
+1. 先对**整批**做嵌套类型预检（批对象、元组条目、条目类型、左右承诺六字段、证明五层元组整数、`context`、`leaf_count` 与 `proof` 各字段、bytes `root`、可调用 `randbelow`；末项错型不被前项无效遮蔽、`bool` 冒充整数一律抛 `TypeError`）；结构检查（空批、计数相符、根长三十二字节、`indices == tuple(range(leaf_count))`）通过后才以全部 `(index, leaf)` 调 `verify_multi_inclusion` 校验 Merkle 根；
+2. 外层包含关系通过后，才以**同一个 `randbelow`** 原样调用 `verify_equal_value_batch(entries, randbelow=randbelow)`：抽取顺序（条目顺序 → 交点升序 → 先左后右）、左右独立权重与跨群分组逐字沿用；在根校验通过前不消费任何随机数，随机源返回非整数/`bool` 抛 `TypeError`、越界抛 `ValueError`、自身异常原样传播。
+
+空批、计数不一致、错误根或非三十二字节根、索引缺漏/重复/乱序、包含证明无效、条目的换序/增删/字段替换或内层批验拒绝一律返回 `False`；`root` 不是 `bytes` 等错型抛 `TypeError`。入口不接触明文值或盲因子，不改写任何输入。
+
+`prove_equal_value_batch_bound(entries) -> (batch, root)` 是规范构造入口：`entries` 沿用 `verify_equal_value_batch` 的全批嵌套类型规则（非 `bytes`/`bytearray`/`str` 序列）且必须非空，完整预检后按原顺序转为元组并保留重复项，调用方列表随后的增删不改变结果，不改写输入；随后逐项以确定性的 `verify_equal_value` 确认既有证明有效（不抽取随机数、不接收明文值或盲因子）；每项按上述同一叶编码成叶（即验根时重算的同一份叶），以全索引 `tuple(range(n))` 调 `prove_multi_inclusion` 得到完整多包含证明（`indices` 覆盖从零开始的全部位置、`siblings` 为空），返回批与该批编码叶的 `merkle_root`。构造结果一次通过 `verify_equal_value_batch_bound(batch, root)`，单项、奇数项、偶数项与重复项都给确定结果，相同有序输入重复构造所得的批、根与证明逐字节一致；负边界、跨零、单点交集、不同声明区间以及条目间不同群与 context 均支持。全批类型预检失败抛 `TypeError`，空批、批次数越出 uint64 或任一同值证明无效抛 `ValueError`。
 
 ### 区间证明批量验证
 

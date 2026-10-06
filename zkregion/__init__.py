@@ -16,6 +16,7 @@ BoundPedersenOpeningReplayGuard /
 RangeProof / prove_range /
 verify_range / RangeBatchEntry / verify_range_batch /
 EqualValueProof / prove_equal_value / verify_equal_value /
+EqualValueBatchEntry / verify_equal_value_batch /
 RangeSetProof / prove_range_set /
 verify_range_set / RangeSetBatchEntry / verify_range_set_batch /
 BoundRangeSetBatch / prove_range_set_batch_bound /
@@ -159,6 +160,7 @@ __all__ = [
     "ConvexPolygonRegion",
     "ConvexPolygonRegionProof",
     "ConvexPolygonReplayGuard",
+    "EqualValueBatchEntry",
     "EqualValueProof",
     "IntervalRangeBatchEntry",
     "IntervalRangeProof",
@@ -283,6 +285,7 @@ __all__ = [
     "verify_convex_polygon_batch_bound",
     "verify_convex_polygon_proof_bundle",
     "verify_equal_value",
+    "verify_equal_value_batch",
     "verify_inclusion",
     "verify_inclusion_batch",
     "verify_inclusion_batch_bound",
@@ -1330,6 +1333,260 @@ def verify_equal_value(
         if pow(h, proof.s_left[i], prime) != left_right_side:
             return False
         if pow(h, proof.s_right[i], prime) != right_right_side:
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class EqualValueBatchEntry:
+    """One item of an equal-value batch verification.
+
+    Fields are the left and right :class:`PedersenCommitment` objects,
+    the :class:`EqualValueProof` and the ``context`` (empty by default)
+    — exactly the arguments of :func:`verify_equal_value`, in the same
+    order. Entries compare by value, are immutable and are not validated
+    at construction time.
+    """
+
+    left: PedersenCommitment
+    right: PedersenCommitment
+    proof: EqualValueProof
+    context: bytes = b""
+
+
+def _check_equal_value_batch_entries_types(
+    entries: object,
+) -> list[EqualValueBatchEntry]:
+    """Validate the equal-value-batch ``entries`` argument types.
+
+    Mirrors the type expectations of :func:`verify_equal_value` for
+    *every* entry before any verification runs: ``entries`` must be a
+    non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`EqualValueBatchEntry` objects whose ``left`` / ``right`` are
+    :class:`PedersenCommitment` objects with non-``bool`` integer
+    ``element`` / ``lower`` / ``upper`` / ``prime`` / ``generator`` /
+    ``h`` fields, whose ``proof`` passes
+    :func:`_check_equal_value_proof_types` and whose ``context`` is
+    ``bytes``. The whole batch is walked (a bad type in the last entry
+    still raises), and the entries are copied into a fresh list so the
+    inputs are never mutated. An empty batch is left to
+    :func:`verify_equal_value_batch` to reject with ``False``;
+    structural and value problems are left to the per-entry prechecks.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of EqualValueBatchEntry")
+    items: list[EqualValueBatchEntry] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, EqualValueBatchEntry):
+            raise TypeError(f"entries[{position}] must be an EqualValueBatchEntry")
+        for side in ("left", "right"):
+            commitment = getattr(entry, side)
+            if not isinstance(commitment, PedersenCommitment):
+                raise TypeError(
+                    f"entries[{position}] {side} must be a PedersenCommitment"
+                )
+            for name in ("element", "lower", "upper", "prime", "generator", "h"):
+                _check_int(
+                    getattr(commitment, name),
+                    f"entries[{position}] {side} commitment {name}",
+                )
+        _check_equal_value_proof_types(entry.proof, f"entries[{position}] proof")
+        _check_bytes(entry.context, f"entries[{position}] context")
+        items.append(entry)
+    return items
+
+
+def _equal_value_batch_material(
+    entry: EqualValueBatchEntry,
+) -> tuple[int, int, int, int, list[int], list[int]]:
+    """Validate one batch entry and return its aggregation material.
+
+    Mirrors :func:`verify_equal_value` up to (but excluding) the
+    per-branch Schnorr equations: both commitments must be legal and
+    share ``prime`` / ``generator`` / ``h``, the declared-range
+    intersection must contain 1 to 256 integers, the five proof tuples
+    must have one entry per intersection integer, the ``t`` / ``e`` /
+    ``s`` values must be in range and the challenge shares must sum to
+    the transcript challenge (which binds the left/right order, every
+    public field of both commitments and the ``context``). Every
+    failure — including a missing modular inverse while recomputing the
+    offsets — raises :class:`ValueError`. The returned tuple is
+    ``(prime, generator, h, size, offsets_left, offsets_right)`` with
+    ``D_side_i = element_side * generator**(lower_side - x_i) mod prime``
+    over the ascending intersection points ``x_i``.
+    """
+    left = entry.left
+    right = entry.right
+    proof = entry.proof
+    if not _equal_value_commitment_legal(left):
+        raise ValueError("left commitment is not a legal commitment")
+    if not _equal_value_commitment_legal(right):
+        raise ValueError("right commitment is not a legal commitment")
+    if (left.prime, left.generator, left.h) != (
+        right.prime,
+        right.generator,
+        right.h,
+    ):
+        raise ValueError("commitments must share prime, generator and h")
+    prime = left.prime
+    generator = left.generator
+    h = left.h
+    lower, upper = _equal_value_intersection(left, right)
+    size = upper - lower + 1
+    if not 1 <= size <= _MAX_RANGE_VALUES:
+        raise ValueError("intersection must contain 1 to 256 integers")
+    if not (
+        len(proof.t_left)
+        == len(proof.t_right)
+        == len(proof.e)
+        == len(proof.s_left)
+        == len(proof.s_right)
+        == size
+    ):
+        raise ValueError("proof fields must have one entry per intersection integer")
+    if any(not 1 <= t_i < prime for t_i in proof.t_left):
+        raise ValueError("proof announcement out of range")
+    if any(not 1 <= t_i < prime for t_i in proof.t_right):
+        raise ValueError("proof announcement out of range")
+    if any(not 0 <= e_i < prime for e_i in proof.e):
+        raise ValueError("proof challenge share out of range")
+    if any(s_i < 0 for s_i in proof.s_left):
+        raise ValueError("proof response must be non-negative")
+    if any(s_i < 0 for s_i in proof.s_right):
+        raise ValueError("proof response must be non-negative")
+    challenge = _equal_value_challenge(
+        left, right, entry.context, size, proof.t_left, proof.t_right
+    )
+    if sum(proof.e) % prime != challenge:
+        raise ValueError(
+            "proof challenge shares do not sum to the transcript challenge"
+        )
+    offsets_left = [
+        left.element * pow(generator, left.lower - (lower + i), prime) % prime
+        for i in range(size)
+    ]
+    offsets_right = [
+        right.element * pow(generator, right.lower - (lower + i), prime) % prime
+        for i in range(size)
+    ]
+    return prime, generator, h, size, offsets_left, offsets_right
+
+
+def verify_equal_value_batch(
+    entries: Sequence[EqualValueBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a batch of :class:`EqualValueProof` objects with random linear checks.
+
+    ``entries`` must be a non-empty, non-string sequence of
+    :class:`EqualValueBatchEntry`; an empty batch returns ``False`` and
+    duplicate entries are legal (each draws its own coefficients). The
+    nested types of the *whole* batch are preflighted first, so a wrong
+    type in any entry — including a ``bool`` passed as an integer, a
+    non-tuple proof field, a non-``bytes`` context or a non-callable
+    ``randbelow`` — raises :class:`TypeError`.
+
+    Every entry is then prechecked exactly as :func:`verify_equal_value`
+    up to the per-branch Schnorr equations, reusing the established
+    :class:`EqualValueProof` transcript byte for byte: both commitments
+    must be legal and share ``prime`` / ``generator`` / ``h`` (different
+    entries may use different groups), the declared-range intersection
+    must contain 1 to 256 integers, the proof tuple sizes and the
+    ``t`` / ``e`` / ``s`` bounds must match, and the challenge shares
+    must sum to the transcript challenge — binding the left/right
+    order, every public field of both commitments and the ``context``.
+    All prechecks run before any randomness is drawn; an illegal
+    commitment, a group-parameter mismatch inside an entry, an empty or
+    oversized intersection, a proof length or value error, a challenge
+    binding mismatch or a missing modular inverse returns ``False``
+    without touching ``randbelow``.
+
+    Each of the two Schnorr equations of every branch — left first, then
+    right, per entry in batch order and per intersection integer in
+    ascending order — then draws exactly one random coefficient
+    ``a = r + 1`` with ``r = randbelow(prime - 1)``, so the left and
+    right equations of a branch never share a weight. Equations sharing
+    the same ``(prime, generator, h)`` group are checked together with a
+    single aggregate equation
+
+    ``h**Σ(a*s) == Π(t**a * D_side**(a*e)) (mod prime)``
+
+    where ``D_side_i = element_side * generator**(lower_side - x_i) mod
+    prime`` is unchanged from :func:`verify_equal_value`; per-equation
+    results are never AND-ed together. A random source returning a
+    non-integer or a ``bool`` raises :class:`TypeError`, a coefficient
+    outside ``[0, prime - 1)`` raises :class:`ValueError`, and
+    exceptions raised by the source itself propagate unchanged. All
+    aggregate equations holding returns ``True``, otherwise ``False``;
+    the demonstration-level security bounds are unchanged. Missing
+    entries cannot be detected: the caller guarantees the batch is
+    complete. Inputs are never mutated.
+    """
+    items = _check_equal_value_batch_entries_types(entries)
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    if not items:
+        return False
+
+    # Every per-entry precheck runs before any randomness is drawn.
+    materials = []
+    for entry in items:
+        try:
+            materials.append(_equal_value_batch_material(entry))
+        except ValueError:
+            return False
+
+    # group -> {"sum": Σ(a*s), "product": Π(t**a * D_side**(a*e))}
+    groups: dict[tuple[int, int, int], dict[str, int]] = {}
+
+    def add_equation(
+        group_key: tuple[int, int, int],
+        t_i: int,
+        e_i: int,
+        s_i: int,
+        offset_i: int,
+    ) -> None:
+        prime, _generator, _h = group_key
+        r = randbelow(prime - 1)
+        if not isinstance(r, int) or isinstance(r, bool):
+            raise TypeError("coefficient source randbelow must return an integer")
+        if not 0 <= r < prime - 1:
+            raise ValueError("coefficient source must satisfy 0 <= r < prime - 1")
+        coefficient = r + 1
+        state = groups.setdefault(group_key, {"sum": 0, "product": 1})
+        state["sum"] += coefficient * s_i
+        state["product"] = (
+            state["product"]
+            * pow(t_i, coefficient, prime)
+            % prime
+            * pow(offset_i, coefficient * e_i, prime)
+            % prime
+        )
+
+    for entry, (prime, generator, h, size, offsets_left, offsets_right) in zip(
+        items, materials
+    ):
+        group_key = (prime, generator, h)
+        proof = entry.proof
+        for i in range(size):
+            add_equation(
+                group_key,
+                proof.t_left[i],
+                proof.e[i],
+                proof.s_left[i],
+                offsets_left[i],
+            )
+            add_equation(
+                group_key,
+                proof.t_right[i],
+                proof.e[i],
+                proof.s_right[i],
+                offsets_right[i],
+            )
+
+    for (prime, _generator, _h), state in groups.items():
+        if pow(_h, state["sum"], prime) != state["product"]:
             return False
     return True
 

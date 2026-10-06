@@ -1436,6 +1436,8 @@ python3 -m zkregion
 - `prove_equal_value(left, right, value, blinding_left, blinding_right, context=b"", *, randbelow=secrets.randbelow) -> EqualValueProof` — 两份 Pedersen 承诺的非交互同值证明：依次接收左右承诺、共同整数值与左右盲因子；两承诺须共享 `prime`/`generator`/`h`，声明区间可不同且单侧不额外限制为 256 个值，但交集须含 1 到 256 个整数（负边界、跨零、单点交集、端点值与左右完全相同均支持）；证明的是两份承诺开合到同一个实际整数而非相同的下界偏移。生成前按 `verify_pedersen_opening` 同一口径核对两份开合，非法承诺、群参数不一致、交集为空或超限、共同值越界、盲因子非法或开合不符均抛 `ValueError` 且不消耗随机数；随机源不可调用或返回非整数（含 `bool`）抛 `TypeError`、抽取值越出该次请求的半开区间抛 `ValueError`，随机源自身异常原样传播；同一组入参在相同随机序列下生成相等证明，输入不被改写
 - `verify_equal_value(left, right, proof, context=b"") -> bool` — 验证同值证明：只接收左右承诺、证明与 context，不接触共同值或盲因子，不消耗随机数；验证绑定左右顺序、两份承诺全部公开字段与 context（以公开字段是否实际变化为准），替换任一项、篡改证明或拼接不同证明的内容均返回 `False`；对象或任一层嵌套字段错型（含 `bool` 整数、非元组证明字段、非 `bytes` context）抛 `TypeError`，公开输入无效、证明结构长度错误或数值非法均返回 `False`，输入不被改写
 - `EqualValueProof(t_left, t_right, e, s_left, s_right)` — 不可变同值证明对象，五个字段均为长度等于交集整数个数的 `tuple[int, ...]`（按交集整数升序逐点排列，`e` 为两侧共享的挑战份额）；可位置构造、按值相等且冻结，不携带明文值、盲因子或命中位置，构造时不做任何校验
+- `EqualValueBatchEntry(left, right, proof, context=b"")` — 不可变同值批验条目，字段类型依次为 `PedersenCommitment`、`PedersenCommitment`、`EqualValueProof`、`bytes`（context 缺省为空字节串），字段次序与 `verify_equal_value` 入参一致；可位置构造、按值相等且不可变，构造时不做任何校验
+- `verify_equal_value_batch(entries, *, randbelow=secrets.randbelow) -> bool` — 同值证明的批量验证：先整批预检嵌套类型（序列本身——非序列、字符串或字节串均不行、条目、左右承诺六字段、证明五字段各层元组整数与 `context`，错型含用 `bool` 冒充整数、非元组证明字段、非 `bytes` context、不可调用随机源与非 `Sequence` 输入，一律抛 `TypeError`），再对整批做与 `verify_equal_value` 相同口径的逐条预检（非法承诺、条目内群参数不一致、交集为空或超限、证明长度或数值非法、挑战绑定不符、所需模逆不存在均返回 `False` 且不抽取随机数）；预检全部通过后按条目顺序、交集整数升序、先左后右，每条 Schnorr 等式恰调用一次 `randbelow(prime - 1)` 取 `r`、以 `a = r + 1` 为权重（同一分支左右两式各自独立取权重），按 `(prime, generator, h)` 分组做一次随机线性组合 `h**Σ(a*s) == Π(t**a * D_side**(a*e))`，全部聚合等式成立返回 `True`，否则返回 `False`；空批返回 `False`，重复条目合法且各自独立抽取，允许跨条目不同群参数与不同 context，漏项无法被发现；随机源返回非整数（含 `bool`）抛 `TypeError`、越出 `[0, prime - 1)` 抛 `ValueError`、自身异常原样传播；不接收共同值或盲因子，演示级安全边界不变，输入不被改写
 - `prove_range_wide(commitment, value, blinding, context=b"", *, randbelow=secrets.randbelow) -> WideRangeProof` — 按位分解的宽区间非交互证明：声明区间内整数个数须恰为 2 的幂，且以 2 为底的位宽须在 1 到 24 之间，越界或个数非 2 的幂抛 `ValueError`；生成前以 `verify_pedersen_opening` 同一口径重算承诺开合，开合不符或值越出声明区间抛 `ValueError`；随机源不可调用或返回非整数（含 `bool`）抛 `TypeError`、抽取值越界抛 `ValueError`；同一组承诺、值、盲因子与上下文在相同随机源下重复生成的证明逐字节一致，输入不被改写
 - `verify_range_wide(commitment, proof, context=b"") -> bool` — 验证宽区间证明：各比特承诺按位加权（`2**i`）的乘积须等于承诺值，逐位重算每个比特分支两条 OR 分支的公告并核对两个挑战份额之和等于转录挑战；位宽越界、个数非 2 的幂、换承诺、换上下文、换声明区间、交换或替换任意比特分支、改动分支内的承诺/挑战份额/响应、挪动位序一律返回 `False` 且不抛异常；任一层字段错型（含用 `bool` 冒充整数）抛 `TypeError`，输入不被改写
 - `WideRangeProof(commitments, challenges, responses)` — 不可变宽区间证明对象；`commitments` 为按位序（低位在前）的比特承诺 `tuple[int, ...]`，`challenges` 与 `responses` 为每个比特分支的两个挑战份额、两个响应组成的 `tuple[tuple[int, int], ...]`，三者长度均为位宽 `k`；可位置构造、按值相等且不可变
@@ -1849,6 +1851,20 @@ D_side_i = element_side * g**(lower_side - x_i) mod prime
 挑战 `c` 的转录依次写入域 `b"zkregion/pedersen-equal-value/v1"`、左承诺六字段、右承诺六字段、`context`、`n` 与逐分支的左右公告；编码与长度帧规则同区间证明。由此验证绑定左右顺序、两份承诺全部公开字段与 `context`——以公开字段是否实际变化为准，替换任一项、篡改证明或拼接不同证明的内容都使挑战不符而返回 `False`。
 
 验证要求每侧 `t_i ∈ [1, prime)`、`e_i ∈ [0, prime)`、`s_i ≥ 0`，`sum(e) mod prime == c`，且每个分支同时满足左右两条 Schnorr 等式。生成的错误口径（非法承诺、群参数不一致、交集为空或超限、共同值越界、盲因子非法、开合不符）一律抛 `ValueError` 且不消耗随机数；类型错误（含 `bool` 整数）抛 `TypeError`；验证侧对应的公开输入无效、证明结构长度错误或数值非法均返回 `False`。两入口均不改写输入。与 `prove_range` 一样，该证明沿用演示群与默认陷门承诺的安全边界，不声称承诺只有唯一开合。
+
+### 同值证明批量验证
+
+`verify_equal_value_batch(entries, *, randbelow=secrets.randbelow)` 一次验证一批 `EqualValueProof`，每个条目就是 `verify_equal_value` 的四个入参（`left`、`right`、`proof`、`context`，后者缺省 `b""`）冻结成的不可变数据类 `EqualValueBatchEntry`，构造时不做任何校验。`entries` 须为非 `bytes`/`bytearray`/`str` 的 `Sequence`（列表、元组均可）：空批返回 `False`，重复条目合法并各自独立抽取权重。漏项无法被发现，批次完整性由调用方保证。
+
+验证分两个固定阶段。先对**整批**做嵌套类型预检：序列本身错型或不是序列、任一条目不是 `EqualValueBatchEntry`、左右承诺不是 `PedersenCommitment` 或其六字段不是非 `bool` 整数、证明不是 `EqualValueProof` 或其五字段不是非 `bool` 整数元组、`context` 不是 `bytes`、`randbelow` 不可调用，都抛 `TypeError`。随后对**整批**逐条做与单条验证相同口径的预检（承诺合法、条目内左右共享 `prime`/`generator`/`h`、交集含 1 到 256 个整数、证明长度与数值界、挑战份额之和等于逐字节复用的转录挑战），任一不符返回 `False`——此阶段不调用 `randbelow`，预检失败不抽取任何随机数。
+
+全部预检通过后，按条目顺序、交集整数升序、每个分支**先左后右**，每条 Schnorr 等式恰调用一次 `randbelow(prime - 1)` 得 `r`，取非零权重 `a = r + 1`——同一分支的左右两式各自独立取权重，不复用，避免两侧误差相互抵消。所有等式按 `(prime, generator, h)` 分组（跨条目可混用不同群），每组只检查一次聚合等式
+
+```
+h**Σ(a*s) == Π(t**a * D_side**(a*e))   (mod prime)
+```
+
+其中 `D_side_i` 的定义与单条验证完全一致；逐等式结果不做布尔汇总。全部聚合等式成立返回 `True`，否则返回 `False`。随机源返回非整数（含 `bool`）抛 `TypeError`、越出 `[0, prime - 1)` 抛 `ValueError`、自身异常原样传播；入口不要求批中条目共享 context，不接触共同值或盲因子，不改写输入，演示级安全边界与单条验证相同。
 
 ### 区间证明批量验证
 

@@ -130,6 +130,8 @@ from zkregion import (
     prove_schnorr_batch_bound,
     region_contains_committed,
     select_merkle_multi_proof,
+    split_merkle_multi_proof,
+    update_merkle_multi_proof,
     verify_bound,
     verify_consistency,
     verify_consistency_batch,
@@ -12988,6 +12990,449 @@ class MergeMultiProofsTest(unittest.TestCase):
                     merge_multi_proofs(bundles)
         # no partial result: the valid envelope alone would merge fine
         self.assertEqual(merge_multi_proofs([good, good]), good)
+
+
+class UpdateMerkleMultiProofTest(unittest.TestCase):
+    """update_merkle_multi_proof: carry an envelope forward over appends."""
+
+    LEAVES = [b"alpha", b"beta", b"gamma", b"delta", b"epsilon"]
+
+    def envelope(self, leaves, indices):
+        indices = tuple(sorted(indices))
+        root = merkle_root(leaves)
+        proof = prove_multi_inclusion(leaves, indices)
+        entries = tuple((i, leaves[i]) for i in indices)
+        return MerkleMultiProofBundle(root, proof, entries)
+
+    def test_matches_prove_multi_for_every_subset_and_growth(self):
+        for old_size in range(1, 9):
+            old_leaves = [f"old-{i}".encode() for i in range(old_size)]
+            for new_size in range(old_size, 13):
+                new_leaves = old_leaves + [
+                    f"new-{i}".encode() for i in range(old_size, new_size)
+                ]
+                new_root = merkle_root(new_leaves)
+                consistency = prove_consistency(new_leaves, old_size)
+                for mask in range(1, 1 << old_size):
+                    indices = tuple(
+                        i for i in range(old_size) if mask & (1 << i)
+                    )
+                    with self.subTest(old=old_size, new=new_size, indices=indices):
+                        bundle = self.envelope(old_leaves, indices)
+                        got = update_merkle_multi_proof(
+                            bundle, new_root, consistency
+                        )
+                        self.assertEqual(
+                            got, self.envelope(new_leaves, indices)
+                        )
+                        self.assertTrue(verify_merkle_multi_proof_bundle(got))
+
+    def test_root_leaf_count_and_entries_are_carried_over(self):
+        old_leaves = list(self.LEAVES)
+        new_leaves = old_leaves + [b"zeta", b"eta", b"theta"]
+        bundle = self.envelope(old_leaves, (0, 2, 4))
+        updated = update_merkle_multi_proof(
+            bundle, merkle_root(new_leaves), prove_consistency(new_leaves, 5)
+        )
+        self.assertEqual(updated.root, merkle_root(new_leaves))
+        self.assertEqual(updated.proof.leaf_count, 8)
+        # the same original indices and leaf bytes, never renumbered and
+        # never extended: no appended leaf is disclosed
+        self.assertEqual(updated.proof.indices, (0, 2, 4))
+        self.assertEqual(updated.entries, bundle.entries)
+        self.assertEqual(
+            updated.entries,
+            ((0, b"alpha"), (2, b"gamma"), (4, b"epsilon")),
+        )
+
+    def test_single_leaf_old_tree(self):
+        for new_size in range(1, 9):
+            new_leaves = [b"only"] + [
+                f"add-{i}".encode() for i in range(1, new_size)
+            ]
+            with self.subTest(new_size=new_size):
+                bundle = self.envelope([b"only"], (0,))
+                got = update_merkle_multi_proof(
+                    bundle,
+                    merkle_root(new_leaves),
+                    prove_consistency(new_leaves, 1),
+                )
+                self.assertEqual(got, self.envelope(new_leaves, (0,)))
+                self.assertTrue(verify_merkle_multi_proof_bundle(got))
+
+    def test_growth_across_power_of_two_boundaries(self):
+        for old_size, new_size in (
+            (1, 2), (2, 3), (2, 4), (3, 4), (4, 5), (4, 8), (7, 8),
+            (8, 9), (3, 8), (5, 16), (8, 17), (6, 7),
+        ):
+            old_leaves = [f"old-{i}".encode() for i in range(old_size)]
+            new_leaves = old_leaves + [
+                f"new-{i}".encode() for i in range(old_size, new_size)
+            ]
+            new_root = merkle_root(new_leaves)
+            consistency = prove_consistency(new_leaves, old_size)
+            for indices in (
+                (0,), (old_size - 1,), tuple(range(old_size)),
+                tuple(range(0, old_size, 2)),
+            ):
+                with self.subTest(old=old_size, new=new_size, indices=indices):
+                    bundle = self.envelope(old_leaves, indices)
+                    got = update_merkle_multi_proof(
+                        bundle, new_root, consistency
+                    )
+                    self.assertEqual(got, self.envelope(new_leaves, indices))
+
+    def test_only_old_last_leaf_proven(self):
+        for old_size in range(1, 9):
+            old_leaves = [f"old-{i}".encode() for i in range(old_size)]
+            for new_size in (old_size, old_size + 1, old_size + 3):
+                new_leaves = old_leaves + [
+                    f"new-{i}".encode() for i in range(old_size, new_size)
+                ]
+                with self.subTest(old=old_size, new=new_size):
+                    bundle = self.envelope(old_leaves, (old_size - 1,))
+                    got = update_merkle_multi_proof(
+                        bundle,
+                        merkle_root(new_leaves),
+                        prove_consistency(new_leaves, old_size),
+                    )
+                    self.assertEqual(
+                        got, self.envelope(new_leaves, (old_size - 1,))
+                    )
+
+    def test_adjacent_and_scattered_indices(self):
+        old_leaves = [f"leaf-{i}".encode() for i in range(7)]
+        new_leaves = old_leaves + [b"extra-0", b"extra-1"]
+        new_root = merkle_root(new_leaves)
+        consistency = prove_consistency(new_leaves, 7)
+        for indices in ((0, 1), (2, 3), (5, 6), (0, 3, 6), (1, 4), (0, 6)):
+            with self.subTest(indices=indices):
+                bundle = self.envelope(old_leaves, indices)
+                got = update_merkle_multi_proof(bundle, new_root, consistency)
+                self.assertEqual(got, self.envelope(new_leaves, indices))
+
+    def test_equal_leaf_contents_at_distinct_indices(self):
+        old_leaves = [b"same", b"middle", b"same", b"other", b"same"]
+        new_leaves = old_leaves + [b"same", b"tail"]
+        new_root = merkle_root(new_leaves)
+        consistency = prove_consistency(new_leaves, 5)
+        bundle = self.envelope(old_leaves, (0, 2, 4))
+        updated = update_merkle_multi_proof(bundle, new_root, consistency)
+        self.assertEqual(updated, self.envelope(new_leaves, (0, 2, 4)))
+        self.assertEqual(
+            updated.entries, ((0, b"same"), (2, b"same"), (4, b"same"))
+        )
+        just_two = update_merkle_multi_proof(
+            select_merkle_multi_proof(bundle, [2]), new_root, consistency
+        )
+        self.assertEqual(just_two, self.envelope(new_leaves, (2,)))
+        just_zero = update_merkle_multi_proof(
+            select_merkle_multi_proof(bundle, [0]), new_root, consistency
+        )
+        self.assertEqual(just_zero, self.envelope(new_leaves, (0,)))
+        self.assertNotEqual(just_zero, just_two)
+
+    def test_equal_counts_return_equal_value(self):
+        for size in range(1, 9):
+            leaves = [f"leaf-{i}".encode() for i in range(size)]
+            root = merkle_root(leaves)
+            consistency = prove_consistency(leaves, size)
+            for mask in range(1, 1 << size):
+                indices = tuple(i for i in range(size) if mask & (1 << i))
+                with self.subTest(size=size, indices=indices):
+                    bundle = self.envelope(leaves, indices)
+                    self.assertEqual(
+                        update_merkle_multi_proof(bundle, root, consistency),
+                        bundle,
+                    )
+
+    def test_sequential_updates_equal_direct_update(self):
+        leaves1 = [b"a", b"b", b"c"]
+        leaves2 = leaves1 + [b"d", b"e"]
+        leaves3 = leaves2 + [b"f", b"g", b"h", b"i"]
+        bundle = self.envelope(leaves1, (0, 2))
+        step1 = update_merkle_multi_proof(
+            bundle, merkle_root(leaves2), prove_consistency(leaves2, 3)
+        )
+        step2 = update_merkle_multi_proof(
+            step1, merkle_root(leaves3), prove_consistency(leaves3, 5)
+        )
+        direct = update_merkle_multi_proof(
+            bundle, merkle_root(leaves3), prove_consistency(leaves3, 3)
+        )
+        self.assertEqual(step2, direct)
+        self.assertEqual(step2, self.envelope(leaves3, (0, 2)))
+        # updating a cropped envelope equals cropping the updated envelope
+        cropped_first = update_merkle_multi_proof(
+            select_merkle_multi_proof(bundle, [2]),
+            merkle_root(leaves3),
+            prove_consistency(leaves3, 3),
+        )
+        self.assertEqual(
+            cropped_first, select_merkle_multi_proof(direct, [2])
+        )
+
+    def test_result_composes_with_select_merge_split_and_codecs(self):
+        old_leaves = list(self.LEAVES)
+        new_leaves = old_leaves + [b"zeta", b"eta", b"theta"]
+        new_root = merkle_root(new_leaves)
+        consistency = prove_consistency(new_leaves, 5)
+        bundle = self.envelope(old_leaves, (0, 2, 4))
+        updated = update_merkle_multi_proof(bundle, new_root, consistency)
+        # codec round trip preserves the value and the verdict
+        decoded = decode_merkle_multi_proof_bundle(
+            encode_merkle_multi_proof_bundle(updated)
+        )
+        self.assertEqual(decoded, updated)
+        self.assertTrue(verify_merkle_multi_proof_bundle(decoded))
+        # cropping the updated envelope gives the direct proof
+        cropped = select_merkle_multi_proof(updated, [4, 0])
+        self.assertEqual(cropped, self.envelope(new_leaves, (0, 4)))
+        # merging updated pieces rebuilds the updated union
+        pieces = [
+            update_merkle_multi_proof(
+                select_merkle_multi_proof(bundle, [i]), new_root, consistency
+            )
+            for i in (0, 2, 4)
+        ]
+        self.assertEqual(merge_multi_proofs(pieces), updated)
+        self.assertEqual(merge_multi_proofs([updated, updated]), updated)
+        # splitting yields single-leaf proofs under the new root
+        singles = split_merkle_multi_proof(updated)
+        self.assertEqual([entry.proof.index for entry in singles], [0, 2, 4])
+        self.assertTrue(verify_inclusion_batch(singles))
+        for entry, (index, leaf) in zip(singles, updated.entries):
+            self.assertEqual(entry.leaf, leaf)
+            self.assertEqual(entry.root, new_root)
+            self.assertEqual(entry.proof, prove_inclusion(new_leaves, index))
+        self.assertEqual(merge_inclusion_proofs(singles, 8), updated)
+
+    def test_works_on_merged_and_cropped_envelopes(self):
+        old_leaves = list(self.LEAVES)
+        new_leaves = old_leaves + [b"zeta", b"eta"]
+        root = merkle_root(old_leaves)
+        new_root = merkle_root(new_leaves)
+        consistency = prove_consistency(new_leaves, 5)
+        singles = [
+            MerkleInclusionBatchEntry(
+                old_leaves[i], prove_inclusion(old_leaves, i), root
+            )
+            for i in (1, 3)
+        ]
+        merged = merge_inclusion_proofs(singles, 5)
+        self.assertEqual(
+            update_merkle_multi_proof(merged, new_root, consistency),
+            self.envelope(new_leaves, (1, 3)),
+        )
+        cropped = select_merkle_multi_proof(
+            self.envelope(old_leaves, (0, 1, 2, 3, 4)), [3, 1]
+        )
+        self.assertEqual(
+            update_merkle_multi_proof(cropped, new_root, consistency),
+            self.envelope(new_leaves, (1, 3)),
+        )
+
+    def test_repeated_calls_are_equal_and_inputs_are_not_mutated(self):
+        old_leaves = list(self.LEAVES)
+        new_leaves = old_leaves + [b"zeta"]
+        new_root = merkle_root(new_leaves)
+        bundle = self.envelope(old_leaves, (1, 3, 4))
+        consistency = prove_consistency(new_leaves, 5)
+        bundle_snapshot = dataclasses.replace(bundle)
+        consistency_snapshot = dataclasses.replace(consistency)
+        first = update_merkle_multi_proof(bundle, new_root, consistency)
+        second = update_merkle_multi_proof(
+            dataclasses.replace(bundle),
+            bytes(new_root),
+            dataclasses.replace(consistency),
+        )
+        self.assertEqual(first, second)
+        self.assertEqual(bundle, bundle_snapshot)
+        self.assertEqual(consistency, consistency_snapshot)
+
+    def test_type_errors(self):
+        old_leaves = list(self.LEAVES)
+        new_leaves = old_leaves + [b"zeta"]
+        new_root = merkle_root(new_leaves)
+        bundle = self.envelope(old_leaves, (1, 3))
+        proof = bundle.proof
+        consistency = prove_consistency(new_leaves, 5)
+        # the bundle object itself
+        for bad in (object(), None, 1, b"bytes", bytearray(b"\x01"),
+                    "seq", [bundle], (bundle,)):
+            with self.assertRaises(TypeError):
+                update_merkle_multi_proof(bad, new_root, consistency)
+        # the bundle root field
+        for bad_root in (None, 1, "root", bytearray(new_root), [new_root]):
+            with self.assertRaises(TypeError):
+                update_merkle_multi_proof(
+                    MerkleMultiProofBundle(bad_root, proof, bundle.entries),
+                    new_root,
+                    consistency,
+                )
+        # the bundle proof fields
+        bad_proofs = [
+            "not-a-proof",
+            MerkleMultiProof(True, proof.indices, proof.siblings),
+            MerkleMultiProof(5, list(proof.indices), proof.siblings),
+            MerkleMultiProof(5, (1, True), proof.siblings),
+            MerkleMultiProof(5, proof.indices, list(proof.siblings)),
+            MerkleMultiProof(5, proof.indices, (proof.siblings[0], 7)),
+        ]
+        for bad_proof in bad_proofs:
+            with self.assertRaises(TypeError):
+                update_merkle_multi_proof(
+                    MerkleMultiProofBundle(bundle.root, bad_proof, bundle.entries),
+                    new_root,
+                    consistency,
+                )
+        # the bundle entries fields: tuples are required, lists are not
+        bad_entries = [
+            list(bundle.entries),
+            ((1, old_leaves[1]), [3, old_leaves[3]]),
+            ((1, old_leaves[1]), (True, old_leaves[3])),
+            ((1, old_leaves[1]), (3, "leaf")),
+            ((1, old_leaves[1]), (3, old_leaves[3], old_leaves[3])),
+        ]
+        for bad in bad_entries:
+            with self.assertRaises(TypeError):
+                update_merkle_multi_proof(
+                    MerkleMultiProofBundle(bundle.root, proof, bad),
+                    new_root,
+                    consistency,
+                )
+        # the new root
+        for bad in (None, 1, "root", bytearray(new_root), [new_root]):
+            with self.assertRaises(TypeError):
+                update_merkle_multi_proof(bundle, bad, consistency)
+        # the consistency proof object
+        for bad in (object(), None, 1, b"bytes", "seq", [consistency]):
+            with self.assertRaises(TypeError):
+                update_merkle_multi_proof(bundle, new_root, bad)
+        # the consistency proof fields
+        bad_consistency = [
+            MerkleConsistencyProof(True, 6, consistency.nodes),
+            MerkleConsistencyProof(5, True, consistency.nodes),
+            MerkleConsistencyProof(5, 6, list(consistency.nodes)),
+            MerkleConsistencyProof(5, 6, consistency.nodes + (7,)),
+        ]
+        for bad in bad_consistency:
+            with self.assertRaises(TypeError):
+                update_merkle_multi_proof(bundle, new_root, bad)
+        # a type error is reported even when a semantic error is present
+        tampered = MerkleMultiProofBundle(
+            bundle.root, proof, ((1, b"tampered"), (3, old_leaves[3]))
+        )
+        with self.assertRaises(TypeError):
+            update_merkle_multi_proof(
+                tampered,
+                new_root,
+                MerkleConsistencyProof(True, 6, consistency.nodes),
+            )
+        with self.assertRaises(TypeError):
+            update_merkle_multi_proof(tampered, 123, consistency)
+        with self.assertRaises(TypeError):
+            update_merkle_multi_proof(
+                MerkleMultiProofBundle(bundle.root, proof, list(bundle.entries)),
+                new_root,
+                MerkleConsistencyProof(5, 4, consistency.nodes),
+            )
+
+    def test_value_errors(self):
+        old_leaves = list(self.LEAVES)
+        new_leaves = old_leaves + [b"zeta", b"eta"]
+        root = merkle_root(old_leaves)
+        new_root = merkle_root(new_leaves)
+        bundle = self.envelope(old_leaves, (1, 3))
+        proof = bundle.proof
+        consistency = prove_consistency(new_leaves, 5)
+        # the old envelope must verify under its own root
+        bad_bundles = [
+            # tampered leaf
+            MerkleMultiProofBundle(
+                root, proof, ((1, b"tampered"), (3, old_leaves[3]))
+            ),
+            # a root the proof does not verify under
+            MerkleMultiProofBundle(new_root, proof, bundle.entries),
+            # a root of the wrong length
+            MerkleMultiProofBundle(b"\x00" * 16, proof, bundle.entries),
+            # misordered indices
+            MerkleMultiProofBundle(
+                root,
+                MerkleMultiProof(5, (3, 1), proof.siblings),
+                ((3, old_leaves[3]), (1, old_leaves[1])),
+            ),
+            # entries/indices mismatch
+            MerkleMultiProofBundle(root, proof, ((1, old_leaves[1]),)),
+            # out-of-range index
+            MerkleMultiProofBundle(
+                root,
+                MerkleMultiProof(5, (1, 5), proof.siblings),
+                ((1, old_leaves[1]), (5, b"extra")),
+            ),
+            # non-positive leaf_count
+            MerkleMultiProofBundle(
+                root, MerkleMultiProof(0, (1, 3), proof.siblings), bundle.entries
+            ),
+            # missing sibling digest
+            MerkleMultiProofBundle(
+                root,
+                MerkleMultiProof(5, (1, 3), proof.siblings[:-1]),
+                bundle.entries,
+            ),
+            # extra sibling digest
+            MerkleMultiProofBundle(
+                root,
+                MerkleMultiProof(5, (1, 3), proof.siblings + (b"\x00" * 32,)),
+                bundle.entries,
+            ),
+            # malformed sibling digest length
+            MerkleMultiProofBundle(
+                root,
+                MerkleMultiProof(5, (1, 3), proof.siblings[:-1] + (b"\x00" * 16,)),
+                bundle.entries,
+            ),
+        ]
+        for bad in bad_bundles:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    update_merkle_multi_proof(bad, new_root, consistency)
+        # the consistency old_count must equal the declared leaf_count
+        for other_count in (4, 6):
+            with self.assertRaises(ValueError):
+                update_merkle_multi_proof(
+                    bundle, new_root, prove_consistency(new_leaves, other_count)
+                )
+        # the consistency proof must verify from the old root to new_root
+        bad_consistency = [
+            # shrinking counts
+            MerkleConsistencyProof(5, 4, consistency.nodes),
+            MerkleConsistencyProof(5, 0, consistency.nodes),
+            # missing node
+            MerkleConsistencyProof(5, 7, consistency.nodes[:-1]),
+            # extra node
+            MerkleConsistencyProof(5, 7, consistency.nodes + (b"\x00" * 32,)),
+            # tampered node
+            MerkleConsistencyProof(
+                5, 7, consistency.nodes[:-1]
+                + (hashlib.sha256(b"tampered").digest(),)
+            ),
+            # malformed node length
+            MerkleConsistencyProof(5, 7, consistency.nodes[:-1] + (b"\x00" * 16,)),
+        ]
+        for bad in bad_consistency:
+            with self.subTest(bad=bad):
+                with self.assertRaises(ValueError):
+                    update_merkle_multi_proof(bundle, new_root, bad)
+        # a new_root the consistency proof does not reach
+        with self.assertRaises(ValueError):
+            update_merkle_multi_proof(bundle, b"\x07" * 32, consistency)
+        # a new_root of the wrong length
+        with self.assertRaises(ValueError):
+            update_merkle_multi_proof(bundle, b"\x07" * 16, consistency)
+        # the old root is not the new root of a growing proof
+        with self.assertRaises(ValueError):
+            update_merkle_multi_proof(bundle, root, consistency)
 
 
 class MerkleMultiInclusionBatchTest(unittest.TestCase):

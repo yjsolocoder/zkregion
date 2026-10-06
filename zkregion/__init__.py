@@ -89,7 +89,7 @@ BoundMerkleInclusionBatchReplayGuard /
 MerkleMultiProof / prove_multi_inclusion /
 verify_multi_inclusion / merge_inclusion_proofs /
 select_merkle_multi_proof / merge_multi_proofs /
-split_merkle_multi_proof /
+split_merkle_multi_proof / update_merkle_multi_proof /
 MerkleMultiProofBundle /
 MerkleMultiBatchEntry /
 verify_multi_inclusion_batch / BoundMerkleMultiBatch /
@@ -274,6 +274,7 @@ __all__ = [
     "region_contains_committed",
     "select_merkle_multi_proof",
     "split_merkle_multi_proof",
+    "update_merkle_multi_proof",
     "verify_bound",
     "verify_consistency",
     "verify_consistency_batch",
@@ -10435,6 +10436,249 @@ def verify_consistency_batch(entries: Sequence[MerkleConsistencyBatchEntry]) -> 
         if not verify_consistency(entry.old_root, entry.new_root, entry.proof):
             return False
     return True
+
+
+def update_merkle_multi_proof(
+    bundle: MerkleMultiProofBundle,
+    new_root: bytes,
+    consistency: MerkleConsistencyProof,
+) -> MerkleMultiProofBundle:
+    """Carry a multi-proof envelope forward as the tree grows by appends.
+
+    Given an existing, valid :class:`MerkleMultiProofBundle` and a
+    :class:`MerkleConsistencyProof` showing the tree grew from the
+    envelope's root to ``new_root`` purely by appending leaves, return a
+    new immutable envelope of the same type that proves the *same* leaves
+    at the *same* original indices under ``new_root``. The caller supplies
+    only the old envelope, the new root and the consistency proof: no full
+    leaf set, no appended leaf contents and no external storage are
+    needed. The output keeps the original ``entries`` (index and leaf
+    bytes, never renumbered, never extended — no additional leaf is
+    disclosed), sets ``root`` to ``new_root`` and ``proof.leaf_count`` to
+    ``consistency.new_count``, and rewrites ``proof.siblings`` for the
+    grown tree shape. ``consistency.old_count`` must equal the envelope's
+    declared ``proof.leaf_count``; the declared counts fix both tree
+    shapes and the true leaf count is never inferred from a root.
+
+    The rebuilt proof follows the existing leaf/internal digest rules,
+    the odd-last-node self-duplication and the level-by-level,
+    left-to-right sibling ordering. Sibling digests are drawn from the
+    old envelope itself for every node whose subtree lies inside the old
+    prefix (a complete aligned subtree keeps its digest when the tree
+    grows), and from the consistency proof — the old-prefix subtree peaks
+    and the appended leaf digests — for every node the append changed or
+    created. For an envelope generated from one complete leaf set the
+    result is field-for-field equal to the bundle built from
+    :func:`prove_multi_inclusion` over the appended leaf set for the same
+    indices, including the exact sibling digest sequence; it carries no
+    extra sibling digest. Single-leaf old trees, odd and even old and new
+    leaf counts, growth across a power-of-two boundary, envelopes proving
+    only the old last leaf, adjacent or scattered indices and equal leaf
+    contents at distinct indices all apply. When ``old_count`` equals
+    ``new_count`` and the consistency proof holds, the result compares
+    equal by value to the input envelope, and updating twice in a row
+    equals updating the original envelope straight to the final tree.
+    The result verifies with :func:`verify_merkle_multi_proof_bundle`,
+    round-trips through :func:`encode_merkle_multi_proof_bundle` /
+    :func:`decode_merkle_multi_proof_bundle` and can be cropped, merged
+    and split with the existing entry points; repeated calls on the same
+    inputs return equal results.
+
+    All argument and nested-field types — ``bundle`` a
+    :class:`MerkleMultiProofBundle` with ``bytes`` root, a
+    :class:`MerkleMultiProof` with a non-``bool`` integer ``leaf_count``,
+    a tuple of non-``bool`` integer ``indices`` and a tuple-of-``bytes``
+    ``siblings``, and a tuple of two-item ``(index, leaf)`` entries with
+    a non-``bool`` integer index and ``bytes`` leaf; ``new_root`` a
+    ``bytes`` object; ``consistency`` a :class:`MerkleConsistencyProof`
+    with non-``bool`` integer counts and a tuple-of-``bytes`` ``nodes`` —
+    are checked across the whole input first, mirroring the type
+    constraints of :func:`encode_merkle_multi_proof_bundle` and
+    :func:`verify_consistency`, so a wrong type raises :class:`TypeError`
+    even when a semantic error is present at the same time. After the
+    type preflight, any envelope that
+    :func:`verify_merkle_multi_proof_bundle` rejects — a wrong root or
+    sibling digest length, a non-positive ``leaf_count``, misordered or
+    out-of-range indices, an entries/indices mismatch, a tampered leaf, a
+    missing or extra sibling digest — raises :class:`ValueError`, as does
+    a consistency ``old_count`` that differs from the declared
+    ``leaf_count`` or any consistency proof
+    :func:`verify_consistency` rejects — invalid counts, a wrong node
+    count, malformed digest lengths or a root mismatch. No partial result
+    is returned. Inputs are never mutated and nothing is written to the
+    file system or a database.
+    """
+    if not isinstance(bundle, MerkleMultiProofBundle):
+        raise TypeError("bundle must be a MerkleMultiProofBundle")
+    if not isinstance(bundle.root, bytes):
+        raise TypeError("root must be bytes")
+    _check_merkle_multi_bundle_proof_types(bundle.proof)
+    _check_merkle_multi_bundle_entries_types(bundle.entries)
+    _check_bytes(new_root, "new_root")
+    if not isinstance(consistency, MerkleConsistencyProof):
+        raise TypeError("consistency must be a MerkleConsistencyProof")
+    for name in ("old_count", "new_count"):
+        value = getattr(consistency, name)
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError(f"consistency {name} must be an integer")
+    if not isinstance(consistency.nodes, tuple):
+        raise TypeError("consistency nodes must be a tuple of bytes")
+    for node in consistency.nodes:
+        _check_bytes(node, "consistency node")
+
+    # The old envelope must verify as a whole under its own root before
+    # anything is carried over to the grown tree; the declared leaf_count
+    # fixes the old tree shape for the walk.
+    if not verify_multi_inclusion(
+        bundle.entries, bundle.proof, bundle.root
+    ):
+        raise ValueError("bundle proof does not verify under the root")
+
+    old_count = bundle.proof.leaf_count
+    if consistency.old_count != old_count:
+        raise ValueError(
+            "consistency old_count must equal the bundle proof leaf_count"
+        )
+    if not verify_consistency(bundle.root, new_root, consistency):
+        raise ValueError(
+            "consistency proof does not verify from the old root to new_root"
+        )
+    new_count = consistency.new_count
+
+    # Reconstruct, level by level, every node digest the old envelope
+    # makes available: the ancestors its verification walk recomputes
+    # from the proven leaves, and the external sibling digests it
+    # supplies. verify_multi_inclusion above already pins this walk to
+    # the declared shape and root; re-running it here also rejects a
+    # missing or surplus sibling explicitly instead of yielding one.
+    original_siblings = bundle.proof.siblings
+    level_recomputed: dict[int, dict[int, bytes]] = {}
+    level_supplied: dict[int, dict[int, bytes]] = {}
+    known: dict[int, bytes] = {
+        index: _leaf_digest(leaf) for index, leaf in bundle.entries
+    }
+    size = old_count
+    cursor = 0
+    level = 0
+    while size > 1:
+        level_recomputed[level] = dict(known)
+        supplied: dict[int, bytes] = {}
+        next_known: dict[int, bytes] = {}
+        for position in sorted(known):
+            sibling = position ^ 1
+            if sibling in known:
+                sibling_digest = known[sibling]
+            elif position == size - 1 and size % 2 == 1:
+                sibling_digest = known[position]  # odd last node duplicates itself
+            else:
+                if cursor >= len(original_siblings):
+                    raise ValueError("bundle proof is missing a sibling digest")
+                sibling_digest = original_siblings[cursor]
+                cursor += 1
+                supplied[sibling] = sibling_digest
+            if position % 2 == 0:
+                digest = _node_digest(known[position], sibling_digest)
+            else:
+                digest = _node_digest(sibling_digest, known[position])
+            next_known[position // 2] = digest
+        level_supplied[level] = supplied
+        known = next_known
+        size = (size + 1) // 2
+        level += 1
+    if cursor != len(original_siblings):
+        raise ValueError("bundle proof carries an extra sibling digest")
+
+    # Frontier data from the consistency proof: the complete-subtree
+    # roots of the old prefix decomposition, keyed by (height, first
+    # leaf), and the digests of the appended leaves in order.
+    old_peaks: dict[tuple[int, int], bytes] = {}
+    offset = 0
+    for peak_height, peak_digest in zip(
+        _peak_heights(old_count), consistency.nodes
+    ):
+        old_peaks[(peak_height, offset)] = peak_digest
+        offset += 1 << peak_height
+    appended = consistency.nodes[len(_peak_heights(old_count)) :]
+
+    def old_subtree_digest(level: int, position: int) -> bytes:
+        # A node whose whole subtree lies inside the old prefix keeps its
+        # old-tree digest in the grown tree; the digest comes from the
+        # old envelope's walk or, on the append boundary, from the old
+        # prefix peaks of the consistency proof.
+        digest = level_recomputed.get(level, {}).get(position)
+        if digest is None:
+            digest = level_supplied.get(level, {}).get(position)
+        if digest is None:
+            digest = old_peaks.get((level, position << level))
+        if digest is None:
+            raise ValueError("updated proof is missing a sibling digest")
+        return digest
+
+    def appended_subtree_digest(level: int, position: int) -> bytes:
+        # A node whose leaves all come from the appended suffix, computed
+        # from the appended leaf digests with the odd-last-node
+        # self-duplication of the layer-by-layer construction.
+        start = position << level
+        stop = min((position + 1) << level, new_count)
+        layer = list(appended[start - old_count : stop - old_count])
+        for _ in range(level):
+            if len(layer) % 2 == 1:
+                layer = layer + [layer[-1]]
+            layer = [
+                _node_digest(layer[offset], layer[offset + 1])
+                for offset in range(0, len(layer), 2)
+            ]
+        return layer[0]
+
+    def node_digest(level: int, position: int) -> bytes:
+        # Digest of the grown tree's node at (level, position). A node
+        # fully inside the old prefix keeps its old digest; a node fully
+        # inside the appended suffix is rebuilt from the appended leaf
+        # digests; a node straddling the boundary combines its children,
+        # duplicating the left child when the right one does not exist.
+        if ((position + 1) << level) <= old_count:
+            return old_subtree_digest(level, position)
+        start = position << level
+        if start >= old_count:
+            return appended_subtree_digest(level, position)
+        left = node_digest(level - 1, 2 * position)
+        middle = start + (1 << (level - 1))
+        if middle >= new_count:
+            return _node_digest(left, left)  # right edge duplicates itself
+        return _node_digest(left, node_digest(level - 1, 2 * position + 1))
+
+    # Collect the compact sibling tuple for the proven indices under the
+    # grown tree shape, in the existing prover order: level by level from
+    # leaf to root, left to right within a level, skipping siblings that
+    # are themselves proven and odd last nodes duplicating themselves.
+    positions = sorted(bundle.proof.indices)
+    size = new_count
+    level = 0
+    compact: list[bytes] = []
+    while size > 1:
+        known_set = set(positions)
+        for position in positions:
+            sibling = position ^ 1
+            if sibling in known_set:
+                continue  # sibling is proven too, nothing to collect
+            if position == size - 1 and size % 2 == 1:
+                continue  # odd last node duplicates itself
+            compact.append(node_digest(level, sibling))
+        positions = sorted({position // 2 for position in positions})
+        size = (size + 1) // 2
+        level += 1
+
+    proof = MerkleMultiProof(
+        leaf_count=new_count,
+        indices=tuple(sorted(bundle.proof.indices)),
+        siblings=tuple(compact),
+    )
+    updated = MerkleMultiProofBundle(
+        root=new_root, proof=proof, entries=bundle.entries
+    )
+    if not verify_multi_inclusion(bundle.entries, proof, new_root):
+        raise ValueError("updated proof does not verify under new_root")
+    return updated
 
 
 # ---------------------------------------------------------------------------

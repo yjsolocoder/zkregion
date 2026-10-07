@@ -21,6 +21,7 @@ verify_equal_value_batch /
 BoundEqualValueBatch / prove_equal_value_batch_bound /
 verify_equal_value_batch_bound /
 AffineValueProof / prove_affine_value / verify_affine_value /
+AffineValueBatchEntry / verify_affine_value_batch /
 RangeSetProof / prove_range_set /
 verify_range_set / RangeSetBatchEntry / verify_range_set_batch /
 BoundRangeSetBatch / prove_range_set_batch_bound /
@@ -131,6 +132,7 @@ from typing import Callable
 __all__ = [
     "DEFAULT_GENERATOR",
     "DEFAULT_PRIME",
+    "AffineValueBatchEntry",
     "AffineValueProof",
     "BoundConsistencyBatch",
     "BoundConsistencyChainBatch",
@@ -291,6 +293,7 @@ __all__ = [
     "split_merkle_multi_proof",
     "update_merkle_multi_proof",
     "verify_affine_value",
+    "verify_affine_value_batch",
     "verify_bound",
     "verify_consistency",
     "verify_consistency_batch",
@@ -2250,6 +2253,298 @@ def verify_affine_value(
         if pow(h, proof.s_left[i], prime) != left_right_side:
             return False
         if pow(h, proof.s_right[i], prime) != right_right_side:
+            return False
+    return True
+
+
+@dataclass(frozen=True)
+class AffineValueBatchEntry:
+    """One item of an affine-relation batch verification.
+
+    Fields are the left :class:`PedersenCommitment`, the right
+    :class:`PedersenCommitment`, the public integer coefficients ``a``
+    and ``b``, the :class:`AffineValueProof` and the ``context`` (empty
+    by default) — exactly the arguments of :func:`verify_affine_value`,
+    in the same order (``left``, ``right``, ``a``, ``b``, ``proof``,
+    ``context``). Entries compare by value and are immutable.
+    Construction never validates the fields: type and value checks
+    belong to :func:`verify_affine_value_batch`.
+    """
+
+    left: PedersenCommitment
+    right: PedersenCommitment
+    a: int
+    b: int
+    proof: AffineValueProof
+    context: bytes = b""
+
+
+def _check_affine_value_batch_entries_types(
+    entries: object,
+) -> list[AffineValueBatchEntry]:
+    """Validate the affine-value-batch ``entries`` argument types.
+
+    Mirrors the type expectations of :func:`verify_affine_value` for
+    *every* entry before any verification runs: ``entries`` must be a
+    non-``bytes`` / ``bytearray`` / ``str`` sequence of
+    :class:`AffineValueBatchEntry` objects whose ``left`` and ``right``
+    are :class:`PedersenCommitment` objects with non-``bool`` integer
+    fields, whose ``a`` and ``b`` are non-``bool`` integers, whose
+    ``proof`` is an :class:`AffineValueProof` with tuple fields of
+    non-``bool`` integers at every nesting level and whose ``context``
+    is ``bytes``. The whole batch is walked (a bad type in the last
+    entry still raises and is not hidden by an earlier invalid entry),
+    and the entries are copied into a fresh list so the inputs are
+    never mutated. An empty batch is left to the caller to reject;
+    structural and value problems are left to the batch material
+    preflight.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of AffineValueBatchEntry")
+    items: list[AffineValueBatchEntry] = []
+    for position, entry in enumerate(entries):
+        if not isinstance(entry, AffineValueBatchEntry):
+            raise TypeError(f"entries[{position}] must be an AffineValueBatchEntry")
+        left = entry.left
+        right = entry.right
+        if not isinstance(left, PedersenCommitment):
+            raise TypeError(
+                f"entries[{position}] left must be a PedersenCommitment"
+            )
+        _check_commitment_fields(left)
+        if not isinstance(right, PedersenCommitment):
+            raise TypeError(
+                f"entries[{position}] right must be a PedersenCommitment"
+            )
+        _check_commitment_fields(right)
+        _check_int(entry.a, f"entries[{position}] a")
+        _check_int(entry.b, f"entries[{position}] b")
+        _check_affine_value_proof_types(
+            entry.proof, f"entries[{position}] proof"
+        )
+        _check_bytes(entry.context, f"entries[{position}] context")
+        items.append(entry)
+    return items
+
+
+def _affine_value_batch_material(
+    entry: AffineValueBatchEntry,
+) -> tuple[tuple[int, int, int], list[tuple[int, int, int, int, int, int, int]]] | None:
+    """Validate one batch entry structurally and return its check material.
+
+    This mirrors :func:`verify_affine_value` up to (but excluding) the
+    per-branch Schnorr equations: commitment legality, shared group
+    parameters, the 1..256 candidate set, tuple lengths, the
+    ``t_left`` / ``t_right`` / ``e`` / ``s_left`` / ``s_right`` bounds
+    and the challenge-sum binding are all checked against the
+    byte-for-byte :func:`_affine_value_challenge` transcript — which
+    binds the actual coefficients ``a`` and ``b``, so a proof cannot be
+    reused under different coefficients even when the candidate set is
+    unchanged — and the per-branch offsets ``D_side_i`` are
+    recomputed. The returned tuple is ``(group_key, branches)`` with
+    ``group_key = (prime, generator, h)`` and one ``(t_left_i,
+    t_right_i, e_i, s_left_i, s_right_i, offset_left_i,
+    offset_right_i)`` per ascending candidate point; any structural,
+    binding or invertibility failure returns ``None``.
+    """
+    left = entry.left
+    right = entry.right
+    proof = entry.proof
+    a = entry.a
+    b = entry.b
+    if not _equal_value_commitment_legal(left):
+        return None
+    if not _equal_value_commitment_legal(right):
+        return None
+    if (left.prime, left.generator, left.h) != (
+        right.prime,
+        right.generator,
+        right.h,
+    ):
+        return None
+    prime = left.prime
+    generator = left.generator
+    h = left.h
+    lower, upper = _affine_value_candidates(left, right, a, b)
+    size = upper - lower + 1
+    if not 1 <= size <= _MAX_RANGE_VALUES:
+        return None
+    if not (
+        len(proof.t_left)
+        == len(proof.t_right)
+        == len(proof.e)
+        == len(proof.s_left)
+        == len(proof.s_right)
+        == size
+    ):
+        return None
+    if any(not 1 <= t_i < prime for t_i in proof.t_left):
+        return None
+    if any(not 1 <= t_i < prime for t_i in proof.t_right):
+        return None
+    if any(not 0 <= e_i < prime for e_i in proof.e):
+        return None
+    if any(s_i < 0 for s_i in proof.s_left):
+        return None
+    if any(s_i < 0 for s_i in proof.s_right):
+        return None
+    challenge = _affine_value_challenge(
+        left, right, a, b, entry.context, size, proof.t_left, proof.t_right
+    )
+    if sum(proof.e) % prime != challenge:
+        return None
+    try:
+        offsets_left = [
+            left.element * pow(generator, left.lower - (lower + i), prime) % prime
+            for i in range(size)
+        ]
+        offsets_right = [
+            right.element
+            * pow(generator, right.lower - (a * (lower + i) + b), prime)
+            % prime
+            for i in range(size)
+        ]
+    except ValueError:
+        return None  # generator not invertible modulo prime
+    branches = [
+        (
+            proof.t_left[i],
+            proof.t_right[i],
+            proof.e[i],
+            proof.s_left[i],
+            proof.s_right[i],
+            offsets_left[i],
+            offsets_right[i],
+        )
+        for i in range(size)
+    ]
+    return (prime, generator, h), branches
+
+
+def verify_affine_value_batch(
+    entries: Sequence[AffineValueBatchEntry],
+    *,
+    randbelow: Callable[[int], int] = secrets.randbelow,
+) -> bool:
+    """Verify a batch of :class:`AffineValueProof` objects with random linear checks.
+
+    ``entries`` must be a non-empty, non-string sequence of
+    :class:`AffineValueBatchEntry`; lists, tuples, duplicate entries
+    and entries over different ``(prime, generator, h)`` groups are all
+    accepted, while the two commitments of a single entry must still
+    share one group. An empty batch returns ``False``. Every entry is
+    exactly the input tuple of :func:`prove_affine_value` /
+    :func:`verify_affine_value`: the left/right order, the public
+    coefficients ``a`` and ``b``, all twelve commitment public fields
+    and the ``context`` stay bound by the unchanged transcript, and
+    the candidate set — the integers of the left declared range whose
+    affine image ``a * x + b`` lies in the right declared range, the
+    relation interpreted over the actual integers — stays limited to
+    1..256 ascending integers. Positive, negative and zero
+    coefficients, negative bounds, ranges crossing zero and
+    single-point candidate sets are all supported; changing ``a`` or
+    ``b`` fails verification even when the candidate set is unchanged.
+    Entries need not share a context, and entries the caller forgot to
+    submit cannot be detected: the caller guarantees the batch is
+    complete.
+
+    The nested types of the *whole* batch are preflighted first, so a
+    wrong type anywhere — including the last entry, a ``bool`` posed as
+    an integer, a non-tuple proof field, a non-bytes context, a
+    non-callable ``randbelow`` or a non-``Sequence`` (including ``str``
+    / ``bytes`` / ``bytearray``) input — raises :class:`TypeError`;
+    only then are illegal commitments, mismatched in-entry group
+    parameters, empty or oversized candidate sets, wrong-length or
+    out-of-range proofs, challenge binding mismatches and missing
+    modular inverses rejected with ``False``. Neither preflight phase
+    draws randomness.
+
+    Every left/right Schnorr equation then draws its own coefficient
+    ``c = r + 1`` with ``r = randbelow(prime - 1)``, in entry order,
+    then ascending candidate order, then left before right — duplicate
+    entries draw independently — so the two sides of a branch never
+    share a weight and one side's error cannot cancel the other's.
+    Equations sharing the same ``(prime, generator, h)`` group are
+    combined per side into a single aggregate
+
+    ``h**Σ(c*s_side) == Π(t_side**c * D_side_i**(c*e_i)) (mod prime)``
+
+    exactly as in :func:`verify_equal_value_batch`; per-entry /
+    per-branch results are never AND-ed together. A draw that is a
+    non-integer or a ``bool`` raises :class:`TypeError`, one outside
+    the requested half-open interval raises :class:`ValueError`, and
+    exceptions raised by the source itself propagate unchanged. The
+    result is ``True`` only if every aggregate equation of every group
+    holds. Verification never sees the secret values or the blindings.
+    Inputs are never mutated.
+    """
+    if isinstance(entries, (bytes, bytearray, str)) or not isinstance(entries, Sequence):
+        raise TypeError("entries must be a sequence of AffineValueBatchEntry")
+    if not callable(randbelow):
+        raise TypeError("randbelow must be callable")
+    items = _check_affine_value_batch_entries_types(entries)
+    if not items:
+        return False
+
+    materials: list[
+        tuple[tuple[int, int, int], list[tuple[int, int, int, int, int, int, int]]]
+    ] = []
+    for entry in items:
+        material = _affine_value_batch_material(entry)
+        if material is None:
+            return False
+        materials.append(material)
+
+    # group -> per-side {"sum": Σ(c*s), "product": Π(t**c * D**(c*e))}
+    groups: dict[
+        tuple[int, int, int], tuple[dict[str, int], dict[str, int]]
+    ] = {}
+
+    def add_equation(
+        state: dict[str, int],
+        prime: int,
+        t_i: int,
+        e_i: int,
+        s_i: int,
+        offset_i: int,
+    ) -> None:
+        r = randbelow(prime - 1)
+        if not isinstance(r, int) or isinstance(r, bool):
+            raise TypeError("coefficient source randbelow must return an integer")
+        if not 0 <= r < prime - 1:
+            raise ValueError("coefficient source must satisfy 0 <= r < prime - 1")
+        coefficient = r + 1
+        state["sum"] += coefficient * s_i
+        state["product"] = (
+            state["product"]
+            * pow(t_i, coefficient, prime)
+            % prime
+            * pow(offset_i, coefficient * e_i, prime)
+            % prime
+        )
+
+    for group_key, branches in materials:
+        prime = group_key[0]
+        left_state, right_state = groups.setdefault(
+            group_key,
+            ({"sum": 0, "product": 1}, {"sum": 0, "product": 1}),
+        )
+        for (
+            t_left_i,
+            t_right_i,
+            e_i,
+            s_left_i,
+            s_right_i,
+            offset_left_i,
+            offset_right_i,
+        ) in branches:
+            add_equation(left_state, prime, t_left_i, e_i, s_left_i, offset_left_i)
+            add_equation(right_state, prime, t_right_i, e_i, s_right_i, offset_right_i)
+
+    for (prime, _generator, h), (left_state, right_state) in groups.items():
+        if pow(h, left_state["sum"], prime) != left_state["product"]:
+            return False
+        if pow(h, right_state["sum"], prime) != right_state["product"]:
             return False
     return True
 

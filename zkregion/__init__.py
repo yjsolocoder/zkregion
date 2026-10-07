@@ -133,6 +133,7 @@ __all__ = [
     "BoundConsistencyChainReplayGuard",
     "BoundConsistencyReplayGuard",
     "BoundConvexPolygonBatch",
+    "BoundConvexPolygonBundleBatch",
     "BoundConvexPolygonReplayGuard",
     "BoundEqualValueBatch",
     "BoundIntervalRangeBatch",
@@ -251,6 +252,7 @@ __all__ = [
     "prove_consistency_chain_batch_bound",
     "prove_convex_polygon",
     "prove_convex_polygon_batch_bound",
+    "prove_convex_polygon_bundle_batch_bound",
     "prove_convex_polygon_interval",
     "prove_equal_value",
     "prove_equal_value_batch_bound",
@@ -291,6 +293,8 @@ __all__ = [
     "verify_convex_polygon",
     "verify_convex_polygon_batch",
     "verify_convex_polygon_batch_bound",
+    "verify_convex_polygon_bundle_batch",
+    "verify_convex_polygon_bundle_batch_bound",
     "verify_convex_polygon_interval",
     "verify_convex_polygon_proof_bundle",
     "verify_equal_value",
@@ -8236,6 +8240,303 @@ def verify_convex_polygon_proof_bundle(bundle: ConvexPolygonProofBundle) -> bool
     raise TypeError(
         "proof must be a ConvexPolygonRegionProof or ConvexPolygonIntervalProof"
     )
+
+
+# ---------------------------------------------------------------------------
+# Batch verification and complete Merkle binding of convex polygon proof
+# bundle envelopes
+#
+# verify_convex_polygon_bundle_batch applies the single-envelope semantics of
+# verify_convex_polygon_proof_bundle to a whole list or tuple of
+# ConvexPolygonProofBundle objects — the two proof variants may mix, and
+# polygons, group parameters and contexts may differ per envelope. The bound
+# variant commits every envelope to a Merkle tree: each leaf is the domain
+# separator b"zkregion/cpbb/v1" concatenated with the envelope's canonical
+# encode_convex_polygon_proof_bundle bytes, and a BoundConvexPolygonBundleBatch
+# carries the entries, the leaf count and a complete MerkleMultiProof covering
+# every index from zero to the batch length minus one. Neither entry point
+# sees coordinates or blinding factors, and neither draws randomness.
+
+
+def _check_convex_polygon_bundle_entry_types(bundle: object, position: int) -> None:
+    """Validate every nested type of one batch :class:`ConvexPolygonProofBundle`.
+
+    Mirrors the dispatch of :func:`verify_convex_polygon_proof_bundle`:
+    the envelope must be a :class:`ConvexPolygonProofBundle` and every
+    nested field — both commitments, the polygon vertices, the proof
+    (either variant, at every nesting level) and the context — must carry
+    the types the corresponding single-envelope verifier preflights,
+    including the ``bool``-as-integer, non-tuple proof field and
+    non-``bytes`` context rules.
+    """
+    label = f"entries[{position}]"
+    if not isinstance(bundle, ConvexPolygonProofBundle):
+        raise TypeError(f"{label} must be a ConvexPolygonProofBundle")
+    proof = bundle.proof
+    if isinstance(proof, ConvexPolygonRegionProof):
+        _check_convex_polygon_input_types(
+            bundle.x_commitment,
+            bundle.y_commitment,
+            bundle.polygon,
+            proof,
+            bundle.context,
+            label=label,
+        )
+        return
+    if isinstance(proof, ConvexPolygonIntervalProof):
+        _check_convex_polygon_interval_input_types(
+            bundle.x_commitment,
+            bundle.y_commitment,
+            bundle.polygon,
+            proof,
+            bundle.context,
+            label=label,
+        )
+        return
+    raise TypeError(
+        f"{label} proof must be a ConvexPolygonRegionProof or "
+        "ConvexPolygonIntervalProof"
+    )
+
+
+def _check_convex_polygon_bundle_batch_types(
+    entries: object,
+) -> list[ConvexPolygonProofBundle]:
+    """Validate the bundle-batch ``entries`` argument types.
+
+    ``entries`` must be a ``list`` or ``tuple`` of
+    :class:`ConvexPolygonProofBundle` objects; any other container (a
+    generator, a bare sequence of another kind, ``bytes`` or ``str``)
+    raises :class:`TypeError`. The *whole* batch is walked before any
+    verification runs, so a wrong nested type in the last envelope —
+    including a ``bool`` masquerading as an integer, a non-tuple proof
+    field or a non-``bytes`` context — raises :class:`TypeError` even
+    when an earlier envelope is already doomed to fail verification.
+    The entries are copied into a fresh list so the inputs are never
+    mutated. An empty batch is left to the callers to reject.
+    """
+    if not isinstance(entries, (list, tuple)):
+        raise TypeError(
+            "entries must be a list or tuple of ConvexPolygonProofBundle"
+        )
+    items: list[ConvexPolygonProofBundle] = []
+    for position, entry in enumerate(entries):
+        _check_convex_polygon_bundle_entry_types(entry, position)
+        items.append(entry)
+    return items
+
+
+def verify_convex_polygon_bundle_batch(
+    entries: Sequence[ConvexPolygonProofBundle],
+) -> bool:
+    """Verify a batch of :class:`ConvexPolygonProofBundle` envelopes.
+
+    ``entries`` must be a non-empty ``list`` or ``tuple`` of
+    :class:`ConvexPolygonProofBundle`; an empty batch returns ``False``
+    and the two proof variants (:class:`ConvexPolygonRegionProof` and
+    :class:`ConvexPolygonIntervalProof`) may mix freely, with different
+    polygons, group parameters and contexts per envelope, in any order
+    and with duplicates allowed. The nested types of the *whole* batch
+    are preflighted first, so a wrong type in any envelope — including
+    the last one, a ``bool`` passed as an integer, a non-tuple proof
+    field or a non-``bytes`` context — raises :class:`TypeError` rather
+    than becoming a batch rejection, and a non-``list`` / non-``tuple``
+    container raises :class:`TypeError` as well.
+
+    Every envelope is then checked with exactly the semantics of
+    :func:`verify_convex_polygon_proof_bundle`: the polygon is taken
+    through its canonical vertex order (a forged object with well-typed
+    but geometrically invalid vertices returns ``False``), boundary
+    points, non-power-of-two interval widths and normalization-equivalent
+    polygons are supported exactly as the matching single-proof entry
+    points, and the verdict is the conjunction of the per-envelope
+    verdicts — one invalid envelope (illegal geometry, mismatched
+    commitments or context, a tampered sub-proof) fails the whole batch
+    with ``False``. Verification needs only the envelopes — never
+    coordinates or blinding factors — and draws no randomness. Inputs
+    are never mutated and nothing is written to disk.
+    """
+    items = _check_convex_polygon_bundle_batch_types(entries)
+    if not items:
+        return False
+    for bundle in items:
+        if not verify_convex_polygon_proof_bundle(bundle):
+            return False
+    return True
+
+
+_CONVEX_POLYGON_BUNDLE_BOUND_DOMAIN = b"zkregion/cpbb/v1"
+
+
+@dataclass(frozen=True)
+class BoundConvexPolygonBundleBatch:
+    """A complete convex polygon bundle batch bound to a Merkle multi-proof.
+
+    Fields, in order: ``entries`` — a tuple of
+    :class:`ConvexPolygonProofBundle`; ``leaf_count`` — a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``; ``proof`` — the :class:`MerkleMultiProof` whose
+    indices cover ``0 .. leaf_count - 1`` without gaps or duplicates.
+    The entries keep their construction order and duplicates, exactly as
+    the bare bundle batch allows any order and repeated envelopes. All
+    three are positional construction arguments; batches compare by
+    value and are immutable, and construction performs no validation.
+    """
+
+    entries: tuple[ConvexPolygonProofBundle, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _bound_convex_polygon_bundle_leaf(bundle: ConvexPolygonProofBundle) -> bytes:
+    """Build the Merkle leaf committed for one :class:`ConvexPolygonProofBundle`.
+
+    The leaf is the direct concatenation of the domain separator
+    ``b"zkregion/cpbb/v1"`` and the envelope's canonical
+    :func:`encode_convex_polygon_proof_bundle` bytes — no extra framing.
+    """
+    return _CONVEX_POLYGON_BUNDLE_BOUND_DOMAIN + encode_convex_polygon_proof_bundle(
+        bundle
+    )
+
+
+def verify_convex_polygon_bundle_batch_bound(
+    batch: BoundConvexPolygonBundleBatch,
+    root: bytes,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundConvexPolygonBundleBatch`.
+
+    The outer Merkle root is checked first: every envelope is encoded to
+    its leaf exactly as specified by
+    :func:`_bound_convex_polygon_bundle_leaf` (the domain separator
+    followed by the canonical envelope bytes) and the whole batch is
+    checked against ``root`` with :func:`verify_multi_inclusion`.
+    ``leaf_count`` must be a positive, non-``bool`` integer equal to both
+    ``len(entries)`` and ``proof.leaf_count``, and ``proof.indices``
+    must cover ``0 .. leaf_count - 1`` with no gaps, duplicates or
+    reordering; an empty batch, a negative or inconsistent count, a
+    missing, duplicated or reordered index, extra sibling digests or a
+    wrong root returns ``False``. Only after the root checks does every
+    envelope go through :func:`verify_convex_polygon_proof_bundle` under
+    its unchanged semantics, so a deleted, inserted, reordered or
+    replaced envelope — or any envelope whose own verification fails —
+    returns ``False`` under the original root.
+
+    Type errors — a batch that is not a
+    :class:`BoundConvexPolygonBundleBatch`, non-tuple entries,
+    non-:class:`ConvexPolygonProofBundle` items, a non-integer or
+    ``bool`` ``leaf_count``, a wrong proof object, non-tuple proof
+    ``indices`` / ``siblings`` fields, malformed nested field types at
+    any nesting level (including a ``bool`` masquerading as an integer
+    or a non-``bytes`` context), or a non-``bytes`` root — raise
+    :class:`TypeError`. Verification draws no randomness and never sees
+    coordinates or blinding factors. Inputs are never mutated.
+    """
+    if not isinstance(batch, BoundConvexPolygonBundleBatch):
+        raise TypeError("batch must be a BoundConvexPolygonBundleBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError(
+            "batch entries must be a tuple of ConvexPolygonProofBundle"
+        )
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        _check_convex_polygon_bundle_entry_types(entry, position)
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    # A forged polygon or commitment whose well-typed fields fail the
+    # envelope encoding rules is a semantic failure (False), never an
+    # exception.
+    try:
+        leaves = [_bound_convex_polygon_bundle_leaf(entry) for entry in entries]
+    except ValueError:
+        return False
+
+    # 1) the outer Merkle root commits to every envelope leaf, then
+    # 2) the unchanged per-envelope bundle verification checks the proofs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    return verify_convex_polygon_bundle_batch(entries)
+
+
+def prove_convex_polygon_bundle_batch_bound(
+    entries: Sequence[ConvexPolygonProofBundle],
+) -> tuple[BoundConvexPolygonBundleBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundConvexPolygonBundleBatch`.
+
+    ``entries`` follows the same ``list``-or-``tuple``-of-
+    :class:`ConvexPolygonProofBundle` rules as
+    :func:`verify_convex_polygon_bundle_batch` and must be non-empty;
+    every envelope is copied into a tuple in its original order with
+    duplicates preserved, later insertions or deletions on the caller's
+    container cannot affect the result, and the inputs are never
+    mutated. Each envelope is encoded to its leaf byte for byte with
+    :func:`_bound_convex_polygon_bundle_leaf` — the domain separator
+    ``b"zkregion/cpbb/v1"`` directly followed by the canonical
+    :func:`encode_convex_polygon_proof_bundle` bytes — and the leaf
+    digests and internal nodes follow the existing SHA-256 Merkle rules.
+    With ``n = len(entries)``, the complete multi-inclusion proof is
+    built with :func:`prove_multi_inclusion` over the encoded leaves and
+    the full indices ``tuple(range(n))`` — so its ``indices`` cover
+    every leaf from zero to ``n - 1`` and its ``siblings`` are empty —
+    and the returned batch carries ``leaf_count = n`` alongside that
+    proof. The second return value is the outer tree's
+    :func:`merkle_root` of the encoded leaves, which is exactly the root
+    the batch verifies under:
+    ``verify_convex_polygon_bundle_batch_bound(batch, root)`` returns
+    ``True``. Single-item, odd- and even-sized batches, mixed proof
+    variants and duplicate envelopes are all deterministic, and the same
+    ordered inputs rebuild an equal batch object and an identical root.
+
+    A type preflight over the whole batch — every envelope and every
+    nested field, including ``bool`` fields and later entries — raises
+    :class:`TypeError` before anything is built; an empty batch, a batch
+    length outside uint64, or any envelope failing
+    :func:`verify_convex_polygon_proof_bundle` (illegal geometry, a
+    commitment or context mismatch, a tampered sub-proof) raises
+    :class:`ValueError`. Construction draws no randomness and never
+    writes to disk.
+    """
+    items = _check_convex_polygon_bundle_batch_types(entries)
+    if not items:
+        raise ValueError("entries must not be empty")
+    if len(items) > _UINT64_MAX:
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    if not verify_convex_polygon_bundle_batch(items):
+        raise ValueError("entries must pass verify_convex_polygon_proof_bundle")
+    ordered = tuple(items)
+    leaves = [_bound_convex_polygon_bundle_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundConvexPolygonBundleBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
 
 
 # ---------------------------------------------------------------------------

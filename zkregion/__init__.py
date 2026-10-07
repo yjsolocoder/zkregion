@@ -43,6 +43,8 @@ quantize_coordinate / quantize_region /
 RegionWideProof / prove_region_wide / verify_region_wide /
 RegionProofBundle / encode_region_proof_bundle /
 decode_region_proof_bundle / verify_region_proof_bundle /
+BoundRegionBundleBatch / prove_region_bundle_batch_bound /
+verify_region_bundle_batch_bound /
 RegionWideBatchEntry / verify_region_wide_batch /
 BoundRegionWideBatch / prove_region_wide_batch_bound /
 verify_region_wide_batch_bound /
@@ -147,6 +149,7 @@ __all__ = [
     "BoundPedersenOpeningReplayGuard",
     "BoundRangeBatch",
     "BoundRegionBatch",
+    "BoundRegionBundleBatch",
     "BoundRegionContainsBatch",
     "BoundRegionContainsReplayGuard",
     "BoundRegionReplayGuard",
@@ -272,6 +275,7 @@ __all__ = [
     "prove_range_wide_batch_bound",
     "prove_region",
     "prove_region_batch_bound",
+    "prove_region_bundle_batch_bound",
     "prove_region_contains_bound",
     "prove_region_interval",
     "prove_region_wide",
@@ -328,6 +332,7 @@ __all__ = [
     "verify_region",
     "verify_region_batch",
     "verify_region_bound",
+    "verify_region_bundle_batch_bound",
     "verify_region_contains_batch",
     "verify_region_contains_bound",
     "verify_region_interval",
@@ -7781,6 +7786,265 @@ def verify_region_proof_bundle(bundle: RegionProofBundle) -> bool:
     raise TypeError(
         "proof must be a RegionProof, RegionWideProof or RegionIntervalProof"
     )
+
+
+# ---------------------------------------------------------------------------
+# Merkle-bound complete batches of region proof envelopes
+#
+# prove_region_bundle_batch_bound commits a whole ordered batch of
+# RegionProofBundle envelopes — RegionProof, RegionWideProof and
+# RegionIntervalProof envelopes may mix freely, each with its own legal
+# group parameters — into one Merkle root, so publishing only the public
+# envelopes and the root fixes the entire batch without ever revealing
+# coordinates or blinding factors. Each leaf is the domain separator
+# b"zkregion/rbb/v1" concatenated with the envelope's canonical
+# encode_region_proof_bundle bytes, and a BoundRegionBundleBatch carries
+# the entries, the leaf count and a complete MerkleMultiProof covering
+# every index from zero to the batch length minus one. Neither entry point
+# sees coordinates or blinding factors, and neither draws randomness.
+
+_REGION_BUNDLE_BOUND_DOMAIN = b"zkregion/rbb/v1"
+
+
+@dataclass(frozen=True)
+class BoundRegionBundleBatch:
+    """A complete region proof bundle batch bound to a Merkle multi-proof.
+
+    Fields, in order: ``entries`` — a tuple of :class:`RegionProofBundle`;
+    ``leaf_count`` — a positive, non-``bool`` integer equal to both
+    ``len(entries)`` and ``proof.leaf_count``; ``proof`` — the
+    :class:`MerkleMultiProof` whose indices cover ``0 .. leaf_count - 1``
+    without gaps or duplicates. The entries keep their construction order
+    and duplicates, exactly as the bare bundle batch allows any order and
+    repeated envelopes. All three are positional construction arguments;
+    batches compare by value and are immutable, and construction performs
+    no validation.
+    """
+
+    entries: tuple[RegionProofBundle, ...]
+    leaf_count: int
+    proof: MerkleMultiProof
+
+
+def _check_region_bundle_entry_types(bundle: object, position: int) -> None:
+    """Validate every nested type of one batch :class:`RegionProofBundle`.
+
+    Mirrors the preflight of :func:`verify_region_proof_bundle`, one level
+    deeper into the proof: the envelope must be a
+    :class:`RegionProofBundle`, both commitments must carry non-``bool``
+    integer fields, the region bounds must be non-``bool`` integers, the
+    context must be ``bytes`` and the proof must be one of the three
+    region-proof types with well-typed fields at every nesting level
+    (including the ``bool``-as-integer and non-tuple proof field rules).
+    Only types are established here — illegal interval widths, illegal
+    declared ranges and every other semantic failure are decided later.
+    """
+    label = f"entries[{position}]"
+    if not isinstance(bundle, RegionProofBundle):
+        raise TypeError(f"{label} must be a RegionProofBundle")
+    _check_commitment_types(bundle.x_commitment, f"{label} x_commitment")
+    _check_commitment_types(bundle.y_commitment, f"{label} y_commitment")
+    _check_region_types(bundle.region, enforce_order=False)
+    if not isinstance(bundle.context, bytes):
+        raise TypeError(f"{label} context must be bytes")
+    proof = bundle.proof
+    if isinstance(proof, RegionProof):
+        _check_range_proof_types(proof.x_proof, f"{label} proof x_proof")
+        _check_range_proof_types(proof.y_proof, f"{label} proof y_proof")
+        return
+    if isinstance(proof, RegionWideProof):
+        _check_bundle_wide_range_proof(proof.x_proof, f"{label} proof x_proof")
+        _check_bundle_wide_range_proof(proof.y_proof, f"{label} proof y_proof")
+        return
+    if isinstance(proof, RegionIntervalProof):
+        _check_interval_range_proof_types(proof.x_proof, f"{label} proof x_proof")
+        _check_interval_range_proof_types(proof.y_proof, f"{label} proof y_proof")
+        return
+    raise TypeError(
+        f"{label} proof must be a RegionProof, RegionWideProof or "
+        "RegionIntervalProof"
+    )
+
+
+def _check_region_bundle_batch_types(
+    entries: object,
+) -> list[RegionProofBundle]:
+    """Validate the bundle-batch ``entries`` argument types.
+
+    ``entries`` must be a ``list`` or ``tuple`` of
+    :class:`RegionProofBundle` objects; any other container (a generator,
+    a bare sequence of another kind, ``bytes`` or ``str``) raises
+    :class:`TypeError`. The *whole* batch is walked before any
+    verification runs, so a wrong nested type in the last envelope —
+    including a ``bool`` masquerading as an integer, a non-tuple proof
+    field or a non-``bytes`` context — raises :class:`TypeError` even
+    when an earlier envelope is already doomed to fail verification.
+    The entries are copied into a fresh list so the inputs are never
+    mutated. An empty batch is left to the callers to reject.
+    """
+    if not isinstance(entries, (list, tuple)):
+        raise TypeError("entries must be a list or tuple of RegionProofBundle")
+    items: list[RegionProofBundle] = []
+    for position, entry in enumerate(entries):
+        _check_region_bundle_entry_types(entry, position)
+        items.append(entry)
+    return items
+
+
+def _bound_region_bundle_leaf(bundle: RegionProofBundle) -> bytes:
+    """Build the Merkle leaf committed for one :class:`RegionProofBundle`.
+
+    The leaf is the direct concatenation of the domain separator
+    ``b"zkregion/rbb/v1"`` and the envelope's canonical
+    :func:`encode_region_proof_bundle` bytes — no extra framing.
+    """
+    return _REGION_BUNDLE_BOUND_DOMAIN + encode_region_proof_bundle(bundle)
+
+
+def verify_region_bundle_batch_bound(
+    batch: BoundRegionBundleBatch,
+    root: bytes,
+) -> bool:
+    """Verify a Merkle-committed complete :class:`BoundRegionBundleBatch`.
+
+    The outer Merkle root is checked first: every envelope is encoded to
+    its leaf exactly as specified by :func:`_bound_region_bundle_leaf`
+    (the domain separator followed by the canonical envelope bytes) and
+    the whole batch is checked against ``root`` with
+    :func:`verify_multi_inclusion`. ``leaf_count`` must be a positive,
+    non-``bool`` integer equal to both ``len(entries)`` and
+    ``proof.leaf_count``, and ``proof.indices`` must cover
+    ``0 .. leaf_count - 1`` with no gaps, duplicates or reordering; an
+    empty batch, a negative or inconsistent count, a missing, duplicated
+    or reordered index, extra sibling digests, a root that is not 32
+    bytes or a wrong root returns ``False``. Only after the root checks
+    does every envelope go through :func:`verify_region_proof_bundle`
+    under its unchanged semantics, so a deleted, inserted, reordered or
+    replaced envelope — or any envelope whose own verification fails —
+    returns ``False`` under the original root. A proof that discloses
+    only some entries is never accepted: the coverage must be complete.
+
+    Type errors — a batch that is not a :class:`BoundRegionBundleBatch`,
+    non-tuple entries, non-:class:`RegionProofBundle` items, a
+    non-integer or ``bool`` ``leaf_count``, a wrong proof object,
+    non-tuple proof ``indices`` / ``siblings`` fields, malformed nested
+    field types at any nesting level (including a ``bool`` masquerading
+    as an integer or a non-``bytes`` context), or a non-``bytes`` root —
+    raise :class:`TypeError`, and the whole batch is walked before any
+    semantic check so a late envelope's wrong type still raises.
+    Verification draws no randomness and never sees coordinates or
+    blinding factors. Inputs are never mutated.
+    """
+    if not isinstance(batch, BoundRegionBundleBatch):
+        raise TypeError("batch must be a BoundRegionBundleBatch")
+    _check_bytes(root, "root")
+    entries = batch.entries
+    if not isinstance(entries, tuple):
+        raise TypeError("batch entries must be a tuple of RegionProofBundle")
+    leaf_count = batch.leaf_count
+    if not isinstance(leaf_count, int) or isinstance(leaf_count, bool):
+        raise TypeError("batch leaf_count must be an integer")
+    proof = batch.proof
+    if not isinstance(proof, MerkleMultiProof):
+        raise TypeError("batch proof must be a MerkleMultiProof")
+    if not isinstance(proof.leaf_count, int) or isinstance(proof.leaf_count, bool):
+        raise TypeError("proof leaf_count must be an integer")
+    if not isinstance(proof.indices, tuple):
+        raise TypeError("proof indices must be a tuple of integers")
+    for index in proof.indices:
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError("proof indices must be a tuple of integers")
+    if not isinstance(proof.siblings, tuple):
+        raise TypeError("proof siblings must be a tuple of bytes")
+    for sibling in proof.siblings:
+        _check_bytes(sibling, "proof sibling")
+    for position, entry in enumerate(entries):
+        _check_region_bundle_entry_types(entry, position)
+
+    if leaf_count < 1:
+        return False
+    if leaf_count != len(entries) or leaf_count != proof.leaf_count:
+        return False
+    if proof.indices != tuple(range(leaf_count)):
+        return False  # empty coverage, gaps, duplicates or reordering
+
+    # A forged region or proof whose well-typed fields fail the envelope
+    # encoding rules is a semantic failure (False), never an exception.
+    try:
+        leaves = [_bound_region_bundle_leaf(entry) for entry in entries]
+    except ValueError:
+        return False
+
+    # 1) the outer Merkle root commits to every envelope leaf, then
+    # 2) the unchanged per-envelope bundle verification checks the proofs
+    if not verify_multi_inclusion(list(enumerate(leaves)), proof, root):
+        return False
+    for bundle in entries:
+        if not verify_region_proof_bundle(bundle):
+            return False
+    return True
+
+
+def prove_region_bundle_batch_bound(
+    entries: Sequence[RegionProofBundle],
+) -> tuple[BoundRegionBundleBatch, bytes]:
+    """Build a complete, Merkle-committed :class:`BoundRegionBundleBatch`.
+
+    ``entries`` must be a non-empty ``list`` or ``tuple`` of
+    :class:`RegionProofBundle`; the three proof types
+    (:class:`RegionProof`, :class:`RegionWideProof` and
+    :class:`RegionIntervalProof`) may mix freely, with different regions,
+    contexts and legal group parameters per envelope, in any order and
+    with duplicates preserved. Every envelope is copied into a tuple in
+    its original order, so later insertions, deletions or replacements on
+    the caller's container cannot affect the result, and the inputs are
+    never mutated. Each envelope is encoded to its leaf byte for byte
+    with :func:`_bound_region_bundle_leaf` — the domain separator
+    ``b"zkregion/rbb/v1"`` directly followed by the canonical
+    :func:`encode_region_proof_bundle` bytes — and the leaf digests and
+    internal nodes follow the existing SHA-256 Merkle rules, so the
+    returned root is exactly ``merkle_root`` over those leaves. With
+    ``n = len(entries)``, the complete multi-inclusion proof is built
+    with :func:`prove_multi_inclusion` over the encoded leaves and the
+    full indices ``tuple(range(n))`` — so its ``indices`` cover every
+    leaf from zero to ``n - 1`` and its ``siblings`` are empty — and the
+    returned batch carries ``leaf_count = n`` alongside that proof.
+    Rebuilding from the same ordered inputs yields an equal batch object
+    and the same root, for a single envelope and for odd and even batch
+    sizes alike, and
+    ``verify_region_bundle_batch_bound(batch, root)`` returns ``True``.
+
+    The nested types of the *whole* batch are preflighted first, so a
+    wrong type in any envelope — including the last one, a ``bool``
+    passed as an integer, a non-tuple proof field or a non-``bytes``
+    context — raises :class:`TypeError` rather than becoming a
+    :class:`ValueError`, and a non-``list`` / non-``tuple`` container
+    raises :class:`TypeError` as well. With types established, an empty
+    batch, a batch length outside the unsigned 64-bit range, an envelope
+    whose proof shape cannot be encoded or whose own verification fails
+    raises :class:`ValueError`. Construction draws no randomness, never
+    sees coordinates or blinding factors and never writes to disk.
+    """
+    items = _check_region_bundle_batch_types(entries)
+    if not items:
+        raise ValueError("entries must not be empty")
+    if len(items) > _UINT64_MAX:
+        raise ValueError("batch length must be an unsigned 64-bit integer")
+    for bundle in items:
+        if not verify_region_proof_bundle(bundle):
+            raise ValueError(
+                "every entry must pass verify_region_proof_bundle"
+            )
+    ordered = tuple(items)
+    leaves = [_bound_region_bundle_leaf(item) for item in ordered]
+    root = merkle_root(leaves)
+    proof = prove_multi_inclusion(leaves, tuple(range(len(ordered))))
+    batch = BoundRegionBundleBatch(
+        entries=ordered,
+        leaf_count=len(ordered),
+        proof=proof,
+    )
+    return batch, root
 
 
 # ---------------------------------------------------------------------------

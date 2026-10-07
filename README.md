@@ -395,6 +395,17 @@ assert verify_affine_value(affine_left, affine_right, 2, 3, affine_proof, contex
 assert not verify_affine_value(affine_left, affine_right, 3, 3, affine_proof, context=b"session-1")
 assert not verify_affine_value(affine_left, affine_right, 2, 3, affine_proof, context=b"other")
 
+# 仿射关系证明的聚合批量验证：一次提交多组左右承诺、公开系数 a/b 与已有证明，
+# 无需秘密值或盲因子（按 (prime, generator, h) 分组，左右等式各取独立随机权重做线性组合）
+from zkregion import AffineValueBatchEntry, verify_affine_value_batch
+
+affine_batch = [
+    AffineValueBatchEntry(affine_left, affine_right, 2, 3, affine_proof, b"session-1"),
+    AffineValueBatchEntry(affine_left, affine_right, 2, 3, affine_proof, b"session-1"),
+]
+assert verify_affine_value_batch(affine_batch)
+assert not verify_affine_value_batch([])  # 空批次为 False
+
 # 同值证明的批量验证：一次提交多组左右承诺与已有证明，无需共同值或盲因子
 # （按 (prime, generator, h) 分组，左右等式各取独立随机权重做线性组合）
 from zkregion import EqualValueBatchEntry, verify_equal_value_batch
